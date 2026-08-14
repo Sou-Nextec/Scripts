@@ -36,6 +36,10 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.4.0  SNMP: opção de baixar o snmp.yml homologado direto do repositório
+           Sou-Nextec/Scripts (por fabricante), sem depender de o operador
+           já ter uma cópia local do arquivo.
+
     2.3.0  Correção da causa raiz do "configuração não vai para o disco":
            Invoke-AlloyCommand não citava caminhos com espaço ao chamar o
            CLI do Alloy, e Update-AlloyBinaryOnly não preservava o
@@ -138,7 +142,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.3.0"
+$InstallerVersion = "2.4.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -153,6 +157,15 @@ $AlloyExe = Join-Path $AlloyDir "alloy-windows-amd64.exe"
 $ConfigFile = Join-Path $AlloyDir "config.alloy"
 $BlackboxFile = Join-Path $AlloyDir "blackbox.yml"
 $SnmpFile = Join-Path $AlloyDir "snmp.yml"
+
+# Repositório Nextec com os snmp.yml homologados por fabricante. Usado para
+# baixar o arquivo certo sem depender de o operador já ter uma cópia local.
+$NextecSnmpRepoBaseUrl = "https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Alloy/snmp"
+$NextecSnmpVendors = [ordered]@{
+    "1" = @{ Label = "pfSense"; File = "pfsense.yml" }
+    "2" = @{ Label = "Fortigate"; File = "fortigate.yml" }
+    "3" = @{ Label = "Mikrotik"; File = "mikrotik.yml" }
+}
 
 # Nome do serviço Windows. Resolve-AlloyInstallation substitui pelo nome real
 # quando o serviço existe com outro nome.
@@ -2534,6 +2547,41 @@ function Read-BlackboxTargets {
     while ($again)
 }
 
+function Get-NextecSnmpConfigFromRepo {
+    <#
+        Baixa o snmp.yml homologado direto do repositório Sou-Nextec/Scripts,
+        pelo tipo de fabricante escolhido pelo operador. Evita depender de o
+        arquivo já estar copiado manualmente na máquina.
+    #>
+    Write-Host ""
+    Write-Host "Fabricantes disponíveis no repositório Nextec:"
+    foreach ($key in $NextecSnmpVendors.Keys) {
+        Write-Host ("  [{0}] {1}" -f $key, $NextecSnmpVendors[$key].Label)
+    }
+
+    $vendorChoice = Read-Required -Prompt ("Escolha o fabricante [1-{0}]" -f $NextecSnmpVendors.Count)
+
+    if (-not $NextecSnmpVendors.Contains($vendorChoice)) {
+        Write-Warn "Opção inválida."
+        return $null
+    }
+
+    $vendor = $NextecSnmpVendors[$vendorChoice]
+    $url = "{0}/{1}" -f $NextecSnmpRepoBaseUrl, $vendor.File
+    $destino = Join-Path $env:TEMP ("nextec-snmp-{0}" -f $vendor.File)
+
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $destino -UseBasicParsing
+    }
+    catch {
+        Write-Warn ("Falha ao baixar {0}: {1}" -f $url, $_.Exception.Message)
+        return $null
+    }
+
+    Write-Info ("Baixado de {0}" -f $url)
+    return $destino
+}
+
 function Read-SnmpTargets {
     $script:SnmpTargets = @()
     $script:SnmpSourceFile = $null
@@ -2575,7 +2623,18 @@ function Read-SnmpTargets {
     Write-Step "SNMP"
 
     while ($true) {
-        $candidate = Read-Required "Caminho do snmp.yml homologado pela Nextec"
+        $origem = Read-Choice -Prompt "Origem do snmp.yml" -Options @("Baixar do repositório Nextec (GitHub)","Informar caminho local") -Default 1
+
+        if ($origem -eq 1) {
+            $candidate = Get-NextecSnmpConfigFromRepo
+
+            if ($null -eq $candidate) {
+                continue
+            }
+        }
+        else {
+            $candidate = Read-Required "Caminho do snmp.yml homologado pela Nextec"
+        }
 
         if (Test-Path -LiteralPath $candidate -PathType Leaf) {
             $script:SnmpSourceFile = (Resolve-Path -LiteralPath $candidate).Path
