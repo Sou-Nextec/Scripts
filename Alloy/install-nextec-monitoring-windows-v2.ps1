@@ -36,6 +36,12 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.11.0 Corrige o registro da tarefa do Speedtest. O gatilho usava
+           [TimeSpan]::MaxValue como duracao da repeticao, o que gera
+           "P99999999DT23H59M59S" e faz o agendador recusar a tarefa com
+           HRESULT 0x80041318. Pelo schema do Task Scheduler, repeticao sem
+           duracao ja significa indefinida.
+
     2.10.0 Falha em capacidade opcional (Blackbox, SNMP, Speedtest) deixa de
            reverter a instalação inteira: a capacidade é desligada, a
            instalação continua e o resumo final lista as pendências. As
@@ -200,7 +206,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.10.0"
+$InstallerVersion = "2.11.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -4957,17 +4963,74 @@ function Register-SpeedtestScheduledTask {
     $action = New-ScheduledTaskAction -Execute "powershell.exe" `
         -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $SpeedtestRunnerScript)
 
-    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-        -RepetitionInterval (New-TimeSpan -Minutes $script:InternetIntervalMinutesResolved) `
-        -RepetitionDuration ([TimeSpan]::MaxValue)
-
     $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
 
-    Register-ScheduledTask -TaskName $SpeedtestTaskName -Action $action -Trigger $trigger `
-        -Principal $principal -Settings $settings -Force | Out-Null
+    $intervalo = New-TimeSpan -Minutes $script:InternetIntervalMinutesResolved
+
+    # Início um minuto à frente: com -At (Get-Date) o instante de disparo já
+    # passou quando a tarefa termina de ser registrada.
+    $inicio = (Get-Date).AddMinutes(1)
+
+    $trigger = New-SpeedtestTrigger -Inicio $inicio -Intervalo $intervalo
+
+    try {
+        Register-ScheduledTask -TaskName $SpeedtestTaskName -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings -Force | Out-Null
+    }
+    catch {
+        # Alguns builds preenchem a duração sozinhos mesmo sem o parâmetro, e
+        # aí o registro falha do mesmo jeito. Dez anos é longo o bastante para
+        # a prática e está dentro do intervalo que o agendador aceita.
+        Write-Warn "O agendador recusou a repetição indefinida; usando duração de 10 anos."
+
+        $trigger = New-ScheduledTaskTrigger -Once -At $inicio `
+            -RepetitionInterval $intervalo `
+            -RepetitionDuration (New-TimeSpan -Days 3650)
+
+        Register-ScheduledTask -TaskName $SpeedtestTaskName -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings -Force | Out-Null
+    }
+}
+
+function New-SpeedtestTrigger {
+    <#
+        Monta o gatilho de repetição da tarefa do Speedtest.
+
+        A duração é deliberadamente omitida: pelo schema do Task Scheduler,
+        Repetition sem Duration repete indefinidamente. Passar
+        [TimeSpan]::MaxValue gera "P99999999DT23H59M59S", que está fora do
+        intervalo aceito, e o registro falha com HRESULT 0x80041318
+        ("The task XML contains a value which is incorrectly formatted or out
+        of range").
+    #>
+    param(
+        [Parameter(Mandatory=$true)][datetime]$Inicio,
+        [Parameter(Mandatory=$true)][TimeSpan]$Intervalo
+    )
+
+    $trigger = New-ScheduledTaskTrigger -Once -At $Inicio -RepetitionInterval $Intervalo
+
+    # Mesmo sem o parâmetro, parte dos builds do PowerShell preenche a duração
+    # com o valor máximo. Limpar aqui evita cair no mesmo erro por outro
+    # caminho; a propriedade nem sempre existe, então a checagem é defensiva.
+    try {
+        if ($null -ne $trigger.PSObject.Properties["Repetition"] -and $null -ne $trigger.Repetition) {
+            $duracao = [string]$trigger.Repetition.Duration
+
+            if ($duracao -match "^P9{6,}" -or $duracao -match "P10675199") {
+                $trigger.Repetition.Duration = $null
+            }
+        }
+    }
+    catch {
+        # Objeto sem a propriedade ou somente leitura: segue com o gatilho como
+        # veio e deixa o fallback do chamador resolver, se precisar.
+    }
+
+    return $trigger
 }
 
 function Install-InternetMonitoring {
