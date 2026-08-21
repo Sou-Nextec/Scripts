@@ -36,6 +36,11 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.7.0  Menu de reconfiguração: "Internet (Speedtest)" e "Exporters
+           adicionais" passam a aparecer sempre. Internet só era oferecida a
+           host que já fosse coletor, e era justamente por ela que se ativava
+           o primeiro; exporters não tinham editor nenhum.
+
     2.6.0  Auto elevação: o instalador reabre a si mesmo com privilégio de
            Administrador em vez de recusar a execução, repassando os
            parâmetros por EncodedCommand e propagando o código de saída.
@@ -173,7 +178,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.6.0"
+$InstallerVersion = "2.7.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -1655,6 +1660,94 @@ function Edit-SnmpTargets {
     $script:Collector = ($script:EnableBlackboxResolved -or $script:EnableSnmpResolved -or $script:EnableInternetResolved)
 }
 
+function Add-CustomExporterEntries {
+    <#
+        Acrescenta endpoints Prometheus um a um, oferecendo o catálogo como
+        atalho de porta e nome de serviço. Não reaproveita a árvore de seleção
+        da instalação porque ali os exporters vêm junto com logs e recursos
+        detectados, e num host já instalado só os exporters estão em jogo.
+    #>
+    $catalogo = Get-NextecExporterCatalog
+    $rotulos = @($catalogo | ForEach-Object { $_.Label })
+
+    do {
+        $indice = Read-Choice -Prompt "Qual exporter?" -Options $rotulos -Default $rotulos.Count
+        $definicao = $catalogo[$indice - 1]
+
+        $nome = ""
+        while ([string]::IsNullOrWhiteSpace($nome)) {
+            $sugestao = if ([string]::IsNullOrWhiteSpace($definicao.DefaultService)) { "" } else { $definicao.Key }
+            $nome = ConvertTo-Slug (Read-Required -Prompt "Nome do exporter" -Default $sugestao)
+
+            if ([string]::IsNullOrWhiteSpace($nome)) {
+                Write-Warn "Nome inválido após normalização."
+                continue
+            }
+
+            if (@($script:CustomExporters | ForEach-Object { $_.Name }) -contains $nome) {
+                Write-Warn ("Já existe um exporter chamado '{0}'. Use outro nome." -f $nome)
+                $nome = ""
+            }
+        }
+
+        $alvo = Read-Required -Prompt "Endereço (host:porta)" -Default $definicao.DefaultTarget
+        $servico = ConvertTo-Slug (Read-Required -Prompt "Serviço (label)" -Default $definicao.DefaultService)
+
+        $script:CustomExporters += [pscustomobject]@{
+            Name = $nome
+            Target = $alvo
+            Service = $servico
+        }
+
+        $mais = Read-YesNo -Prompt "Adicionar outro exporter?" -Default $false
+    }
+    while ($mais)
+}
+
+function Edit-CustomExporters {
+    <#
+        Edita os endpoints Prometheus adicionais de um host já instalado.
+
+        Espelha Edit-BlackboxTargets e Edit-SnmpTargets: sem este editor, um
+        exporter só podia ser acrescentado reinstalando o host do zero.
+    #>
+    Write-Step "Exporters adicionais"
+
+    if ($script:CustomExporters.Count -eq 0) {
+        Write-Info "Nenhum exporter configurado."
+    }
+    else {
+        for ($i = 0; $i -lt $script:CustomExporters.Count; $i++) {
+            $exporter = $script:CustomExporters[$i]
+            Write-Host ("  [{0}] {1,-20} {2,-24} {3}" -f ($i + 1), $exporter.Name, $exporter.Target, $exporter.Service)
+        }
+    }
+
+    $opcoes = @("Adicionar exporters", "Remover um exporter", "Refazer a lista do zero", "Voltar")
+    $escolha = Read-Choice -Prompt "O que deseja fazer?" -Options $opcoes -Default 4
+
+    switch ($escolha) {
+        1 { Add-CustomExporterEntries }
+        2 {
+            if ($script:CustomExporters.Count -eq 0) {
+                Write-Warn "Não há exporters para remover."
+                return
+            }
+
+            $nomes = @($script:CustomExporters | ForEach-Object { "{0} ({1})" -f $_.Name, $_.Target })
+            $indice = Read-Choice -Prompt "Qual exporter remover?" -Options $nomes -Default 1
+            $script:CustomExporters = @($script:CustomExporters | Where-Object { $_ -ne $script:CustomExporters[$indice - 1] })
+        }
+        3 {
+            $script:CustomExporters = @()
+            Add-CustomExporterEntries
+        }
+    }
+
+    $script:EnableExportersResolved = ($script:CustomExporters.Count -gt 0)
+    $script:Collector = ($script:EnableBlackboxResolved -or $script:EnableSnmpResolved -or $script:EnableInternetResolved -or $script:EnableExportersResolved)
+}
+
 function Edit-InternetSettings {
     Write-Step "Internet (Speedtest)"
 
@@ -1747,9 +1840,11 @@ function Invoke-ConfigurationMenu {
         [void]$opcoes.Add("Alvos de conectividade (Blackbox)")
         [void]$opcoes.Add("Alvos SNMP")
 
-        if ($script:Collector) {
-            [void]$opcoes.Add("Internet (Speedtest)")
-        }
+        # Internet e exporters aparecem sempre. Condicionar a "já ser coletor"
+        # criava um beco: o item só existia se o host já tivesse algum alvo, e
+        # era justamente por esse item que se ativava o primeiro.
+        [void]$opcoes.Add("Internet (Speedtest)")
+        [void]$opcoes.Add("Exporters adicionais")
 
         [void]$opcoes.Add("Credenciais do NOC")
         [void]$opcoes.Add("Destino do NOC")
@@ -1767,6 +1862,7 @@ function Invoke-ConfigurationMenu {
             "Alvos de conectividade (Blackbox)" { Edit-BlackboxTargets; $alterou = $true }
             "Alvos SNMP" { Edit-SnmpTargets; $alterou = $true }
             "Internet (Speedtest)" { Edit-InternetSettings; $alterou = $true }
+            "Exporters adicionais" { Edit-CustomExporters; $alterou = $true }
             "Credenciais do NOC" {
                 # Limpa o que veio do registro para que Read-NocCredentials
                 # pergunte de novo em vez de reaproveitar em silêncio.
