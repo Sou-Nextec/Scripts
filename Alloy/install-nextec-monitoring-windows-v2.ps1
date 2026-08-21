@@ -36,6 +36,17 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.9.0  Intervalo de sondagem do Blackbox passa a ser configurável (padrão
+           60s, mínimo 5s), com o timeout derivado do intervalo. Piso do
+           Speedtest reduzido para 5 minutos, com confirmação e estimativa de
+           consumo abaixo de 15 minutos.
+
+    2.8.0  Apresentação no console: títulos de etapa com régua, campos em
+           colunas alinhadas e valores destacados por cor. A etapa de Internet
+           passa a explicar que o Speedtest mede velocidade e não
+           disponibilidade, avisa o custo de intervalos curtos e oferece criar
+           os alvos ICMP de disponibilidade (gateway, 1.1.1.1, 8.8.8.8).
+
     2.7.0  Menu de reconfiguração: "Internet (Speedtest)" e "Exporters
            adicionais" passam a aparecer sempre. Internet só era oferecida a
            host que já fosse coletor, e era justamente por ela que se ativava
@@ -123,7 +134,7 @@ param(
     # [Modo Silencioso] Intervalo em minutos entre execuções do teste de
     # velocidade. Padrão 30min: um link residencial não deve ser saturado por
     # um teste de banda a cada poucos minutos.
-    [ValidateRange(10, 1440)]
+    [ValidateRange(5, 1440)]
     [int]$InternetIntervalMinutes = 30,
 
     # [Modo Silencioso] Define um ou mais alvos para o Blackbox Exporter. Formato: "nome|endereco|modulo|tipo".
@@ -178,7 +189,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.7.0"
+$InstallerVersion = "2.9.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -275,6 +286,11 @@ $script:EnableExportersResolved = $false
 $script:SelectedExporterKeys = [string[]]@()
 $script:EnableInternetResolved = $false
 $script:InternetIntervalMinutesResolved = 30
+
+# Intervalo de sondagem dos alvos Blackbox. 60s é o padrão histórico e serve
+# para "o site está no ar". Para medir disponibilidade de link, latência e
+# jitter com alguma resolução, o intervalo precisa cair para 10s ou 15s.
+$script:BlackboxIntervalSecondsResolved = 60
 $script:BlackboxTargets = @()
 $script:SnmpTargets = @()
 $script:SnmpSourceFile = $null
@@ -289,10 +305,38 @@ $script:LokiPassword = ""
 # SAÍDA
 # ==============================================================================
 
+$script:LarguraConsole = 64
+
 function Write-Step {
     param([Parameter(Mandatory=$true)][string]$Message)
     Write-Host ""
-    Write-Host ("==> {0}" -f $Message) -ForegroundColor Cyan
+    Write-Host ("  {0}" -f $Message.ToUpperInvariant()) -ForegroundColor Cyan
+    Write-Host ("  {0}" -f ("-" * [Math]::Min($script:LarguraConsole, $Message.Length + 4))) -ForegroundColor DarkCyan
+}
+
+function Write-Section {
+    # Subtítulo dentro de uma etapa, para separar blocos de informação.
+    param([Parameter(Mandatory=$true)][string]$Message)
+    Write-Host ""
+    Write-Host ("  {0}" -f $Message) -ForegroundColor White
+}
+
+function Write-Field {
+    <#
+        Par rótulo/valor com colunas alinhadas. Mantém o alinhamento mesmo
+        quando o rótulo tem acento, porque o padding é aplicado depois da
+        formatação e conta caracteres, não bytes.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Label,
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Value,
+        [ConsoleColor]$ValueColor = [ConsoleColor]::Gray,
+        [int]$Width = 16
+    )
+
+    $rotulo = ("{0}:" -f $Label).PadRight($Width)
+    Write-Host ("    {0}" -f $rotulo) -ForegroundColor DarkGray -NoNewline
+    Write-Host $Value -ForegroundColor $ValueColor
 }
 
 function Write-Ok {
@@ -1177,6 +1221,14 @@ function Read-CurrentAlloyConfiguration {
     $blackboxTargets = @()
     $blackboxSection = Get-AlloyConfigSection -Content $content -Header 'prometheus.exporter.blackbox "network"'
 
+    # Intervalo de sondagem vive no bloco de scrape, não no de exporter.
+    $blackboxIntervalSeconds = 60
+    $scrapeBlackbox = Get-AlloyConfigSection -Content $content -Header 'prometheus.scrape "blackbox"'
+    $intervalMatch = [Regex]::Match($scrapeBlackbox, 'scrape_interval\s*=\s*"(\d+)s"')
+    if ($intervalMatch.Success) {
+        $blackboxIntervalSeconds = [int]$intervalMatch.Groups[1].Value
+    }
+
     # O fechamento do bloco pode vir com dois espaços (como este instalador
     # gera) ou com TAB (como "alloy fmt" reformata depois da primeira
     # validação). "[ \t]*" aceita os dois; antes disso, qualquer configuração
@@ -1267,6 +1319,7 @@ function Read-CurrentAlloyConfiguration {
         CustomExporters          = $customExporters
         EnableInternet           = $enableInternet
         InternetIntervalMinutes  = $internetIntervalMinutes
+        BlackboxIntervalSeconds  = $blackboxIntervalSeconds
         Modificado               = (Get-Item -LiteralPath $ConfigFile).LastWriteTime
         Arquivo                  = $ConfigFile
     }
@@ -1324,33 +1377,35 @@ function Show-CurrentConfiguration {
 
     Write-Step "Configuração atual"
 
-    Write-Host "Identificação" -ForegroundColor White
-    Write-Host ("  Cliente:      {0}" -f $c.Cliente)
-    Write-Host ("  Host:         {0}" -f $c.HostLabel)
-    Write-Host ("  Tipo:         {0}" -f $c.TipoLabel)
-    Write-Host ("  Ambiente:     {0}" -f $c.Ambiente)
-    Write-Host ("  Local:        {0}" -f $c.Local)
-    Write-Host ("  Criticidade:  {0}" -f $c.Criticidade)
+    Write-Section "Identificação"
+    Write-Field -Label "Cliente" -Value $c.Cliente -ValueColor White
+    Write-Field -Label "Host" -Value $c.HostLabel -ValueColor White
+    Write-Field -Label "Tipo" -Value $c.TipoLabel
+    Write-Field -Label "Ambiente" -Value $c.Ambiente
+    Write-Field -Label "Local" -Value $c.Local
+    Write-Field -Label "Criticidade" -Value $c.Criticidade -ValueColor $(
+        if ($c.Criticidade -eq "critico") { [ConsoleColor]::Red }
+        elseif ($c.Criticidade -eq "alto") { [ConsoleColor]::Yellow }
+        else { [ConsoleColor]::Gray }
+    )
 
-    Write-Host ""
-    Write-Host "Destino" -ForegroundColor White
-    Write-Host ("  Métricas:     {0}" -f $c.RemoteWriteUrl)
+    Write-Section "Destino"
+    Write-Field -Label "Métricas" -Value $c.RemoteWriteUrl
 
     if ([string]::IsNullOrWhiteSpace($c.LokiUrl)) {
-        Write-Host "  Logs:         não configurado"
+        Write-Field -Label "Logs" -Value "não configurado" -ValueColor DarkGray
     }
     else {
-        Write-Host ("  Logs:         {0}" -f $c.LokiUrl)
+        Write-Field -Label "Logs" -Value $c.LokiUrl
     }
 
-    Write-Host ""
-    Write-Host "Coleta do host" -ForegroundColor White
+    Write-Section "Coleta do host"
 
     if ($c.MonitorHost) {
-        Write-Host ("  Coletores:    {0}" -f ($c.Collectors -join ", "))
+        Write-Field -Label "Coletores" -Value ($c.Collectors -join ", ")
     }
     else {
-        Write-Host "  Coletores:    host não monitorado (somente collector de rede)"
+        Write-Field -Label "Coletores" -Value "host não monitorado (somente collector de rede)" -ValueColor DarkGray
     }
 
     $logResumo = New-Object System.Collections.Generic.List[string]
@@ -1359,17 +1414,24 @@ function Show-CurrentConfiguration {
     if ($c.EnableSecurity) { $logResumo.Add("segurança") }
 
     if ($logResumo.Count -gt 0) {
-        Write-Host ("  Logs:         {0}" -f ($logResumo -join ", "))
+        Write-Field -Label "Logs" -Value ($logResumo -join ", ")
     }
     else {
-        Write-Host "  Logs:         desabilitados"
+        Write-Field -Label "Logs" -Value "desabilitados" -ValueColor DarkGray
+    }
+
+    if ($c.EnableInternet) {
+        Write-Field -Label "Internet" -Value ("Speedtest a cada {0} min" -f $c.InternetIntervalMinutes)
+    }
+    else {
+        Write-Field -Label "Internet" -Value "não monitorada" -ValueColor DarkGray
     }
 
     if ($c.BlackboxTargets.Count -gt 0) {
-        Write-Host ""
-        Write-Host "Conectividade (Blackbox)" -ForegroundColor White
+        Write-Section ("Conectividade, Blackbox ({0} alvo(s))" -f $c.BlackboxTargets.Count)
+        Write-Host ("    {0,-18} {1,-28} {2,-16} {3}" -f "NOME", "ENDEREÇO", "MÓDULO", "TIPO") -ForegroundColor DarkGray
         foreach ($t in $c.BlackboxTargets) {
-            Write-Host ("  {0,-20} {1,-30} {2,-16} {3}" -f $t.Name, $t.Address, $t.Module, $t.Type)
+            Write-Host ("    {0,-18} {1,-28} {2,-16} {3}" -f $t.Name, $t.Address, $t.Module, $t.Type)
         }
     }
 
@@ -1435,6 +1497,7 @@ function Import-CurrentConfiguration {
     }
 
     $script:BlackboxTargets = @($c.BlackboxTargets)
+    $script:BlackboxIntervalSecondsResolved = $c.BlackboxIntervalSeconds
     $script:SnmpTargets     = @($c.SnmpTargets)
     $script:CustomExporters = @($c.CustomExporters)
 
@@ -1569,6 +1632,68 @@ function Edit-LogSettings {
     }
 }
 
+function Read-BlackboxInterval {
+    <#
+        Define de quanto em quanto tempo cada alvo é sondado.
+
+        O intervalo é o que determina a resolução de tudo que se calcula em
+        cima: com 60s, uma queda de 40 segundos pode passar entre duas sondas.
+        Com 10s, a janela cega cai para 10 segundos e sobram amostras
+        suficientes para jitter e taxa de perda terem significado.
+    #>
+    Write-Section "Intervalo de sondagem"
+    Write-Host "    Quanto menor, mais fina a medição de disponibilidade, latência e jitter." -ForegroundColor DarkGray
+    Write-Host "    Cada alvo gera cerca de 9 séries por sondagem." -ForegroundColor DarkGray
+    Write-Host ""
+
+    $opcoes = @(
+        "10 segundos - disponibilidade e latência de link, jitter confiável",
+        "15 segundos - equilíbrio entre resolução e volume",
+        "30 segundos - suficiente para serviços e sites",
+        "60 segundos - padrão, indicado para site externo e alvo remoto",
+        "Informar outro valor"
+    )
+    $valores = @(10, 15, 30, 60)
+
+    $atual = [Array]::IndexOf($valores, [int]$script:BlackboxIntervalSecondsResolved)
+    $padrao = if ($atual -ge 0) { $atual + 1 } else { 4 }
+
+    $escolha = Read-Choice -Prompt "Sondar os alvos a cada" -Options $opcoes -Default $padrao
+
+    if ($escolha -le $valores.Count) {
+        $script:BlackboxIntervalSecondsResolved = $valores[$escolha - 1]
+    }
+    else {
+        while ($true) {
+            $texto = Read-Host ("    Intervalo em segundos [{0}]" -f $script:BlackboxIntervalSecondsResolved)
+
+            if ([string]::IsNullOrWhiteSpace($texto)) {
+                break
+            }
+
+            $valor = 0
+            if (-not [int]::TryParse($texto, [ref]$valor)) {
+                Write-Warn "Informe um número inteiro."
+                continue
+            }
+
+            # O piso de 5s existe porque o timeout da sonda precisa caber
+            # dentro do intervalo, e abaixo disso a sonda não termina a tempo.
+            if ($valor -lt 5 -or $valor -gt 300) {
+                Write-Warn "Informe um valor entre 5 e 300 segundos."
+                continue
+            }
+
+            $script:BlackboxIntervalSecondsResolved = $valor
+            break
+        }
+    }
+
+    $porDia = [Math]::Floor(86400 / $script:BlackboxIntervalSecondsResolved)
+    Write-Host ""
+    Write-Ok ("Sondagem a cada {0}s, {1} medições por alvo por dia." -f $script:BlackboxIntervalSecondsResolved, $porDia)
+}
+
 function Edit-BlackboxTargets {
     Write-Step "Alvos de conectividade (Blackbox)"
 
@@ -1582,8 +1707,10 @@ function Edit-BlackboxTargets {
         }
     }
 
-    $opcoes = @("Adicionar alvos", "Remover um alvo", "Refazer a lista do zero", "Voltar")
-    $escolha = Read-Choice -Prompt "O que deseja fazer?" -Options $opcoes -Default 4
+    Write-Field -Label "Sondagem" -Value ("a cada {0}s" -f $script:BlackboxIntervalSecondsResolved)
+
+    $opcoes = @("Adicionar alvos", "Remover um alvo", "Alterar o intervalo de sondagem", "Refazer a lista do zero", "Voltar")
+    $escolha = Read-Choice -Prompt "O que deseja fazer?" -Options $opcoes -Default 5
 
     switch ($escolha) {
         1 {
@@ -1604,7 +1731,8 @@ function Edit-BlackboxTargets {
             $indice = Read-Choice -Prompt "Qual alvo remover?" -Options $nomes -Default 1
             $script:BlackboxTargets = @($script:BlackboxTargets | Where-Object { $_ -ne $script:BlackboxTargets[$indice - 1] })
         }
-        3 {
+        3 { Read-BlackboxInterval }
+        4 {
             $script:BlackboxTargets = @()
             $script:EnableBlackboxResolved = $true
             Read-BlackboxTargets
@@ -1758,7 +1886,13 @@ function Edit-InternetSettings {
         Write-Info "Desabilitado."
     }
 
-    $habilitar = Read-YesNo -Prompt "Habilitar monitoramento de Internet (Speedtest Ookla)?" -Default $script:EnableInternetResolved
+    Write-Host ""
+    Write-Host "    O Speedtest satura o link durante o teste e consome banda de verdade." -ForegroundColor DarkGray
+    Write-Host "    Ele mede velocidade, não disponibilidade: para saber se o link caiu," -ForegroundColor DarkGray
+    Write-Host "    use os alvos de conectividade (Blackbox), que testam a cada minuto." -ForegroundColor DarkGray
+    Write-Host ""
+
+    $habilitar = Read-YesNo -Prompt "Habilitar medição de velocidade (Speedtest Ookla)?" -Default $script:EnableInternetResolved
 
     if (-not $habilitar) {
         $script:EnableInternetResolved = $false
@@ -1766,7 +1900,7 @@ function Edit-InternetSettings {
     }
 
     while ($true) {
-        $intervaloTexto = Read-Host ("Intervalo em minutos entre execuções [{0}]" -f $script:InternetIntervalMinutesResolved)
+        $intervaloTexto = Read-Host ("    Intervalo em minutos entre execuções [{0}]" -f $script:InternetIntervalMinutesResolved)
 
         if ([string]::IsNullOrWhiteSpace($intervaloTexto)) {
             Write-Host ""
@@ -1774,16 +1908,136 @@ function Edit-InternetSettings {
         }
 
         $intervalo = 0
-        if ([int]::TryParse($intervaloTexto, [ref]$intervalo) -and $intervalo -ge 10 -and $intervalo -le 1440) {
-            $script:InternetIntervalMinutesResolved = $intervalo
-            Write-Host ""
-            break
+        if (-not [int]::TryParse($intervaloTexto, [ref]$intervalo)) {
+            Write-Warn "Informe um número inteiro."
+            continue
         }
 
-        Write-Warn "Informe um número entre 10 e 1440."
+        if ($intervalo -lt 5) {
+            Write-Warn "Intervalo mínimo é 5 minutos."
+            continue
+        }
+
+        if ($intervalo -gt 1440) {
+            Write-Warn "Intervalo máximo é 1440 minutos (24 horas)."
+            continue
+        }
+
+        # Cada execução ocupa o link inteiro por cerca de 15 segundos em cada
+        # sentido, então o consumo cresce com a velocidade contratada: num link
+        # de 300 Mbps cada teste transfere perto de meio giga. Abaixo de 15
+        # minutos o operador vê a conta antes de confirmar.
+        if ($intervalo -lt 15) {
+            $porDia = [Math]::Floor(1440 / $intervalo)
+            Write-Host ""
+            Write-Warn ("A cada {0} min são {1} testes por dia." -f $intervalo, $porDia)
+            Write-Host ("    Em um link de 100 Mbps isso passa de {0} GB por dia." -f [Math]::Round($porDia * 0.37, 0)) -ForegroundColor Yellow
+            Write-Host ("    Em um link de 300 Mbps, mais de {0} GB por dia." -f [Math]::Round($porDia * 1.1, 0)) -ForegroundColor Yellow
+            Write-Host "    Durante cada teste o link fica saturado e o cliente sente lentidão." -ForegroundColor Yellow
+            Write-Host "    Para disponibilidade e latência contínuas, use os alvos ICMP." -ForegroundColor DarkGray
+            Write-Host ""
+
+            if (-not (Read-YesNo -Prompt ("Confirma medir velocidade a cada {0} minutos?" -f $intervalo) -Default $false)) {
+                continue
+            }
+        }
+
+        $script:InternetIntervalMinutesResolved = $intervalo
+        Write-Host ""
+        break
     }
 
     $script:EnableInternetResolved = $true
+
+    # Velocidade sem disponibilidade conta metade da história: um teste a cada
+    # 30 minutos não enxerga uma queda de cinco. Os alvos ICMP fecham essa
+    # lacuna e separam "a internet caiu" de "o roteador do cliente caiu".
+    if ($script:BlackboxTargets.Count -eq 0) {
+        Write-Host ""
+        Write-Info "Nenhum alvo de conectividade configurado neste host."
+
+        if (Read-YesNo -Prompt "Criar os alvos padrão de disponibilidade (gateway, 1.1.1.1, 8.8.8.8)?" -Default $true) {
+            Add-DefaultConnectivityTargets
+        }
+    }
+}
+
+function Add-DefaultConnectivityTargets {
+    <#
+        Cria os três alvos ICMP que respondem à pergunta que aparece primeiro
+        em toda queda: o problema é o link, o roteador ou a internet inteira.
+
+        O gateway sai da tabela de rotas do próprio host; se não der para
+        descobrir, apenas os dois destinos externos são criados.
+    #>
+    $novos = New-Object System.Collections.Generic.List[object]
+
+    $gateway = ""
+    try {
+        $rota = Get-CimInstance -ClassName Win32_IP4RouteTable -Filter "Destination='0.0.0.0'" -ErrorAction Stop |
+                Sort-Object Metric1 |
+                Select-Object -First 1
+
+        if ($null -ne $rota) {
+            $gateway = [string]$rota.NextHop
+        }
+    }
+    catch {
+        $gateway = ""
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($gateway) -and $gateway -ne "0.0.0.0") {
+        $novos.Add([pscustomobject]@{
+            Name = "gateway"
+            Address = $gateway
+            Module = "icmp_ipv4"
+            Type = "rede"
+            Service = "conectividade"
+        })
+    }
+    else {
+        Write-Warn "Não foi possível descobrir o gateway padrão; criando apenas os destinos externos."
+    }
+
+    $novos.Add([pscustomobject]@{
+        Name = "dns_cloudflare"
+        Address = "1.1.1.1"
+        Module = "icmp_ipv4"
+        Type = "rede"
+        Service = "conectividade"
+    })
+
+    $novos.Add([pscustomobject]@{
+        Name = "dns_google"
+        Address = "8.8.8.8"
+        Module = "icmp_ipv4"
+        Type = "rede"
+        Service = "conectividade"
+    })
+
+    $existentes = @($script:BlackboxTargets | ForEach-Object { $_.Name })
+    $adicionados = @($novos | Where-Object { $existentes -notcontains $_.Name })
+
+    $script:BlackboxTargets = @($script:BlackboxTargets) + $adicionados
+    $script:EnableBlackboxResolved = ($script:BlackboxTargets.Count -gt 0)
+    $script:Collector = $true
+
+    foreach ($alvo in $adicionados) {
+        Write-Ok ("Alvo criado: {0} ({1})" -f $alvo.Name, $alvo.Address)
+    }
+
+    # Alvo de disponibilidade de link só cumpre o papel com sondagem curta:
+    # a 60s uma queda de quarenta segundos passa despercebida entre duas
+    # medições.
+    if ($script:BlackboxIntervalSecondsResolved -gt 15) {
+        Write-Host ""
+        Write-Info ("A sondagem está em {0}s, o que é grosseiro para medir queda de link." -f $script:BlackboxIntervalSecondsResolved)
+
+        if (Read-YesNo -Prompt "Reduzir para 10 segundos?" -Default $true) {
+            $script:BlackboxIntervalSecondsResolved = 10
+            Write-Ok "Sondagem ajustada para 10s."
+        }
+    }
 }
 
 function Edit-NocDestination {
@@ -2861,6 +3115,8 @@ function Read-BlackboxTargets {
         $again = Read-YesNo -Prompt "Adicionar outro alvo de conectividade/disponibilidade?" -Default $false
     }
     while ($again)
+
+    Read-BlackboxInterval
 }
 
 function Get-NextecSnmpConfigFromRepo {
@@ -5143,12 +5399,18 @@ function New-AlloyConfiguration {
 
         [void]$builder.AppendLine("}")
         [void]$builder.AppendLine("")
+        # O timeout precisa caber dentro do intervalo, senão o Alloy recusa a
+        # configuração em tempo de execução (o validate não pega isso). Fica
+        # dois segundos abaixo do intervalo, limitado a 20s.
+        $intervaloBlackbox = [Math]::Max(5, [int]$script:BlackboxIntervalSecondsResolved)
+        $timeoutBlackbox = [Math]::Max(3, [Math]::Min($intervaloBlackbox - 2, 20))
+
         [void]$builder.AppendLine('prometheus.scrape "blackbox" {')
         [void]$builder.AppendLine("  targets         = prometheus.exporter.blackbox.network.targets")
         [void]$builder.AppendLine("  forward_to      = [prometheus.relabel.filtro_nextec.receiver]")
         [void]$builder.AppendLine('  job_name        = "integrations/blackbox"')
-        [void]$builder.AppendLine('  scrape_interval = "60s"')
-        [void]$builder.AppendLine('  scrape_timeout  = "20s"')
+        [void]$builder.AppendLine(('  scrape_interval = "{0}s"' -f $intervaloBlackbox))
+        [void]$builder.AppendLine(('  scrape_timeout  = "{0}s"' -f $timeoutBlackbox))
         [void]$builder.AppendLine("}")
         [void]$builder.AppendLine("")
     }
