@@ -36,6 +36,22 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.6.0  Auto elevação: o instalador reabre a si mesmo com privilégio de
+           Administrador em vez de recusar a execução, repassando os
+           parâmetros por EncodedCommand e propagando o código de saída.
+           Correções: atributo do coletor textfile do exporter Windows
+           (rejeitava a configuração inteira quando o Speedtest estava
+           ligado), BOM no .prom do Speedtest, reconfiguração de host com
+           SNMP pelo menu, preservação das credenciais SNMP existentes,
+           acúmulo de fabricantes SNMP no mesmo host, backup e rollback dos
+           arquivos auxiliares e identificação em cabeçalho estruturado.
+
+    2.5.0  SNMP sem digitação: o módulo é lido do próprio snmp.yml e escolhido
+           pela versão SNMP, e a credencial passa a ser montada pelo
+           instalador em snmp-auth.yml. Os defaults antigos ("system,if_mib"
+           e "public_v2") não existiam em nenhum arquivo do repositório e
+           geravam alvo que nunca coletava.
+
     2.4.0  SNMP: opção de baixar o snmp.yml homologado direto do repositório
            Sou-Nextec/Scripts (por fabricante), sem depender de o operador
            já ter uma cópia local do arquivo.
@@ -127,6 +143,21 @@ param(
 # exatamente os mesmos parâmetros que o operador informou.
 $script:OriginalBoundParameters = $PSBoundParameters
 
+# Texto do próprio script, capturado aqui porque dentro de uma função
+# $MyInvocation passa a ser o da função. Serve para reabrir o instalador
+# quando ele foi executado sem arquivo em disco, pelo one-liner.
+$script:OriginalScriptText = ""
+try {
+    $script:OriginalScriptText = [string]$MyInvocation.MyCommand.ScriptBlock
+}
+catch {
+    $script:OriginalScriptText = ""
+}
+
+$script:RelaunchTempScript = ""
+$script:Relaunched = $false
+$script:ExitCode = 0
+
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
@@ -142,7 +173,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.4.0"
+$InstallerVersion = "2.6.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -157,6 +188,11 @@ $AlloyExe = Join-Path $AlloyDir "alloy-windows-amd64.exe"
 $ConfigFile = Join-Path $AlloyDir "config.alloy"
 $BlackboxFile = Join-Path $AlloyDir "blackbox.yml"
 $SnmpFile = Join-Path $AlloyDir "snmp.yml"
+
+# Credencial SNMP em arquivo separado do módulo do fabricante. O snmp.yml do
+# repositório traz só a seção "modules"; a seção "auths" é específica do
+# cliente e nunca entra no repositório. O Alloy junta os dois em memória.
+$SnmpAuthFile = Join-Path $AlloyDir "snmp-auth.yml"
 
 # Repositório Nextec com os snmp.yml homologados por fabricante. Usado para
 # baixar o arquivo certo sem depender de o operador já ter uma cópia local.
@@ -196,6 +232,7 @@ $RegistryPath = "HKLM:\SOFTWARE\GrafanaLabs\Alloy"
 $LatestInstallerUrl = "https://github.com/grafana/alloy/releases/latest/download/alloy-installer-windows-amd64.exe"
 
 $script:ConfigBackup = $null
+$script:AuxiliaryBackups = @()
 $script:RegistryBackup = $null
 $script:ConfigChanged = $false
 $script:TranscriptStarted = $false
@@ -236,6 +273,7 @@ $script:InternetIntervalMinutesResolved = 30
 $script:BlackboxTargets = @()
 $script:SnmpTargets = @()
 $script:SnmpSourceFile = $null
+$script:SnmpAuthBlocks = @()
 $script:CustomExporters = @()
 $script:RwUsername = ""
 $script:RwPassword = ""
@@ -304,7 +342,19 @@ function Wait-NextecOperator {
 }
 
 function Show-Banner {
-    Clear-Host
+    if ($Silent) {
+        return
+    }
+
+    # Alguns hosts de RMM não implementam RawUI, e ali Clear-Host lança. Com
+    # $ErrorActionPreference = "Stop" isso derrubaria o script na primeira
+    # linha útil, com uma mensagem que não tem relação com o problema real.
+    try {
+        Clear-Host
+    }
+    catch {
+    }
+
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host "       NEXTEC NOC MONITORING INSTALLER, WINDOWS" -ForegroundColor White
     Write-Host "============================================================" -ForegroundColor Cyan
@@ -353,106 +403,250 @@ function Stop-Logging {
 # UTILITÁRIOS
 # ==============================================================================
 
-function Assert-Administrator {
+function Test-NextecIsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Assert-Administrator {
+    # Rede de segurança dentro do processo que vai instalar de fato. A decisão
+    # de elevar acontece antes, no despacho do script.
+    if (-not (Test-NextecIsAdministrator)) {
         throw "Execute este script em uma sessão do PowerShell aberta como Administrador."
     }
 }
 
-function Test-NextecProcessNeedsRelaunch {
+function Test-NextecProcessNeedsBitnessRelaunch {
     # "Windows PowerShell (x86)" é um processo de 32 bits. Em Windows Server
     # de 64 bits, Get-WindowsFeature (usado para detectar DNS, File Server,
     # IIS etc.) não existe nesse processo, então a detecção de funções do
-    # servidor fica incompleta em silêncio. Detectamos isso aqui para
-    # reabrir automaticamente no PowerShell de 64 bits antes de qualquer
-    # outra coisa rodar.
+    # servidor fica incompleta em silêncio.
     return ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess)
 }
 
-function ConvertTo-NextecRelaunchArguments {
-    param([Parameter(Mandatory=$true)][System.Collections.IDictionary]$BoundParameters)
+function ConvertTo-NextecPowerShellLiteral {
+    <#
+        Converte um valor para a sua representação literal em PowerShell,
+        preservando tipo. Usado para reconstruir os parâmetros na sessão nova.
 
-    $parts = New-Object System.Collections.Generic.List[string]
+        Passar parâmetros pela linha de comando com -File não funciona para
+        array: "-Nome a b" é recusado pelo binder, "-Nome a -Nome b" é
+        recusado como parâmetro repetido e "-Nome a,b" chega como uma única
+        string literal. Reconstruir um hashtable e aplicá-lo por splatting
+        resolve os três casos e ainda dispensa escape de aspas e de barra
+        invertida final.
+    #>
+    param([AllowNull()]$Value)
 
-    foreach ($key in $BoundParameters.Keys) {
-        $value = $BoundParameters[$key]
-
-        if ($value -is [switch]) {
-            if ($value.IsPresent) {
-                $parts.Add(("-{0}" -f $key))
-            }
-            continue
-        }
-
-        if ($value -is [System.Array]) {
-            if ($value.Count -eq 0) {
-                continue
-            }
-
-            # Repetir "-Nome valor1 -Nome valor2" faz o segundo sobrescrever
-            # o primeiro na reconstrução da linha de comando. O jeito correto
-            # de reconstruir um parâmetro array é um único "-Nome" seguido de
-            # todos os valores.
-            $parts.Add(("-{0}" -f $key))
-            foreach ($item in $value) {
-                $parts.Add(('"{0}"' -f ([string]$item).Replace('"', '""')))
-            }
-            continue
-        }
-
-        $parts.Add(("-{0}" -f $key))
-        $parts.Add(('"{0}"' -f ([string]$value).Replace('"', '""')))
+    if ($null -eq $Value) {
+        return '$null'
     }
 
-    return ($parts -join " ")
+    if ($Value -is [switch]) {
+        if ($Value.IsPresent) { return '$true' }
+        return '$false'
+    }
+
+    if ($Value -is [bool]) {
+        if ($Value) { return '$true' }
+        return '$false'
+    }
+
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
+        return ([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0}", $Value))
+    }
+
+    if ($Value -is [System.Array]) {
+        $items = @(@($Value) | ForEach-Object { ConvertTo-NextecPowerShellLiteral -Value $_ })
+
+        if ($items.Count -eq 0) {
+            return '@()'
+        }
+
+        return ('@({0})' -f ($items -join ","))
+    }
+
+    # Aspas simples não interpolam nada; o único escape necessário é a própria
+    # aspa simples, duplicada.
+    return ("'{0}'" -f ([string]$Value).Replace("'", "''"))
 }
 
-function Invoke-NextecRelaunchAs64Bit {
-    param([Parameter(Mandatory=$true)][System.Collections.IDictionary]$BoundParameters)
+function Get-NextecRelaunchScriptPath {
+    <#
+        Devolve um caminho em disco de onde a sessão nova pode carregar este
+        script.
 
-    $sysnativePowerShell = Join-Path $env:WINDIR "Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+        Executado pelo one-liner (irm mais scriptblock) não existe arquivo:
+        $PSCommandPath fica vazio. Nesse caso o próprio texto do script é
+        gravado em ProgramData, que o processo elevado enxerga, ao contrário
+        do %TEMP% do usuário. O mesmo vale quando o script está numa unidade
+        mapeada ou em UNC, que o token elevado normalmente não enxerga.
+    #>
+    $origem = [string]$PSCommandPath
+    $precisaMaterializar = [string]::IsNullOrWhiteSpace($origem)
 
-    if (-not (Test-Path -LiteralPath $sysnativePowerShell)) {
-        throw ("PowerShell de 32 bits (x86) detectado num Windows de 64 bits, e o PowerShell de 64 bits não foi encontrado em {0} para reabrir automaticamente. Feche esta janela e abra 'Windows PowerShell' (sem '(x86)') como Administrador." -f $sysnativePowerShell)
+    if (-not $precisaMaterializar) {
+        $raiz = [IO.Path]::GetPathRoot($origem)
+
+        if ($origem.StartsWith("\\") -or [string]::IsNullOrWhiteSpace($raiz)) {
+            $precisaMaterializar = $true
+        }
+        elseif ([IO.DriveInfo]::new($raiz).DriveType -ne [IO.DriveType]::Fixed) {
+            $precisaMaterializar = $true
+        }
     }
 
-    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
-        throw "PowerShell de 32 bits (x86) detectado num Windows de 64 bits, mas não foi possível identificar o caminho deste script para reabrir automaticamente. Feche esta janela e abra 'Windows PowerShell' (sem '(x86)') como Administrador."
+    if (-not $precisaMaterializar) {
+        return $origem
     }
 
-    Write-Warn "PowerShell de 32 bits (x86) detectado num Windows de 64 bits."
-    Write-Info "Reabrindo automaticamente em uma janela do PowerShell de 64 bits, como Administrador..."
-
-    # -NoExit mantém a janela nova aberta depois que o script termina. Sem
-    # ele, a janela criada aqui fecha no instante em que o script retorna, por
-    # sucesso ou por erro, e o operador não vê o resultado nem a mensagem de
-    # falha: a tela simplesmente some.
-    $argumentList = New-Object System.Collections.Generic.List[string]
-    $argumentList.Add("-NoExit")
-    $argumentList.Add("-NoProfile")
-    $argumentList.Add("-ExecutionPolicy")
-    $argumentList.Add("Bypass")
-    $argumentList.Add("-File")
-    $argumentList.Add(('"{0}"' -f $PSCommandPath))
-
-    $extraArguments = ConvertTo-NextecRelaunchArguments -BoundParameters $BoundParameters
-    if (-not [string]::IsNullOrWhiteSpace($extraArguments)) {
-        $argumentList.Add($extraArguments)
+    if ([string]::IsNullOrWhiteSpace($script:OriginalScriptText)) {
+        throw "Não foi possível recuperar o texto deste script para reabrir a sessão. Salve o arquivo .ps1 em disco local e execute-o novamente."
     }
 
+    $destinoDir = Join-Path $env:ProgramData "Nextec\installer"
+    New-Item -ItemType Directory -Path $destinoDir -Force | Out-Null
+
+    $destino = Join-Path $destinoDir "install-nextec-monitoring-windows.ps1"
+
+    # UTF-8 com BOM: o Windows PowerShell 5.1 lê arquivo sem BOM como ANSI e
+    # os acentos das mensagens do instalador chegariam corrompidos.
+    [IO.File]::WriteAllText($destino, $script:OriginalScriptText, (New-Object Text.UTF8Encoding($true)))
+
+    $script:RelaunchTempScript = $destino
+    return $destino
+}
+
+function Invoke-NextecRelaunch {
+    <#
+        Reabre o instalador numa sessão adequada e devolve o código de saída
+        dela.
+
+        Dois motivos levam a relançar: processo de 32 bits num Windows de 64
+        bits, e falta de elevação. O tratamento é o mesmo, então vale uma
+        função só.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][System.Collections.IDictionary]$BoundParameters,
+        [switch]$NeedsBitness,
+        [switch]$NeedsElevation
+    )
+
+    if ($NeedsElevation -and $Silent) {
+        # Elevar em automação abriria um prompt de UAC que ninguém responde, e
+        # o processo ficaria pendurado até alguém notar. 740 é o
+        # ERROR_ELEVATION_REQUIRED do Windows, que o RMM sabe interpretar.
+        Write-Fail "Este script precisa de privilégio administrativo e o modo silencioso não pode responder ao prompt do UAC."
+        Write-Info "Execute o agente como SYSTEM ou como administrador local."
+        return 740
+    }
+
+    # O caminho canônico é System32 mesmo quando o processo atual é de 32
+    # bits: quem cria o processo elevado é o serviço AppInfo, de 64 bits, para
+    # o qual o alias Sysnative não existe. Sysnative serve apenas para este
+    # processo conferir que o binário está lá.
+    $sysnative = Join-Path $env:WINDIR "Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+    $system32 = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+
+    if ($NeedsBitness) {
+        if (-not (Test-Path -LiteralPath $sysnative)) {
+            throw ("PowerShell de 32 bits detectado num Windows de 64 bits, e o PowerShell de 64 bits não foi encontrado em {0}. Feche esta janela e abra 'Windows PowerShell' (sem '(x86)') como Administrador." -f $sysnative)
+        }
+
+        Write-Warn "PowerShell de 32 bits detectado num Windows de 64 bits."
+    }
+
+    if ($NeedsElevation) {
+        Write-Warn "Esta sessão não está elevada."
+    }
+
+    $scriptPath = Get-NextecRelaunchScriptPath
+    $literais = New-Object System.Collections.Generic.List[string]
+
+    foreach ($key in $BoundParameters.Keys) {
+        $literais.Add(("  {0} = {1}" -f $key, (ConvertTo-NextecPowerShellLiteral -Value $BoundParameters[$key])))
+    }
+
+    $hashtable = "@{}"
+    if ($literais.Count -gt 0) {
+        $hashtable = "@{" + [Environment]::NewLine + ($literais -join [Environment]::NewLine) + [Environment]::NewLine + "}"
+    }
+
+    # -EncodedCommand em vez de -File: comando não é arquivo de script, então
+    # escapa da Execution Policy vinda de GPO, que sobrepõe o -ExecutionPolicy
+    # Bypass da linha de comando e faria a sessão nova morrer ao carregar.
+    # A sessão elevada nasce em System32, não no diretório do operador, e aí
+    # qualquer caminho relativo que ele tenha passado deixa de resolver.
+    $diretorio = $env:SystemRoot
     try {
-        # -Verb RunAs garante elevação mesmo que esta janela de 32 bits não
-        # esteja rodando como Administrador ainda.
-        Start-Process -FilePath $sysnativePowerShell -ArgumentList ($argumentList -join " ") -Verb RunAs | Out-Null
+        if ($PWD.Provider.Name -eq "FileSystem") {
+            $diretorio = $PWD.ProviderPath
+        }
     }
     catch {
-        throw ("Falha ao reabrir automaticamente em 64 bits: {0}. Feche esta janela e abra 'Windows PowerShell' (sem '(x86)') como Administrador." -f $_.Exception.Message)
+        $diretorio = $env:SystemRoot
     }
 
-    Write-Ok "Nova janela de 64 bits aberta. Pode fechar esta janela de 32 bits."
+    $comando = @"
+`$ErrorActionPreference = 'Continue'
+Set-Location -LiteralPath '$($diretorio.Replace("'", "''"))'
+`$parametros = $hashtable
+`$global:LASTEXITCODE = 0
+& '$($scriptPath.Replace("'", "''"))' @parametros
+exit `$global:LASTEXITCODE
+"@
+
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($comando))
+
+    $argumentos = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded)
+    $executavel = if ($NeedsBitness) { $system32 } else { (Get-Process -Id $PID).Path }
+
+    if ([string]::IsNullOrWhiteSpace($executavel)) {
+        $executavel = $system32
+    }
+
+    Write-Info "Reabrindo o instalador em uma sessão com privilégio de Administrador..."
+
+    try {
+        $parametrosStart = @{
+            FilePath = $executavel
+            ArgumentList = $argumentos
+            PassThru = $true
+            Wait = $true
+        }
+
+        if ($NeedsElevation) {
+            $parametrosStart["Verb"] = "RunAs"
+        }
+        else {
+            $parametrosStart["NoNewWindow"] = $true
+        }
+
+        $processo = Start-Process @parametrosStart
+    }
+    catch {
+        # ShellExecute devolve 1223 (ERROR_CANCELLED) quando o operador nega o
+        # UAC. Vale distinguir de falha real para não mandar o técnico caçar
+        # problema que não existe.
+        if ($_.Exception.Message -match "cancel|1223") {
+            throw "Elevação cancelada no prompt do UAC. Aceite o prompt ou abra o PowerShell como Administrador e rode de novo."
+        }
+
+        throw ("Falha ao reabrir o instalador com privilégio administrativo: {0}" -f $_.Exception.Message)
+    }
+    finally {
+        if (-not [string]::IsNullOrWhiteSpace([string]$script:RelaunchTempScript)) {
+            Remove-Item -LiteralPath $script:RelaunchTempScript -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if ($null -eq $processo) {
+        throw "Não foi possível iniciar a sessão elevada do instalador."
+    }
+
+    return [int]$processo.ExitCode
 }
 
 function ConvertTo-Slug {
@@ -942,6 +1136,21 @@ function Read-CurrentAlloyConfiguration {
     $exporter    = Get-AlloyConfigSection -Content $content -Header 'prometheus.exporter.windows "system"'
     $labels      = Get-AlloyRelabelValues -Section (Get-AlloyConfigSection -Content $content -Header 'discovery.relabel "system_labels"')
 
+    # O cabeçalho estruturado é a fonte preferida da identificação: existe em
+    # todos os modos, inclusive coletor puro, onde o bloco system_labels nem
+    # chega a ser gerado. O relabel continua valendo como leitura de
+    # configurações geradas por versões anteriores.
+    foreach ($cabecalho in [Regex]::Matches($content, '(?m)^\s*//\s*nextec:(?<chave>[a-z_]+)\s*=\s*(?<valor>.*?)\s*$')) {
+        $chave = $cabecalho.Groups["chave"].Value
+        $valor = $cabecalho.Groups["valor"].Value
+
+        if ($chave -eq "versao" -or [string]::IsNullOrWhiteSpace($valor)) {
+            continue
+        }
+
+        $labels[$chave] = $valor
+    }
+
     $collectors = @()
     $collectorMatch = [Regex]::Match($exporter, 'enabled_collectors\s*=\s*\[([^\]]*)\]')
     if ($collectorMatch.Success) {
@@ -1301,7 +1510,14 @@ function Edit-IdentificationSettings {
     Write-Info ("Local atual: {0}" -f $script:Local)
     $local = Read-Host "Novo local (ENTER mantém)"
     if (-not [string]::IsNullOrWhiteSpace($local)) {
-        $script:Local = ConvertTo-Slug $local
+        # Mesma validação da primeira instalação. Sem ela, uma entrada como
+        # "###" vira string vazia na normalização e o host chega ao NOC sem a
+        # label obrigatória, sem nada acusar.
+        $slugLocal = ConvertTo-Slug $local
+        if ([string]::IsNullOrWhiteSpace($slugLocal)) {
+            throw ("Local inválido após normalização: {0}" -f $local)
+        }
+        $script:Local = $slugLocal
     }
 
     $ambientes = @("producao","homologacao","desenvolvimento","backup","teste")
@@ -1317,7 +1533,11 @@ function Edit-IdentificationSettings {
     Write-Info ("Host atual: {0}" -f $script:HostLabel)
     $hostLabel = Read-Host "Novo nome do host (ENTER mantém)"
     if (-not [string]::IsNullOrWhiteSpace($hostLabel)) {
-        $script:HostLabel = ConvertTo-Slug $hostLabel
+        $slugHost = ConvertTo-Slug $hostLabel
+        if ([string]::IsNullOrWhiteSpace($slugHost)) {
+            throw ("Nome de host inválido após normalização: {0}" -f $hostLabel)
+        }
+        $script:HostLabel = $slugHost
     }
 }
 
@@ -1410,7 +1630,7 @@ function Edit-SnmpTargets {
         1 {
             $existentes = @($script:SnmpTargets)
             $script:EnableSnmpResolved = $true
-            Read-SnmpTargets
+            Read-SnmpTargets -Append
             $script:SnmpTargets = @($existentes) + @($script:SnmpTargets)
         }
         2 {
@@ -1425,6 +1645,7 @@ function Edit-SnmpTargets {
         }
         3 {
             $script:SnmpTargets = @()
+            $script:SnmpAuthBlocks = @()
             $script:EnableSnmpResolved = $true
             Read-SnmpTargets
         }
@@ -1685,9 +1906,8 @@ function Get-WindowsInventory {
     }
 
     # A checagem de processo 32 bits em Windows 64 bits acontece bem antes
-    # disso, no despacho final do script (Test-NextecProcessNeedsRelaunch +
-    # Invoke-NextecRelaunchAs64Bit), que reabre automaticamente em 64 bits
-    # antes mesmo de chegar aqui.
+    # disso, no despacho final do script (Test-NextecProcessNeedsBitnessRelaunch
+    # e Invoke-NextecRelaunch), que reabre em 64 bits antes de chegar aqui.
 
     [pscustomobject]@{
         Caption      = [string]$os.Caption
@@ -2582,9 +2802,369 @@ function Get-NextecSnmpConfigFromRepo {
     return $destino
 }
 
+function Get-SnmpConfigSectionKeys {
+    <#
+        Devolve as chaves de primeiro nível de uma seção do snmp.yml
+        ("modules" ou "auths").
+
+        Parser de texto, não de YAML: o PowerShell 5.1 não traz leitor de YAML
+        e o pfsense.yml passa de 270 KB, grande demais para converter inteiro
+        só para descobrir dois nomes. As chaves ficam sempre com dois espaços
+        de indentação sob a seção, formato gerado pelo snmp_exporter.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Section
+    )
+
+    $keys = @()
+    $inSection = $false
+    $sectionPattern = "^{0}\s*:" -f [regex]::Escape($Section)
+
+    foreach ($line in [IO.File]::ReadLines($Path)) {
+        if ($line -match "^\s*#") {
+            continue
+        }
+
+        if ($line -match $sectionPattern) {
+            $inSection = $true
+            continue
+        }
+
+        if (-not $inSection) {
+            continue
+        }
+
+        # Linha começando na coluna zero encerra a seção.
+        if ($line -match "^\S") {
+            break
+        }
+
+        if ($line -match "^\s{2}(?<key>[A-Za-z0-9_.\-]+)\s*:\s*$") {
+            $keys += $Matches["key"]
+        }
+    }
+
+    return $keys
+}
+
+function Get-SnmpAuthBlocksFromFile {
+    <#
+        Recupera os blocos da seção "auths" de um snmp-auth.yml já instalado,
+        cada um como um texto pronto para ser regravado.
+
+        Serve para preservar a credencial dos equipamentos que já existem
+        quando o operador acrescenta um alvo novo pelo menu: sem isso o
+        arquivo é regravado só com a auth nova e os alvos antigos passam a
+        apontar para uma chave inexistente, o que o Alloy aceita em silêncio.
+    #>
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $blocks = @()
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $blocks
+    }
+
+    $current = $null
+    $inSection = $false
+
+    foreach ($line in [IO.File]::ReadLines($Path)) {
+        if ($line -match "^auths\s*:") {
+            $inSection = $true
+            continue
+        }
+
+        if (-not $inSection) {
+            continue
+        }
+
+        if ($line -match "^\S") {
+            break
+        }
+
+        if ($line -match "^\s{2}[A-Za-z0-9_.\-]+\s*:\s*$") {
+            if ($null -ne $current) {
+                $blocks += ($current -join [Environment]::NewLine)
+            }
+
+            $current = @($line.TrimEnd())
+            continue
+        }
+
+        if ($null -ne $current -and -not [string]::IsNullOrWhiteSpace($line)) {
+            $current += $line.TrimEnd()
+        }
+    }
+
+    if ($null -ne $current) {
+        $blocks += ($current -join [Environment]::NewLine)
+    }
+
+    return $blocks
+}
+
+function Get-SnmpModuleBlocksFromFile {
+    <#
+        Devolve os blocos da seção "modules" indexados pelo nome do módulo,
+        cada um como a lista de linhas originais.
+
+        Usado para acumular fabricantes diferentes num único snmp.yml, já que
+        o Alloy aceita um arquivo por exporter e um host pode ter firewall,
+        switch e nobreak de marcas distintas.
+    #>
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $blocks = [ordered]@{}
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $blocks
+    }
+
+    $currentName = $null
+    $currentLines = $null
+    $inSection = $false
+
+    foreach ($line in [IO.File]::ReadLines($Path)) {
+        if (-not $inSection) {
+            if ($line -match "^modules\s*:") {
+                $inSection = $true
+            }
+
+            continue
+        }
+
+        if ($line -match "^\S") {
+            break
+        }
+
+        if ($line -match "^\s{2}(?<key>[A-Za-z0-9_.\-]+)\s*:\s*$") {
+            if ($null -ne $currentName) {
+                $blocks[$currentName] = $currentLines
+            }
+
+            $currentName = $Matches["key"]
+            $currentLines = @($line.TrimEnd())
+            continue
+        }
+
+        if ($null -ne $currentName) {
+            $currentLines += $line.TrimEnd()
+        }
+    }
+
+    if ($null -ne $currentName) {
+        $blocks[$currentName] = $currentLines
+    }
+
+    return $blocks
+}
+
+function Merge-SnmpModuleFile {
+    <#
+        Acumula no snmp.yml instalado os módulos de um arquivo novo, sem
+        remover os que já estavam lá.
+
+        Copiar por cima mataria o equipamento anterior: o config.alloy
+        continuaria pedindo, por exemplo, "pfsense_v2c" num arquivo que agora
+        só tem os módulos do Mikrotik. O Alloy não acusa isso, o alvo só para
+        de coletar.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$NewFile,
+        [Parameter(Mandatory=$true)][string]$Destination
+    )
+
+    $newBlocks = Get-SnmpModuleBlocksFromFile -Path $NewFile
+
+    if ($newBlocks.Count -eq 0) {
+        throw ("Nenhum módulo encontrado na seção 'modules' de {0}." -f $NewFile)
+    }
+
+    $merged = Get-SnmpModuleBlocksFromFile -Path $Destination
+    $added = @()
+
+    foreach ($name in @($newBlocks.Keys)) {
+        if ($merged.Contains($name)) {
+            continue
+        }
+
+        $merged[$name] = $newBlocks[$name]
+        $added += $name
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    [void]$lines.Add("# Gerado pelo instalador Nextec. Acumula os módulos SNMP dos fabricantes")
+    [void]$lines.Add("# usados por este host. As credenciais ficam em snmp-auth.yml.")
+    [void]$lines.Add("modules:")
+
+    foreach ($name in @($merged.Keys)) {
+        foreach ($line in $merged[$name]) {
+            [void]$lines.Add($line)
+        }
+    }
+
+    $encoding = New-Object Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($Destination, (($lines -join [Environment]::NewLine) + [Environment]::NewLine), $encoding)
+
+    if ($added.Count -gt 0) {
+        Write-Info ("Módulos acrescentados ao snmp.yml: {0}" -f ($added -join ", "))
+    }
+
+    $preserved = @($merged.Keys | Where-Object { $added -notcontains $_ })
+    if ($preserved.Count -gt 0) {
+        Write-Info ("Módulos preservados: {0}" -f ($preserved -join ", "))
+    }
+}
+
+function Get-SnmpAuthBlockName {
+    param([Parameter(Mandatory=$true)][string]$Block)
+
+    $firstLine = @($Block -split "`r?`n")[0]
+    return $firstLine.Trim().TrimEnd(":").Trim()
+}
+
+function Select-SnmpModules {
+    <#
+        Escolhe quais módulos do arquivo entram no alvo.
+
+        O sufixo de versão (_v1, _v2c, _v3) marca variantes do MESMO módulo,
+        que diferem apenas na versão SNMP: só uma pode entrar, senão o mesmo
+        walk é feito duas vezes e uma das cópias falha na autenticação.
+        Módulos sem esse sufixo são complementares e entram todos.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][string[]]$Modules,
+        [Parameter(Mandatory=$true)][string]$SnmpVersion
+    )
+
+    if ($Modules.Count -eq 0) {
+        return ""
+    }
+
+    $selected = @()
+    $families = [ordered]@{}
+
+    foreach ($module in $Modules) {
+        if ($module -match "^(?<base>.+)_(?<version>v1|v2c|v2|v3)$") {
+            $base = $Matches["base"]
+            $version = $Matches["version"]
+
+            if (-not $families.Contains($base)) {
+                $families[$base] = [ordered]@{}
+            }
+
+            $families[$base][$version] = $module
+        }
+        else {
+            $selected += $module
+        }
+    }
+
+    foreach ($base in @($families.Keys)) {
+        $variants = $families[$base]
+
+        if ($variants.Contains($SnmpVersion)) {
+            $selected += $variants[$SnmpVersion]
+            continue
+        }
+
+        $fallback = @($variants.Values)[0]
+        Write-Warn ("O arquivo não tem variante {0} de '{1}'; usando '{2}'. Confira se a credencial bate com a versão do módulo." -f $SnmpVersion, $base, $fallback)
+        $selected += $fallback
+    }
+
+    return ($selected -join ",")
+}
+
+function ConvertTo-YamlSingleQuoted {
+    <#
+        Escapa um valor para YAML entre aspas simples, onde a única sequência
+        especial é a própria aspa simples, duplicada. Senhas SNMP costumam ter
+        $, ! e # e não sobrevivem a aspas duplas sem tratamento.
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyString()][string]$Value)
+
+    return ("'{0}'" -f ($Value -replace "'", "''"))
+}
+
+function Read-SnmpAuthDefinition {
+    <#
+        Monta a credencial SNMP do equipamento e devolve o nome da auth mais o
+        bloco YAML correspondente.
+
+        O snmp.yml do repositório traz só "modules". A seção "auths" é do
+        cliente e é escrita aqui, em arquivo separado, para nunca ir para o
+        repositório junto com o módulo do fabricante.
+    #>
+    param([Parameter(Mandatory=$true)][string]$EquipmentName)
+
+    $versionChoice = Read-Choice -Prompt "Versão SNMP" -Options @("v2c (community)","v3 (usuário e senha)") -Default 1
+    $lines = @()
+
+    if ($versionChoice -eq 1) {
+        $authName = ConvertTo-Slug ("{0}_v2c" -f $EquipmentName)
+        $community = Read-Required -Prompt "Community SNMP" -Default "public"
+
+        $lines += ("  {0}:" -f $authName)
+        $lines += "    version: 2"
+        $lines += ("    community: {0}" -f (ConvertTo-YamlSingleQuoted $community))
+
+        return [pscustomobject]@{
+            Name = $authName
+            Version = "v2c"
+            Yaml = ($lines -join [Environment]::NewLine)
+        }
+    }
+
+    $authName = ConvertTo-Slug ("{0}_v3" -f $EquipmentName)
+    $username = Read-Required -Prompt "Usuário SNMPv3" -Default "nextec_monitoramento"
+
+    $levelChoice = Read-Choice -Prompt "Nível de segurança" -Options @("authPriv (autenticação e criptografia)","authNoPriv (só autenticação)") -Default 1
+    $authProtocol = Read-Required -Prompt "Protocolo de autenticação" -Default "SHA"
+    $authPassword = Read-RequiredSecret -Prompt "Senha de autenticação"
+
+    $lines += ("  {0}:" -f $authName)
+    $lines += "    version: 3"
+    $lines += ("    username: {0}" -f (ConvertTo-YamlSingleQuoted $username))
+    $lines += ("    auth_protocol: {0}" -f $authProtocol)
+    $lines += ("    password: {0}" -f (ConvertTo-YamlSingleQuoted $authPassword))
+
+    if ($levelChoice -eq 1) {
+        $privProtocol = Read-Required -Prompt "Protocolo de criptografia" -Default "AES"
+        $privPassword = Read-RequiredSecret -Prompt "Senha de criptografia"
+
+        $lines += "    security_level: authPriv"
+        $lines += ("    priv_protocol: {0}" -f $privProtocol)
+        $lines += ("    priv_password: {0}" -f (ConvertTo-YamlSingleQuoted $privPassword))
+    }
+    else {
+        $lines += "    security_level: authNoPriv"
+    }
+
+    return [pscustomobject]@{
+        Name = $authName
+        Version = "v3"
+        Yaml = ($lines -join [Environment]::NewLine)
+    }
+}
+
 function Read-SnmpTargets {
-    $script:SnmpTargets = @()
-    $script:SnmpSourceFile = $null
+    <#
+        -Append acrescenta equipamentos a uma configuração existente: mantém
+        os alvos já lidos, recupera do disco as credenciais dos equipamentos
+        atuais e reaproveita o snmp.yml instalado, em vez de recomeçar do zero.
+    #>
+    param([switch]$Append)
+
+    if (-not $Append) {
+        $script:SnmpTargets = @()
+        $script:SnmpSourceFile = $null
+        $script:SnmpAuthBlocks = @()
+    }
+    else {
+        $script:SnmpAuthBlocks = @(Get-SnmpAuthBlocksFromFile -Path $SnmpAuthFile)
+    }
 
     if (-not $script:EnableSnmpResolved) {
         return
@@ -2601,14 +3181,57 @@ function Read-SnmpTargets {
 
         $script:SnmpSourceFile = (Resolve-Path -LiteralPath $SnmpConfig).Path
 
+        # No modo silencioso o arquivo precisa trazer as duas seções, porque
+        # não há operador para informar credencial. Módulo ou auth inexistente
+        # passa por fmt e validate e sobe "healthy": o alvo nunca produz série
+        # e a automação registra sucesso.
+        $modulosValidos = @(Get-SnmpConfigSectionKeys -Path $script:SnmpSourceFile -Section "modules")
+        $authsValidas = @(Get-SnmpConfigSectionKeys -Path $script:SnmpSourceFile -Section "auths")
+
+        if ($modulosValidos.Count -eq 0) {
+            throw ("O arquivo {0} não tem seção 'modules'." -f $script:SnmpSourceFile)
+        }
+
+        if ($authsValidas.Count -eq 0) {
+            throw ("O arquivo {0} não tem seção 'auths'. No modo silencioso o -SnmpConfig precisa conter módulos e credenciais." -f $script:SnmpSourceFile)
+        }
+
+        $nomesUsados = @()
+
         foreach ($entry in $SnmpTarget) {
             $parts = @($entry -split "\|", 6)
             if ($parts.Count -ne 6) {
                 throw ("SnmpTarget inválido: {0}" -f $entry)
             }
 
+            $nome = ConvertTo-Slug $parts[0]
+
+            if ([string]::IsNullOrWhiteSpace($nome)) {
+                throw ("SnmpTarget com nome inválido após normalização: {0}" -f $entry)
+            }
+
+            if ($nomesUsados -contains $nome) {
+                throw ("SnmpTarget duplicado: {0}. Nomes repetidos derrubam o exporter SNMP inteiro." -f $nome)
+            }
+
+            if ([string]::IsNullOrWhiteSpace($parts[1])) {
+                throw ("SnmpTarget sem endereço: {0}" -f $entry)
+            }
+
+            foreach ($modulo in @($parts[2] -split ",")) {
+                if ($modulosValidos -notcontains $modulo.Trim()) {
+                    throw ("Módulo SNMP '{0}' não existe em {1}. Disponíveis: {2}" -f $modulo.Trim(), $script:SnmpSourceFile, ($modulosValidos -join ", "))
+                }
+            }
+
+            if ($authsValidas -notcontains $parts[3]) {
+                throw ("Auth SNMP '{0}' não existe em {1}. Disponíveis: {2}" -f $parts[3], $script:SnmpSourceFile, ($authsValidas -join ", "))
+            }
+
+            $nomesUsados += $nome
+
             $script:SnmpTargets += [pscustomobject]@{
-                Name = ConvertTo-Slug $parts[0]
+                Name = $nome
                 Address = $parts[1]
                 Module = $parts[2]
                 Auth = $parts[3]
@@ -2622,8 +3245,20 @@ function Read-SnmpTargets {
 
     Write-Step "SNMP"
 
+    $temArquivoInstalado = Test-Path -LiteralPath $SnmpFile -PathType Leaf
+    $opcoesOrigem = @("Baixar do repositório Nextec (GitHub)","Informar caminho local")
+
+    if ($temArquivoInstalado) {
+        $opcoesOrigem += "Usar o snmp.yml já instalado neste host"
+    }
+
     while ($true) {
-        $origem = Read-Choice -Prompt "Origem do snmp.yml" -Options @("Baixar do repositório Nextec (GitHub)","Informar caminho local") -Default 1
+        $origem = Read-Choice -Prompt "Origem do snmp.yml" -Options $opcoesOrigem -Default $(if ($temArquivoInstalado) { 3 } else { 1 })
+
+        if ($origem -eq 3) {
+            $script:SnmpSourceFile = (Resolve-Path -LiteralPath $SnmpFile).Path
+            break
+        }
 
         if ($origem -eq 1) {
             $candidate = Get-NextecSnmpConfigFromRepo
@@ -2644,11 +3279,59 @@ function Read-SnmpTargets {
         Write-Warn ("Arquivo não encontrado: {0}" -f $candidate)
     }
 
+    # Fabricantes diferentes convivem no mesmo host: os módulos do arquivo
+    # escolhido são somados aos que já estão instalados, então a lista
+    # oferecida ao operador precisa considerar as duas origens.
+    $availableModules = @(Get-SnmpConfigSectionKeys -Path $script:SnmpSourceFile -Section "modules")
+
+    if ($temArquivoInstalado) {
+        foreach ($instalado in @(Get-SnmpConfigSectionKeys -Path $SnmpFile -Section "modules")) {
+            if ($availableModules -notcontains $instalado) {
+                $availableModules += $instalado
+            }
+        }
+    }
+
+    if ($availableModules.Count -eq 0) {
+        throw ("Nenhum módulo encontrado na seção 'modules' de {0}." -f $script:SnmpSourceFile)
+    }
+
+    Write-Info ("Módulos disponíveis: {0}" -f ($availableModules -join ", "))
+
     do {
-        $name = ConvertTo-Slug (Read-Required "Nome do equipamento")
+        # Nome repetido gera chave duplicada em auths e derruba o exporter
+        # SNMP inteiro em tempo de execução, não só o alvo repetido. O laço
+        # fica aqui, e não no do/while externo, porque "continue" ali pularia
+        # para a condição de repetição antes de ela ser definida.
+        $name = ""
+
+        while ([string]::IsNullOrWhiteSpace($name)) {
+            $name = ConvertTo-Slug (Read-Required "Nome do equipamento")
+
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                Write-Warn "Nome inválido após normalização. Use letras, números, hífen ou sublinhado."
+                continue
+            }
+
+            if (@($script:SnmpTargets | ForEach-Object { $_.Name }) -contains $name) {
+                Write-Warn ("Já existe um equipamento chamado '{0}' nesta configuração. Use outro nome." -f $name)
+                $name = ""
+            }
+        }
+
         $address = Read-Required "IP/FQDN SNMP"
-        $module = Read-Required -Prompt "Módulo SNMP" -Default "system,if_mib"
-        $auth = Read-Required -Prompt "Auth SNMP" -Default "public_v2"
+
+        $authDefinition = Read-SnmpAuthDefinition -EquipmentName $name
+        $auth = $authDefinition.Name
+        $script:SnmpAuthBlocks += $authDefinition.Yaml
+
+        $module = Select-SnmpModules -Modules $availableModules -SnmpVersion $authDefinition.Version
+
+        if ([string]::IsNullOrWhiteSpace($module)) {
+            throw "Não foi possível determinar o módulo SNMP a partir do arquivo informado."
+        }
+
+        Write-Info ("Módulo aplicado: {0}" -f $module)
 
         $typeOptions = @("firewall","switch","storage","ap","ups")
         $typeChoice = Read-Choice -Prompt "Tipo do equipamento" -Options $typeOptions -Default 1
@@ -2797,6 +3480,7 @@ function Get-NextecConfiguration {
     $script:SnmpTargets = @()
     $script:CustomExporters = @()
     $script:SnmpSourceFile = $null
+    $script:SnmpAuthBlocks = @()
     $script:DetectedHostFeatures = @($DetectedFeatures)
     $script:SelectedHostFeatureKeys = [string[]]@()
 
@@ -3218,6 +3902,7 @@ function Resolve-AlloyInstallation {
     $script:ConfigFile = Join-Path $script:AlloyDir "config.alloy"
     $script:BlackboxFile = Join-Path $script:AlloyDir "blackbox.yml"
     $script:SnmpFile = Join-Path $script:AlloyDir "snmp.yml"
+    $script:SnmpAuthFile = Join-Path $script:AlloyDir "snmp-auth.yml"
 }
 
 function Test-AlloyInstalled {
@@ -3354,14 +4039,41 @@ function Install-OrUpdateAlloy {
 function Backup-ExistingConfiguration {
     New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
 
+    $carimbo = Get-Date -Format "yyyyMMdd-HHmmss"
+
     if (Test-Path $ConfigFile) {
-        $backupName = "config.alloy.{0}.bak" -f (Get-Date -Format "yyyyMMdd-HHmmss")
-        $backupPath = Join-Path $BackupDir $backupName
+        $backupPath = Join-Path $BackupDir ("config.alloy.{0}.bak" -f $carimbo)
 
         Copy-Item -Path $ConfigFile -Destination $backupPath -Force
 
         $script:ConfigBackup = $backupPath
         Write-Ok ("Backup da configuração: {0}" -f $backupPath)
+    }
+
+    # Os arquivos auxiliares são reescritos antes da validação do config.alloy.
+    # Sem eles no backup, um rollback devolve o config antigo apontando para
+    # módulos e credenciais que já foram substituídos no disco, e o alvo
+    # simplesmente para de coletar sem erro nenhum.
+    $script:AuxiliaryBackups = @()
+
+    foreach ($alvo in @($SnmpFile, $SnmpAuthFile, $BlackboxFile)) {
+        if (-not (Test-Path -LiteralPath $alvo -PathType Leaf)) {
+            continue
+        }
+
+        $nome = Split-Path -Leaf $alvo
+        $destino = Join-Path $BackupDir ("{0}.{1}.bak" -f $nome, $carimbo)
+
+        Copy-Item -LiteralPath $alvo -Destination $destino -Force
+
+        $script:AuxiliaryBackups += [pscustomobject]@{
+            Original = $alvo
+            Backup = $destino
+        }
+    }
+
+    if ($script:AuxiliaryBackups.Count -gt 0) {
+        Write-Ok ("Backup dos arquivos auxiliares: {0} arquivo(s)." -f $script:AuxiliaryBackups.Count)
     }
 }
 
@@ -3543,24 +4255,105 @@ function Install-SnmpConfiguration {
         return
     }
 
+    # Reconfiguração pelo menu: o parser recupera os alvos do config.alloy mas
+    # não o caminho de origem do snmp.yml, então aqui a origem vem vazia. O
+    # arquivo já instalado é a origem correta nesse caso, e barrar a gravação
+    # impediria qualquer alteração num host que já tem SNMP.
     if ([string]::IsNullOrWhiteSpace([string]$script:SnmpSourceFile)) {
-        throw "Arquivo snmp.yml não informado."
+        if (Test-Path -LiteralPath $SnmpFile -PathType Leaf) {
+            Write-Info "Reaproveitando o snmp.yml já instalado neste host."
+            Install-SnmpAuthFile
+            return
+        }
+
+        throw "Arquivo snmp.yml não informado e nenhum arquivo instalado neste host."
     }
 
     if (-not (Test-Path -LiteralPath $script:SnmpSourceFile -PathType Leaf)) {
         throw ("Arquivo snmp.yml não encontrado: {0}" -f $script:SnmpSourceFile)
     }
 
-    # Na reexecução o operador costuma informar o arquivo que já está
-    # instalado. Copy-Item com origem igual ao destino lança erro.
     $sourceFull = (Resolve-Path -LiteralPath $script:SnmpSourceFile).Path
 
     if ($sourceFull -ieq $SnmpFile) {
         Write-Info "O snmp.yml informado já é o arquivo instalado; nada a copiar."
+    }
+    else {
+        Merge-SnmpModuleFile -NewFile $sourceFull -Destination $SnmpFile
+    }
+
+    Install-SnmpAuthFile
+}
+
+function Install-SnmpAuthFile {
+    <#
+        Grava a seção "auths" em arquivo próprio, com ACL restrita a SYSTEM e
+        Administradores. Fica separado do snmp.yml porque o módulo do
+        fabricante é público e versionado no repositório, e a credencial do
+        cliente não pode acompanhar esse arquivo.
+    #>
+    if ($script:SnmpAuthBlocks.Count -eq 0) {
         return
     }
 
-    Copy-Item -LiteralPath $sourceFull -Destination $SnmpFile -Force
+    # Duas credenciais com o mesmo nome viram chave YAML repetida, e aí o
+    # Alloy derruba o exporter SNMP inteiro em tempo de execução com
+    # "key already set in map". O fmt e o validate não pegam isso.
+    # A última definição vence, que é a informada agora pelo operador.
+    $unique = [ordered]@{}
+
+    foreach ($block in $script:SnmpAuthBlocks) {
+        $name = Get-SnmpAuthBlockName -Block $block
+
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            continue
+        }
+
+        $unique[$name] = $block
+    }
+
+    $content = @("auths:") + @($unique.Values)
+    $text = ($content -join [Environment]::NewLine) + [Environment]::NewLine
+
+    # UTF-8 sem BOM: o parser YAML do Alloy trata o BOM como caractere do
+    # conteúdo e rejeita o arquivo.
+    $encoding = New-Object Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($SnmpAuthFile, $text, $encoding)
+
+    Protect-NextecSecretFile -Path $SnmpAuthFile
+    Write-Ok ("Credenciais SNMP gravadas em {0}" -f $SnmpAuthFile)
+}
+
+function Protect-NextecSecretFile {
+    <#
+        Remove herança e deixa apenas SYSTEM e Administradores com acesso.
+        Mesmo tratamento aplicado às credenciais do NOC no registro.
+    #>
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    try {
+        $acl = Get-Acl -Path $Path
+        $acl.SetAccessRuleProtection($true, $false)
+
+        foreach ($rule in @($acl.Access)) {
+            [void]$acl.RemoveAccessRule($rule)
+        }
+
+        foreach ($identity in @("NT AUTHORITY\SYSTEM","BUILTIN\Administrators")) {
+            $account = New-Object Security.Principal.NTAccount($identity)
+            $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+                $account,
+                [Security.AccessControl.FileSystemRights]::FullControl,
+                [Security.AccessControl.AccessControlType]::Allow
+            )
+            $acl.AddAccessRule($rule)
+        }
+
+        Set-Acl -Path $Path -AclObject $acl
+    }
+    catch {
+        Write-Warn ("Não foi possível restringir a ACL de {0}: {1}" -f $Path, $_.Exception.Message)
+    }
 }
 
 # ==============================================================================
@@ -3701,7 +4494,11 @@ catch {
 # resultando em métrica truncada e scrape com erro de parsing. Grava em
 # arquivo temporário e troca com Move-Item, que no NTFS é atômico dentro do
 # mesmo volume.
-Set-Content -LiteralPath $tempFile -Value ($lines -join "`n") -Encoding utf8 -NoNewline
+# UTF-8 sem BOM: "Set-Content -Encoding utf8" no Windows PowerShell 5.1 grava
+# COM BOM, e o parser do formato texto do Prometheus lê o BOM como parte do
+# primeiro nome de métrica, descartando o arquivo inteiro com
+# "invalid metric name".
+[IO.File]::WriteAllText($tempFile, ($lines -join "`n"), (New-Object Text.UTF8Encoding($false)))
 Move-Item -LiteralPath $tempFile -Destination $metricsFile -Force
 '@
 
@@ -3899,6 +4696,19 @@ function New-AlloyConfiguration {
     [void]$builder.AppendLine("// Nextec NOC Monitoring, Windows")
     [void]$builder.AppendLine("// Gerado por install-nextec-monitoring-windows-v2.ps1")
     [void]$builder.AppendLine("// Credenciais não ficam neste arquivo.")
+    [void]$builder.AppendLine("//")
+    # Identificação em cabeçalho estruturado. O menu de reconfiguração lia
+    # esses valores do bloco discovery.relabel "system_labels", que só existe
+    # quando o host é monitorado; num coletor puro (só Blackbox, SNMP ou
+    # exporters) o bloco não é gerado e o host ficava impossível de
+    # reconfigurar pelo menu. O cabeçalho existe em todos os modos.
+    [void]$builder.AppendLine(("// nextec:versao      = {0}" -f $InstallerVersion))
+    [void]$builder.AppendLine(("// nextec:cliente     = {0}" -f $script:Cliente))
+    [void]$builder.AppendLine(("// nextec:host        = {0}" -f $script:HostLabel))
+    [void]$builder.AppendLine(("// nextec:ambiente    = {0}" -f $script:Ambiente))
+    [void]$builder.AppendLine(("// nextec:local       = {0}" -f $script:Local))
+    [void]$builder.AppendLine(("// nextec:criticidade = {0}" -f $script:Criticidade))
+    [void]$builder.AppendLine(("// nextec:tipo        = {0}" -f $script:TipoLabel))
     [void]$builder.AppendLine("// =============================================================================")
     [void]$builder.AppendLine("")
 
@@ -4041,7 +4851,10 @@ function New-AlloyConfiguration {
             [void]$builder.AppendLine("")
             [void]$builder.AppendLine("  // Internet (Speedtest): le o .prom gravado pela tarefa agendada.")
             [void]$builder.AppendLine("  textfile {")
-            [void]$builder.AppendLine(('    directory = "{0}"' -f (ConvertTo-AlloyEscapedString $SpeedtestMetricsDir)))
+            # O atributo do exporter windows chama-se text_file_directory.
+            # "directory" é o nome equivalente no exporter unix e o Alloy
+            # recusa a configuração inteira com "unrecognized attribute name".
+            [void]$builder.AppendLine(('    text_file_directory = "{0}"' -f (ConvertTo-AlloyEscapedString $SpeedtestMetricsDir)))
             [void]$builder.AppendLine("  }")
         }
 
@@ -4246,8 +5059,32 @@ function New-AlloyConfiguration {
 
     if ($script:EnableSnmpResolved) {
         [void]$builder.AppendLine("// SNMP")
+
+        # O módulo do fabricante e a credencial do cliente vivem em arquivos
+        # separados e são unidos em memória pelo Alloy. Só o arquivo de módulo
+        # é público; snmp-auth.yml tem ACL restrita e nunca vai ao repositório.
+        $useSplitSnmpConfig = $script:SnmpAuthBlocks.Count -gt 0
+
+        if ($useSplitSnmpConfig) {
+            [void]$builder.AppendLine('local.file "snmp_modules" {')
+            [void]$builder.AppendLine(('  filename = "{0}"' -f (ConvertTo-AlloyEscapedString $SnmpFile)))
+            [void]$builder.AppendLine("}")
+            [void]$builder.AppendLine("")
+            [void]$builder.AppendLine('local.file "snmp_auth" {')
+            [void]$builder.AppendLine(('  filename  = "{0}"' -f (ConvertTo-AlloyEscapedString $SnmpAuthFile)))
+            [void]$builder.AppendLine("  is_secret = true")
+            [void]$builder.AppendLine("}")
+            [void]$builder.AppendLine("")
+        }
+
         [void]$builder.AppendLine('prometheus.exporter.snmp "network" {')
-        [void]$builder.AppendLine(('  config_file = "{0}"' -f (ConvertTo-AlloyEscapedString $SnmpFile)))
+
+        if ($useSplitSnmpConfig) {
+            [void]$builder.AppendLine('  config = local.file.snmp_auth.content + "\n" + local.file.snmp_modules.content')
+        }
+        else {
+            [void]$builder.AppendLine(('  config_file = "{0}"' -f (ConvertTo-AlloyEscapedString $SnmpFile)))
+        }
 
         foreach ($target in $script:SnmpTargets) {
             [void]$builder.AppendLine("")
@@ -4621,6 +5458,26 @@ function Restore-Configuration {
             Write-Warn "Configuração nova removida, pois não existia configuração anterior."
         }
 
+        foreach ($auxiliar in @($script:AuxiliaryBackups)) {
+            if (Test-Path -LiteralPath $auxiliar.Backup -PathType Leaf) {
+                Copy-Item -LiteralPath $auxiliar.Backup -Destination $auxiliar.Original -Force
+                Write-Warn ("Restaurado: {0}" -f (Split-Path -Leaf $auxiliar.Original))
+            }
+        }
+
+        # A tarefa agendada é criada antes da validação do config.alloy. Se a
+        # instalação foi revertida, deixá-la ativa produz um teste de
+        # velocidade a cada 30 minutos num host que não coleta o resultado.
+        if ($script:EnableInternetResolved -and -not $restored) {
+            try {
+                Unregister-ScheduledTask -TaskName $SpeedtestTaskName -Confirm:$false -ErrorAction SilentlyContinue
+                Write-Warn ("Tarefa agendada {0} removida no rollback." -f $SpeedtestTaskName)
+            }
+            catch {
+                Write-Warn ("Não foi possível remover a tarefa {0}: {1}" -f $SpeedtestTaskName, $_.Exception.Message)
+            }
+        }
+
         # O registro guarda as credenciais e os argumentos do serviço, e é
         # reescrito antes da configuração. Sem restaurá-lo, o Alloy continua no
         # ar com a config antiga mas com credenciais novas e erradas, e passa a
@@ -4728,8 +5585,8 @@ function Show-FinalSummary {
 
 function Invoke-NextecInstaller {
     Show-Banner
-    Assert-Administrator
     Initialize-Logging
+    Assert-Administrator
 
     try {
         Set-NocDestination
@@ -4775,14 +5632,18 @@ function Invoke-NextecInstaller {
         Restore-Configuration
         throw
     }
-    finally {
-        Stop-Logging
-    }
 }
 
 try {
-    if (Test-NextecProcessNeedsRelaunch) {
-        Invoke-NextecRelaunchAs64Bit -BoundParameters $script:OriginalBoundParameters
+    # A decisão de relançar vem antes de tudo, inclusive do banner: Show-Banner
+    # limpa a tela, e limpar a tela para em seguida abrir outra janela apaga o
+    # contexto do operador sem necessidade.
+    $precisaBitness = Test-NextecProcessNeedsBitnessRelaunch
+    $precisaElevar = -not (Test-NextecIsAdministrator)
+
+    if ($precisaBitness -or $precisaElevar) {
+        $script:Relaunched = $true
+        $script:ExitCode = Invoke-NextecRelaunch -BoundParameters $script:OriginalBoundParameters -NeedsBitness:$precisaBitness -NeedsElevation:$precisaElevar
     }
     else {
         Invoke-NextecInstaller
@@ -4791,24 +5652,36 @@ try {
 catch {
     # Ponto único onde o erro é mostrado ao operador, cobrindo tanto falhas
     # de dentro do try de Invoke-NextecInstaller (rollback já feito lá)
-    # quanto falhas antes disso (ex.: Assert-Administrator). Sem este
-    # try/catch aqui fora, o PowerShell também despejaria o stack trace
-    # nativo do erro por cima da nossa mensagem, duplicando tudo na tela.
+    # quanto falhas antes disso. Sem este try/catch aqui fora, o PowerShell
+    # também despejaria o stack trace nativo por cima da nossa mensagem.
     Write-Fail $_.Exception.Message
 
-    # "exit" fecha a sessão inteira se o script for rodado com F5 na ISE ou
-    # "dot-sourced" num console interativo — por isso só usamos em modo
-    # -Silent (automação/RMM), onde não há sessão interativa para proteger e
-    # o código de saída não-zero é o que permite a automação detectar falha.
-    if ($Silent) {
-        exit 1
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:InstallerLog)) {
+        Write-Info ("Log desta execução: {0}" -f $script:InstallerLog)
+    }
+
+    if ($script:ExitCode -eq 0) {
+        $script:ExitCode = 1
     }
 }
 finally {
-    # Segura a janela antes de devolver o controle. O console criado pelo
-    # relaunch de 64 bits, por duplo clique ou por atalho fecha no instante em
-    # que o script retorna, levando junto o resumo e qualquer mensagem de erro.
-    if (-not $Silent) {
+    # Stop-Logging fica aqui, depois do Write-Fail, para que a causa da falha
+    # entre no transcript. No finally interno, o log era encerrado antes de a
+    # mensagem existir e o suporte recebia um log que parava no rollback.
+    Stop-Logging
+
+    # Segura a janela antes de devolver o controle, porque o console aberto por
+    # duplo clique ou atalho fecha assim que o script retorna. Quando o
+    # trabalho foi delegado a outra sessão, quem espera o operador é ela.
+    if (-not $Silent -and -not $script:Relaunched) {
         Wait-NextecOperator
     }
+}
+
+# Dot-source (". .\script.ps1") roda no processo do operador, e ali "exit"
+# encerraria a sessão inteira dele. Fora esse caso, o código de saída é o que
+# permite a automação distinguir sucesso de falha, inclusive quando o trabalho
+# foi feito pela sessão elevada.
+if ($MyInvocation.InvocationName -ne ".") {
+    exit $script:ExitCode
 }
