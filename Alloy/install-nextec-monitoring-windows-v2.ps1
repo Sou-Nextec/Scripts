@@ -36,6 +36,12 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.10.0 Falha em capacidade opcional (Blackbox, SNMP, Speedtest) deixa de
+           reverter a instalação inteira: a capacidade é desligada, a
+           instalação continua e o resumo final lista as pendências. As
+           verificações pós-instalação também deixaram de causar rollback.
+           Código de saída 2 significa instalado com pendências.
+
     2.9.0  Intervalo de sondagem do Blackbox passa a ser configurável (padrão
            60s, mínimo 5s), com o timeout derivado do intervalo. Piso do
            Speedtest reduzido para 5 minutos, com confirmação e estimativa de
@@ -174,6 +180,11 @@ $script:RelaunchTempScript = ""
 $script:Relaunched = $false
 $script:ExitCode = 0
 
+# Etapas opcionais que falharam. A instalação segue sem elas e o resumo final
+# lista o que ficou pendente, para o técnico resolver depois sem precisar
+# reinstalar o host inteiro.
+$script:EtapasComFalha = @()
+
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
@@ -189,7 +200,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.9.0"
+$InstallerVersion = "2.10.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -451,6 +462,75 @@ function Stop-Logging {
 # ==============================================================================
 # UTILITÁRIOS
 # ==============================================================================
+
+function Invoke-NextecOptionalStep {
+    <#
+        Executa uma etapa que não é essencial para o host ser monitorado.
+
+        Falha ao baixar o Speedtest CLI ou ao obter um snmp.yml não justifica
+        desfazer a instalação inteira: o host continua entregando CPU,
+        memória, disco, serviços e logs. O que a falha exige é desligar a
+        capacidade correspondente, senão o config.alloy sai referenciando um
+        arquivo que não existe e a validação derruba tudo mais adiante.
+
+        -AoFalhar recebe o scriptblock que desliga a capacidade.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Nome,
+        [Parameter(Mandatory=$true)][scriptblock]$Acao,
+        [scriptblock]$AoFalhar
+    )
+
+    try {
+        & $Acao
+        return $true
+    }
+    catch {
+        $mensagem = $_.Exception.Message
+
+        $script:EtapasComFalha += [pscustomobject]@{
+            Nome = $Nome
+            Erro = $mensagem
+        }
+
+        Write-Host ""
+        Write-Warn ("{0} não pôde ser configurado: {1}" -f $Nome, $mensagem)
+
+        if ($null -ne $AoFalhar) {
+            & $AoFalhar
+        }
+
+        Write-Info "A instalação continua sem esse item; o resumo final lista o que ficou pendente."
+        Write-Host ""
+
+        return $false
+    }
+}
+
+function Invoke-NextecVerification {
+    <#
+        Executa uma verificação pós-instalação. Falha aqui é diagnóstico, não
+        motivo para rollback: a configuração já está no disco e válida, e o
+        serviço já subiu. Reverter por causa de um teste de ingestão que não
+        respondeu a tempo destruiria uma instalação que está correta.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Nome,
+        [Parameter(Mandatory=$true)][scriptblock]$Acao
+    )
+
+    try {
+        & $Acao
+    }
+    catch {
+        $script:EtapasComFalha += [pscustomobject]@{
+            Nome = $Nome
+            Erro = $_.Exception.Message
+        }
+
+        Write-Warn ("{0}: {1}" -f $Nome, $_.Exception.Message)
+    }
+}
 
 function Test-NextecIsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -5884,10 +5964,17 @@ function Restore-Configuration {
 function Show-FinalSummary {
     param([Parameter(Mandatory=$true)][object]$Inventory)
 
+    # O título muda quando algo ficou pendente: encerrar um atendimento lendo
+    # "INSTALAÇÃO CONCLUÍDA" numa instalação que perdeu o SNMP é o tipo de
+    # coisa que só aparece semanas depois, quando alguém sente falta do dado.
+    $comPendencia = ($script:EtapasComFalha.Count -gt 0)
+    $cor = if ($comPendencia) { [ConsoleColor]::Yellow } else { [ConsoleColor]::Green }
+    $titulo = if ($comPendencia) { "        INSTALAÇÃO CONCLUÍDA COM PENDÊNCIAS" } else { "                 INSTALAÇÃO CONCLUÍDA" }
+
     Write-Host ""
-    Write-Host "============================================================" -ForegroundColor Green
-    Write-Host "                 INSTALAÇÃO CONCLUÍDA" -ForegroundColor Green
-    Write-Host "============================================================" -ForegroundColor Green
+    Write-Host "============================================================" -ForegroundColor $cor
+    Write-Host $titulo -ForegroundColor $cor
+    Write-Host "============================================================" -ForegroundColor $cor
     Write-Host ("Cliente:        {0}" -f $script:Cliente)
     Write-Host ("Host:           {0}" -f $script:HostLabel)
     Write-Host ("Sistema:        {0}" -f $Inventory.Caption)
@@ -5929,6 +6016,21 @@ function Show-FinalSummary {
     }
 
     Write-Host ("Log instalador: {0}" -f $script:InstallerLog)
+
+    if ($comPendencia) {
+        Write-Host ""
+        Write-Host "PENDÊNCIAS" -ForegroundColor Yellow
+        Write-Host "O host está sendo monitorado, mas estes itens não puderam ser" -ForegroundColor Yellow
+        Write-Host "configurados. Rode o instalador de novo e use a opção" -ForegroundColor Yellow
+        Write-Host "'Ver e alterar a configuração atual' para tentar só o que faltou." -ForegroundColor Yellow
+        Write-Host ""
+
+        foreach ($etapa in $script:EtapasComFalha) {
+            Write-Host ("  - {0}" -f $etapa.Nome) -ForegroundColor Yellow
+            Write-Host ("      {0}" -f $etapa.Erro) -ForegroundColor DarkGray
+        }
+    }
+
     Write-Host ""
     Write-Host "Diagnóstico:"
     Write-Host '  Get-Service Alloy'
@@ -5970,16 +6072,54 @@ function Invoke-NextecInstaller {
         # oficial escreve no diretório de configuração, e um backup posterior
         # guardaria o arquivo já sobrescrito.
         Backup-ExistingConfiguration
+
+        # Daqui até a validação, só o essencial derruba a instalação: binário,
+        # credenciais, geração e validação da configuração, e o serviço. As
+        # capacidades opcionais que falharem são desligadas e reportadas no
+        # fim, para que uma falha em SNMP não custe ao cliente o
+        # monitoramento de CPU, disco, serviços e logs.
         Install-OrUpdateAlloy
         Set-AlloyServiceEnvironment
-        New-BlackboxConfiguration
-        Install-SnmpConfiguration
-        Install-InternetMonitoring
+
+        if ($script:EnableBlackboxResolved) {
+            Invoke-NextecOptionalStep -Nome "Alvos de conectividade (Blackbox)" -Acao {
+                New-BlackboxConfiguration
+            } -AoFalhar {
+                $script:EnableBlackboxResolved = $false
+                $script:BlackboxTargets = @()
+            } | Out-Null
+        }
+
+        if ($script:EnableSnmpResolved) {
+            Invoke-NextecOptionalStep -Nome "SNMP" -Acao {
+                Install-SnmpConfiguration
+            } -AoFalhar {
+                $script:EnableSnmpResolved = $false
+                $script:SnmpTargets = @()
+                $script:SnmpAuthBlocks = @()
+            } | Out-Null
+        }
+
+        if ($script:EnableInternetResolved) {
+            Invoke-NextecOptionalStep -Nome "Internet (Speedtest)" -Acao {
+                Install-InternetMonitoring
+            } -AoFalhar {
+                $script:EnableInternetResolved = $false
+            } | Out-Null
+        }
+
+        $script:Collector = ($script:EnableBlackboxResolved -or $script:EnableSnmpResolved -or
+                             $script:EnableInternetResolved -or ($script:CustomExporters.Count -gt 0))
+
         New-AlloyConfiguration -Inventory $inventory
         Format-AndValidateAlloyConfiguration
         Restart-AlloyService
-        Test-AlloyReadiness
-        Test-AlloyIngestion
+
+        # Verificação não reverte nada: a configuração já está válida no disco
+        # e o serviço já subiu. Falha aqui é informação para o técnico.
+        Invoke-NextecVerification -Nome "Prontidão do Alloy" -Acao { Test-AlloyReadiness }
+        Invoke-NextecVerification -Nome "Teste de ingestão no NOC" -Acao { Test-AlloyIngestion }
+
         Show-FinalSummary -Inventory $inventory
     }
     catch {
@@ -6005,6 +6145,12 @@ try {
     }
     else {
         Invoke-NextecInstaller
+
+        # 2 distingue, para a automação, "instalou e está monitorando, mas
+        # algo opcional ficou de fora" de sucesso pleno (0) e de falha (1).
+        if ($script:EtapasComFalha.Count -gt 0) {
+            $script:ExitCode = 2
+        }
     }
 }
 catch {
