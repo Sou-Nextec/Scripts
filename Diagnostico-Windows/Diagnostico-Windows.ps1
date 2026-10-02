@@ -25,30 +25,30 @@
     Pula testes ativos de conectividade (ping, DNS, portas).
 
 .PARAMETER SemZip
-    Nao gera o arquivo .zip no final.
+    Não gera o arquivo .zip no final.
 
-.PARAMETER NaoAbrir
-    Nao abre o RESUMO.html automaticamente ao terminar.
+.PARAMETER Abrir
+    Abre o RESUMO.html no navegador ao terminar. Por padrão não abre: o caminho do relatório é mostrado no final.
 
 .PARAMETER SemDadosSensiveis
-    Nao coleta: log de Seguranca, cache DNS, conexoes TCP, Wi-Fi (SSID), whoami /all,
+    Não coleta: log de Segurança, cache DNS, conexões TCP, Wi-Fi (SSID), whoami /all,
     gpresult, contas locais e dsregcmd bruto. Use quando o zip vai sair da empresa/cliente.
 
 .PARAMETER Comparar
-    Caminho de um achados.json de uma execucao anterior. O RESUMO mostra o que e novo
-    e o que foi resolvido desde entao.
+    Caminho de um achados.json de uma execução anterior. O RESUMO mostra o que e novo
+    e o que foi resolvido desde então.
 
 .PARAMETER SemElevar
-    Por padrao, se nao estiver como Administrador o script se reabre elevado (pede o UAC) com os mesmos
+    Por padrão, se não estiver como Administrador o script se reabre elevado (pede o UAC) com os mesmos
     parametros. Use -SemElevar para rodar sem elevar (coleta incompleta).
 
 .PARAMETER ApagarScriptAoFinal
-    Uso interno do Executar-Diagnostico.bat: remove a copia temporaria do script ao terminar.
+    Uso interno do Executar-Diagnostico.bat: remove a cópia temporaria do script ao terminar.
 
 .NOTES
-    Somente leitura: nao altera configuracao, registro, servicos nem arquivos do sistema.
-    Grava apenas a pasta de saida e o .zip. O zip pode conter dados pessoais (nomes de
-    usuario, programas, redes); trate-o como confidencial.
+    Somente leitura: não altera configuração, registro, serviços nem arquivos do sistema.
+    Grava apenas a pasta de saída e o .zip. O zip pode conter dados pessoais (nomes de
+    usuário, programas, redes); trate-o como confidencial.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\Diagnostico-Windows.ps1
@@ -62,7 +62,7 @@ param(
     [switch]$Completo,
     [switch]$SemRede,
     [switch]$SemZip,
-    [switch]$NaoAbrir,
+    [switch]$Abrir,
     [switch]$SemDadosSensiveis,
     [switch]$SemElevar,
     [string]$Comparar,
@@ -90,7 +90,7 @@ if (-not $ehAdmin -and -not $SemElevar -and $PSCommandPath) {
         Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $linha -ErrorAction Stop
         return
     } catch {
-        Write-Warning "Nao foi possivel elevar ($($_.Exception.Message)). Seguindo sem administrador: a coleta ficara incompleta."
+        Write-Warning "Não foi possível elevar ($($_.Exception.Message)). Seguindo sem administrador: a coleta ficará incompleta."
     }
 }
 
@@ -102,7 +102,8 @@ if ($PSVersionTable.PSEdition -eq 'Desktop') {
     $caminhosModulo = @($env:PSModulePath -split ';' | Where-Object { $_ -match 'WindowsPowerShell' })
     if ($caminhosModulo.Count) { $env:PSModulePath = $caminhosModulo -join ';' }
 }
-$script:Versao         = '2.0'
+$script:Versao         = '2.1'
+$script:Rotulo         = @{ CRITICO = 'CRÍTICO'; ALTO = 'ALTO'; MEDIO = 'MÉDIO'; BAIXO = 'BAIXO'; INFO = 'INFO' }
 $script:Inicio         = Get-Date
 $script:DesdeData      = (Get-Date).AddDays(-$Dias)
 
@@ -118,7 +119,7 @@ $script:Raiz  = Join-Path $OutputPath ("Diagnostico_{0}_{1}" -f $env:COMPUTERNAM
 if (($script:Raiz.Length + 110) -gt 255) {
     $OutputPath = Join-Path $env:PUBLIC 'Diagnostico'
     $script:Raiz = Join-Path $OutputPath ("Diagnostico_{0}_{1}" -f $env:COMPUTERNAME, $carimbo)
-    Write-Warning "Caminho de saida muito longo; usando $OutputPath"
+    Write-Warning "Caminho de saída muito longo; usando $OutputPath"
 }
 $pastas = '01_Sistema', '02_Hardware', '03_Eventos', '04_Falhas', '05_Desempenho',
           '06_Servicos', '07_Rede', '08_Seguranca', '09_Updates', '10_Integridade',
@@ -159,7 +160,7 @@ function Add-Achado {
         Titulo = $Titulo; Detalhe = $Detalhe; Evidencia = $Evidencia
     })
     $nivelLog = if ($ordem -le 1) { 'AVISO' } else { 'INFO' }
-    Write-Log ("ACHADO [{0}] {1}: {2}" -f $Severidade, $Categoria, $Titulo) $nivelLog
+    Write-Log ("ACHADO [{0}] {1}: {2}" -f $script:Rotulo[$Severidade], $Categoria, $Titulo) $nivelLog
 }
 
 function Invoke-Etapa {
@@ -211,7 +212,7 @@ function Invoke-Externo {
         # Mata a arvore inteira: matar so o cmd deixaria o filho rodando e segurando o arquivo.
         & "$env:SystemRoot\System32\taskkill.exe" /PID $proc.Id /T /F *> $null
         Start-Sleep -Milliseconds 300
-        try { Add-Content -Path $destino -Value "`r`n*** TIMEOUT apos $TimeoutSeg s ***" -Encoding UTF8 } catch { }
+        try { Add-Content -Path $destino -Value "`r`n*** TIMEOUT após $TimeoutSeg s ***" -Encoding UTF8 } catch { }
         Add-Lacuna $Arquivo "timeout de $TimeoutSeg s"
         return $null
     }
@@ -300,7 +301,7 @@ function Get-UsuarioAlvo {
        tenha sido elevado com outra conta. Dados por usuario (registro HKCU, perfil) vem dele. #>
     $atual = [Security.Principal.WindowsIdentity]::GetCurrent()
     $res = [pscustomobject]@{ Nome = $atual.Name; SID = $atual.User.Value; Perfil = $env:USERPROFILE
-        Origem = 'usuario do processo'; HKU = "Registry::HKEY_USERS\$($atual.User.Value)"; Outro = $false }
+        Origem = 'usuário do processo'; HKU = "Registry::HKEY_USERS\$($atual.User.Value)"; Outro = $false }
     try {
         $console = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName
         $cands = foreach ($p in (Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop)) {
@@ -314,7 +315,7 @@ function Get-UsuarioAlvo {
             $perfil = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($alvo.SID)" -ErrorAction SilentlyContinue).ProfileImagePath
             if (-not $perfil) { $perfil = $env:USERPROFILE }
             $res = [pscustomobject]@{ Nome = $alvo.Nome; SID = $alvo.SID; Perfil = $perfil
-                Origem = 'usuario logado (explorer.exe)'; HKU = "Registry::HKEY_USERS\$($alvo.SID)"
+                Origem = 'usuário logado (explorer.exe)'; HKU = "Registry::HKEY_USERS\$($alvo.SID)"
                 Outro = ($alvo.SID -ne $atual.User.Value) }
         }
     } catch { }
@@ -322,27 +323,27 @@ function Get-UsuarioAlvo {
 }
 Write-Host ''
 Write-Host '=====================================================' -ForegroundColor Cyan
-Write-Host '  DIAGNOSTICO COMPLETO DO WINDOWS' -ForegroundColor Cyan
-Write-Host "  Maquina : $env:COMPUTERNAME" -ForegroundColor Cyan
-Write-Host "  Periodo : ultimos $Dias dias" -ForegroundColor Cyan
-Write-Host "  Saida   : $script:Raiz" -ForegroundColor Cyan
+Write-Host '  DIAGNÓSTICO COMPLETO DO WINDOWS' -ForegroundColor Cyan
+Write-Host "  Máquina : $env:COMPUTERNAME" -ForegroundColor Cyan
+Write-Host "  Período : últimos $Dias dias" -ForegroundColor Cyan
+Write-Host "  Saída   : $script:Raiz" -ForegroundColor Cyan
 Write-Host '=====================================================' -ForegroundColor Cyan
 Write-Host ''
 
 if (-not $script:IsAdmin) {
-    Write-Log 'Script NAO esta rodando como Administrador. Varias coletas ficarao incompletas.' 'AVISO'
-    Add-Achado -Severidade MEDIO -Categoria 'Execucao' -Titulo 'Diagnostico executado sem privilegios de administrador' `
-        -Detalhe 'SMART, BitLocker, log de Seguranca, DISM e alguns eventos nao foram coletados. Rode novamente como Administrador.'
+    Write-Log 'Script NÃO está rodando como Administrador. Várias coletas ficarão incompletas.' 'AVISO'
+    Add-Achado -Severidade MEDIO -Categoria 'Execução' -Titulo 'Diagnóstico executado sem privilégios de administrador' `
+        -Detalhe 'SMART, BitLocker, log de Segurança, DISM e alguns eventos não foram coletados. Rode novamente como Administrador.'
 }
 
 $script:Alvo = Get-UsuarioAlvo
-Write-Log ("Usuario alvo: {0} (SID {1}, origem: {2})" -f $script:Alvo.Nome, $script:Alvo.SID, $script:Alvo.Origem)
+Write-Log ("Usuário alvo: {0} (SID {1}, origem: {2})" -f $script:Alvo.Nome, $script:Alvo.SID, $script:Alvo.Origem)
 if ($script:Alvo.Outro) {
-    Add-Achado INFO 'Execucao' "Script elevado com outra conta: dados por usuario foram lidos do usuario logado ($($script:Alvo.Nome))" `
-        'Programas, inicializacao, proxy, unidades mapeadas e Office refletem o usuario logado, nao a conta administrativa.'
+    Add-Achado INFO 'Execução' "Script elevado com outra conta: dados por usuário foram lidos do usuário logado ($($script:Alvo.Nome))" `
+        'Programas, inicialização, proxy, unidades mapeadas e Office refletem o usuário logado, não a conta administrativa.'
 }
 if ($SemDadosSensiveis) {
-    Write-Log 'Modo -SemDadosSensiveis: log de Seguranca, cache DNS, conexoes, Wi-Fi, whoami, gpresult e contas locais NAO serao coletados.' 'AVISO'
+    Write-Log 'Modo -SemDadosSensiveis: log de Segurança, cache DNS, conexões, Wi-Fi, whoami, gpresult e contas locais NÃO serão coletados.' 'AVISO'
 }
 
 
@@ -383,8 +384,8 @@ Invoke-Etapa 'Sistema operacional' {
     $script:InfoSistema = $info
 
     if ($uptime.TotalDays -gt 30) {
-        Add-Achado ALTO 'Sistema' "Maquina ligada ha $([int]$uptime.TotalDays) dias sem reiniciar" `
-            'Uptime longo acumula vazamento de memoria e impede a conclusao de updates.' '01_Sistema\resumo_sistema.txt'
+        Add-Achado ALTO 'Sistema' "Máquina ligada há $([int]$uptime.TotalDays) dias sem reiniciar" `
+            'Uptime longo acumula vazamento de memória e impede a conclusão de updates.' '01_Sistema\resumo_sistema.txt'
     }
 
     # Ciclo de vida. Datas de fim de suporte por build (Home/Pro, Enterprise/Education).
@@ -410,13 +411,13 @@ Invoke-Etapa 'Sistema operacional' {
             $dataFim = [datetime]::ParseExact($(if ($edicaoEnt) { $c[2] } else { $c[1] }), 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
             $dias = [int]($dataFim - (Get-Date)).TotalDays
             if ($dias -lt 0) {
-                $extra = if ($build -lt 22000) { 'Windows 10 so recebe correcoes com ESU (pago). Planeje a migracao para o Windows 11.' } else { 'Atualize para a versao mais recente do Windows 11.' }
-                Add-Achado ALTO 'Sistema' "$($c[0]) sem suporte desde $($dataFim.ToString('dd/MM/yyyy'))" "Nao recebe correcoes de seguranca. $extra" '01_Sistema\resumo_sistema.txt'
+                $extra = if ($build -lt 22000) { 'Windows 10 só recebe correções com ESU (pago). Planeje a migração para o Windows 11.' } else { 'Atualize para a versão mais recente do Windows 11.' }
+                Add-Achado ALTO 'Sistema' "$($c[0]) sem suporte desde $($dataFim.ToString('dd/MM/yyyy'))" "Não recebe correções de segurança. $extra" '01_Sistema\resumo_sistema.txt'
             } elseif ($dias -le 120) {
-                Add-Achado MEDIO 'Sistema' "$($c[0]) perde o suporte em $dias dias ($($dataFim.ToString('dd/MM/yyyy')))" 'Planeje a atualizacao de versao.' '01_Sistema\resumo_sistema.txt'
+                Add-Achado MEDIO 'Sistema' "$($c[0]) perde o suporte em $dias dias ($($dataFim.ToString('dd/MM/yyyy')))" 'Planeje a atualização de versão.' '01_Sistema\resumo_sistema.txt'
             }
         } elseif ($build -lt 19045 -and $build -ge 10240) {
-            Add-Achado CRITICO 'Sistema' "Build do Windows 10 antigo e sem suporte ($build)" 'Versao muito antiga: atualizar para o Windows 11.' '01_Sistema\resumo_sistema.txt'
+            Add-Achado CRITICO 'Sistema' "Build do Windows 10 antigo e sem suporte ($build)" 'Versão muito antiga: atualizar para o Windows 11.' '01_Sistema\resumo_sistema.txt'
         }
     }
 
@@ -431,36 +432,36 @@ Invoke-Etapa 'Sistema operacional' {
     Save-Texto '01_Sistema' 'variaveis_ambiente.txt' ($vars | Format-List)
 }
 
-Invoke-Etapa 'Reinicializacao pendente' {
+Invoke-Etapa 'Reinicialização pendente' {
     $motivos = New-Object System.Collections.Generic.List[string]
     if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $motivos.Add('CBS (componentes do Windows)') }
     if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $motivos.Add('Windows Update') }
     $pfro = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
-    if ($pfro) { $motivos.Add('Renomeacao de arquivos pendente') }
+    if ($pfro) { $motivos.Add('Renomeação de arquivos pendente') }
     $atual = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName').ComputerName
     $novo  = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName').ComputerName
     if ($atual -ne $novo) { $motivos.Add("Troca de nome do computador ($atual -> $novo)") }
 
-    Save-Texto '01_Sistema' 'reboot_pendente.txt' $(if ($motivos.Count) { $motivos.ToArray() } else { 'Nenhuma reinicializacao pendente' })
+    Save-Texto '01_Sistema' 'reboot_pendente.txt' $(if ($motivos.Count) { $motivos.ToArray() } else { 'Nenhuma reinicialização pendente' })
     if ($motivos.Count) {
-        Add-Achado MEDIO 'Sistema' 'Reinicializacao pendente' ($motivos.ToArray() -join '; ') '01_Sistema\reboot_pendente.txt'
+        Add-Achado MEDIO 'Sistema' 'Reinicialização pendente' ($motivos.ToArray() -join '; ') '01_Sistema\reboot_pendente.txt'
     }
 }
 
-Invoke-Etapa 'Ativacao do Windows' {
+Invoke-Etapa 'Ativação do Windows' {
     $lic = Get-CimInstance SoftwareLicensingProduct -Filter "PartialProductKey IS NOT NULL AND Name LIKE 'Windows%'" -ErrorAction SilentlyContinue
-    $status = @{ 0 = 'Nao licenciado'; 1 = 'Licenciado'; 2 = 'Periodo OOB'; 3 = 'Periodo OOT'; 4 = 'Nao original'; 5 = 'Notificacao'; 6 = 'Periodo estendido' }
+    $status = @{ 0 = 'Não licenciado'; 1 = 'Licenciado'; 2 = 'Período OOB'; 3 = 'Período OOT'; 4 = 'Não original'; 5 = 'Notificação'; 6 = 'Período estendido' }
     $dados = $lic | Select-Object Name, Description, @{n = 'Status'; e = { $status[[int]$_.LicenseStatus] } }, PartialProductKey
     Save-Texto '01_Sistema' 'ativacao.txt' ($dados | Format-List)
     if ($lic -and -not ($lic | Where-Object LicenseStatus -eq 1)) {
-        Add-Achado MEDIO 'Sistema' 'Windows nao esta ativado' ($dados.Status -join ', ') '01_Sistema\ativacao.txt'
+        Add-Achado MEDIO 'Sistema' 'Windows não está ativado' ($dados.Status -join ', ') '01_Sistema\ativacao.txt'
     }
 }
 
 # ---------------------------------------------------------------------------
 # 02 HARDWARE
 # ---------------------------------------------------------------------------
-Invoke-Etapa 'CPU e memoria' {
+Invoke-Etapa 'CPU e memória' {
     $cpu = Get-CimInstance Win32_Processor
     Save-Texto '02_Hardware' 'cpu.txt' ($cpu | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors,
         MaxClockSpeed, CurrentClockSpeed, LoadPercentage, L2CacheSize, L3CacheSize, VirtualizationFirmwareEnabled | Format-List)
@@ -472,15 +473,15 @@ Invoke-Etapa 'CPU e memoria' {
     $os = Get-CimInstance Win32_OperatingSystem
     $usoRam = [math]::Round((1 - $os.FreePhysicalMemory / $os.TotalVisibleMemorySize) * 100, 1)
     if ($usoRam -ge 90) {
-        Add-Achado ALTO 'Hardware' "Memoria RAM com $usoRam% de uso no momento da coleta" 'Verifique os processos em 05_Desempenho.'
+        Add-Achado ALTO 'Hardware' "Memória RAM com $usoRam% de uso no momento da coleta" 'Verifique os processos em 05_Desempenho.'
     }
     $totalGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
     if ($totalGB -lt 7.5) {
-        Add-Achado MEDIO 'Hardware' "Pouca memoria RAM instalada ($totalGB GB)" 'Para Windows 10/11 com uso corporativo o recomendado e 8 GB ou mais.'
+        Add-Achado MEDIO 'Hardware' "Pouca memória RAM instalada ($totalGB GB)" 'Para Windows 10/11 com uso corporativo o recomendado é 8 GB ou mais.'
     }
     $velocidades = $pentes | Select-Object -ExpandProperty ConfiguredClockSpeed -Unique
     if (($velocidades | Measure-Object).Count -gt 1) {
-        Add-Achado BAIXO 'Hardware' 'Pentes de memoria com velocidades diferentes' ($velocidades -join ', ')
+        Add-Achado BAIXO 'Hardware' 'Pentes de memória com velocidades diferentes' ($velocidades -join ', ')
     }
 }
 
@@ -492,16 +493,16 @@ Invoke-Etapa 'Discos e volumes' {
     foreach ($d in $fisicos) {
         switch ("$($d.HealthStatus)") {
             'Unhealthy' {
-                Add-Achado CRITICO 'Hardware' "Disco '$($d.FriendlyName)' com saude: Unhealthy" `
-                    "Status operacional: $($d.OperationalStatus). Faca backup imediatamente." '02_Hardware\discos_fisicos.csv'
+                Add-Achado CRITICO 'Hardware' "Disco '$($d.FriendlyName)' com saúde: Unhealthy" `
+                    "Status operacional: $($d.OperationalStatus). Faça backup imediatamente." '02_Hardware\discos_fisicos.csv'
             }
             'Warning' {
-                Add-Achado ALTO 'Hardware' "Disco '$($d.FriendlyName)' com saude: Warning" `
-                    "Status operacional: $($d.OperationalStatus). Confira o SMART e faca backup." '02_Hardware\discos_fisicos.csv'
+                Add-Achado ALTO 'Hardware' "Disco '$($d.FriendlyName)' com saúde: Warning" `
+                    "Status operacional: $($d.OperationalStatus). Confira o SMART e faça backup." '02_Hardware\discos_fisicos.csv'
             }
             'Unknown' {
-                Add-Achado BAIXO 'Hardware' "Disco '$($d.FriendlyName)' com saude desconhecida ($($d.BusType))" `
-                    'Comum em USB e leitor de cartao, que nao expoem SMART. Nao indica defeito por si so.' '02_Hardware\discos_fisicos.csv'
+                Add-Achado BAIXO 'Hardware' "Disco '$($d.FriendlyName)' com saúde desconhecida ($($d.BusType))" `
+                    'Comum em USB e leitor de cartão, que não expõem SMART. Não indica defeito por si só.' '02_Hardware\discos_fisicos.csv'
             }
         }
     }
@@ -522,11 +523,11 @@ Invoke-Etapa 'Discos e volumes' {
         Save-Csv '02_Hardware' 'smart_confiabilidade.csv' $smart
         foreach ($s in $smart) {
             if ($s.ErrosLeituraNaoCorrigidos -gt 0 -or $s.ErrosEscritaNaoCorrigidos -gt 0) {
-                Add-Achado CRITICO 'Hardware' "Disco '$($s.Disco)' com erros nao corrigidos (SMART)" `
+                Add-Achado CRITICO 'Hardware' "Disco '$($s.Disco)' com erros não corrigidos (SMART)" `
                     "Leitura: $($s.ErrosLeituraNaoCorrigidos) / Escrita: $($s.ErrosEscritaNaoCorrigidos)" '02_Hardware\smart_confiabilidade.csv'
             }
             if ($s.Desgaste -ge 80) {
-                Add-Achado ALTO 'Hardware' "SSD '$($s.Disco)' com $($s.Desgaste)% de desgaste" 'Planeje a substituicao.'
+                Add-Achado ALTO 'Hardware' "SSD '$($s.Disco)' com $($s.Desgaste)% de desgaste" 'Planeje a substituição.'
             }
             if ($s.Temperatura -ge 60) {
                 Add-Achado MEDIO 'Hardware' "Disco '$($s.Disco)' a $($s.Temperatura) C" 'Temperatura elevada para disco.'
@@ -545,10 +546,10 @@ Invoke-Etapa 'Discos e volumes' {
         if ($pred) {
             Save-Texto '02_Hardware' 'smart_predicao.txt' ($pred | Select-Object InstanceName, PredictFailure, Reason, Active | Format-Table -AutoSize)
             foreach ($p in $pred | Where-Object PredictFailure) {
-                Add-Achado CRITICO 'Hardware' "SMART preve falha iminente do disco ($($p.InstanceName))" 'Faca backup imediatamente e substitua o disco.' '02_Hardware\smart_predicao.txt'
+                Add-Achado CRITICO 'Hardware' "SMART prevê falha iminente do disco ($($p.InstanceName))" 'Faça backup imediatamente e substitua o disco.' '02_Hardware\smart_predicao.txt'
             }
         } else {
-            Save-Texto '02_Hardware' 'smart_predicao.txt' 'Indisponivel (comum em NVMe). Veja smart_confiabilidade.csv.'
+            Save-Texto '02_Hardware' 'smart_predicao.txt' 'Indisponível (comum em NVMe). Veja smart_confiabilidade.csv.'
         }
     }
     $chk = @(Get-EventosSeguro @{ LogName = 'Application'; ProviderName = 'Microsoft-Windows-Wininit'; Id = 1001 } 10) +
@@ -566,7 +567,7 @@ Invoke-Etapa 'Discos e volumes' {
         if ($pct -lt 5) {
             Add-Achado CRITICO 'Hardware' "Unidade $($v.DriveLetter): quase cheia ($pct% livre, $(Format-Bytes $v.SizeRemaining))" '' '02_Hardware\volumes.csv'
         } elseif ($pct -lt 15) {
-            Add-Achado ALTO 'Hardware' "Unidade $($v.DriveLetter): com pouco espaco ($pct% livre, $(Format-Bytes $v.SizeRemaining))" '' '02_Hardware\volumes.csv'
+            Add-Achado ALTO 'Hardware' "Unidade $($v.DriveLetter): com pouco espaço ($pct% livre, $(Format-Bytes $v.SizeRemaining))" '' '02_Hardware\volumes.csv'
         }
         if ($v.HealthStatus -and $v.HealthStatus -ne 'Healthy') {
             Add-Achado ALTO 'Hardware' "Volume $($v.DriveLetter): com status $($v.HealthStatus)" 'Rode chkdsk /scan.'
@@ -580,17 +581,17 @@ Invoke-Etapa 'Discos e volumes' {
         $sujos.Add($v.DriveLetter)
     }
     if ($sujos.Count) {
-        Add-Achado ALTO 'Hardware' "Volume marcado como corrompido (dirty bit): $($sujos.ToArray() -join ', ')" 'O Windows vai forcar chkdsk no proximo boot.'
+        Add-Achado ALTO 'Hardware' "Volume marcado como corrompido (dirty bit): $($sujos.ToArray() -join ', ')" 'O Windows vai forçar chkdsk no próximo boot.'
     }
 }
 
 Invoke-Etapa 'Dispositivos com erro' {
     $codigos = @{
-        1 = 'Nao configurado'; 3 = 'Driver corrompido/pouca memoria'; 10 = 'Nao pode iniciar'; 12 = 'Conflito de recursos'
+        1 = 'Não configurado'; 3 = 'Driver corrompido/pouca memória'; 10 = 'Não pode iniciar'; 12 = 'Conflito de recursos'
         14 = 'Requer reinicio'; 18 = 'Reinstalar driver'; 19 = 'Registro corrompido'; 22 = 'Desabilitado'
-        24 = 'Nao presente/sem driver'; 28 = 'Driver nao instalado'; 31 = 'Nao funciona corretamente'
-        32 = 'Servico do driver desabilitado'; 37 = 'Falha na inicializacao do driver'; 39 = 'Driver corrompido ou ausente'
-        43 = 'Dispositivo reportou problema'; 45 = 'Desconectado'; 52 = 'Assinatura do driver invalida'
+        24 = 'Não presente/sem driver'; 28 = 'Driver não instalado'; 31 = 'Não funciona corretamente'
+        32 = 'Serviço do driver desabilitado'; 37 = 'Falha na inicialização do driver'; 39 = 'Driver corrompido ou ausente'
+        43 = 'Dispositivo reportou problema'; 45 = 'Desconectado'; 52 = 'Assinatura do driver inválida'
     }
     $todos = Get-CimInstance Win32_PnPEntity
     $comErro = $todos | Where-Object { $_.ConfigManagerErrorCode -ne 0 } |
@@ -600,7 +601,7 @@ Invoke-Etapa 'Dispositivos com erro' {
     Save-Csv '02_Hardware' 'dispositivos_todos.csv' ($todos | Select-Object Name, PNPClass, Manufacturer, Status, ConfigManagerErrorCode, DeviceID)
 
     foreach ($d in $comErro | Where-Object ConfigManagerErrorCode -ne 22) {
-        Add-Achado ALTO 'Hardware' "Dispositivo com erro: $($d.Name)" "Codigo $($d.ConfigManagerErrorCode): $($d.Significado)" '02_Hardware\dispositivos_com_erro.csv'
+        Add-Achado ALTO 'Hardware' "Dispositivo com erro: $($d.Name)" "Código $($d.ConfigManagerErrorCode): $($d.Significado)" '02_Hardware\dispositivos_com_erro.csv'
     }
 
     $drivers = Get-CimInstance Win32_PnPSignedDriver | Where-Object DeviceName |
@@ -608,12 +609,12 @@ Invoke-Etapa 'Dispositivos com erro' {
     Save-Csv '02_Hardware' 'drivers.csv' $drivers
     $naoAssinados = $drivers | Where-Object { $_.IsSigned -eq $false }
     if ($naoAssinados) {
-        Add-Achado MEDIO 'Hardware' "$(($naoAssinados | Measure-Object).Count) driver(s) nao assinado(s)" (($naoAssinados.DeviceName | Select-Object -First 5) -join '; ') '02_Hardware\drivers.csv'
+        Add-Achado MEDIO 'Hardware' "$(($naoAssinados | Measure-Object).Count) driver(s) não assinado(s)" (($naoAssinados.DeviceName | Select-Object -First 5) -join '; ') '02_Hardware\drivers.csv'
     }
     Invoke-Externo '02_Hardware' 'driverquery.txt' 'driverquery /v /fo table' 90 | Out-Null
 }
 
-Invoke-Etapa 'Video, bateria e temperatura' {
+Invoke-Etapa 'Vídeo, bateria e temperatura' {
     Save-Texto '02_Hardware' 'video.txt' (Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, DriverDate,
         VideoModeDescription, @{n = 'VRAM'; e = { Format-Bytes $_.AdapterRAM } }, Status | Format-List)
 
@@ -624,7 +625,7 @@ Invoke-Etapa 'Video, bateria e temperatura' {
         $design = (Get-CimInstance -Namespace root\wmi -ClassName BatteryStaticData -ErrorAction SilentlyContinue | Select-Object -First 1).DesignedCapacity
         if ($full -and $design) {
             $saude = [math]::Round($full / $design * 100, 1)
-            Save-Texto '02_Hardware' 'bateria.txt' "Capacidade projetada: $design mWh`r`nCapacidade atual: $full mWh`r`nSaude: $saude%"
+            Save-Texto '02_Hardware' 'bateria.txt' "Capacidade projetada: $design mWh`r`nCapacidade atual: $full mWh`r`nSaúde: $saude%"
             if ($saude -lt 50) { Add-Achado ALTO 'Hardware' "Bateria com apenas $saude% da capacidade original" '' '02_Hardware\relatorio_bateria.html' }
             elseif ($saude -lt 70) { Add-Achado MEDIO 'Hardware' "Bateria degradada ($saude% da capacidade original)" '' '02_Hardware\relatorio_bateria.html' }
         }
@@ -635,42 +636,42 @@ Invoke-Etapa 'Video, bateria e temperatura' {
         $lista = $temps | Select-Object InstanceName, @{n = 'Celsius'; e = { [math]::Round($_.CurrentTemperature / 10 - 273.15, 1) } }
         Save-Texto '02_Hardware' 'temperatura_acpi.txt' ($lista | Format-Table -AutoSize)
         foreach ($t in $lista | Where-Object { $_.Celsius -ge 85 -and $_.Celsius -lt 150 }) {
-            Add-Achado ALTO 'Hardware' "Zona termica $($t.InstanceName) a $($t.Celsius) C" 'Possivel superaquecimento: verifique ventoinha e pasta termica.'
+            Add-Achado ALTO 'Hardware' "Zona térmica $($t.InstanceName) a $($t.Celsius) C" 'Possível superaquecimento: verifique ventoinha e pasta térmica.'
         }
     }
 }
 
 
-Invoke-Etapa 'Diagnostico de memoria do Windows' {
+Invoke-Etapa 'Diagnóstico de memória do Windows' {
     $ev = @(Get-EventosSeguro @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-MemoryDiagnostics-Results'; Id = 1201, 1202 } 10)
     Save-Csv '02_Hardware' 'diagnostico_memoria_windows.csv' ($ev | Select-Object TimeCreated, Id,
         @{n = 'Mensagem'; e = { ($_.Message -replace '\s+', ' ').Trim() } })
     $ultimo = $ev | Sort-Object TimeCreated -Descending | Select-Object -First 1
     if (-not $ultimo) {
-        Save-Texto '02_Hardware' 'diagnostico_memoria_nota.txt' 'O Diagnostico de Memoria do Windows (mdsched.exe) nunca foi executado nesta maquina.'
+        Save-Texto '02_Hardware' 'diagnostico_memoria_nota.txt' 'O Diagnóstico de Memória do Windows (mdsched.exe) nunca foi executado nesta máquina.'
     } elseif ($ultimo.Id -eq 1202) {
-        Add-Achado CRITICO 'Hardware' "Diagnostico de Memoria do Windows encontrou ERROS (em $($ultimo.TimeCreated.ToString('dd/MM/yyyy')))" `
+        Add-Achado CRITICO 'Hardware' "Diagnóstico de Memória do Windows encontrou ERROS (em $($ultimo.TimeCreated.ToString('dd/MM/yyyy')))" `
             'RAM defeituosa: teste pente a pente e substitua o que falhar.' '02_Hardware\diagnostico_memoria_windows.csv'
     } else {
-        Add-Achado INFO 'Hardware' "Diagnostico de Memoria do Windows sem erros (teste de $($ultimo.TimeCreated.ToString('dd/MM/yyyy')))" '' '02_Hardware\diagnostico_memoria_windows.csv'
+        Add-Achado INFO 'Hardware' "Diagnóstico de Memória do Windows sem erros (teste de $($ultimo.TimeCreated.ToString('dd/MM/yyyy')))" '' '02_Hardware\diagnostico_memoria_windows.csv'
     }
 }
 
-Invoke-Etapa 'Uso de espaco em disco' {
+Invoke-Etapa 'Uso de espaço em disco' {
     $perfil = $script:Alvo.Perfil
     $pastas = New-Object System.Collections.Generic.List[object]
     $limite = 25
-    $pastas.Add(@('Temp do usuario', (Join-Path $perfil 'AppData\Local\Temp'), $true))
+    $pastas.Add(@('Temp do usuário', (Join-Path $perfil 'AppData\Local\Temp'), $true))
     $pastas.Add(@('Temp do Windows', "$env:SystemRoot\Temp", $true))
     $pastas.Add(@('Cache de download do Windows Update', "$env:SystemRoot\SoftwareDistribution\Download", $true))
     $pastas.Add(@('Windows.old', "$env:SystemDrive\Windows.old", $true))
-    $pastas.Add(@('Downloads do usuario', (Join-Path $perfil 'Downloads'), $false))
-    $pastas.Add(@('AppData Local do usuario', (Join-Path $perfil 'AppData\Local'), $false))
+    $pastas.Add(@('Downloads do usuário', (Join-Path $perfil 'Downloads'), $false))
+    $pastas.Add(@('AppData Local do usuário', (Join-Path $perfil 'AppData\Local'), $false))
     $pastas.Add(@('Logs do Windows', "$env:SystemRoot\Logs", $false))
-    $pastas.Add(@('Relatorios de erro (WER)', "$env:ProgramData\Microsoft\Windows\WER", $true))
+    $pastas.Add(@('Relatórios de erro (WER)', "$env:ProgramData\Microsoft\Windows\WER", $true))
     if ($Completo) {
         $limite = 90
-        $pastas.Add(@('Perfil completo do usuario', $perfil, $false))
+        $pastas.Add(@('Perfil completo do usuário', $perfil, $false))
         $pastas.Add(@('ProgramData', $env:ProgramData, $false))
         $pastas.Add(@('Program Files', $env:ProgramFiles, $false))
         $pastas.Add(@('Program Files (x86)', ${env:ProgramFiles(x86)}, $false))
@@ -686,7 +687,7 @@ Invoke-Etapa 'Uso de espaco em disco' {
         if (-not $p[1]) { continue }
         $restante = $orcamento - $relogio.Elapsed.TotalSeconds
         if ($restante -lt 5) {
-            Add-Lacuna 'uso de espaco em disco' "orcamento de $orcamento s esgotado; pastas seguintes nao foram medidas (a partir de '$($p[0])')"
+            Add-Lacuna 'uso de espaço em disco' "orçamento de $orcamento s esgotado; pastas seguintes não foram medidas (a partir de '$($p[0])')"
             break
         }
         $t = Get-TamanhoPasta $p[1] ([math]::Min($limite, [int]$restante))
@@ -702,11 +703,11 @@ Invoke-Etapa 'Uso de espaco em disco' {
     }
     Save-Csv '02_Hardware' 'uso_espaco.csv' ($linhas.ToArray() | Sort-Object Bytes -Descending)
     if ($recuperavel -ge 5GB) {
-        Add-Achado MEDIO 'Hardware' "$(Format-Bytes $recuperavel) em temporarios, caches e Windows.old" `
-            'Espaco recuperavel (Temp, cache do Windows Update, relatorios de erro, instalacao anterior do Windows).' '02_Hardware\uso_espaco.csv'
+        Add-Achado MEDIO 'Hardware' "$(Format-Bytes $recuperavel) em temporários, caches e Windows.old" `
+            'Espaço recuperável (Temp, cache do Windows Update, relatórios de erro, instalação anterior do Windows).' '02_Hardware\uso_espaco.csv'
     }
     $wo = $linhas.ToArray() | Where-Object { $_.Descricao -eq 'Windows.old' -and $_.Bytes -gt 0 }
-    if ($wo) { Add-Achado INFO 'Hardware' "Windows.old presente ($($wo.Tamanho))" 'Copia da versao anterior do Windows; pode ser removida pela Limpeza de Disco apos validar a atualizacao.' '02_Hardware\uso_espaco.csv' }
+    if ($wo) { Add-Achado INFO 'Hardware' "Windows.old presente ($($wo.Tamanho))" 'Cópia da versão anterior do Windows; pode ser removida pela Limpeza de Disco após validar a atualização.' '02_Hardware\uso_espaco.csv' }
 }
 
 # ---------------------------------------------------------------------------
@@ -735,14 +736,14 @@ Invoke-Etapa 'Exportar logs de eventos (evtx)' {
         $destino = Join-Path $script:Raiz "03_Eventos\evtx\$nome"
         New-Item -ItemType Directory -Path (Split-Path $destino) -Force | Out-Null
         & wevtutil.exe epl $l $destino "/q:*[System[TimeCreated[timediff(@SystemTime) <= $ms]]]" /ow:true 2>$null
-        if ($LASTEXITCODE -ne 0) { Add-Lacuna "evtx $l" "wevtutil epl retornou $LASTEXITCODE (log inexistente ou sem permissao)"; continue }
+        if ($LASTEXITCODE -ne 0) { Add-Lacuna "evtx $l" "wevtutil epl retornou $LASTEXITCODE (log inexistente ou sem permissão)"; continue }
         # 'al' grava os metadados de mensagem ao lado do .evtx: sem isso, em outra maquina os eventos de
         # programas de terceiros aparecem sem texto.
         & wevtutil.exe al $destino "/l:$cultura" 2>$null
     }
 }
 
-Invoke-Etapa 'Erros e criticos (System/Application)' {
+Invoke-Etapa 'Erros e críticos (System/Application)' {
     $eventos = foreach ($log in 'System', 'Application') {
         Get-EventosSeguro @{ LogName = $log; Level = 1, 2; StartTime = $script:DesdeData } 10000
     }
@@ -776,27 +777,27 @@ Invoke-Etapa 'Eventos conhecidos de problema' {
     # viram um achado separado e mais brando.
     $regras = @(
         @{ Log = 'System'; Fonte = 'Microsoft-Windows-WHEA-Logger'; Ids = 1, 17, 18, 19, 20, 46, 47; Sev = 'CRITICO'
-           Tit = 'Erro de hardware NAO corrigido (WHEA)'; Exp = 'Erro fatal reportado pelo hardware: CPU, memoria, PCIe ou barramento.'
+           Tit = 'Erro de hardware NÃO corrigido (WHEA)'; Exp = 'Erro fatal reportado pelo hardware: CPU, memória, PCIe ou barramento.'
            Leves = @{ Tit = 'Erros de hardware corrigidos (WHEA)'; Sev = 'BAIXO'; SevMuitos = 'MEDIO'; Limite = 10
-                      Exp = 'O proprio hardware corrigiu (ex.: PCIe AER). Costuma ser energia/ASPM de Wi-Fi ou NVMe: atualize BIOS e drivers; se for frequente, investigue o dispositivo indicado.' } }
+                      Exp = 'O próprio hardware corrigiu (ex.: PCIe AER). Costuma ser energia/ASPM de Wi-Fi ou NVMe: atualize BIOS e drivers; se for frequente, investigue o dispositivo indicado.' } }
         @{ Log = 'System'; Fonte = $null; Ids = 7, 11, 15, 51, 52, 153, 129; Sev = 'CRITICO'; Tit = 'Erro de disco/controladora (7/11/15/51/52/129/153)'; Exp = 'Setores ruins, timeout de I/O ou cabo/controladora com defeito.'; Provs = 'disk', 'Disk', 'storahci', 'stornvme', 'iaStorA', 'iaStorAC', 'nvme', 'atapi', 'Ntfs' }
-        @{ Log = 'System'; Fonte = 'Ntfs'; Ids = 55, 137, 140; Sev = 'ALTO'; Tit = 'Corrupcao no sistema de arquivos NTFS'; Exp = 'Rode chkdsk /f no volume afetado.' }
-        @{ Log = 'System'; Fonte = 'Microsoft-Windows-Resource-Exhaustion-Detector'; Ids = 2004; Sev = 'ALTO'; Tit = 'Falta de memoria virtual (2004)'; Exp = 'Algum processo consumiu toda a memoria. O evento indica qual.' }
-        @{ Log = 'System'; Fonte = 'Service Control Manager'; Ids = 7000, 7001, 7009, 7011, 7022, 7023, 7024, 7026, 7031, 7032, 7034, 7043; Sev = 'MEDIO'; Tit = 'Servicos falhando ao iniciar ou parando inesperadamente'; Exp = 'Veja quais servicos em 03_Eventos\eventos_conhecidos.csv.' }
-        @{ Log = 'System'; Fonte = 'Microsoft-Windows-DNS-Client'; Ids = 1014; Sev = 'MEDIO'; Tit = 'Falhas de resolucao DNS (1014)'; Exp = 'Timeout ao consultar os servidores DNS configurados.' }
-        @{ Log = 'System'; Fonte = 'Microsoft-Windows-Time-Service'; Ids = 36, 47, 129, 134; Sev = 'BAIXO'; Tit = 'Falha na sincronizacao de horario'; Exp = 'Horario incorreto quebra Kerberos, TLS e autenticacao.' }
-        @{ Log = 'System'; Fonte = 'NETLOGON'; Ids = 3210, 5719, 5722, 5723, 5805; Sev = 'ALTO'; Tit = 'Falha de comunicacao com o controlador de dominio'; Exp = 'Relacao de confianca, rede ou DNS com o AD.' }
+        @{ Log = 'System'; Fonte = 'Ntfs'; Ids = 55, 137, 140; Sev = 'ALTO'; Tit = 'Corrupção no sistema de arquivos NTFS'; Exp = 'Rode chkdsk /f no volume afetado.' }
+        @{ Log = 'System'; Fonte = 'Microsoft-Windows-Resource-Exhaustion-Detector'; Ids = 2004; Sev = 'ALTO'; Tit = 'Falta de memória virtual (2004)'; Exp = 'Algum processo consumiu toda a memória. O evento indica qual.' }
+        @{ Log = 'System'; Fonte = 'Service Control Manager'; Ids = 7000, 7001, 7009, 7011, 7022, 7023, 7024, 7026, 7031, 7032, 7034, 7043; Sev = 'MEDIO'; Tit = 'Serviços falhando ao iniciar ou parando inesperadamente'; Exp = 'Veja quais serviços em 03_Eventos\eventos_conhecidos.csv.' }
+        @{ Log = 'System'; Fonte = 'Microsoft-Windows-DNS-Client'; Ids = 1014; Sev = 'MEDIO'; Tit = 'Falhas de resolução DNS (1014)'; Exp = 'Timeout ao consultar os servidores DNS configurados.' }
+        @{ Log = 'System'; Fonte = 'Microsoft-Windows-Time-Service'; Ids = 36, 47, 129, 134; Sev = 'BAIXO'; Tit = 'Falha na sincronização de horário'; Exp = 'Horário incorreto quebra Kerberos, TLS e autenticação.' }
+        @{ Log = 'System'; Fonte = 'NETLOGON'; Ids = 3210, 5719, 5722, 5723, 5805; Sev = 'ALTO'; Tit = 'Falha de comunicação com o controlador de domínio'; Exp = 'Relação de confiança, rede ou DNS com o AD.' }
         @{ Log = 'System'; Fonte = 'Microsoft-Windows-GroupPolicy'; Ids = 1030, 1058, 1085, 1096, 1129; Sev = 'MEDIO'; Tit = 'Falha ao aplicar GPO'; Exp = 'Veja 13_Politicas\gpresult.html.' }
-        @{ Log = 'System'; Fonte = 'volmgr'; Ids = 45, 46, 49, 161; Sev = 'ALTO'; Tit = 'Falha ao gravar dump de memoria'; Exp = 'Pagefile ausente/pequeno: o Windows nao consegue registrar a causa das telas azuis.' }
-        @{ Log = 'System'; Fonte = 'Display'; Ids = 4101; Sev = 'MEDIO'; Tit = 'Driver de video parou de responder e recuperou (TDR)'; Exp = 'Atualize/reinstale o driver de video.' }
+        @{ Log = 'System'; Fonte = 'volmgr'; Ids = 45, 46, 49, 161; Sev = 'ALTO'; Tit = 'Falha ao gravar dump de memória'; Exp = 'Pagefile ausente/pequeno: o Windows não consegue registrar a causa das telas azuis.' }
+        @{ Log = 'System'; Fonte = 'Display'; Ids = 4101; Sev = 'MEDIO'; Tit = 'Driver de vídeo parou de responder e recuperou (TDR)'; Exp = 'Atualize/reinstale o driver de vídeo.' }
         @{ Log = 'System'; Fonte = 'Microsoft-Windows-Kernel-Processor-Power'; Ids = 37; Sev = 'MEDIO'; Tit = 'CPU com velocidade limitada pelo firmware (37)'; Exp = 'Throttling por temperatura ou energia.' }
-        @{ Log = 'System'; Fonte = 'Microsoft-Windows-Kernel-PnP'; Ids = 219; Sev = 'BAIXO'; Tit = 'Driver falhou ao carregar (Kernel-PnP 219)'; Exp = 'Dispositivo sem driver ou driver incompativel.' }
-        @{ Log = 'Application'; Fonte = 'Application Error'; Ids = 1000; Sev = 'MEDIO'; Tit = 'Aplicativos travando (Application Error 1000)'; Exp = 'Veja quais executaveis em 04_Falhas\crashes_aplicativos.csv.' }
+        @{ Log = 'System'; Fonte = 'Microsoft-Windows-Kernel-PnP'; Ids = 219; Sev = 'BAIXO'; Tit = 'Driver falhou ao carregar (Kernel-PnP 219)'; Exp = 'Dispositivo sem driver ou driver incompatível.' }
+        @{ Log = 'Application'; Fonte = 'Application Error'; Ids = 1000; Sev = 'MEDIO'; Tit = 'Aplicativos travando (Application Error 1000)'; Exp = 'Veja quais executáveis em 04_Falhas\crashes_aplicativos.csv.' }
         @{ Log = 'Application'; Fonte = 'Application Hang'; Ids = 1002; Sev = 'MEDIO'; Tit = 'Aplicativos congelando (Application Hang 1002)'; Exp = 'Veja 04_Falhas\crashes_aplicativos.csv.' }
-        @{ Log = 'Application'; Fonte = '.NET Runtime'; Ids = 1026; Sev = 'BAIXO'; Tit = 'Excecoes .NET nao tratadas (1026)'; Exp = '' }
-        @{ Log = 'Application'; Fonte = 'Microsoft-Windows-User Profiles Service'; Ids = 1500, 1511, 1515, 1521, 1542; Sev = 'ALTO'; Tit = 'Problema no perfil de usuario (perfil temporario/corrompido)'; Exp = 'Usuario pode estar entrando com perfil temporario.' }
-        @{ Log = 'Application'; Fonte = 'ESENT'; Ids = 454, 455, 465, 467, 489; Sev = 'BAIXO'; Tit = 'Corrupcao em banco ESENT (Search/Update)'; Exp = '' }
-        @{ Log = 'Application'; Fonte = 'Microsoft-Windows-Winlogon'; Ids = 6004; Sev = 'BAIXO'; Tit = 'Falha em notificacao do Winlogon'; Exp = '' }
+        @{ Log = 'Application'; Fonte = '.NET Runtime'; Ids = 1026; Sev = 'BAIXO'; Tit = 'Exceções .NET não tratadas (1026)'; Exp = '' }
+        @{ Log = 'Application'; Fonte = 'Microsoft-Windows-User Profiles Service'; Ids = 1500, 1511, 1515, 1521, 1542; Sev = 'ALTO'; Tit = 'Problema no perfil de usuário (perfil temporario/corrompido)'; Exp = 'Usuário pode estar entrando com perfil temporário.' }
+        @{ Log = 'Application'; Fonte = 'ESENT'; Ids = 454, 455, 465, 467, 489; Sev = 'BAIXO'; Tit = 'Corrupção em banco ESENT (Search/Update)'; Exp = '' }
+        @{ Log = 'Application'; Fonte = 'Microsoft-Windows-Winlogon'; Ids = 6004; Sev = 'BAIXO'; Tit = 'Falha em notificação do Winlogon'; Exp = '' }
     )
 
     $todos = New-Object System.Collections.Generic.List[object]
@@ -838,14 +839,14 @@ Invoke-Etapa 'Eventos conhecidos de problema' {
                 } | Group-Object | Sort-Object Count -Descending | Select-Object -First 3
                 if ($comp) { $extra = ' Componentes: ' + (($comp | ForEach-Object { "$($_.Name) ($($_.Count)x)" }) -join ', ') + '.' }
             }
-            Add-Achado $g.Sev 'Eventos' "$($g.Tit): $($g.Ev.Count) ocorrencia(s), ultima em $($ultimo.TimeCreated.ToString('dd/MM/yyyy HH:mm'))" `
+            Add-Achado $g.Sev 'Eventos' "$($g.Tit): $($g.Ev.Count) ocorrência(s), última em $($ultimo.TimeCreated.ToString('dd/MM/yyyy HH:mm'))" `
                 "$($g.Exp)$extra Exemplo: $amostra" '03_Eventos\eventos_conhecidos.csv'
         }
     }
     Save-Csv '03_Eventos' 'eventos_conhecidos.csv' ($todos.ToArray() | Sort-Object TimeCreated -Descending)
 }
 
-Invoke-Etapa 'Historico de boot/desligamento' {
+Invoke-Etapa 'Histórico de boot/desligamento' {
     $ev = Get-EventosSeguro @{ LogName = 'System'; Id = 12, 13, 41, 1074, 6005, 6006, 6008, 1, 42, 107, 109; StartTime = $script:DesdeData } 3000
     $ev = $ev | Where-Object { $_.Id -ne 1 -or $_.ProviderName -eq 'Microsoft-Windows-Power-Troubleshooter' }
     Save-Csv '03_Eventos' 'boot_desligamento_suspensao.csv' ($ev | Select-Object TimeCreated, Id, ProviderName,
@@ -874,11 +875,11 @@ Invoke-Etapa 'Telas azuis e dumps' {
     Save-Csv '04_Falhas' 'bsod_historico_completo.csv' ($bug | Select-Object TimeCreated, @{n = 'Mensagem'; e = { ($_.Message -replace '\s+', ' ').Trim() } })
 
     $cfg = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' -ErrorAction SilentlyContinue
-    $tipos = @{ 0 = 'Nenhum'; 1 = 'Completo'; 2 = 'Kernel'; 3 = 'Pequeno (minidump)'; 7 = 'Automatico' }
+    $tipos = @{ 0 = 'Nenhum'; 1 = 'Completo'; 2 = 'Kernel'; 3 = 'Pequeno (minidump)'; 7 = 'Automático' }
     Save-Texto '04_Falhas' 'config_dump.txt' ("Tipo de dump: {0}`r`nArquivo: {1}`r`nPasta minidump: {2}`r`nReiniciar automaticamente: {3}" -f
         $tipos[[int]$cfg.CrashDumpEnabled], $cfg.DumpFile, $cfg.MinidumpDir, $cfg.AutoReboot)
     if ($cfg -and [int]$cfg.CrashDumpEnabled -eq 0) {
-        Add-Achado MEDIO 'Falhas' 'Gravacao de dump de memoria desabilitada' 'Sem dump nao da para descobrir a causa de telas azuis.'
+        Add-Achado MEDIO 'Falhas' 'Gravação de dump de memória desabilitada' 'Sem dump não da para descobrir a causa de telas azuis.'
     }
 
     $pastaMini = Join-Path $env:SystemRoot 'Minidump'
@@ -894,7 +895,7 @@ Invoke-Etapa 'Telas azuis e dumps' {
     $memDmp = Join-Path $env:SystemRoot 'MEMORY.DMP'
     if (Test-Path $memDmp) {
         $f = Get-Item $memDmp
-        Save-Texto '04_Falhas' 'memory_dmp.txt' "MEMORY.DMP encontrado: $(Format-Bytes $f.Length), gerado em $($f.LastWriteTime). Nao copiado por tamanho."
+        Save-Texto '04_Falhas' 'memory_dmp.txt' "MEMORY.DMP encontrado: $(Format-Bytes $f.Length), gerado em $($f.LastWriteTime). Não copiado por tamanho."
     }
 
     # Codigos de parada lidos do texto do evento 1001
@@ -907,30 +908,30 @@ Invoke-Etapa 'Telas azuis e dumps' {
 Invoke-Etapa 'Resumo de travamentos do sistema' {
     # Consolida Kernel-Power 41, BugCheck 1001, 6008 e minidumps: um travamento = uma linha.
     $nomes = @{
-        '0x0000000A' = 'IRQL_NOT_LESS_OR_EQUAL: driver acessou memoria invalida. Atualize ou remova drivers recentes.'
-        '0x0000001A' = 'MEMORY_MANAGEMENT: RAM defeituosa ou driver. Rode o Diagnostico de Memoria (mdsched).'
-        '0x0000001E' = 'KMODE_EXCEPTION_NOT_HANDLED: excecao em driver. Veja o modulo no dump.'
+        '0x0000000A' = 'IRQL_NOT_LESS_OR_EQUAL: driver acessou memória inválida. Atualize ou remova drivers recentes.'
+        '0x0000001A' = 'MEMORY_MANAGEMENT: RAM defeituosa ou driver. Rode o Diagnóstico de Memória (mdsched).'
+        '0x0000001E' = 'KMODE_EXCEPTION_NOT_HANDLED: exceção em driver. Veja o modulo no dump.'
         '0x00000024' = 'NTFS_FILE_SYSTEM: problema no disco ou sistema de arquivos. Rode chkdsk e confira o SMART.'
-        '0x0000003B' = 'SYSTEM_SERVICE_EXCEPTION: driver, antivirus ou driver de video.'
+        '0x0000003B' = 'SYSTEM_SERVICE_EXCEPTION: driver, antivírus ou driver de vídeo.'
         '0x00000050' = 'PAGE_FAULT_IN_NONPAGED_AREA: RAM defeituosa ou driver.'
         '0x0000007A' = 'KERNEL_DATA_INPAGE_ERROR: leitura de disco falhou (disco, cabo ou controladora).'
         '0x0000007B' = 'INACCESSIBLE_BOOT_DEVICE: controladora de disco, modo SATA/RAID na BIOS ou disco.'
         '0x0000007E' = 'SYSTEM_THREAD_EXCEPTION_NOT_HANDLED: driver. Veja o modulo no dump.'
         '0x0000009C' = 'MACHINE_CHECK_EXCEPTION: erro de CPU/hardware, temperatura ou overclock.'
-        '0x0000009F' = 'DRIVER_POWER_STATE_FAILURE: driver nao concluiu a troca de estado de energia (rede, video, chipset).'
+        '0x0000009F' = 'DRIVER_POWER_STATE_FAILURE: driver não concluiu a troca de estado de energia (rede, vídeo, chipset).'
         '0x000000BE' = 'ATTEMPTED_WRITE_TO_READONLY_MEMORY: driver.'
         '0x000000C2' = 'BAD_POOL_CALLER: driver.'
-        '0x000000D1' = 'DRIVER_IRQL_NOT_LESS_OR_EQUAL: driver (rede, antivirus, VPN).'
-        '0x000000EF' = 'CRITICAL_PROCESS_DIED: processo critico do Windows encerrou (disco, corrupcao, driver).'
+        '0x000000D1' = 'DRIVER_IRQL_NOT_LESS_OR_EQUAL: driver (rede, antivírus, VPN).'
+        '0x000000EF' = 'CRITICAL_PROCESS_DIED: processo crítico do Windows encerrou (disco, corrupção, driver).'
         '0x000000F4' = 'CRITICAL_OBJECT_TERMINATION: disco ou controladora.'
-        '0x00000101' = 'CLOCK_WATCHDOG_TIMEOUT: CPU nao respondeu (BIOS, virtualizacao, hardware).'
+        '0x00000101' = 'CLOCK_WATCHDOG_TIMEOUT: CPU não respondeu (BIOS, virtualização, hardware).'
         '0x00000109' = 'CRITICAL_STRUCTURE_CORRUPTION: driver, RAM ou hardware.'
-        '0x00000116' = 'VIDEO_TDR_FAILURE: driver de video.'
-        '0x00000117' = 'VIDEO_TDR_TIMEOUT_DETECTED: driver de video.'
+        '0x00000116' = 'VIDEO_TDR_FAILURE: driver de vídeo.'
+        '0x00000117' = 'VIDEO_TDR_TIMEOUT_DETECTED: driver de vídeo.'
         '0x00000124' = 'WHEA_UNCORRECTABLE_ERROR: erro fatal de hardware (CPU, RAM, PCIe).'
         '0x00000133' = 'DPC_WATCHDOG_VIOLATION: driver ou firmware de SSD.'
-        '0x00000139' = 'KERNEL_SECURITY_CHECK_FAILURE: driver, RAM ou corrupcao.'
-        '0x00000154' = 'UNEXPECTED_STORE_EXCEPTION: SSD ou antivirus.'
+        '0x00000139' = 'KERNEL_SECURITY_CHECK_FAILURE: driver, RAM ou corrupção.'
+        '0x00000154' = 'UNEXPECTED_STORE_EXCEPTION: SSD ou antivírus.'
     }
     $k41   = @(Get-EventosSeguro @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 41; StartTime = $script:DesdeData } 500)
     $s6008 = @(Get-EventosSeguro @{ LogName = 'System'; ProviderName = 'EventLog'; Id = 6008; StartTime = $script:DesdeData } 500)
@@ -941,8 +942,8 @@ Invoke-Etapa 'Resumo de travamentos do sistema' {
         $cod = [int64]0
         try { $cod = [int64]$e.Properties[0].Value } catch { }
         $hex = '0x{0:X8}' -f $cod
-        $sig = if ($cod -ne 0) { $nomes[$hex] } else { 'Sem bugcheck: queda de energia, travamento total (hang) ou botao de energia mantido pressionado' }
-        if (-not $sig) { $sig = '(codigo sem descricao na tabela do script)' }
+        $sig = if ($cod -ne 0) { $nomes[$hex] } else { 'Sem bugcheck: queda de energia, travamento total (hang) ou botão de energia mantido pressionado' }
+        if (-not $sig) { $sig = '(código sem descrição na tabela do script)' }
         $linhas.Add([pscustomobject]@{ Data = $e.TimeCreated; Tipo = $(if ($cod -ne 0) { 'Tela azul' } else { 'Desligamento inesperado' })
             Codigo = $(if ($cod -ne 0) { $hex } else { '' }); Significado = $sig; Fonte = 'Kernel-Power 41' })
     }
@@ -951,7 +952,7 @@ Invoke-Etapa 'Resumo de travamentos do sistema' {
         if ($perto) { continue }
         $hex = ''
         if ($e.Message -match '0x[0-9a-fA-F]{8}') { $hex = '0x' + $Matches[0].Substring(2).ToUpper() }
-        $sig = $nomes[$hex]; if (-not $sig) { $sig = '(codigo sem descricao na tabela do script)' }
+        $sig = $nomes[$hex]; if (-not $sig) { $sig = '(código sem descrição na tabela do script)' }
         $linhas.Add([pscustomobject]@{ Data = $e.TimeCreated; Tipo = 'Tela azul'; Codigo = $hex; Significado = $sig; Fonte = 'BugCheck 1001' })
     }
     foreach ($e in $s6008) {
@@ -968,11 +969,11 @@ Invoke-Etapa 'Resumo de travamentos do sistema' {
         $top = $telas | Where-Object Codigo | Group-Object Codigo | Sort-Object Count -Descending | Select-Object -First 3
         $det = ($top | ForEach-Object { "$($_.Name) ($($_.Count)x): $($nomes[$_.Name])" }) -join ' | '
         if ($script:MinidumpsRecentes -gt 0) { $det += " | $($script:MinidumpsRecentes) minidump(s) em 04_Falhas\minidumps (analise com WinDbg: !analyze -v)" }
-        Add-Achado CRITICO 'Falhas' "$($telas.Count) tela(s) azul(is) nos ultimos $Dias dias" $det '04_Falhas\travamentos_consolidado.csv'
+        Add-Achado CRITICO 'Falhas' "$($telas.Count) tela(s) azul(is) nos últimos $Dias dias" $det '04_Falhas\travamentos_consolidado.csv'
     }
     if ($quedas.Count) {
-        Add-Achado ALTO 'Falhas' "$($quedas.Count) desligamento(s) inesperado(s) sem tela azul nos ultimos $Dias dias" `
-            'Queda de energia, travamento total (hang) ou botao de energia mantido. Em notebook verifique bateria e carregador; em desktop, fonte e nobreak.' '04_Falhas\travamentos_consolidado.csv'
+        Add-Achado ALTO 'Falhas' "$($quedas.Count) desligamento(s) inesperado(s) sem tela azul nos últimos $Dias dias" `
+            'Queda de energia, travamento total (hang) ou botão de energia mantido. Em notebook verifique bateria e carregador; em desktop, fonte e nobreak.' '04_Falhas\travamentos_consolidado.csv'
     }
 }
 
@@ -998,7 +999,7 @@ Invoke-Etapa 'Crashes de aplicativos' {
     }
 }
 
-Invoke-Etapa 'Relatorios WER' {
+Invoke-Etapa 'Relatórios WER' {
     $bases = "$env:ProgramData\Microsoft\Windows\WER\ReportArchive", "$env:ProgramData\Microsoft\Windows\WER\ReportQueue",
              "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportArchive", "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportQueue"
     $rel = foreach ($b in $bases) {
@@ -1016,7 +1017,7 @@ Invoke-Etapa 'Relatorios WER' {
         Where-Object LastWriteTime -ge $script:DesdeData
     if ($kernel) {
         Save-Texto '04_Falhas' 'live_kernel_reports.txt' ($kernel | Select-Object FullName, LastWriteTime, Length | Format-Table -AutoSize)
-        Add-Achado ALTO 'Falhas' "$(($kernel | Measure-Object).Count) LiveKernelReport(s) recentes" 'Normalmente travamento de driver de video, USB ou rede (WATCHDOG).' '04_Falhas\live_kernel_reports.txt'
+        Add-Achado ALTO 'Falhas' "$(($kernel | Measure-Object).Count) LiveKernelReport(s) recentes" 'Normalmente travamento de driver de vídeo, USB ou rede (WATCHDOG).' '04_Falhas\live_kernel_reports.txt'
     }
 }
 
@@ -1028,7 +1029,7 @@ Invoke-Etapa 'Monitor de confiabilidade' {
     Save-Csv '04_Falhas' 'confiabilidade_indice.csv' ($idx | Select-Object TimeGenerated, SystemStabilityIndex)
     $atual = $idx | Select-Object -First 1
     if ($atual -and $atual.SystemStabilityIndex -lt 5) {
-        Add-Achado ALTO 'Falhas' "Indice de estabilidade baixo: $([math]::Round($atual.SystemStabilityIndex, 2)) de 10" '' '04_Falhas\confiabilidade_indice.csv'
+        Add-Achado ALTO 'Falhas' "Índice de estabilidade baixo: $([math]::Round($atual.SystemStabilityIndex, 2)) de 10" '' '04_Falhas\confiabilidade_indice.csv'
     }
 }
 
@@ -1060,7 +1061,7 @@ Invoke-Etapa 'Processos e contadores' {
         Add-Achado MEDIO 'Desempenho' "Processo $($p.Nome) (PID $($p.PID)) usando $($p.CPUPct)% de CPU" $p.Caminho '05_Desempenho\top_cpu.txt'
     }
     foreach ($p in $procs | Where-Object { $_.Handles -ge 50000 }) {
-        Add-Achado MEDIO 'Desempenho' "Processo $($p.Nome) com $($p.Handles) handles (possivel vazamento)" '' '05_Desempenho\processos.csv'
+        Add-Achado MEDIO 'Desempenho' "Processo $($p.Nome) com $($p.Handles) handles (possível vazamento)" '' '05_Desempenho\processos.csv'
     }
 
     Invoke-Externo '05_Desempenho' 'tasklist_servicos.txt' 'tasklist /svc' 60 | Out-Null
@@ -1095,17 +1096,17 @@ Invoke-Etapa 'Processos e contadores' {
         Save-Texto '05_Desempenho' 'contadores_media.txt' (($media | Format-Table -AutoSize | Out-String) + ($lat | Format-Table -AutoSize | Out-String))
 
         foreach ($l in $lat | Where-Object LatenciaMediaMs -gt 50) {
-            Add-Achado ALTO 'Desempenho' "Latencia de disco alta na $($l.Operacao.ToLower()): $($l.LatenciaMediaMs) ms" 'Acima de 20 ms ja e lento; acima de 50 ms indica disco sobrecarregado ou falhando.' '05_Desempenho\contadores_media.txt'
+            Add-Achado ALTO 'Desempenho' "Latência de disco alta na $($l.Operacao.ToLower()): $($l.LatenciaMediaMs) ms" 'Acima de 20 ms já é lento; acima de 50 ms indica disco sobrecarregado ou falhando.' '05_Desempenho\contadores_media.txt'
         }
         $commit = ($media | Where-Object Contador -eq 'MemComprometidaPct').Media
-        if ($commit -gt 90) { Add-Achado ALTO 'Desempenho' "Memoria comprometida em $commit%" 'Risco de falta de memoria virtual.' '05_Desempenho\contadores.csv' }
+        if ($commit -gt 90) { Add-Achado ALTO 'Desempenho' "Memória comprometida em $commit%" 'Risco de falta de memória virtual.' '05_Desempenho\contadores.csv' }
         $cpuMedia = ($media | Where-Object Contador -eq 'CPUPct').Media
-        if ($cpuMedia -gt 85) { Add-Achado ALTO 'Desempenho' "CPU com media de $cpuMedia% durante a coleta" 'Veja 05_Desempenho\top_cpu.txt.' '05_Desempenho\contadores.csv' }
+        if ($cpuMedia -gt 85) { Add-Achado ALTO 'Desempenho' "CPU com média de $cpuMedia% durante a coleta" 'Veja 05_Desempenho\top_cpu.txt.' '05_Desempenho\contadores.csv' }
         $discoMedia = ($media | Where-Object Contador -eq 'DiscoOcupadoPct').Media
         if ($discoMedia -gt 90) { Add-Achado MEDIO 'Desempenho' "Disco ocupado $discoMedia% do tempo durante a coleta" '' '05_Desempenho\contadores.csv' }
     } catch {
         # Contadores corrompidos: lodctr /r e winmgmt /resyncperf corrigem
-        Add-Achado BAIXO 'Desempenho' 'Nao foi possivel ler os contadores de desempenho' "Possivel corrupcao. Correcao (admin): lodctr /r e depois winmgmt /resyncperf. Erro: $($_.Exception.Message)"
+        Add-Achado BAIXO 'Desempenho' 'Não foi possível ler os contadores de desempenho' "Possível corrupção. Correção (admin): lodctr /r e depois winmgmt /resyncperf. Erro: $($_.Exception.Message)"
     }
 }
 
@@ -1134,8 +1135,8 @@ Invoke-Etapa 'Processos detalhados e assinaturas' {
     $assin = @{}
     $sw.Restart()
     foreach ($c in $caminhos) {
-        if ($sw.Elapsed.TotalSeconds -gt 60) { Add-Lacuna 'assinaturas digitais' 'limite de 60 s atingido; alguns executaveis nao foram verificados'; break }
-        if ($c -like '*\WindowsApps\*') { $assin[$c] = [pscustomobject]@{ Status = 'Indisponivel (WindowsApps)'; Assinante = '' }; continue }
+        if ($sw.Elapsed.TotalSeconds -gt 60) { Add-Lacuna 'assinaturas digitais' 'limite de 60 s atingido; alguns executáveis não foram verificados'; break }
+        if ($c -like '*\WindowsApps\*') { $assin[$c] = [pscustomobject]@{ Status = 'Indisponível (WindowsApps)'; Assinante = '' }; continue }
         try { $s = Get-AuthenticodeSignature -LiteralPath $c -ErrorAction Stop }
         catch {
             Add-Lacuna 'assinaturas digitais' $_.Exception.Message
@@ -1154,31 +1155,31 @@ Invoke-Etapa 'Processos detalhados e assinaturas' {
     Save-Csv '05_Desempenho' 'processos_detalhados.csv' ($final | Sort-Object Nome)
 
     foreach ($p in $final | Where-Object { $_.Assinatura -eq 'HashMismatch' } | Select-Object -First 5) {
-        Add-Achado ALTO 'Seguranca' "Executavel em uso com assinatura invalida (alterado?): $($p.Nome)" $p.Caminho '05_Desempenho\processos_detalhados.csv'
+        Add-Achado ALTO 'Segurança' "Executável em uso com assinatura inválida (alterado?): $($p.Nome)" $p.Caminho '05_Desempenho\processos_detalhados.csv'
     }
     $gravaveis = '\\AppData\\|\\Temp\\|\\Downloads\\|\\Users\\Public\\|\\ProgramData\\'
     $suspeitos = @($final | Where-Object { $_.Assinatura -eq 'NotSigned' -and $_.Caminho -match $gravaveis } | Sort-Object Nome -Unique)
     if ($suspeitos.Count) {
         $nomes = ($suspeitos | Select-Object -First 8 | ForEach-Object { $_.Nome }) -join ', '
-        Add-Achado MEDIO 'Seguranca' "$($suspeitos.Count) processo(s) sem assinatura digital rodando de pasta gravavel pelo usuario" `
+        Add-Achado MEDIO 'Segurança' "$($suspeitos.Count) processo(s) sem assinatura digital rodando de pasta gravável pelo usuário" `
             "Confirme a origem: $nomes" '05_Desempenho\processos_detalhados.csv'
     }
 }
 
-Invoke-Etapa 'Arquivo de paginacao' {
+Invoke-Etapa 'Arquivo de paginação' {
     $pf = Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue
     $cfg = Get-CimInstance Win32_ComputerSystem
     Save-Texto '05_Desempenho' 'pagefile.txt' (("Gerenciado automaticamente: {0}" -f $cfg.AutomaticManagedPagefile),
         ($pf | Select-Object Name, AllocatedBaseSize, CurrentUsage, PeakUsage | Format-Table -AutoSize | Out-String))
     if (-not $pf) {
-        Add-Achado MEDIO 'Desempenho' 'Sem arquivo de paginacao' 'Pode causar falta de memoria e impede gravacao de dumps de tela azul.'
+        Add-Achado MEDIO 'Desempenho' 'Sem arquivo de paginação' 'Pode causar falta de memória e impede gravação de dumps de tela azul.'
     }
 }
 
 # ---------------------------------------------------------------------------
 # 06 SERVICOS
 # ---------------------------------------------------------------------------
-Invoke-Etapa 'Servicos' {
+Invoke-Etapa 'Serviços' {
     $svcs = Get-CimInstance Win32_Service
     Save-Csv '06_Servicos' 'servicos_todos.csv' ($svcs | Select-Object Name, DisplayName, State, StartMode, StartName, ExitCode, PathName | Sort-Object Name)
 
@@ -1193,20 +1194,20 @@ Invoke-Etapa 'Servicos' {
     $problema = $parados | Where-Object { $_.ExitCode -ne 0 -and $_.ExitCode -ne 1077 }
     Save-Csv '06_Servicos' 'automaticos_parados.csv' ($parados | Select-Object Name, DisplayName, State, ExitCode, PathName)
     foreach ($s in $problema) {
-        Add-Achado MEDIO 'Servicos' "Servico automatico parado com erro: $($s.DisplayName)" "Nome: $($s.Name), codigo de saida: $($s.ExitCode)" '06_Servicos\automaticos_parados.csv'
+        Add-Achado MEDIO 'Serviços' "Serviço automático parado com erro: $($s.DisplayName)" "Nome: $($s.Name), código de saída: $($s.ExitCode)" '06_Servicos\automaticos_parados.csv'
     }
 
     # Serviços essenciais
-    $essenciais = @{ 'Dhcp' = 'Cliente DHCP'; 'Dnscache' = 'Cliente DNS'; 'EventLog' = 'Log de eventos'; 'LanmanWorkstation' = 'Estacao de trabalho'
+    $essenciais = @{ 'Dhcp' = 'Cliente DHCP'; 'Dnscache' = 'Cliente DNS'; 'EventLog' = 'Log de eventos'; 'LanmanWorkstation' = 'Estação de trabalho'
                      'RpcSs' = 'RPC'; 'Winmgmt' = 'WMI'; 'mpssvc' = 'Firewall'; 'CryptSvc' = 'Criptografia'; 'Schedule' = 'Agendador'
-                     'Spooler' = 'Spooler de impressao'; 'W32Time' = 'Horario do Windows'; 'AudioSrv' = 'Audio'; 'nsi' = 'NSI (rede)' }
+                     'Spooler' = 'Spooler de impressão'; 'W32Time' = 'Horário do Windows'; 'AudioSrv' = 'Áudio'; 'nsi' = 'NSI (rede)' }
     foreach ($k in $essenciais.Keys) {
         $s = $svcs | Where-Object Name -eq $k
         if ($s -and $s.State -ne 'Running' -and $s.StartMode -ne 'Disabled' -and $k -ne 'W32Time') {
-            Add-Achado ALTO 'Servicos' "Servico essencial parado: $($essenciais[$k]) ($k)" "Modo: $($s.StartMode)"
+            Add-Achado ALTO 'Serviços' "Serviço essencial parado: $($essenciais[$k]) ($k)" "Modo: $($s.StartMode)"
         }
         if ($s -and $s.StartMode -eq 'Disabled' -and $k -in 'Dhcp', 'Dnscache', 'EventLog', 'RpcSs', 'Winmgmt', 'mpssvc', 'CryptSvc') {
-            Add-Achado ALTO 'Servicos' "Servico essencial DESABILITADO: $($essenciais[$k]) ($k)"
+            Add-Achado ALTO 'Serviços' "Serviço essencial DESABILITADO: $($essenciais[$k]) ($k)"
         }
     }
 
@@ -1214,14 +1215,14 @@ Invoke-Etapa 'Servicos' {
     $semAspas = $svcs | Where-Object { $_.PathName -and $_.PathName -notmatch '^"' -and $_.PathName -match '^[^"]+\s[^"]+\.exe' -and $_.PathName -notmatch '^C:\\Windows\\' }
     if ($semAspas) {
         Save-Csv '06_Servicos' 'caminho_sem_aspas.csv' ($semAspas | Select-Object Name, PathName, StartName)
-        Add-Achado BAIXO 'Seguranca' "$(($semAspas | Measure-Object).Count) servico(s) com caminho sem aspas (unquoted service path)" '' '06_Servicos\caminho_sem_aspas.csv'
+        Add-Achado BAIXO 'Segurança' "$(($semAspas | Measure-Object).Count) serviço(s) com caminho sem aspas (unquoted service path)" '' '06_Servicos\caminho_sem_aspas.csv'
     }
 }
 
 # ---------------------------------------------------------------------------
 # 07 REDE
 # ---------------------------------------------------------------------------
-Invoke-Etapa 'Configuracao de rede' {
+Invoke-Etapa 'Configuração de rede' {
     Invoke-Externo '07_Rede' 'ipconfig_all.txt'       'ipconfig /all' 30 | Out-Null
     Invoke-Externo '07_Rede' 'route_print.txt'        'route print' 30 | Out-Null
     Invoke-Externo '07_Rede' 'proxy_winhttp.txt'      'netsh winhttp show proxy' 30 | Out-Null
@@ -1251,7 +1252,7 @@ Invoke-Etapa 'Configuracao de rede' {
         Add-Achado MEDIO 'Rede' "Adaptador '$($s.Name)' com erros de pacote" "Recebidos: $($s.ReceivedPacketErrors) / Enviados: $($s.OutboundPacketErrors). Cabo, porta do switch ou driver." '07_Rede\adaptadores_estatisticas.csv'
     }
     foreach ($a in $adapt | Where-Object { $_.Status -eq 'Up' -and $_.LinkSpeed -match '^(10|100) Mbps' -and $_.InterfaceDescription -notmatch 'Virtual|VPN|TAP|Hyper-V|Wi-?Fi|Wireless' }) {
-        Add-Achado MEDIO 'Rede' "Adaptador '$($a.Name)' negociando apenas $($a.LinkSpeed)" 'Provavel cabo ruim ou porta de switch limitada.'
+        Add-Achado MEDIO 'Rede' "Adaptador '$($a.Name)' negociando apenas $($a.LinkSpeed)" 'Provável cabo ruim ou porta de switch limitada.'
     }
 
     $ipcfg = Get-NetIPConfiguration -ErrorAction SilentlyContinue
@@ -1259,7 +1260,7 @@ Invoke-Etapa 'Configuracao de rede' {
     foreach ($c in $ipcfg | Where-Object { $_.NetAdapter.Status -eq 'Up' -and "$($_.InterfaceAlias) $($_.InterfaceDescription)" -notmatch $script:RegexVirtuais }) {
         foreach ($ip in $c.IPv4Address) {
             if ($ip.IPAddress -like '169.254.*') {
-                Add-Achado ALTO 'Rede' "Adaptador '$($c.InterfaceAlias)' com IP APIPA ($($ip.IPAddress))" 'Nao obteve IP do DHCP.'
+                Add-Achado ALTO 'Rede' "Adaptador '$($c.InterfaceAlias)' com IP APIPA ($($ip.IPAddress))" 'Não obteve IP do DHCP.'
             }
         }
     }
@@ -1291,7 +1292,7 @@ Invoke-Etapa 'Configuracao de rede' {
 
 Invoke-Etapa 'Wi-Fi' {
     $wl = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceDescription -match 'Wi-?Fi|Wireless|802\.11|WLAN' -and $_.InterfaceDescription -notmatch 'Virtual|Direct' })
-    if (-not $wl.Count) { Save-Texto '07_Rede' 'wifi_analise.txt' 'Sem adaptador Wi-Fi nesta maquina.'; return }
+    if (-not $wl.Count) { Save-Texto '07_Rede' 'wifi_analise.txt' 'Sem adaptador Wi-Fi nesta máquina.'; return }
 
     $txt = (& netsh.exe wlan show interfaces 2>&1 | Out-String)
     $d = @{}
@@ -1314,18 +1315,18 @@ Invoke-Etapa 'Wi-Fi' {
         if ($pct -lt 40) { Add-Achado MEDIO 'Rede' "Sinal Wi-Fi fraco no momento da coleta ($pct%)" 'Aproxime-se do roteador ou revise o posicionamento do ponto de acesso.' '07_Rede\wifi_analise.txt' }
     }
     if ($resumo.TipoRadio -match '802\.11(n|g|b|a)\b' -and $resumo.TipoRadio -notmatch 'ac|ax|be') {
-        Add-Achado BAIXO 'Rede' "Wi-Fi conectado em padrao antigo ($($resumo.TipoRadio))" 'Roteador ou adaptador limitam a velocidade; verifique 5 GHz / Wi-Fi 5 ou 6.' '07_Rede\wifi_analise.txt'
+        Add-Achado BAIXO 'Rede' "Wi-Fi conectado em padrão antigo ($($resumo.TipoRadio))" 'Roteador ou adaptador limitam a velocidade; verifique 5 GHz / Wi-Fi 5 ou 6.' '07_Rede\wifi_analise.txt'
     }
 
     # Quedas e falhas de conexao no periodo
     $ev = @(Get-EventosSeguro @{ LogName = 'Microsoft-Windows-WLAN-AutoConfig/Operational'; Id = 8001, 8002, 8003; StartTime = $script:DesdeData } 3000)
     $desc = @($ev | Where-Object Id -eq 8003); $falha = @($ev | Where-Object Id -eq 8002)
     $porDia = $desc | Group-Object { $_.TimeCreated.ToString('yyyy-MM-dd') } | Sort-Object Name -Descending | Select-Object Name, Count
-    Save-Texto '07_Rede' 'wifi_quedas_por_dia.txt' ("Conexoes: $(@($ev | Where-Object Id -eq 8001).Count)  Desconexoes: $($desc.Count)  Falhas ao conectar: $($falha.Count)`r`n" + ($porDia | Format-Table -AutoSize | Out-String))
+    Save-Texto '07_Rede' 'wifi_quedas_por_dia.txt' ("Conexões: $(@($ev | Where-Object Id -eq 8001).Count)  Desconexões: $($desc.Count)  Falhas ao conectar: $($falha.Count)`r`n" + ($porDia | Format-Table -AutoSize | Out-String))
     if (-not $SemDadosSensiveis) {
         Save-Csv '07_Rede' 'wifi_eventos.csv' ($ev | Select-Object TimeCreated, Id, @{n = 'Mensagem'; e = { ($_.Message -replace '\s+', ' ').Trim() } })
     }
-    if ($desc.Count -ge 30) { Add-Achado MEDIO 'Rede' "$($desc.Count) desconexoes do Wi-Fi em $Dias dias" 'Quedas frequentes: sinal, roaming entre pontos, driver ou economia de energia do adaptador.' '07_Rede\wifi_quedas_por_dia.txt' }
+    if ($desc.Count -ge 30) { Add-Achado MEDIO 'Rede' "$($desc.Count) desconexões do Wi-Fi em $Dias dias" 'Quedas frequentes: sinal, roaming entre pontos, driver ou economia de energia do adaptador.' '07_Rede\wifi_quedas_por_dia.txt' }
     if ($falha.Count -ge 10) { Add-Achado MEDIO 'Rede' "$($falha.Count) falhas ao conectar no Wi-Fi em $Dias dias" '' '07_Rede\wifi_quedas_por_dia.txt' }
     foreach ($a in $wl | Where-Object { $_.DriverDate -and $_.DriverDate -lt (Get-Date).AddYears(-3) }) {
         Add-Achado BAIXO 'Rede' "Driver do Wi-Fi com mais de 3 anos ($($a.DriverDate.ToString('dd/MM/yyyy')))" $a.InterfaceDescription '07_Rede\adaptadores.csv'
@@ -1340,13 +1341,13 @@ Invoke-Etapa 'VPN' {
     try { $vpnWin = @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue) + @(Get-VpnConnection -ErrorAction SilentlyContinue) } catch { }
     $saida = New-Object System.Collections.Generic.List[string]
     $saida.Add('ADAPTADORES'); foreach ($a in $ads) { $saida.Add(("  {0} | {1} | {2}" -f $a.Name, $a.InterfaceDescription, $a.Status)) }
-    $saida.Add('SERVICOS EM EXECUCAO'); foreach ($s in $svcs) { $saida.Add(("  {0} ({1})" -f $s.DisplayName, $s.Name)) }
-    $saida.Add('CONEXOES VPN DO WINDOWS'); foreach ($v in $vpnWin) { $saida.Add(("  {0} | {1} | {2}" -f $v.Name, $v.ServerAddress, $v.ConnectionStatus)) }
+    $saida.Add('SERVIÇOS EM EXECUÇÃO'); foreach ($s in $svcs) { $saida.Add(("  {0} ({1})" -f $s.DisplayName, $s.Name)) }
+    $saida.Add('CONEXÕES VPN DO WINDOWS'); foreach ($v in $vpnWin) { $saida.Add(("  {0} | {1} | {2}" -f $v.Name, $v.ServerAddress, $v.ConnectionStatus)) }
     Save-Texto '07_Rede' 'vpn.txt' $saida.ToArray()
     $ativas = @($ads | Where-Object Status -eq 'Up') + @($vpnWin | Where-Object { $_.ConnectionStatus -eq 'Connected' })
     if ($ativas.Count) {
         $nomes = (($ads | Where-Object Status -eq 'Up' | ForEach-Object { $_.InterfaceDescription }) + ($vpnWin | Where-Object { $_.ConnectionStatus -eq 'Connected' } | ForEach-Object { $_.Name })) -join ', '
-        Add-Achado INFO 'Rede' "VPN ativa: $nomes" 'A VPN pode forcar rotas e DNS: relevante para lentidao, falha de DNS e erros de Windows Update (ex.: 0x800F0922).' '07_Rede\vpn.txt'
+        Add-Achado INFO 'Rede' "VPN ativa: $nomes" 'A VPN pode forçar rotas e DNS: relevante para lentidão, falha de DNS e erros de Windows Update (ex.: 0x800F0922).' '07_Rede\vpn.txt'
     }
 }
 
@@ -1388,19 +1389,19 @@ if (-not $SemRede) {
         $pingOk = @($res | Where-Object { $_.PerdaPct -lt 100 }).Count
         $internetOk = ($tcpOk -gt 0) -or ($pingOk -gt 0)
         if (-not $internetOk) {
-            Add-Achado ALTO 'Rede' 'Sem conectividade com a internet (nenhum ping nem conexao TCP respondeu)' 'Verifique cabo/Wi-Fi, gateway, proxy e firewall.' '07_Rede\ping.txt'
+            Add-Achado ALTO 'Rede' 'Sem conectividade com a internet (nenhum ping nem conexão TCP respondeu)' 'Verifique cabo/Wi-Fi, gateway, proxy e firewall.' '07_Rede\ping.txt'
         } else {
             foreach ($r in $res) {
                 if ($r.PerdaPct -eq 100) {
-                    Add-Achado INFO 'Rede' "$($r.Alvo) ($($r.Host)) nao responde ping, mas a internet responde" 'Normal quando o roteador/firewall bloqueia ICMP.' '07_Rede\ping.txt'
+                    Add-Achado INFO 'Rede' "$($r.Alvo) ($($r.Host)) não responde ping, mas a internet responde" 'Normal quando o roteador/firewall bloqueia ICMP.' '07_Rede\ping.txt'
                 } elseif ($r.PerdaPct -ge 20) {
                     Add-Achado MEDIO 'Rede' "Perda de pacotes para $($r.Alvo): $($r.PerdaPct)%" '' '07_Rede\ping.txt'
                 }
-                if ($r.Alvo -eq 'Gateway' -and $r.MediaMs -gt 20) { Add-Achado MEDIO 'Rede' "Latencia alta ate o gateway: $($r.MediaMs) ms" 'Rede local congestionada ou Wi-Fi fraco.' '07_Rede\ping.txt' }
+                if ($r.Alvo -eq 'Gateway' -and $r.MediaMs -gt 20) { Add-Achado MEDIO 'Rede' "Latência alta até o gateway: $($r.MediaMs) ms" 'Rede local congestionada ou Wi-Fi fraco.' '07_Rede\ping.txt' }
             }
             foreach ($p in $portas | Where-Object { -not $_.Aberta }) {
                 if ($p.Porta -eq 53) { Add-Achado INFO 'Rede' "DNS externo $($p.Host):53 bloqueado" 'Normal em rede que obriga o uso do DNS interno.' '07_Rede\teste_portas.txt' }
-                else { Add-Achado MEDIO 'Rede' "Sem conexao TCP em $($p.Host):$($p.Porta) (os demais destinos respondem)" 'Site bloqueado por firewall/proxy ou indisponivel.' '07_Rede\teste_portas.txt' }
+                else { Add-Achado MEDIO 'Rede' "Sem conexão TCP em $($p.Host):$($p.Porta) (os demais destinos respondem)" 'Site bloqueado por firewall/proxy ou indisponível.' '07_Rede\teste_portas.txt' }
             }
         }
 
@@ -1435,14 +1436,14 @@ if (-not $SemRede) {
         foreach ($g in $porSrv) {
             $oks = @($g.Group | Where-Object Resolveu)
             if ($oks.Count -eq 0) {
-                if ($bons.Count) { Add-Achado MEDIO 'Rede' "Servidor DNS $($g.Name) nao responde (outro servidor responde)" 'Se for o primeiro da lista, cada consulta espera o timeout antes de usar o outro.' '07_Rede\teste_dns_por_servidor.txt' }
-                else { Add-Achado ALTO 'Rede' "Servidor DNS $($g.Name) nao respondeu a nenhuma consulta" '' '07_Rede\teste_dns_por_servidor.txt' }
+                if ($bons.Count) { Add-Achado MEDIO 'Rede' "Servidor DNS $($g.Name) não responde (outro servidor responde)" 'Se for o primeiro da lista, cada consulta espera o timeout antes de usar o outro.' '07_Rede\teste_dns_por_servidor.txt' }
+                else { Add-Achado ALTO 'Rede' "Servidor DNS $($g.Name) não respondeu a nenhuma consulta" '' '07_Rede\teste_dns_por_servidor.txt' }
             } else {
                 $media = [math]::Round(($oks | Measure-Object Ms -Average).Average)
-                if ($media -gt 300) { Add-Achado MEDIO 'Rede' "Servidor DNS $($g.Name) lento (media de $media ms)" '' '07_Rede\teste_dns_por_servidor.txt' }
+                if ($media -gt 300) { Add-Achado MEDIO 'Rede' "Servidor DNS $($g.Name) lento (média de $media ms)" '' '07_Rede\teste_dns_por_servidor.txt' }
             }
         }
-        if (-not $servidores.Count) { Add-Lacuna 'DNS por servidor' 'nenhum servidor DNS IPv4 encontrado nos adaptadores fisicos' }
+        if (-not $servidores.Count) { Add-Lacuna 'DNS por servidor' 'nenhum servidor DNS IPv4 encontrado nos adaptadores físicos' }
 
         # HTTP/TLS: portal cativo, proxy interferindo e inspecao de certificado (TLS interceptado)
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -1457,7 +1458,7 @@ if (-not $SemRede) {
             $ok = ($cod -eq 200 -and $corpo -match 'Microsoft Connect Test')
             $http.Add([pscustomobject]@{ Teste = 'Portal cativo (connecttest)'; Alvo = 'msftconnecttest.com'; Status = $cod; Ms = $sw.ElapsedMilliseconds; Ok = $ok; Detalhe = $loc })
             if (-not $ok) {
-                Add-Achado MEDIO 'Rede' "Resposta inesperada ao teste de conectividade do Windows (HTTP $cod)" "Portal cativo, proxy ou filtro de conteudo alterando a resposta. Location: $loc" '07_Rede\teste_http_tls.csv'
+                Add-Achado MEDIO 'Rede' "Resposta inesperada ao teste de conectividade do Windows (HTTP $cod)" "Portal cativo, proxy ou filtro de conteúdo alterando a resposta. Location: $loc" '07_Rede\teste_http_tls.csv'
             }
         } catch {
             $http.Add([pscustomobject]@{ Teste = 'Portal cativo (connecttest)'; Alvo = 'msftconnecttest.com'; Status = 'erro'; Ms = ''; Ok = $false; Detalhe = $_.Exception.Message })
@@ -1469,7 +1470,7 @@ if (-not $SemRede) {
             $cod = 'erro'; $erro = ''; $proxyUsado = ''; $emissorCompleto = ''
             $req = [Net.HttpWebRequest]::Create("https://$h/")
             $req.Timeout = 12000; $req.AllowAutoRedirect = $false
-            $req.UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Diagnostico-Windows'
+            $req.UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Diagnóstico-Windows'
             try { $proxyUsado = $req.Proxy.GetProxy($req.RequestUri).AbsoluteUri } catch { }
             try {
                 $resp = $req.GetResponse(); $cod = [int]$resp.StatusCode; $resp.Close()
@@ -1489,9 +1490,9 @@ if (-not $SemRede) {
             $http.Add([pscustomobject]@{ Teste = 'TLS'; Alvo = $h; Status = $cod; Ms = $sw.ElapsedMilliseconds; Ok = $ok
                 Detalhe = ("Emissor: {0} | Proxy: {1} {2}" -f $emissor, $proxyUsado, $erro).Trim() })
             if ($emissorCompleto -and -not $ok) {
-                Add-Achado MEDIO 'Rede' "Possivel inspecao TLS em $h (emissor do certificado: $emissor)" 'Proxy, firewall ou antivirus reemite certificados. Aplicativos sem a CA da empresa falham com erro de certificado.' '07_Rede\teste_http_tls.csv'
+                Add-Achado MEDIO 'Rede' "Possível inspeção TLS em $h (emissor do certificado: $emissor)" 'Proxy, firewall ou antivírus reemite certificados. Aplicativos sem a CA da empresa falham com erro de certificado.' '07_Rede\teste_http_tls.csv'
             } elseif (-not $emissorCompleto -and $tcpOk -gt 0) {
-                Add-Achado MEDIO 'Rede' "Falha TLS/HTTPS ao acessar $h" "$erro (a porta 443 responde, mas o handshake TLS nao concluiu)" '07_Rede\teste_http_tls.csv'
+                Add-Achado MEDIO 'Rede' "Falha TLS/HTTPS ao acessar $h" "$erro (a porta 443 responde, mas o handshake TLS não concluiu)" '07_Rede\teste_http_tls.csv'
             }
         }
         if ($script:UrlPac) {
@@ -1502,7 +1503,7 @@ if (-not $SemRede) {
                 $http.Add([pscustomobject]@{ Teste = 'Script PAC'; Alvo = $script:UrlPac; Status = $cod; Ms = $sw.ElapsedMilliseconds; Ok = ($cod -eq 200); Detalhe = "$tam bytes" })
             } catch {
                 $http.Add([pscustomobject]@{ Teste = 'Script PAC'; Alvo = $script:UrlPac; Status = 'erro'; Ms = ''; Ok = $false; Detalhe = $_.Exception.Message })
-                Add-Achado MEDIO 'Rede' "Script PAC de proxy inacessivel: $($script:UrlPac)" $_.Exception.Message '07_Rede\teste_http_tls.csv'
+                Add-Achado MEDIO 'Rede' "Script PAC de proxy inacessível: $($script:UrlPac)" $_.Exception.Message '07_Rede\teste_http_tls.csv'
             }
         }
         Save-Csv '07_Rede' 'teste_http_tls.csv' $http.ToArray()
@@ -1514,7 +1515,7 @@ if (-not $SemRede) {
         Invoke-Externo '07_Rede' 'w32tm_stripchart.txt' 'w32tm /stripchart /computer:time.windows.com /samples:3 /dataonly' 40 | Out-Null
         $sc = Get-Content (Join-Path $script:Raiz '07_Rede\w32tm_stripchart.txt') -ErrorAction SilentlyContinue | Select-String '([+-]\d+[.,]\d+)s' | Select-Object -Last 1
         if ($sc -and [math]::Abs([double]($sc.Matches[0].Groups[1].Value -replace ',', '.')) -gt 120) {
-            Add-Achado ALTO 'Sistema' "Relogio da maquina com diferenca de $($sc.Matches[0].Groups[1].Value)s" 'Mais de 5 minutos quebra autenticacao Kerberos/Microsoft 365.' '07_Rede\w32tm_stripchart.txt'
+            Add-Achado ALTO 'Sistema' "Relógio da máquina com diferença de $($sc.Matches[0].Groups[1].Value)s" 'Mais de 5 minutos quebra autenticação Kerberos/Microsoft 365.' '07_Rede\w32tm_stripchart.txt'
         }
     }
 }
@@ -1523,7 +1524,7 @@ if (-not $SemRede) {
 # ---------------------------------------------------------------------------
 # 08 SEGURANCA
 # ---------------------------------------------------------------------------
-Invoke-Etapa 'Antivirus e Defender' {
+Invoke-Etapa 'Antivírus e Defender' {
     $av = Get-CimInstance -Namespace root\SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction SilentlyContinue
     $lista = foreach ($a in $av) {
         $hex = '{0:X6}' -f [int]$a.productState
@@ -1531,73 +1532,73 @@ Invoke-Etapa 'Antivirus e Defender' {
             Atualizado = ($hex.Substring(4, 2) -eq '00'); Executavel = $a.pathToSignedProductExe; Estado = $hex }
     }
     Save-Texto '08_Seguranca' 'antivirus.txt' ($lista | Format-Table -AutoSize)
-    if ($lista -and -not ($lista | Where-Object Ativo)) { Add-Achado CRITICO 'Seguranca' 'Nenhum antivirus ativo' '' '08_Seguranca\antivirus.txt' }
-    foreach ($a in $lista | Where-Object { $_.Ativo -and -not $_.Atualizado }) { Add-Achado ALTO 'Seguranca' "Antivirus desatualizado: $($a.Produto)" }
+    if ($lista -and -not ($lista | Where-Object Ativo)) { Add-Achado CRITICO 'Segurança' 'Nenhum antivírus ativo' '' '08_Seguranca\antivirus.txt' }
+    foreach ($a in $lista | Where-Object { $_.Ativo -and -not $_.Atualizado }) { Add-Achado ALTO 'Segurança' "Antivírus desatualizado: $($a.Produto)" }
     if (($lista | Where-Object Ativo | Measure-Object).Count -gt 1) {
-        Add-Achado MEDIO 'Seguranca' 'Mais de um antivirus ativo ao mesmo tempo' (($lista | Where-Object Ativo).Produto -join ', ')
+        Add-Achado MEDIO 'Segurança' 'Mais de um antivírus ativo ao mesmo tempo' (($lista | Where-Object Ativo).Produto -join ', ')
     }
 
     $mp = Get-MpComputerStatus -ErrorAction SilentlyContinue
     if ($mp) {
         Save-Texto '08_Seguranca' 'defender_status.txt' ($mp | Format-List)
         Save-Texto '08_Seguranca' 'defender_preferencias.txt' (Get-MpPreference -ErrorAction SilentlyContinue | Format-List)
-        if ($mp.AMRunningMode -eq 'Normal' -and -not $mp.RealTimeProtectionEnabled) { Add-Achado CRITICO 'Seguranca' 'Protecao em tempo real do Defender desativada' }
-        if ($mp.AntivirusSignatureAge -gt 7 -and $mp.AMRunningMode -eq 'Normal') { Add-Achado ALTO 'Seguranca' "Assinaturas do Defender com $($mp.AntivirusSignatureAge) dias" }
-        if ($mp.IsTamperProtected -eq $false -and $mp.AMRunningMode -eq 'Normal') { Add-Achado BAIXO 'Seguranca' 'Protecao contra adulteracao (Tamper Protection) desativada' }
+        if ($mp.AMRunningMode -eq 'Normal' -and -not $mp.RealTimeProtectionEnabled) { Add-Achado CRITICO 'Segurança' 'Proteção em tempo real do Defender desativada' }
+        if ($mp.AntivirusSignatureAge -gt 7 -and $mp.AMRunningMode -eq 'Normal') { Add-Achado ALTO 'Segurança' "Assinaturas do Defender com $($mp.AntivirusSignatureAge) dias" }
+        if ($mp.IsTamperProtected -eq $false -and $mp.AMRunningMode -eq 'Normal') { Add-Achado BAIXO 'Segurança' 'Proteção contra adulteração (Tamper Protection) desativada' }
         $excl = Get-MpPreference -ErrorAction SilentlyContinue
         $qtdExcl = ($excl.ExclusionPath | Measure-Object).Count + ($excl.ExclusionProcess | Measure-Object).Count
         if ($qtdExcl -gt 0 -and $excl.ExclusionPath -notmatch 'N/A: Must be') {
-            Add-Achado BAIXO 'Seguranca' "Defender com $qtdExcl exclusao(oes) configurada(s)" 'Revise se sao legitimas.' '08_Seguranca\defender_preferencias.txt'
+            Add-Achado BAIXO 'Segurança' "Defender com $qtdExcl exclusão(ões) configurada(s)" 'Revise se são legítimas.' '08_Seguranca\defender_preferencias.txt'
         }
     }
     $ameacas = Get-MpThreatDetection -ErrorAction SilentlyContinue | Where-Object InitialDetectionTime -ge (Get-Date).AddDays(-30)
     if ($ameacas) {
         $nomes = Get-MpThreat -ErrorAction SilentlyContinue
         Save-Csv '08_Seguranca' 'ameacas_detectadas.csv' ($ameacas | Select-Object InitialDetectionTime, ThreatID, ActionSuccess, ProcessName,
-            @{n = 'Ameaca'; e = { $id = $_.ThreatID; ($nomes | Where-Object ThreatID -eq $id).ThreatName } }, @{n = 'Recursos'; e = { $_.Resources -join ' | ' } })
-        Add-Achado ALTO 'Seguranca' "$(($ameacas | Measure-Object).Count) ameaca(s) detectada(s) pelo Defender nos ultimos 30 dias" '' '08_Seguranca\ameacas_detectadas.csv'
+            @{n = 'Ameaça'; e = { $id = $_.ThreatID; ($nomes | Where-Object ThreatID -eq $id).ThreatName } }, @{n = 'Recursos'; e = { $_.Resources -join ' | ' } })
+        Add-Achado ALTO 'Segurança' "$(($ameacas | Measure-Object).Count) ameaça(s) detectada(s) pelo Defender nos últimos 30 dias" '' '08_Seguranca\ameacas_detectadas.csv'
     }
 }
 
 Invoke-Etapa 'Firewall, BitLocker, TPM, Secure Boot, UAC' {
     $fw = Get-NetFirewallProfile -ErrorAction SilentlyContinue
     Save-Texto '08_Seguranca' 'firewall.txt' ($fw | Select-Object Name, Enabled, DefaultInboundAction, DefaultOutboundAction, LogFileName | Format-Table -AutoSize)
-    foreach ($p in $fw | Where-Object { -not $_.Enabled }) { Add-Achado ALTO 'Seguranca' "Firewall do Windows desativado no perfil $($p.Name)" }
+    foreach ($p in $fw | Where-Object { -not $_.Enabled }) { Add-Achado ALTO 'Segurança' "Firewall do Windows desativado no perfil $($p.Name)" }
 
     if ($script:IsAdmin) {
         Invoke-Externo '08_Seguranca' 'bitlocker.txt' 'manage-bde -status' 60 | Out-Null
         $bl = Get-BitLockerVolume -ErrorAction SilentlyContinue
         $sis = $bl | Where-Object MountPoint -eq $env:SystemDrive
         if ($sis -and $sis.ProtectionStatus -ne 'On') {
-            Add-Achado MEDIO 'Seguranca' "Unidade do sistema ($env:SystemDrive) sem BitLocker ativo" "Status: $($sis.VolumeStatus)" '08_Seguranca\bitlocker.txt'
+            Add-Achado MEDIO 'Segurança' "Unidade do sistema ($env:SystemDrive) sem BitLocker ativo" "Status: $($sis.VolumeStatus)" '08_Seguranca\bitlocker.txt'
         }
         $tpm = Get-Tpm -ErrorAction SilentlyContinue
         Save-Texto '08_Seguranca' 'tpm.txt' ($tpm | Format-List)
-        if ($tpm -and -not $tpm.TpmReady) { Add-Achado MEDIO 'Seguranca' 'TPM presente mas nao esta pronto' "Presente: $($tpm.TpmPresent), Habilitado: $($tpm.TpmEnabled)" }
+        if ($tpm -and -not $tpm.TpmReady) { Add-Achado MEDIO 'Segurança' 'TPM presente mas não está pronto' "Presente: $($tpm.TpmPresent), Habilitado: $($tpm.TpmEnabled)" }
         try {
             $sb = Confirm-SecureBootUEFI -ErrorAction Stop
             Save-Texto '08_Seguranca' 'secureboot.txt' "Secure Boot: $sb"
-            if (-not $sb) { Add-Achado MEDIO 'Seguranca' 'Secure Boot desativado' }
-        } catch { Save-Texto '08_Seguranca' 'secureboot.txt' "Nao suportado ou BIOS legado: $($_.Exception.Message)" }
+            if (-not $sb) { Add-Achado MEDIO 'Segurança' 'Secure Boot desativado' }
+        } catch { Save-Texto '08_Seguranca' 'secureboot.txt' "Não suportado ou BIOS legado: $($_.Exception.Message)" }
     }
 
     $uac = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ErrorAction SilentlyContinue
     Save-Texto '08_Seguranca' 'uac.txt' ($uac | Select-Object EnableLUA, ConsentPromptBehaviorAdmin, PromptOnSecureDesktop, FilterAdministratorToken | Format-List)
-    if ($uac.EnableLUA -eq 0) { Add-Achado ALTO 'Seguranca' 'UAC (Controle de Conta de Usuario) desativado' }
+    if ($uac.EnableLUA -eq 0) { Add-Achado ALTO 'Segurança' 'UAC (Controle de Conta de Usuário) desativado' }
 
     $rdp = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -ErrorAction SilentlyContinue).fDenyTSConnections
     $nla = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -ErrorAction SilentlyContinue).UserAuthentication
     Save-Texto '08_Seguranca' 'rdp.txt' "RDP habilitado: $($rdp -eq 0)`r`nNLA exigido: $($nla -eq 1)"
-    if ($rdp -eq 0 -and $nla -ne 1) { Add-Achado MEDIO 'Seguranca' 'Area de Trabalho Remota habilitada sem NLA' }
+    if ($rdp -eq 0 -and $nla -ne 1) { Add-Achado MEDIO 'Segurança' 'Área de Trabalho Remota habilitada sem NLA' }
 
     # Win32_OptionalFeature não exige elevação (Get-WindowsOptionalFeature exige)
     $smb1 = Get-CimInstance Win32_OptionalFeature -Filter "Name='SMB1Protocol'" -ErrorAction SilentlyContinue
-    if ($smb1 -and $smb1.InstallState -eq 1) { Add-Achado MEDIO 'Seguranca' 'Protocolo SMBv1 habilitado' 'Protocolo obsoleto e explorado por ransomware (WannaCry).' }
+    if ($smb1 -and $smb1.InstallState -eq 1) { Add-Achado MEDIO 'Segurança' 'Protocolo SMBv1 habilitado' 'Protocolo obsoleto é explorado por ransomware (WannaCry).' }
 }
 
 Invoke-Etapa 'Contas e logons' {
     if ($SemDadosSensiveis) {
-        Save-Texto '08_Seguranca' 'contas_nao_coletadas.txt' 'Modo -SemDadosSensiveis: contas locais, administradores e logons nao foram coletados.'
+        Save-Texto '08_Seguranca' 'contas_nao_coletadas.txt' 'Modo -SemDadosSensiveis: contas locais, administradores e logons não foram coletados.'
         return
     }
     $admins = $null
@@ -1612,13 +1613,13 @@ Invoke-Etapa 'Contas e logons' {
         }
     }
     Save-Texto '08_Seguranca' 'administradores_locais.txt' ($admins | Format-Table -AutoSize)
-    if (-not $admins) { Add-Lacuna 'administradores locais' 'lista vazia ou indisponivel' }
-    elseif (@($admins).Count -gt 4) { Add-Achado BAIXO 'Seguranca' "$(@($admins).Count) membros no grupo Administradores local" 'Revise se todos precisam de privilegio administrativo.' '08_Seguranca\administradores_locais.txt' }
+    if (-not $admins) { Add-Lacuna 'administradores locais' 'lista vazia ou indisponível' }
+    elseif (@($admins).Count -gt 4) { Add-Achado BAIXO 'Segurança' "$(@($admins).Count) membros no grupo Administradores local" 'Revise se todos precisam de privilégio administrativo.' '08_Seguranca\administradores_locais.txt' }
 
     $usuarios = Get-LocalUser -ErrorAction SilentlyContinue
     Save-Csv '08_Seguranca' 'usuarios_locais.csv' ($usuarios | Select-Object Name, Enabled, LastLogon, PasswordLastSet, PasswordExpires, PasswordRequired, Description)
     $guest = $usuarios | Where-Object { $_.SID -like '*-501' -and $_.Enabled }
-    if ($guest) { Add-Achado ALTO 'Seguranca' 'Conta Convidado (Guest) habilitada' }
+    if ($guest) { Add-Achado ALTO 'Segurança' 'Conta Convidado (Guest) habilitada' }
     Invoke-Externo '08_Seguranca' 'whoami.txt' 'whoami /all' 30 | Out-Null
 
     if ($script:IsAdmin) {
@@ -1630,8 +1631,8 @@ Invoke-Etapa 'Contas e logons' {
         } | Group-Object Conta, Origem | Sort-Object Count -Descending |
             Select-Object Count, @{n = 'Conta_Origem'; e = { $_.Name } } -First 50
         Save-Texto '08_Seguranca' 'logons_falhos.txt' ($resumo | Format-Table -AutoSize)
-        if ($falhas.Count -ge 50) { Add-Achado ALTO 'Seguranca' "$($falhas.Count) tentativas de logon com falha em $Dias dias" 'Possivel ataque de forca bruta ou senha antiga salva em algum servico.' '08_Seguranca\logons_falhos.txt' }
-        if ($bloqueios.Count) { Add-Achado MEDIO 'Seguranca' "$($bloqueios.Count) bloqueio(s) de conta" '' '03_Eventos\evtx\Security.evtx' }
+        if ($falhas.Count -ge 50) { Add-Achado ALTO 'Segurança' "$($falhas.Count) tentativas de logon com falha em $Dias dias" 'Possível ataque de força bruta ou senha antiga salva em algum serviço.' '08_Seguranca\logons_falhos.txt' }
+        if ($bloqueios.Count) { Add-Achado MEDIO 'Segurança' "$($bloqueios.Count) bloqueio(s) de conta" '' '03_Eventos\evtx\Security.evtx' }
     }
 }
 
@@ -1648,15 +1649,15 @@ Invoke-Etapa 'Identidade (Entra ID / Intune)' {
     if (-not $kv.Count) { return }
 
     $hibrido = ($kv['AzureAdJoined'] -eq 'YES' -and $kv['DomainJoined'] -eq 'YES')
-    $tipo = if ($hibrido) { 'Hibrido (AD + Entra ID)' } elseif ($kv['AzureAdJoined'] -eq 'YES') { 'Entra ID (somente nuvem)' } elseif ($kv['DomainJoined'] -eq 'YES') { 'Dominio AD' } else { 'Grupo de trabalho' }
+    $tipo = if ($hibrido) { 'Híbrido (AD + Entra ID)' } elseif ($kv['AzureAdJoined'] -eq 'YES') { 'Entra ID (somente nuvem)' } elseif ($kv['DomainJoined'] -eq 'YES') { 'Domínio AD' } else { 'Grupo de trabalho' }
     if ($kv['WorkplaceJoined'] -eq 'YES') { $tipo += ' + conta de trabalho/escola registrada' }
     Add-Achado INFO 'Identidade' "Tipo de ingresso: $tipo$(if ($kv['MdmUrl']) { ' | gerenciado por MDM (Intune)' })" '' '08_Seguranca\identidade_resumo.txt'
     if ($kv['AzureAdJoined'] -eq 'YES' -and $kv['DeviceAuthStatus'] -and $kv['DeviceAuthStatus'] -ne 'SUCCESS') {
-        Add-Achado ALTO 'Identidade' "Dispositivo nao autenticado no Entra ID (DeviceAuthStatus: $($kv['DeviceAuthStatus']))" 'O dispositivo pode ter sido desabilitado/removido no Entra ID ou ter perdido o certificado.' '08_Seguranca\identidade_resumo.txt'
+        Add-Achado ALTO 'Identidade' "Dispositivo não autenticado no Entra ID (DeviceAuthStatus: $($kv['DeviceAuthStatus']))" 'O dispositivo pode ter sido desabilitado/removido no Entra ID ou ter perdido o certificado.' '08_Seguranca\identidade_resumo.txt'
     }
     if ($kv['AzureAdJoined'] -eq 'YES' -and $kv['AzureAdPrt'] -eq 'NO') {
-        $nota = if ($script:Alvo.Outro) { ' Atencao: este valor e da conta que elevou o script, nao do usuario logado; rode sem elevar para ver o do usuario.' } else { '' }
-        Add-Achado MEDIO 'Identidade' 'Sem token de SSO (PRT) do Entra ID para este usuario' "Sem PRT o usuario ve pedidos repetidos de login no Microsoft 365/Teams. Verifique acesso a login.microsoftonline.com, horario e a conta.$nota" '08_Seguranca\identidade_resumo.txt'
+        $nota = if ($script:Alvo.Outro) { ' Atenção: este valor é da conta que elevou o script, não do usuário logado; rode sem elevar para ver o do usuário.' } else { '' }
+        Add-Achado MEDIO 'Identidade' 'Sem token de SSO (PRT) do Entra ID para este usuário' "Sem PRT o usuário vê pedidos repetidos de login no Microsoft 365/Teams. Verifique acesso a login.microsoftonline.com, horário e a conta.$nota" '08_Seguranca\identidade_resumo.txt'
     }
 }
 
@@ -1669,7 +1670,7 @@ Invoke-Etapa 'Windows Update' {
     Save-Csv '09_Updates' 'hotfixes.csv' ($hf | Select-Object HotFixID, Description, InstalledOn, InstalledBy)
     $ultimo = $hf | Where-Object InstalledOn | Select-Object -First 1
     if ($ultimo -and $ultimo.InstalledOn -lt (Get-Date).AddDays(-60)) {
-        Add-Achado ALTO 'Updates' "Ultimo update instalado ha $([int]((Get-Date) - $ultimo.InstalledOn).TotalDays) dias ($($ultimo.HotFixID))" 'Windows Update pode estar quebrado ou bloqueado.' '09_Updates\hotfixes.csv'
+        Add-Achado ALTO 'Updates' "Último update instalado há $([int]((Get-Date) - $ultimo.InstalledOn).TotalDays) dias ($($ultimo.HotFixID))" 'Windows Update pode estar quebrado ou bloqueado.' '09_Updates\hotfixes.csv'
     }
 
     # Histórico via COM (inclui falhas com código de erro)
@@ -1678,26 +1679,26 @@ Invoke-Etapa 'Windows Update' {
         $busca = $sessao.CreateUpdateSearcher()
         $total = $busca.GetTotalHistoryCount()
         $hist = if ($total -gt 0) { $busca.QueryHistory(0, [math]::Min($total, 200)) } else { @() }
-        $res = @{ 0 = 'Nao iniciado'; 1 = 'Em andamento'; 2 = 'Sucesso'; 3 = 'Sucesso com erros'; 4 = 'Falhou'; 5 = 'Abortado' }
+        $res = @{ 0 = 'Não iniciado'; 1 = 'Em andamento'; 2 = 'Sucesso'; 3 = 'Sucesso com erros'; 4 = 'Falhou'; 5 = 'Abortado' }
         # Significado resumido dos codigos mais comuns do Windows Update
         $erros = @{
             '0x80240034' = 'Falha no download (WU_E_DOWNLOAD_FAILED): rede, proxy ou cache de download corrompido'
-            '0x80246007' = 'Update nao foi baixado (WU_E_DM_NOTDOWNLOADED): comum em driver; repetir ou ignorar'
-            '0x80070002' = 'Arquivo nao encontrado: cache do Windows Update corrompido'
-            '0x80070005' = 'Acesso negado: permissao, antivirus ou politica'
-            '0x80070057' = 'Parametro invalido: componente de servicing danificado'
-            '0x80070643' = 'Erro fatal na instalacao (MSI, .NET ou Defender)'
-            '0x80070BC9' = 'Reinicializacao pendente impede a instalacao'
+            '0x80246007' = 'Update não foi baixado (WU_E_DM_NOTDOWNLOADED): comum em driver; repetir ou ignorar'
+            '0x80070002' = 'Arquivo não encontrado: cache do Windows Update corrompido'
+            '0x80070005' = 'Acesso negado: permissão, antivírus ou política'
+            '0x80070057' = 'Parâmetro inválido: componente de servicing danificado'
+            '0x80070643' = 'Erro fatal na instalação (MSI, .NET ou Defender)'
+            '0x80070BC9' = 'Reinicialização pendente impede a instalação'
             '0x80073712' = 'Componente do Windows ausente/corrompido (CBS): DISM /RestoreHealth e sfc /scannow'
-            '0x800F081F' = 'Arquivos de origem nao encontrados (DISM/.NET)'
-            '0x800F0922' = 'Falha de servicing: pouco espaco na particao de sistema ou VPN ativa'
-            '0x8024402C' = 'Nao resolveu o nome do servidor de updates (proxy, DNS ou firewall)'
+            '0x800F081F' = 'Arquivos de origem não encontrados (DISM/.NET)'
+            '0x800F0922' = 'Falha de servicing: pouco espaço na partição de sistema ou VPN ativa'
+            '0x8024402C' = 'Não resolveu o nome do servidor de updates (proxy, DNS ou firewall)'
             '0x80072EE2' = 'Timeout de rede com o servidor de updates'
-            '0x80244022' = 'Servidor de updates indisponivel (HTTP 503)'
-            '0x8024001E' = 'Operacao interrompida (servico parado ou desligamento)'
-            '0x80240438' = 'Sem conexao com o servico de updates (proxy/WSUS)'
-            '0x8007000E' = 'Memoria insuficiente'
-            '0x800705B4' = 'Timeout: operacao nao concluida a tempo'
+            '0x80244022' = 'Servidor de updates indisponível (HTTP 503)'
+            '0x8024001E' = 'Operação interrompida (serviço parado ou desligamento)'
+            '0x80240438' = 'Sem conexão com o serviço de updates (proxy/WSUS)'
+            '0x8007000E' = 'Memória insuficiente'
+            '0x800705B4' = 'Timeout: operação não concluída a tempo'
         }
         $linhas = foreach ($h in $hist) {
             $hr = '0x{0:X8}' -f $h.HResult
@@ -1723,13 +1724,13 @@ Invoke-Etapa 'Windows Update' {
         $itens = @($itens)
         Save-Csv '09_Updates' 'falhas_update_30dias.csv' $itens
         foreach ($i in $itens | Where-Object { $_.Classe -eq 'Windows' -and -not $_.Resolvida } | Select-Object -First 5) {
-            Add-Achado ALTO 'Updates' "Update do Windows nao instalado: $($i.Titulo) ($($i.Vezes) falha(s), ultima em $($i.Ultima.ToString('dd/MM/yyyy')))" "$($i.HResult) $($i.Significado)" '09_Updates\falhas_update_30dias.csv'
+            Add-Achado ALTO 'Updates' "Update do Windows não instalado: $($i.Titulo) ($($i.Vezes) falha(s), última em $($i.Ultima.ToString('dd/MM/yyyy')))" "$($i.HResult) $($i.Significado)" '09_Updates\falhas_update_30dias.csv'
         }
         foreach ($i in $itens | Where-Object { $_.Classe -eq 'Driver' -and -not $_.Resolvida } | Select-Object -First 5) {
-            Add-Achado BAIXO 'Updates' "Driver/firmware nao instalado pelo Windows Update: $($i.Titulo)" "$($i.HResult) $($i.Significado)" '09_Updates\falhas_update_30dias.csv'
+            Add-Achado BAIXO 'Updates' "Driver/firmware não instalado pelo Windows Update: $($i.Titulo)" "$($i.HResult) $($i.Significado)" '09_Updates\falhas_update_30dias.csv'
         }
         $lojaPend = @($itens | Where-Object { $_.Classe -eq 'Loja' -and -not $_.Resolvida })
-        if ($lojaPend.Count) { Add-Achado INFO 'Updates' "$($lojaPend.Count) app(s) da Store com falha de atualizacao" (($lojaPend | Select-Object -First 3 | ForEach-Object { $_.Titulo }) -join '; ') '09_Updates\falhas_update_30dias.csv' }
+        if ($lojaPend.Count) { Add-Achado INFO 'Updates' "$($lojaPend.Count) app(s) da Store com falha de atualização" (($lojaPend | Select-Object -First 3 | ForEach-Object { $_.Titulo }) -join '; ') '09_Updates\falhas_update_30dias.csv' }
         $resolvidas = @($itens | Where-Object { $_.Resolvida })
         if ($resolvidas.Count) { Add-Achado INFO 'Updates' "$($resolvidas.Count) update(s) falharam mas foram instalados depois" '' '09_Updates\falhas_update_30dias.csv' }
 
@@ -1739,19 +1740,19 @@ Invoke-Etapa 'Windows Update' {
             $lp = foreach ($u in $pend) { [pscustomobject]@{ Titulo = $u.Title; KB = ($u.KBArticleIDs -join ','); Severidade = $u.MsrcSeverity; Tamanho = Format-Bytes $u.MaxDownloadSize } }
             Save-Csv '09_Updates' 'updates_pendentes.csv' $lp
             $crit = $lp | Where-Object Severidade -in 'Critical', 'Important'
-            if ($crit) { Add-Achado ALTO 'Updates' "$(($crit | Measure-Object).Count) update(s) de seguranca critico/importante pendente(s)" '' '09_Updates\updates_pendentes.csv' }
+            if ($crit) { Add-Achado ALTO 'Updates' "$(($crit | Measure-Object).Count) update(s) de segurança crítico/importante pendente(s)" '' '09_Updates\updates_pendentes.csv' }
         }
     } catch {
-        Add-Achado MEDIO 'Updates' 'Nao foi possivel consultar o Windows Update' $_.Exception.Message
+        Add-Achado MEDIO 'Updates' 'Não foi possível consultar o Windows Update' $_.Exception.Message
     }
 
     foreach ($s in 'wuauserv', 'BITS', 'CryptSvc', 'TrustedInstaller', 'UsoSvc') {
         $svc = Get-Service $s -ErrorAction SilentlyContinue
-        if ($svc -and $svc.StartType -eq 'Disabled') { Add-Achado ALTO 'Updates' "Servico $s ($($svc.DisplayName)) esta desabilitado" 'Windows Update nao funciona sem ele.' }
+        if ($svc -and $svc.StartType -eq 'Disabled') { Add-Achado ALTO 'Updates' "Serviço $s ($($svc.DisplayName)) está desabilitado" 'Windows Update não funciona sem ele.' }
     }
     $pol = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate', 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -ErrorAction SilentlyContinue
     Save-Texto '09_Updates' 'politicas_update.txt' ($pol | Format-List)
-    if ($pol | Where-Object { $_.NoAutoUpdate -eq 1 }) { Add-Achado MEDIO 'Updates' 'Atualizacao automatica desabilitada por politica' '' '09_Updates\politicas_update.txt' }
+    if ($pol | Where-Object { $_.NoAutoUpdate -eq 1 }) { Add-Achado MEDIO 'Updates' 'Atualização automática desabilitada por política' '' '09_Updates\politicas_update.txt' }
 
     if ($Completo) {
         Write-Log 'Gerando WindowsUpdate.log (pode demorar)...'
@@ -1769,9 +1770,9 @@ Invoke-Etapa 'Integridade (DISM, SFC, CBS)' {
         # "Nenhuma corrupcao ... detectada" contem a palavra corrupcao: so a palavra "repar" (repairable/reparavel/reparado)
         # indica problema real. Resultado fora do esperado vira informativo.
         if ($txt -match '(?i)repar') {
-            Add-Achado ALTO 'Integridade' 'Imagem do Windows com corrupcao detectada pelo DISM' 'Correcao: DISM /Online /Cleanup-Image /RestoreHealth e depois sfc /scannow.' '10_Integridade\dism_checkhealth.txt'
+            Add-Achado ALTO 'Integridade' 'Imagem do Windows com corrupção detectada pelo DISM' 'Correção: DISM /Online /Cleanup-Image /RestoreHealth e depois sfc /scannow.' '10_Integridade\dism_checkhealth.txt'
         } elseif ($txt -notmatch '(?i)(No component store corruption|Nenhuma corrup)') {
-            Add-Achado BAIXO 'Integridade' 'Resultado do DISM /CheckHealth nao reconhecido' 'Leia 10_Integridade\dism_checkhealth.txt.' '10_Integridade\dism_checkhealth.txt'
+            Add-Achado BAIXO 'Integridade' 'Resultado do DISM /CheckHealth não reconhecido' 'Leia 10_Integridade\dism_checkhealth.txt.' '10_Integridade\dism_checkhealth.txt'
         }
         if ($Completo) {
             Write-Log 'Rodando SFC /verifyonly (10 a 20 minutos)...'
@@ -1780,11 +1781,11 @@ Invoke-Etapa 'Integridade (DISM, SFC, CBS)' {
             $sfc = (Get-Content (Join-Path $script:Raiz '10_Integridade\sfc_verifyonly.txt') -Raw -ErrorAction SilentlyContinue) -replace "`0", ''
             # "nao encontrou violacoes de integridade" tambem contem "violacoes": testar a negativa primeiro
             if ($sfc -match '(?i)n.{1,3}o encontrou|did not find|found no integrity') {
-                Save-Texto '10_Integridade' 'sfc_conclusao.txt' 'SFC: nenhuma violacao de integridade.'
+                Save-Texto '10_Integridade' 'sfc_conclusao.txt' 'SFC: nenhuma violação de integridade.'
             } elseif ($sfc -match '(?i)encontrou viola|found integrity violations') {
-                Add-Achado ALTO 'Integridade' 'SFC encontrou arquivos de sistema corrompidos' 'Correcao: sfc /scannow (como admin).' '10_Integridade\sfc_verifyonly.txt'
+                Add-Achado ALTO 'Integridade' 'SFC encontrou arquivos de sistema corrompidos' 'Correção: sfc /scannow (como admin).' '10_Integridade\sfc_verifyonly.txt'
             } else {
-                Add-Achado BAIXO 'Integridade' 'SFC /verifyonly nao concluiu ou resultado nao reconhecido' 'Leia 10_Integridade\sfc_verifyonly.txt.' '10_Integridade\sfc_verifyonly.txt'
+                Add-Achado BAIXO 'Integridade' 'SFC /verifyonly não concluiu ou resultado não reconhecido' 'Leia 10_Integridade\sfc_verifyonly.txt.' '10_Integridade\sfc_verifyonly.txt'
             }
         }
     }
@@ -1801,7 +1802,7 @@ Invoke-Etapa 'Integridade (DISM, SFC, CBS)' {
     $wmi = & winmgmt /verifyrepository 2>&1 | Out-String
     Save-Texto '10_Integridade' 'wmi_repositorio.txt' $wmi
     if ($script:IsAdmin -and $wmi -match 'inconsisten') {
-        Add-Achado ALTO 'Integridade' 'Repositorio WMI inconsistente' 'Correcao: winmgmt /salvagerepository.' '10_Integridade\wmi_repositorio.txt'
+        Add-Achado ALTO 'Integridade' 'Repositório WMI inconsistente' 'Correção: winmgmt /salvagerepository.' '10_Integridade\wmi_repositorio.txt'
     }
 }
 
@@ -1817,21 +1818,21 @@ Invoke-Etapa 'Programas instalados' {
         Select-Object DisplayName, DisplayVersion, Publisher,
             @{n = 'Instalado'; e = { if ($_.InstallDate -match '^\d{8}$') { [datetime]::ParseExact($_.InstallDate, 'yyyyMMdd', $null).ToString('yyyy-MM-dd') } else { $_.InstallDate } } },
             @{n = 'TamanhoMB'; e = { if ($_.EstimatedSize) { [math]::Round($_.EstimatedSize / 1KB, 1) } } }, InstallLocation,
-            @{n = 'Escopo'; e = { if ($_.PSPath -match 'HKEY_USERS') { 'Usuario' } elseif ($_.PSPath -match 'WOW6432') { '32 bits' } else { '64 bits' } } } |
+            @{n = 'Escopo'; e = { if ($_.PSPath -match 'HKEY_USERS') { 'Usuário' } elseif ($_.PSPath -match 'WOW6432') { '32 bits' } else { '64 bits' } } } |
         Sort-Object DisplayName -Unique
     Save-Csv '11_Software' 'programas_instalados.csv' $progs
 
     $recentes = $progs | Where-Object { $_.Instalado -match '^\d{4}-' -and [datetime]$_.Instalado -ge $script:DesdeData }
     Save-Csv '11_Software' 'instalados_no_periodo.csv' $recentes
     if ($recentes) {
-        Add-Achado INFO 'Software' "$(($recentes | Measure-Object).Count) programa(s) instalado(s)/atualizado(s) nos ultimos $Dias dias" `
+        Add-Achado INFO 'Software' "$(($recentes | Measure-Object).Count) programa(s) instalado(s)/atualizado(s) nos últimos $Dias dias" `
             'Se o problema comecou recentemente, confira esta lista.' '11_Software\instalados_no_periodo.csv'
     }
 
     # Softwares de acesso remoto (evidência útil em incidentes)
     $remotos = $progs | Where-Object DisplayName -match 'AnyDesk|TeamViewer|RustDesk|UltraViewer|Supremo|ScreenConnect|ConnectWise|Splashtop|RemotePC|Ammyy|LogMeIn|NinjaOne|Atera|VNC'
     if ($remotos) {
-        Add-Achado INFO 'Seguranca' "Software de acesso remoto instalado: $(($remotos.DisplayName | Select-Object -Unique) -join ', ')" 'Confirme se e autorizado.' '11_Software\programas_instalados.csv'
+        Add-Achado INFO 'Segurança' "Software de acesso remoto instalado: $(($remotos.DisplayName | Select-Object -Unique) -join ', ')" 'Confirme se é autorizado.' '11_Software\programas_instalados.csv'
     }
 
     # Com elevacao por outra conta, lista os apps do usuario logado (exige admin)
@@ -1845,7 +1846,7 @@ Invoke-Etapa 'Programas instalados' {
     Invoke-Externo '11_Software' 'dotnet_versoes.txt' 'reg query "HKLM\SOFTWARE\Microsoft\NET Framework Setup\NDP" /s /v Version' 30 | Out-Null
 }
 
-Invoke-Etapa 'Inicializacao automatica' {
+Invoke-Etapa 'Inicialização automática' {
     $itens = New-Object System.Collections.Generic.List[object]
     $runs = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
             'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run', "$($script:Alvo.HKU)\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
@@ -1859,14 +1860,14 @@ Invoke-Etapa 'Inicializacao automatica' {
         Get-ChildItem $pasta -ErrorAction SilentlyContinue | ForEach-Object { $itens.Add([pscustomobject]@{ Local = $pasta; Nome = $_.Name; Comando = $_.FullName }) }
     }
     Save-Csv '11_Software' 'inicializacao.csv' $itens.ToArray()
-    if ($itens.Count -gt 25) { Add-Achado BAIXO 'Desempenho' "$($itens.Count) itens na inicializacao automatica" 'Muitos itens deixam o logon lento.' '11_Software\inicializacao.csv' }
+    if ($itens.Count -gt 25) { Add-Achado BAIXO 'Desempenho' "$($itens.Count) itens na inicialização automática" 'Muitos itens deixam o logon lento.' '11_Software\inicializacao.csv' }
 
     # Winlogon alterado (Shell/Userinit) é sinal clássico de malware
     $wl = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue
     Save-Texto '11_Software' 'winlogon.txt' ($wl | Select-Object Shell, Userinit, AutoAdminLogon, DefaultUserName | Format-List)
-    if ($wl.Shell -and $wl.Shell -ne 'explorer.exe') { Add-Achado ALTO 'Seguranca' "Shell do Winlogon alterado: $($wl.Shell)" 'Esperado: explorer.exe' }
-    if ($wl.Userinit -and $wl.Userinit.TrimEnd(',') -notmatch '^C:\\Windows\\system32\\userinit\.exe$') { Add-Achado ALTO 'Seguranca' "Userinit alterado: $($wl.Userinit)" }
-    if ($wl.AutoAdminLogon -eq '1') { Add-Achado MEDIO 'Seguranca' "Logon automatico habilitado (usuario $($wl.DefaultUserName))" }
+    if ($wl.Shell -and $wl.Shell -ne 'explorer.exe') { Add-Achado ALTO 'Segurança' "Shell do Winlogon alterado: $($wl.Shell)" 'Esperado: explorer.exe' }
+    if ($wl.Userinit -and $wl.Userinit.TrimEnd(',') -notmatch '^C:\\Windows\\system32\\userinit\.exe$') { Add-Achado ALTO 'Segurança' "Userinit alterado: $($wl.Userinit)" }
+    if ($wl.AutoAdminLogon -eq '1') { Add-Achado MEDIO 'Segurança' "Logon automático habilitado (usuário $($wl.DefaultUserName))" }
 }
 
 Invoke-Etapa 'Tarefas agendadas' {
@@ -1883,7 +1884,7 @@ Invoke-Etapa 'Tarefas agendadas' {
     $falhas = $info | Where-Object { $_.UltimoResultado -notin $normais -and $_.Caminho -notlike '\Microsoft\*' }
     Save-Csv '11_Software' 'tarefas_com_falha.csv' $falhas
     if ($falhas) {
-        Add-Achado BAIXO 'Software' "$(($falhas | Measure-Object).Count) tarefa(s) agendada(s) de terceiros com falha na ultima execucao" (($falhas | Select-Object -First 5 | ForEach-Object { "$($_.Nome) [$($_.UltimoResultado)]" }) -join '; ') '11_Software\tarefas_com_falha.csv'
+        Add-Achado BAIXO 'Software' "$(($falhas | Measure-Object).Count) tarefa(s) agendada(s) de terceiros com falha na última execução" (($falhas | Select-Object -First 5 | ForEach-Object { "$($_.Nome) [$($_.UltimoResultado)]" }) -join '; ') '11_Software\tarefas_com_falha.csv'
     }
 }
 
@@ -1893,7 +1894,7 @@ Invoke-Etapa 'Impressoras' {
     if ($fila) {
         Save-Csv '11_Software' 'fila_impressao.csv' ($fila | Select-Object PrinterName, DocumentName, JobStatus, SubmittedTime, UserName)
         $travados = $fila | Where-Object { $_.JobStatus -match 'Error|Paused|Blocked' -or $_.SubmittedTime -lt (Get-Date).AddHours(-2) }
-        if ($travados) { Add-Achado BAIXO 'Software' "$(($travados | Measure-Object).Count) trabalho(s) de impressao travado(s)" '' '11_Software\fila_impressao.csv' }
+        if ($travados) { Add-Achado BAIXO 'Software' "$(($travados | Measure-Object).Count) trabalho(s) de impressão travado(s)" '' '11_Software\fila_impressao.csv' }
     }
 }
 
@@ -1916,21 +1917,21 @@ Invoke-Etapa 'Office, OneDrive, Teams e navegadores' {
         }
         $guid = ("$($c2r.CDNBaseUrl)" -split '/')[-1]
         $canal = if ($canais.ContainsKey($guid)) { $canais[$guid] } else { "desconhecido ($guid)" }
-        & $add 'Office' 'Versao' $c2r.VersionToReport
-        & $add 'Office' 'Canal de atualizacao' $canal
+        & $add 'Office' 'Versão' $c2r.VersionToReport
+        & $add 'Office' 'Canal de atualização' $canal
         & $add 'Office' 'Plataforma' $c2r.Platform
         & $add 'Office' 'Produtos' $c2r.ProductReleaseIds
-        & $add 'Office' 'Atualizacoes habilitadas' $c2r.UpdatesEnabled
-        if ("$($c2r.UpdatesEnabled)" -eq 'False') { Add-Achado BAIXO 'Office' 'Atualizacoes automaticas do Office desabilitadas' 'Politica ou configuracao local impede updates.' '11_Software\office_colaboracao.csv' }
+        & $add 'Office' 'Atualizações habilitadas' $c2r.UpdatesEnabled
+        if ("$($c2r.UpdatesEnabled)" -eq 'False') { Add-Achado BAIXO 'Office' 'Atualizações automáticas do Office desabilitadas' 'Política ou configuração local impede updates.' '11_Software\office_colaboracao.csv' }
     } else {
-        & $add 'Office' 'Click-to-Run' 'nao instalado'
+        & $add 'Office' 'Click-to-Run' 'não instalado'
     }
 
     # Suplementos e suplementos desabilitados por falha (Resiliency)
     $falhaAddin = New-Object System.Collections.Generic.List[string]
     foreach ($app in 'Outlook', 'Word', 'Excel', 'PowerPoint') {
         $vistos = @{}
-        foreach ($raiz in @(@('HKLM', "HKLM:\SOFTWARE\Microsoft\Office\$app\Addins"), @('HKLM-32bit', "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\$app\Addins"), @('Usuario', "$hku\Software\Microsoft\Office\$app\Addins"))) {
+        foreach ($raiz in @(@('HKLM', "HKLM:\SOFTWARE\Microsoft\Office\$app\Addins"), @('HKLM-32bit', "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\$app\Addins"), @('Usuário', "$hku\Software\Microsoft\Office\$app\Addins"))) {
             foreach ($k in Get-ChildItem $raiz[1] -ErrorAction SilentlyContinue) {
                 $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
                 $chv = "$($k.PSChildName)|$($raiz[0] -replace '-32bit', '')"
@@ -1956,7 +1957,7 @@ Invoke-Etapa 'Office, OneDrive, Teams e navegadores' {
         $lista = ($falhaAddin.ToArray() | Select-Object -Unique) -join ' | '
         $relevantes = @($falhaAddin.ToArray() | Where-Object { $_ -notmatch 'visualiza|preview' })
         $sev = if ($relevantes.Count) { 'MEDIO' } else { 'BAIXO' }
-        Add-Achado $sev 'Office' "$($falhaAddin.Count) item(ns) desativado(s) pelo proprio Office por falha (Resiliency)" "O Office desativa suplementos e visualizadores que travam. Itens: $lista" '11_Software\office_colaboracao.csv'
+        Add-Achado $sev 'Office' "$($falhaAddin.Count) item(ns) desativado(s) pelo próprio Office por falha (Resiliency)" "O Office desativa suplementos e visualizadores que travam. Itens: $lista" '11_Software\office_colaboracao.csv'
     }
 
     # Caixas de e-mail locais (OST/PST). O OST tem limite padrao de 50 GB.
@@ -1966,33 +1967,33 @@ Invoke-Etapa 'Office, OneDrive, Teams e navegadores' {
     }
     Save-Csv '11_Software' 'outlook_ost_pst.csv' $ost
     foreach ($o in $ost | Where-Object { $_.Bytes -gt 40GB }) {
-        Add-Achado MEDIO 'Office' "Arquivo do Outlook com $($o.Tamanho): $($o.Name)" 'O OST/PST perto do limite (50 GB) fica lento e pode corromper. Reduza o periodo de cache ou arquive.' '11_Software\outlook_ost_pst.csv'
+        Add-Achado MEDIO 'Office' "Arquivo do Outlook com $($o.Tamanho): $($o.Name)" 'O OST/PST perto do limite (50 GB) fica lento e pode corromper. Reduza o período de cache ou arquive.' '11_Software\outlook_ost_pst.csv'
     }
 
     # OneDrive
     $od = Get-Process OneDrive -ErrorAction SilentlyContinue
     $contas = @(Get-ChildItem "$hku\Software\Microsoft\OneDrive\Accounts" -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath })
-    & $add 'OneDrive' 'Em execucao' ([bool]$od)
-    & $add 'OneDrive' 'Versao' (Get-ItemProperty "$hku\Software\Microsoft\OneDrive" -ErrorAction SilentlyContinue).Version
+    & $add 'OneDrive' 'Em execução' ([bool]$od)
+    & $add 'OneDrive' 'Versão' (Get-ItemProperty "$hku\Software\Microsoft\OneDrive" -ErrorAction SilentlyContinue).Version
     foreach ($c in $contas | Where-Object { $_.UserEmail -or $_.UserFolder }) {
         $mail = if ($SemDadosSensiveis) { '(oculto)' } else { $c.UserEmail }
         & $add 'OneDrive' 'Conta' ("{0} | pasta: {1}" -f $mail, $c.UserFolder)
     }
-    if ($contas.Count -and -not $od) { Add-Achado MEDIO 'Office' 'OneDrive configurado mas nao esta em execucao' 'Sincronizacao parada: arquivos podem estar desatualizados.' '11_Software\office_colaboracao.csv' }
+    if ($contas.Count -and -not $od) { Add-Achado MEDIO 'Office' 'OneDrive configurado mas não está em execução' 'Sincronização parada: arquivos podem estar desatualizados.' '11_Software\office_colaboracao.csv' }
 
     # Teams (novo e classico)
     $apps = @(Get-AppxPackage MSTeams -ErrorAction SilentlyContinue)
     foreach ($a in $apps) { & $add 'Teams' 'Novo Teams (MSTeams)' $a.Version }
     $classico = Join-Path $perfil 'AppData\Local\Microsoft\Teams\current\Teams.exe'
     if (Test-Path -LiteralPath $classico) {
-        & $add 'Teams' 'Teams classico' (Get-Item -LiteralPath $classico).VersionInfo.ProductVersion
-        Add-Achado BAIXO 'Office' 'Teams classico ainda instalado' 'O Teams classico foi descontinuado; migre para o novo Teams.' '11_Software\office_colaboracao.csv'
+        & $add 'Teams' 'Teams clássico' (Get-Item -LiteralPath $classico).VersionInfo.ProductVersion
+        Add-Achado BAIXO 'Office' 'Teams clássico ainda instalado' 'O Teams clássico foi descontinuado; migre para o novo Teams.' '11_Software\office_colaboracao.csv'
     }
 
     # WebView2 e navegadores
     $wv = (Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue).pv
-    & $add 'Navegadores' 'WebView2 Runtime' $(if ($wv) { $wv } else { 'nao instalado' })
-    if (-not $wv) { Add-Achado BAIXO 'Office' 'WebView2 Runtime ausente' 'Necessario ao novo Outlook, Teams e varios aplicativos.' '11_Software\office_colaboracao.csv' }
+    & $add 'Navegadores' 'WebView2 Runtime' $(if ($wv) { $wv } else { 'não instalado' })
+    if (-not $wv) { Add-Achado BAIXO 'Office' 'WebView2 Runtime ausente' 'Necessário ao novo Outlook, Teams e vários aplicativos.' '11_Software\office_colaboracao.csv' }
     $navs = @{
         'Edge'   = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
         'Chrome' = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
@@ -2024,22 +2025,22 @@ Invoke-Etapa 'Energia' {
             Invoke-Externo '12_Energia' 'energy_saida.txt' "powercfg /energy /output `"$en`" /duration 60" 150 | Out-Null
             $saida = Get-Content (Join-Path $script:Raiz '12_Energia\energy_saida.txt') -Raw -ErrorAction SilentlyContinue
             if ($saida -match '(\d+)\s+(Errors|Erros)') { if ([int]$matches[1] -gt 0) {
-                Add-Achado BAIXO 'Energia' "powercfg /energy reportou $($matches[1]) erro(s) de eficiencia energetica" '' '12_Energia\energy_report.html' } }
+                Add-Achado BAIXO 'Energia' "powercfg /energy reportou $($matches[1]) erro(s) de eficiência energética" '' '12_Energia\energy_report.html' } }
         }
     }
     $fast = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -ErrorAction SilentlyContinue).HiberbootEnabled
-    Save-Texto '12_Energia' 'inicializacao_rapida.txt' "Inicializacao rapida (Fast Startup): $(if ($fast -eq 1) { 'ATIVADA' } else { 'desativada' })"
+    Save-Texto '12_Energia' 'inicializacao_rapida.txt' "Inicialização rápida (Fast Startup): $(if ($fast -eq 1) { 'ATIVADA' } else { 'desativada' })"
     if ($fast -eq 1) {
-        Add-Achado INFO 'Energia' 'Inicializacao rapida (Fast Startup) ativada' '"Desligar" nao zera o kernel: o uptime continua contando e drivers nao reiniciam. Use Reiniciar para testes.'
+        Add-Achado INFO 'Energia' 'Inicialização rápida (Fast Startup) ativada' '"Desligar" não zera o kernel: o uptime continua contando e drivers não reiniciam. Use Reiniciar para testes.'
     }
 }
 
 # ---------------------------------------------------------------------------
 # 13 POLITICAS
 # ---------------------------------------------------------------------------
-Invoke-Etapa 'Politicas de grupo' {
+Invoke-Etapa 'Políticas de grupo' {
     if ($SemDadosSensiveis) {
-        Save-Texto '13_Politicas' 'gpresult_nao_coletado.txt' 'Modo -SemDadosSensiveis: gpresult nao coletado.'
+        Save-Texto '13_Politicas' 'gpresult_nao_coletado.txt' 'Modo -SemDadosSensiveis: gpresult não coletado.'
     } else {
         $escopo = if ($script:IsAdmin) { '' } else { '/scope user' }
         # gpresult recusa caminhos com mais de 127 caracteres (Desktop no OneDrive estoura): gera em pasta curta e move
@@ -2049,7 +2050,7 @@ Invoke-Etapa 'Politicas de grupo' {
         if (Test-Path -LiteralPath $tmp) {
             Move-Item -LiteralPath $tmp -Destination (Join-Path $script:Raiz '13_Politicas\gpresult.html') -Force
         } else {
-            Add-Lacuna 'gpresult.html' 'relatorio nao foi gerado (veja gpresult_saida.txt)'
+            Add-Lacuna 'gpresult.html' 'relatório não foi gerado (veja gpresult_saida.txt)'
         }
         Invoke-Externo '13_Politicas' 'gpresult_resumo.txt' "gpresult /r $escopo" 120 | Out-Null
     }
@@ -2059,23 +2060,23 @@ Invoke-Etapa 'Politicas de grupo' {
         # Test-ComputerSecureChannel tambem falha quando o DC esta inacessivel (fora da rede/VPN): checar o DC antes
         $rc = Invoke-Externo '13_Politicas' 'nltest_dc.txt' "nltest /dsgetdc:$($cs.Domain)" 30
         if ($rc -ne 0) {
-            Add-Achado MEDIO 'Rede' 'Controlador de dominio inacessivel' "nltest /dsgetdc:$($cs.Domain) falhou (codigo $rc). Maquina fora da rede corporativa/VPN, DNS interno indisponivel ou DC fora do ar. O canal seguro nao foi testado." '13_Politicas\nltest_dc.txt'
+            Add-Achado MEDIO 'Rede' 'Controlador de domínio inacessível' "nltest /dsgetdc:$($cs.Domain) falhou (código $rc). Máquina fora da rede corporativa/VPN, DNS interno indisponível ou DC fora do ar. O canal seguro não foi testado." '13_Politicas\nltest_dc.txt'
         } elseif ($script:IsAdmin) {
             $canal = $null
-            try { $canal = Test-ComputerSecureChannel -ErrorAction Stop } catch { Add-Lacuna 'canal seguro com o dominio' $_.Exception.Message }
-            Save-Texto '13_Politicas' 'canal_seguro_dominio.txt' "Canal seguro com o dominio: $canal"
+            try { $canal = Test-ComputerSecureChannel -ErrorAction Stop } catch { Add-Lacuna 'canal seguro com o domínio' $_.Exception.Message }
+            Save-Texto '13_Politicas' 'canal_seguro_dominio.txt' "Canal seguro com o domínio: $canal"
             if ($canal -eq $false) {
-                Add-Achado CRITICO 'Rede' 'Relacao de confianca com o dominio quebrada' 'DC acessivel, mas o canal seguro falhou. Correcao: Test-ComputerSecureChannel -Repair -Credential (Get-Credential)' '13_Politicas\canal_seguro_dominio.txt'
+                Add-Achado CRITICO 'Rede' 'Relação de confiança com o domínio quebrada' 'DC acessível, mas o canal seguro falhou. Correção: Test-ComputerSecureChannel -Repair -Credential (Get-Credential)' '13_Politicas\canal_seguro_dominio.txt'
             }
         } else {
-            Add-Lacuna 'canal seguro com o dominio' 'requer administrador'
+            Add-Lacuna 'canal seguro com o domínio' 'requer administrador'
         }
     }
 }
 
 if ($Completo) {
     Invoke-Etapa 'msinfo32' {
-        Write-Log 'Gerando relatorio msinfo32 (pode levar alguns minutos)...'
+        Write-Log 'Gerando relatório msinfo32 (pode levar alguns minutos)...'
         $nfo = Join-Path $script:Raiz '01_Sistema\msinfo32.txt'
         $p = Start-Process msinfo32.exe -ArgumentList "/report `"$nfo`"" -PassThru -WindowStyle Hidden
         if (-not $p.WaitForExit(600000)) { try { $p.Kill() } catch { }; Write-Log 'msinfo32 excedeu 10 minutos' 'AVISO' }
@@ -2105,14 +2106,14 @@ Invoke-Etapa 'Linha do tempo' {
     }
     # Servicos instalados, falhas de servico
     foreach ($e in Get-EventosSeguro @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = 7045; StartTime = $script:DesdeData } 300) {
-        & $reg $e.TimeCreated 'Servico novo' "Servico instalado: $($e.Properties[0].Value)" "$($e.Properties[1].Value)"
+        & $reg $e.TimeCreated 'Serviço novo' "Serviço instalado: $($e.Properties[0].Value)" "$($e.Properties[1].Value)"
     }
     foreach ($e in Get-EventosSeguro @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = 7031, 7034; StartTime = $script:DesdeData } 300) {
-        & $reg $e.TimeCreated 'Falha de servico' "Servico encerrou: $($e.Properties[0].Value)" ''
+        & $reg $e.TimeCreated 'Falha de serviço' "Serviço encerrou: $($e.Properties[0].Value)" ''
     }
     # Instalacoes (MSI), crashes de aplicativos, servicing do Windows e ameacas
     foreach ($e in Get-EventosSeguro @{ LogName = 'Application'; ProviderName = 'MsiInstaller'; Id = 11707, 11708, 11724; StartTime = $script:DesdeData } 500) {
-        $tipo = if ($e.Id -eq 11724) { 'Desinstalacao' } else { 'Instalacao' }
+        $tipo = if ($e.Id -eq 11724) { 'Desinstalação' } else { 'Instalação' }
         & $reg $e.TimeCreated $tipo (& $cond $e.Message) ''
     }
     foreach ($e in Get-EventosSeguro @{ LogName = 'Application'; ProviderName = 'Application Error', 'Application Hang'; Id = 1000, 1002; StartTime = $script:DesdeData } 500) {
@@ -2122,7 +2123,7 @@ Invoke-Etapa 'Linha do tempo' {
         & $reg $e.TimeCreated 'Update' 'Pacote do Windows instalado' (& $cond $e.Message)
     }
     foreach ($e in Get-EventosSeguro @{ LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = 1116; StartTime = $script:DesdeData } 200) {
-        & $reg $e.TimeCreated 'Ameaca' 'Defender detectou ameaca' (& $cond $e.Message)
+        & $reg $e.TimeCreated 'Ameaça' 'Defender detectou ameaça' (& $cond $e.Message)
     }
     # Historico do Windows Update
     try {
@@ -2138,7 +2139,7 @@ Invoke-Etapa 'Linha do tempo' {
     } catch { }
     # Programas instalados no periodo (so a data, sem hora)
     foreach ($p in @(Import-Csv -LiteralPath (Join-Path $script:Raiz '11_Software\instalados_no_periodo.csv') -Delimiter ';' -ErrorAction SilentlyContinue)) {
-        if ($p.Instalado -match '^\d{4}-\d{2}-\d{2}$') { & $reg ([datetime]$p.Instalado) 'Instalacao' "$($p.DisplayName) $($p.DisplayVersion)" $p.Publisher }
+        if ($p.Instalado -match '^\d{4}-\d{2}-\d{2}$') { & $reg ([datetime]$p.Instalado) 'Instalação' "$($p.DisplayName) $($p.DisplayVersion)" $p.Publisher }
     }
 
     # O historico do Windows Update repete o mesmo item varias vezes no mesmo minuto: agrupa
@@ -2155,10 +2156,10 @@ Invoke-Etapa 'Linha do tempo' {
     $primeiro = $tl.ToArray() | Where-Object { $_.Tipo -in 'Tela azul', 'Desligamento inesperado' } | Sort-Object Data | Select-Object -First 1
     if ($primeiro) {
         $ini = $primeiro.Data.AddHours(-48)
-        $mud = @($tl.ToArray() | Where-Object { $_.Tipo -in 'Update', 'Driver', 'Instalacao', 'Desinstalacao', 'Servico novo' -and $_.Data -ge $ini -and $_.Data -le $primeiro.Data } | Sort-Object Data)
+        $mud = @($tl.ToArray() | Where-Object { $_.Tipo -in 'Update', 'Driver', 'Instalação', 'Desinstalação', 'Serviço novo' -and $_.Data -ge $ini -and $_.Data -le $primeiro.Data } | Sort-Object Data)
         if ($mud.Count) {
             $lista = ($mud | Select-Object -First 6 | ForEach-Object { "$($_.Data.ToString('dd/MM HH:mm')) $($_.Tipo): $($_.Evento)" }) -join ' | '
-            Add-Achado INFO 'Correlacao' "$($mud.Count) mudanca(s) nas 48 h antes do primeiro travamento do periodo ($($primeiro.Data.ToString('dd/MM HH:mm')))" $lista '03_Eventos\linha_do_tempo.txt'
+            Add-Achado INFO 'Correlação' "$($mud.Count) mudança(s) nas 48 h antes do primeiro travamento do período ($($primeiro.Data.ToString('dd/MM HH:mm')))" $lista '03_Eventos\linha_do_tempo.txt'
         }
     }
 }
@@ -2192,16 +2193,16 @@ if ($Comparar) {
             $kAtu = @{}; foreach ($a in $achados) { $kAtu[(& $chave $a)] = $a }
             $novos      = @($achados | Where-Object { -not $kAnt.ContainsKey((& $chave $_)) })
             $resolvidos = @($ant.Achados | Where-Object { -not $kAtu.ContainsKey($_.Chave) })
-        } catch { Add-Lacuna 'comparacao com execucao anterior' $_.Exception.Message }
-    } else { Add-Lacuna 'comparacao com execucao anterior' "arquivo nao encontrado: $Comparar" }
+        } catch { Add-Lacuna 'comparação com execução anterior' $_.Exception.Message }
+    } else { Add-Lacuna 'comparação com execução anterior' "arquivo não encontrado: $Comparar" }
 }
 $lacunas = $script:Lacunas.ToArray()
 
-$veredito = if ($contagem.CRITICO) { 'Problemas criticos encontrados. Comece pelos itens em vermelho.' }
+$veredito = if ($contagem.CRITICO) { 'Problemas críticos encontrados. Comece pelos itens em vermelho.' }
             elseif ($contagem.ALTO) { 'Problemas relevantes encontrados. Veja os itens de severidade alta.' }
-            elseif ($contagem.MEDIO) { 'Maquina funcional, com pontos de atencao.' }
-            else { 'Nenhum problema relevante detectado nas evidencias coletadas.' }
-if ($lacunas.Count) { $veredito += " Atencao: $($lacunas.Count) item(ns) NAO foram coletados (veja Lacunas de coleta); a ausencia de achados neles nao significa que estao saudaveis." }
+            elseif ($contagem.MEDIO) { 'Máquina funcional, com pontos de atenção.' }
+            else { 'Nenhum problema relevante detectado nas evidências coletadas.' }
+if ($lacunas.Count) { $veredito += " Atenção: $($lacunas.Count) item(ns) NÃO foram coletados (veja Lacunas de coleta); a ausência de achados neles não significa que estão saudáveis." }
 
 # JSON (para comparar execucoes e maquinas)
 $sis = [ordered]@{}
@@ -2221,25 +2222,25 @@ Save-Csv '.' 'lacunas.csv' $lacunas
 
 # Resumo em texto (para colar em chamado)
 $txt = New-Object System.Text.StringBuilder
-[void]$txt.AppendLine("DIAGNOSTICO WINDOWS v$($script:Versao): $env:COMPUTERNAME")
-[void]$txt.AppendLine("Gerado em: $(Get-Date -Format 'dd/MM/yyyy HH:mm') | Periodo analisado: $Dias dias | Duracao: $([int]$duracao.TotalMinutes) min $($duracao.Seconds) s | Admin: $script:IsAdmin | Usuario: $($script:Alvo.Nome)")
+[void]$txt.AppendLine("DIAGNÓSTICO WINDOWS v$($script:Versao): $env:COMPUTERNAME")
+[void]$txt.AppendLine("Gerado em: $(Get-Date -Format 'dd/MM/yyyy HH:mm') | Período analisado: $Dias dias | Duração: $([int]$duracao.TotalMinutes) min $($duracao.Seconds) s | Admin: $script:IsAdmin | Usuário: $($script:Alvo.Nome)")
 if ($script:InfoSistema) { [void]$txt.AppendLine("SO: $($script:InfoSistema.SO) $($script:InfoSistema.DisplayVersion) build $($script:InfoSistema.Build) | $($script:InfoSistema.Fabricante) $($script:InfoSistema.Modelo) | Uptime $($script:InfoSistema.Uptime)") }
-[void]$txt.AppendLine("Criticos: $($contagem.CRITICO) | Altos: $($contagem.ALTO) | Medios: $($contagem.MEDIO) | Baixos: $($contagem.BAIXO) | Info: $($contagem.INFO) | Lacunas: $($lacunas.Count)")
+[void]$txt.AppendLine("Críticos: $($contagem.CRITICO) | Altos: $($contagem.ALTO) | Médios: $($contagem.MEDIO) | Baixos: $($contagem.BAIXO) | Info: $($contagem.INFO) | Lacunas: $($lacunas.Count)")
 [void]$txt.AppendLine("Veredito: $veredito")
 [void]$txt.AppendLine(('-' * 80))
 foreach ($a in $achados) {
-    [void]$txt.AppendLine("[$($a.Severidade)] $($a.Categoria): $($a.Titulo)")
+    [void]$txt.AppendLine("[$($script:Rotulo[$a.Severidade])] $($a.Categoria): $($a.Titulo)")
     if ($a.Detalhe)   { [void]$txt.AppendLine("    $($a.Detalhe)") }
-    if ($a.Evidencia) { [void]$txt.AppendLine("    Evidencia: $($a.Evidencia)") }
+    if ($a.Evidencia) { [void]$txt.AppendLine("    Evidência: $($a.Evidencia)") }
 }
 if ($lacunas.Count) {
-    [void]$txt.AppendLine(('-' * 80)); [void]$txt.AppendLine('LACUNAS DE COLETA (nao foi possivel coletar)')
+    [void]$txt.AppendLine(('-' * 80)); [void]$txt.AppendLine('LACUNAS DE COLETA (não foi possível coletar)')
     foreach ($l in $lacunas) { [void]$txt.AppendLine("  [$($l.Etapa)] $($l.Item): $($l.Motivo)") }
 }
 if ($Comparar) {
-    [void]$txt.AppendLine(('-' * 80)); [void]$txt.AppendLine("COMPARACAO COM A EXECUCAO DE $anteriorEm")
-    foreach ($a in $novos) { [void]$txt.AppendLine("  NOVO      [$($a.Severidade)] $($a.Titulo)") }
-    foreach ($a in $resolvidos) { [void]$txt.AppendLine("  RESOLVIDO [$($a.Severidade)] $($a.Titulo)") }
+    [void]$txt.AppendLine(('-' * 80)); [void]$txt.AppendLine("COMPARAÇÃO COM A EXECUÇÃO DE $anteriorEm")
+    foreach ($a in $novos) { [void]$txt.AppendLine("  NOVO      [$($script:Rotulo[$a.Severidade])] $($a.Titulo)") }
+    foreach ($a in $resolvidos) { [void]$txt.AppendLine("  RESOLVIDO [$($script:Rotulo[$a.Severidade])] $($a.Titulo)") }
 }
 [void]$txt.AppendLine(('-' * 80))
 [void]$txt.AppendLine('ETAPAS')
@@ -2247,22 +2248,22 @@ foreach ($e in $etapas) { [void]$txt.AppendLine(('{0,-7} {1,6}s  {2} {3}' -f $e.
 $txt.ToString() | Out-File (Join-Path $script:Raiz 'RESUMO.txt') -Encoding UTF8
 
 @"
-Diagnostico Windows v$($script:Versao): $env:COMPUTERNAME
+Diagnóstico Windows v$($script:Versao): $env:COMPUTERNAME
 Gerado em $(Get-Date -Format 'dd/MM/yyyy HH:mm')
 
 COMO LER
-  1. RESUMO.html (ou RESUMO.txt): achados por severidade, com o arquivo de evidencia de cada um.
-  2. 03_Eventos\linha_do_tempo.txt: o que mudou e o que falhou, em ordem cronologica.
-  3. lacunas.csv: o que NAO foi coletado (sem admin, sem permissao, timeout). Ausencia de achado nesses itens nao e prova de saude.
-  4. achados.json: mesmo conteudo em JSON; use -Comparar para ver o que mudou entre duas execucoes.
+  1. RESUMO.html (ou RESUMO.txt): achados por severidade, com o arquivo de evidência de cada um.
+  2. 03_Eventos\linha_do_tempo.txt: o que mudou e o que falhou, em ordem cronológica.
+  3. lacunas.csv: o que NÃO foi coletado (sem admin, sem permissão, timeout). Ausência de achado nesses itens não é prova de saúde.
+  4. achados.json: mesmo conteúdo em JSON; use -Comparar para ver o que mudou entre duas execuções.
 
 PASTAS
   01_Sistema 02_Hardware 03_Eventos 04_Falhas 05_Desempenho 06_Servicos 07_Rede
   08_Seguranca 09_Updates 10_Integridade 11_Software 12_Energia 13_Politicas
 
 CONFIDENCIALIDADE
-  Este material pode conter nomes de usuario, programas instalados, redes e logs. Trate como confidencial.
-  Modo sem dados sensiveis: $([bool]$SemDadosSensiveis)
+  Este material pode conter nomes de usuário, programas instalados, redes e logs. Trate como confidencial.
+  Modo sem dados sensíveis: $([bool]$SemDadosSensiveis)
   Os arquivos .evtx abrem no Visualizador de Eventos do Windows.
 "@ | Out-File (Join-Path $script:Raiz 'LEIA-ME.txt') -Encoding UTF8
 
@@ -2270,11 +2271,11 @@ CONFIDENCIALIDADE
 $cores = @{ CRITICO = '#c62828'; ALTO = '#ef6c00'; MEDIO = '#f9a825'; BAIXO = '#1565c0'; INFO = '#607d8b' }
 $linhas = foreach ($a in $achados) {
     $ev = if ($a.Evidencia) { "<a href=""$(ConvertTo-Html-Seguro ($a.Evidencia -replace '\\', '/'))"">$(ConvertTo-Html-Seguro $a.Evidencia)</a>" } else { '' }
-    "<tr><td><span class='tag' style='background:$($cores[$a.Severidade])'>$($a.Severidade)</span></td><td>$(ConvertTo-Html-Seguro $a.Categoria)</td>" +
+    "<tr><td><span class='tag' style='background:$($cores[$a.Severidade])'>$($script:Rotulo[$a.Severidade])</span></td><td>$(ConvertTo-Html-Seguro $a.Categoria)</td>" +
     "<td><b>$(ConvertTo-Html-Seguro $a.Titulo)</b><div class='det'>$(ConvertTo-Html-Seguro $a.Detalhe)</div></td><td class='ev'>$ev</td></tr>"
 }
 $cards = foreach ($s in 'CRITICO', 'ALTO', 'MEDIO', 'BAIXO', 'INFO') {
-    "<div class='card' style='border-top:4px solid $($cores[$s])'><div class='num'>$($contagem[$s])</div><div>$s</div></div>"
+    "<div class='card' style='border-top:4px solid $($cores[$s])'><div class='num'>$($contagem[$s])</div><div>$($script:Rotulo[$s])</div></div>"
 }
 $cards = @($cards) + "<div class='card' style='border-top:4px solid #6a1b9a'><div class='num'>$($lacunas.Count)</div><div>LACUNAS</div></div>"
 $sisHtml = if ($script:InfoSistema) {
@@ -2287,16 +2288,19 @@ $lEtapas = foreach ($e in $etapas) {
 $lLacunas = foreach ($l in $lacunas) {
     "<tr><td>$(ConvertTo-Html-Seguro $l.Etapa)</td><td>$(ConvertTo-Html-Seguro $l.Item)</td><td>$(ConvertTo-Html-Seguro $l.Motivo)</td></tr>"
 }
-$secLacunas = if ($lacunas.Count) { "<h2>Lacunas de coleta</h2><p class='sub'>Itens que o script nao conseguiu coletar. Nao ha achado sobre eles, mas isso nao prova que estejam saudaveis.</p><table><tr><th>Etapa</th><th>Item</th><th>Motivo</th></tr>$($lLacunas -join "`n")</table>" } else { '' }
+$secLacunas = if ($lacunas.Count) { "<h2>Lacunas de coleta</h2><p class='sub'>Itens que o script não conseguiu coletar. Não há achado sobre eles, mas isso não prova que estejam saudáveis.</p><table><tr><th>Etapa</th><th>Item</th><th>Motivo</th></tr>$($lLacunas -join "`n")</table>" } else { '' }
 $secComp = ''
 if ($Comparar) {
-    $lc = @($novos | ForEach-Object { "<tr><td><span class='tag' style='background:#c62828'>NOVO</span></td><td>$($_.Severidade)</td><td>$(ConvertTo-Html-Seguro $_.Titulo)</td></tr>" }) +
-          @($resolvidos | ForEach-Object { "<tr><td><span class='tag' style='background:#2e7d32'>RESOLVIDO</span></td><td>$($_.Severidade)</td><td>$(ConvertTo-Html-Seguro $_.Titulo)</td></tr>" })
-    $secComp = "<h2>Comparacao com a execucao de $(ConvertTo-Html-Seguro $anteriorEm)</h2><p class='sub'>$($novos.Count) novo(s), $($resolvidos.Count) resolvido(s).</p><table><tr><th>Situacao</th><th>Severidade</th><th>Achado</th></tr>$($lc -join "`n")</table>"
+    $lc = @($novos | ForEach-Object { "<tr><td><span class='tag' style='background:#c62828'>NOVO</span></td><td>$($script:Rotulo[$_.Severidade])</td><td>$(ConvertTo-Html-Seguro $_.Titulo)</td></tr>" }) +
+          @($resolvidos | ForEach-Object { "<tr><td><span class='tag' style='background:#2e7d32'>RESOLVIDO</span></td><td>$($script:Rotulo[$_.Severidade])</td><td>$(ConvertTo-Html-Seguro $_.Titulo)</td></tr>" })
+    $secComp = "<h2>Comparação com a execução de $(ConvertTo-Html-Seguro $anteriorEm)</h2><p class='sub'>$($novos.Count) novo(s), $($resolvidos.Count) resolvido(s).</p><table><tr><th>Situação</th><th>Severidade</th><th>Achado</th></tr>$($lc -join "`n")</table>"
 }
 
+# Logo da Nextec embutido em base64 (logo-dark.png): o relatório continua sendo um arquivo único
+$logoNextec = 'data:image/png;base64,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'
+
 $html = @"
-<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>Diagnostico $env:COMPUTERNAME</title>
+<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>Diagnóstico $env:COMPUTERNAME</title>
 <style>
 body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#222;background:#f5f6f8}
 h1{margin:0 0 4px}h2{margin-top:32px;border-bottom:2px solid #ddd;padding-bottom:4px}
@@ -2306,18 +2310,22 @@ h1{margin:0 0 4px}h2{margin-top:32px;border-bottom:2px solid #ddd;padding-bottom
 th,td{padding:8px 10px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}th{background:#fafafa;white-space:nowrap}
 .tag{color:#fff;padding:2px 8px;border-radius:10px;font-size:.8em;font-weight:bold}.det{color:#555;font-size:.9em;margin-top:4px}
 .ev{font-size:.85em;white-space:nowrap}a{color:#1565c0}
+.topo{display:flex;align-items:center;gap:16px;border-bottom:3px solid #4b00ff;padding-bottom:12px;margin-bottom:18px}
+.topo img{height:46px;display:block}.topo .rot{color:#555;font-size:.95em;margin-left:auto;text-align:right}
+@media print{body{background:#fff}.card,table{box-shadow:none}}
 </style></head><body>
-<h1>Diagnostico: $env:COMPUTERNAME</h1>
-<div class="sub">v$($script:Versao) | Gerado em $(Get-Date -Format 'dd/MM/yyyy HH:mm') | Ultimos $Dias dias | Admin: $script:IsAdmin | Usuario: $(ConvertTo-Html-Seguro $script:Alvo.Nome) | Modo completo: $([bool]$Completo) | Duracao: $([int]$duracao.TotalMinutes) min</div>
+<div class="topo"><img src="$logoNextec" alt="Nextec"><div class="rot">Diagnóstico de máquina Windows<br>v$($script:Versao)</div></div>
+<h1>Diagnóstico: $env:COMPUTERNAME</h1>
+<div class="sub">v$($script:Versao) | Gerado em $(Get-Date -Format 'dd/MM/yyyy HH:mm') | Últimos $Dias dias | Admin: $script:IsAdmin | Usuário: $(ConvertTo-Html-Seguro $script:Alvo.Nome) | Modo completo: $([bool]$Completo) | Duração: $([int]$duracao.TotalMinutes) min</div>
 <div class="cards">$($cards -join '')</div>
 <div class="veredito">$(ConvertTo-Html-Seguro $veredito)</div>
 $secComp
 <h2>Achados</h2>
-<table><tr><th>Severidade</th><th>Categoria</th><th>Achado</th><th>Evidencia</th></tr>$($linhas -join "`n")</table>
+<table><tr><th>Severidade</th><th>Categoria</th><th>Achado</th><th>Evidência</th></tr>$($linhas -join "`n")</table>
 $secLacunas
 <h2>Sistema</h2><table>$sisHtml</table>
 <h2>Etapas executadas</h2><table><tr><th>Status</th><th>Etapa</th><th>Tempo</th><th>Erro</th></tr>$($lEtapas -join "`n")</table>
-<p class="sub">Todas as evidencias brutas estao nas subpastas deste diretorio. Os arquivos .evtx abrem no Visualizador de Eventos. Material confidencial.</p>
+<p class="sub">Todas as evidências brutas estão nas subpastas deste diretório. Os arquivos .evtx abrem no Visualizador de Eventos. Material confidencial.</p>
 </body></html>
 "@
 $html | Out-File (Join-Path $script:Raiz 'RESUMO.html') -Encoding UTF8
@@ -2326,7 +2334,7 @@ $html | Out-File (Join-Path $script:Raiz 'RESUMO.html') -Encoding UTF8
 $zip = "$script:Raiz.zip"
 if (-not $SemZip) {
     try {
-        Write-Log 'Compactando evidencias...'
+        Write-Log 'Compactando evidências...'
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         if (Test-Path $zip) { Remove-Item $zip -Force }
         [System.IO.Compression.ZipFile]::CreateFromDirectory($script:Raiz, $zip, [System.IO.Compression.CompressionLevel]::Optimal, $true)
@@ -2335,16 +2343,17 @@ if (-not $SemZip) {
 
 Write-Host ''
 Write-Host '=====================================================' -ForegroundColor Cyan
-Write-Host "  CONCLUIDO em $([int]$duracao.TotalMinutes) min $($duracao.Seconds) s" -ForegroundColor Cyan
-Write-Host ("  Criticos: {0}  Altos: {1}  Medios: {2}  Baixos: {3}  Lacunas: {4}" -f $contagem.CRITICO, $contagem.ALTO, $contagem.MEDIO, $contagem.BAIXO, $lacunas.Count) -ForegroundColor Cyan
+Write-Host "  CONCLUÍDO em $([int]$duracao.TotalMinutes) min $($duracao.Seconds) s" -ForegroundColor Cyan
+Write-Host ("  Críticos: {0}  Altos: {1}  Médios: {2}  Baixos: {3}  Lacunas: {4}" -f $contagem.CRITICO, $contagem.ALTO, $contagem.MEDIO, $contagem.BAIXO, $lacunas.Count) -ForegroundColor Cyan
 Write-Host "  Pasta : $script:Raiz" -ForegroundColor Cyan
+Write-Host "  Abrir : $(Join-Path $script:Raiz 'RESUMO.html')" -ForegroundColor Cyan
 if ($zip -and -not $SemZip) { Write-Host "  Zip   : $zip" -ForegroundColor Cyan }
 Write-Host '=====================================================' -ForegroundColor Cyan
 foreach ($a in $achados | Where-Object Ordem -le 1) {
     $cor = if ($a.Severidade -eq 'CRITICO') { 'Red' } else { 'Yellow' }
-    Write-Host "  [$($a.Severidade)] $($a.Titulo)" -ForegroundColor $cor
+    Write-Host "  [$($script:Rotulo[$a.Severidade])] $($a.Titulo)" -ForegroundColor $cor
 }
 Write-Host ''
-if (-not $NaoAbrir) { try { Start-Process (Join-Path $script:Raiz 'RESUMO.html') } catch { } }
+if ($Abrir) { try { Start-Process (Join-Path $script:Raiz 'RESUMO.html') } catch { } }
 # Copia temporaria criada pelo .bat: remove ao terminar
 if ($ApagarScriptAoFinal -and $PSCommandPath) { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue }
