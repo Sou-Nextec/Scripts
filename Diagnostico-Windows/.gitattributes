@@ -1,0 +1,4 @@
+# Preserva exatamente o BOM UTF-8 e as quebras de linha CRLF: sem BOM os acentos quebram o parse
+# no Windows PowerShell 5.1, e .bat com LF solto se comporta mal. Nao deixar o Git converter.
+*.ps1 -text
+*.bat -text
