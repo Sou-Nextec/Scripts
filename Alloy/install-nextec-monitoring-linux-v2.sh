@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.1.0
+# Versão: 2.2.0
+#
+# USO
+# ---
+#   sudo bash install-nextec-monitoring-linux-v2.sh                   instalação completa
+#   sudo bash install-nextec-monitoring-linux-v2.sh --somente-coleta  só a Coleta
+#     Complementar, para servidor cujo Alloy roda fora deste instalador
+#     (ex.: o servidor da central, coletado pelo Alloy da stack)
 #
 # OBJETIVO
 # -------
@@ -39,7 +46,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.1.0"
+INSTALLER_VERSION="2.2.0"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -267,7 +274,7 @@ detect_os() {
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
     source /etc/os-release
-    INSTALLER_VERSION="2.1.0"
+    INSTALLER_VERSION="2.2.0"
     DISTRO_ID="${ID:-unknown}"
     DISTRO_LIKE="${ID_LIKE:-}"
     PRETTY_OS="${PRETTY_NAME:-$DISTRO_ID}"
@@ -1962,6 +1969,46 @@ final_summary() {
   warn "Valide no NOC a chegada de cliente=\"${CLIENTE}\" e host=\"${HOST_LABEL}\"."
 }
 
+main_somente_coleta() {
+  # Para servidores cujo Alloy não foi instalado por este instalador
+  # (ex.: o servidor da central, coletado pelo Alloy da stack). Instala só a
+  # Coleta Complementar; o Alloy existente precisa ler os arquivos dela.
+  banner
+  need_root
+  need_systemd
+  detect_os
+  detect_docker
+
+  step "Somente Coleta Complementar"
+  info "Este modo não instala nem altera o Alloy deste servidor."
+  ENABLE_INTERNET=0
+  ENABLE_LINKS=0
+  ENABLE_VELOCIDADE=0
+  ENABLE_DOCKER=0
+  LINKS=()
+
+  ask_yes_no "Medir a internet (status, DNS e IP público)?" s && ENABLE_INTERNET=1
+  ask_yes_no "Cadastrar links de internet (local com mais de um link)?" n && { ENABLE_LINKS=1; ENABLE_INTERNET=1; }
+  ask_yes_no "Teste de velocidade a cada 30 minutos?" s && ENABLE_VELOCIDADE=1
+  if [[ "$DOCKER_DETECTED" == "1" ]]; then
+    ask_yes_no "Coletar Docker (estado, consumo, health e eventos)?" s && ENABLE_DOCKER=1
+  fi
+
+  if ! coleta_enabled; then
+    warn "Nenhum módulo escolhido. Nada a fazer."
+    exit 0
+  fi
+  [[ "$ENABLE_LINKS" == "1" ]] && collect_links_inputs
+
+  install_coleta_complementar
+
+  step "Próximo passo: o Alloy deste servidor precisa ler a Coleta Complementar"
+  echo "  Métricas: ${COLETA_TEXTFILE}/*.prom  (prometheus.exporter.unix com o coletor textfile)"
+  echo "  Eventos:  ${COLETA_EVENTOS}  (loki.source.file + loki.process)"
+  echo "  Modelo pronto: Alloy/coleta-complementar/alloy-central.alloy.example no repositório Scripts."
+  echo "  Alloy em container: use os caminhos como o container os enxerga (ex.: /rootfs${COLETA_TEXTFILE})."
+}
+
 main() {
   banner
   need_root
@@ -1993,4 +2040,8 @@ main() {
   final_summary
 }
 
-main "$@"
+if [[ "${1:-}" == "--somente-coleta" ]]; then
+  main_somente_coleta
+else
+  main "$@"
+fi

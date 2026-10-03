@@ -119,6 +119,16 @@ Um JSON por linha. `tipo`, `categoria` e `link` viram rótulos no Loki; o restan
 
 Execuções do health check não viram evento de acesso. Parada pedida (`stop`, `restart`, atualização) vira `parado`, não `caiu`.
 
+## Servidor cujo Alloy não veio do instalador
+
+Caso do servidor da central (`nxt-srv-app01`), coletado pelo Alloy da stack em container.
+
+```bash
+sudo bash install-nextec-monitoring-linux-v2.sh --somente-coleta
+```
+
+Instala só a Coleta Complementar (serviço `coleta-complementar`), sem tocar no Alloy. Depois, inclua no arquivo do cliente no Alloy central o bloco de `alloy-central.alloy.example`, com os caminhos como o container os enxerga (`/rootfs/var/lib/coleta-complementar/textfile` e `/var/log/coleta-complementar/eventos.jsonl`).
+
 ## Testar uma branch
 
 ```bash

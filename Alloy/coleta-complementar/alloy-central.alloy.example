@@ -1,0 +1,171 @@
+// =============================================================================
+// Coleta Complementar Nextec lida por um Alloy que NÃO foi instalado pelo
+// instalador Nextec (ex.: o Alloy da stack central, em container).
+//
+// Uso:
+//   1. No servidor: sudo bash install-nextec-monitoring-linux-v2.sh --somente-coleta
+//   2. Copie este bloco para o arquivo do cliente no Alloy central
+//      (ex.: /opt/monitoramento/aplicacoes/alloy/config/<cliente>.alloy) e troque
+//      <cliente>, <host>, <host_sem_hifen>, <ambiente> e <local>.
+//   3. Ajuste os caminhos ao que o container enxerga. A stack monta o / do host
+//      em /rootfs e o /var/log do host em /var/log.
+//   4. docker exec alloy_nextec alloy validate /etc/alloy e reinicie o Alloy.
+//   5. Se o cAdvisor ainda estiver configurado para o mesmo host, remova o bloco:
+//      ele não enxerga containers no Docker com armazenamento do containerd.
+//
+// Usa prometheus.remote_write "central" e loki.write "central" do 00-base.alloy.
+// =============================================================================
+
+// -------------------------------------------------------------
+// COLETA COMPLEMENTAR NEXTEC (internet, velocidade e Docker)
+// O programa roda no host como serviço (coleta-complementar) e grava:
+//   métricas: /var/lib/coleta-complementar/textfile/*.prom
+//             (aqui em /rootfs, porque o / do host está montado nesse caminho)
+//   eventos:  /var/log/coleta-complementar/eventos.jsonl
+// Substitui o cAdvisor embutido, que não enxerga os containers no
+// Docker com armazenamento de imagens do containerd.
+// honor_labels mantém os rótulos próprios das métricas (ex.: name, stack).
+// -------------------------------------------------------------
+prometheus.exporter.unix "coleta_<host_sem_hifen>" {
+  set_collectors = ["textfile"]
+
+  textfile {
+    directory = "/rootfs/var/lib/coleta-complementar/textfile"
+  }
+}
+
+discovery.relabel "coleta_<host_sem_hifen>" {
+  targets = prometheus.exporter.unix.coleta_<host_sem_hifen>.targets
+
+  rule {
+    target_label = "instance"
+    replacement  = "<host>"
+  }
+  rule {
+    target_label = "cliente"
+    replacement  = "<cliente>"
+  }
+  rule {
+    target_label = "host"
+    replacement  = "<host>"
+  }
+  rule {
+    target_label = "servico"
+    replacement  = "coleta_complementar"
+  }
+  rule {
+    target_label = "tipo"
+    replacement  = "servidor"
+  }
+  rule {
+    target_label = "ambiente"
+    replacement  = "<ambiente>"
+  }
+  rule {
+    target_label = "local"
+    replacement  = "<local>"
+  }
+  rule {
+    target_label = "os"
+    replacement  = "linux"
+  }
+  rule {
+    target_label = "origem"
+    replacement  = "alloy"
+  }
+}
+
+prometheus.scrape "coleta_<host_sem_hifen>" {
+  targets         = discovery.relabel.coleta_<host_sem_hifen>.output
+  forward_to      = [prometheus.remote_write.central.receiver]
+  job_name        = "integrations/coleta_complementar"
+  honor_labels    = true
+  scrape_interval = "15s"
+  scrape_timeout  = "10s"
+}
+
+loki.source.file "coleta_<host_sem_hifen>" {
+  targets = [{
+    "__path__" = "/var/log/coleta-complementar/eventos.jsonl",
+    cliente    = "<cliente>",
+    host       = "<host>",
+    servico    = "coleta_complementar",
+    ambiente   = "<ambiente>",
+    local      = "<local>",
+    os         = "linux",
+    origem     = "alloy",
+  }]
+  forward_to    = [loki.process.coleta_<host_sem_hifen>.receiver]
+  tail_from_end = true
+}
+
+loki.process "coleta_<host_sem_hifen>" {
+  forward_to = [loki.write.central.receiver]
+
+  stage.json {
+    expressions = {
+      tipo      = "",
+      categoria = "",
+      link      = "",
+      ts        = "",
+    }
+  }
+
+  stage.labels {
+    values = {
+      tipo      = "",
+      categoria = "",
+      link      = "",
+    }
+  }
+
+  stage.timestamp {
+    source = "ts"
+    format = "RFC3339"
+  }
+}
+
+// -------------------------------------------------------------
+// LOGS DOS CONTAINERS
+// Rótulos container e stack (projeto do compose; avulso quando não há).
+// -------------------------------------------------------------
+discovery.docker "containers_<host_sem_hifen>" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "containers_<host_sem_hifen>_logs" {
+  targets = discovery.docker.containers_<host_sem_hifen>.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    regex         = "^$"
+    target_label  = "stack"
+    replacement   = "avulso"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    regex         = "(.+)"
+    target_label  = "stack"
+  }
+}
+
+loki.source.docker "containers_<host_sem_hifen>" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers_<host_sem_hifen>_logs.output
+  forward_to = [loki.write.central.receiver]
+  labels = {
+    cliente  = "<cliente>",
+    host     = "<host>",
+    servico  = "docker",
+    tipo     = "container",
+    ambiente = "<ambiente>",
+    local    = "<local>",
+    os       = "linux",
+    origem   = "alloy",
+  }
+}
