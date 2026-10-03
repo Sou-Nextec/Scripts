@@ -36,6 +36,10 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.13.0 Todas as respostas digitadas são validadas e a pergunta é repetida
+           quando o valor é inválido, em vez de encerrar: cliente (hífen e
+           acento convertidos para o padrão de labels), host, local, IPs,
+           host:porta, URLs, listas de destinos e interface WAN dos links.
     2.12.0 Coleta Complementar Nextec: monitoramento de internet (status,
            DNS, IP público, diagnóstico) e de cada link do local (failover,
            gateway da operadora, causa das quedas). Arquivo único baixado do
@@ -218,7 +222,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.12.0"
+$InstallerVersion = "2.13.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -844,6 +848,170 @@ function ConvertTo-ClienteSlug {
     $slug = (ConvertTo-Slug $Value) -replace "-", "_"
     $slug = $slug -replace "_+", "_"
     return $slug.Trim("_")
+}
+
+# -----------------------------------------------------------------------------
+# VALIDAÇÃO DE ENTRADAS
+# Toda resposta digitada passa por aqui: valor inválido gera aviso e a pergunta
+# é repetida. O instalador nunca encerra por erro de digitação.
+# -----------------------------------------------------------------------------
+function Test-NextecIPv4 {
+    param([string]$Value)
+    if ($Value -notmatch '^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$') { return $false }
+    foreach ($i in 1..4) {
+        if ([int]$Matches[$i] -gt 255) { return $false }
+    }
+    return $true
+}
+
+function Test-NextecHost {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    if (Test-NextecIPv4 $Value) { return $true }
+    # Só números e pontos precisa ser um IP válido ("1.2.3" não é host).
+    if ($Value -notmatch '[A-Za-z]') { return $false }
+    return ($Value.Length -le 253 -and $Value -match '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$')
+}
+
+function Test-NextecPort {
+    param([string]$Value)
+    $port = 0
+    return ($Value -match '^\d{1,5}$' -and [int]::TryParse($Value, [ref]$port) -and $port -ge 1 -and $port -le 65535)
+}
+
+function Test-NextecHostPort {
+    param([string]$Value)
+    $i = $Value.LastIndexOf(":")
+    if ($i -lt 1) { return $false }
+    return ((Test-NextecHost $Value.Substring(0, $i)) -and (Test-NextecPort $Value.Substring($i + 1)))
+}
+
+function Test-NextecDestino {
+    # Destino de sonda: URL http(s), host/IP ou host:porta.
+    param([string]$Value)
+    if ($Value -match '^https?://([^/:?#]+)(:(\d+))?([/?#].*)?$') {
+        $urlHost = $Matches[1]
+        $urlPorta = $Matches[3]
+        if (-not (Test-NextecHost $urlHost)) { return $false }
+        return ([string]::IsNullOrEmpty($urlPorta) -or (Test-NextecPort $urlPorta))
+    }
+    return ((Test-NextecHost $Value) -or (Test-NextecHostPort $Value))
+}
+
+function Test-NextecAddress {
+    param([string]$Value, [string]$Kind)
+    switch ($Kind) {
+        "ip"       { return (Test-NextecIPv4 $Value) }
+        "host"     { return (Test-NextecHost $Value) }
+        "hostport" { return (Test-NextecHostPort $Value) }
+        "destino"  { return (Test-NextecDestino $Value) }
+    }
+    return $false
+}
+
+function Get-NextecAddressExample {
+    param([string]$Kind)
+    switch ($Kind) {
+        "ip"       { return "ex.: 192.168.0.1" }
+        "host"     { return "ex.: 192.168.0.1 ou fw.cliente.com.br" }
+        "hostport" { return "ex.: 127.0.0.1:9182" }
+        "destino"  { return "ex.: 192.168.0.1, cliente.com.br, https://cliente.com.br ou 10.0.0.5:3389" }
+    }
+    return ""
+}
+
+function Read-NextecAddress {
+    # Kind: ip, host, hostport ou destino. -List aceita vários separados por vírgula.
+    param(
+        [Parameter(Mandatory=$true)][string]$Prompt,
+        [string]$Default = "",
+        [Parameter(Mandatory=$true)][ValidateSet("ip","host","hostport","destino")][string]$Kind,
+        [switch]$Optional,
+        [switch]$List
+    )
+
+    while ($true) {
+        if ($Optional) {
+            $value = Read-Host ("{0} (ENTER para pular)" -f $Prompt)
+            if ([string]::IsNullOrWhiteSpace($value)) { Write-Host ""; return "" }
+            $value = $value.Trim()
+        }
+        else {
+            $value = Read-Required -Prompt $Prompt -Default $Default
+        }
+
+        if ($List) {
+            $itens = @($value -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+            $invalidos = @($itens | Where-Object { -not (Test-NextecAddress -Value $_ -Kind $Kind) })
+            if ($itens.Count -gt 0 -and $invalidos.Count -eq 0) {
+                return ($itens -join ", ")
+            }
+            Write-Warn ("Endereço inválido: {0}. Use {1}, separados por vírgula." -f ($(if ($invalidos.Count) { $invalidos -join ", " } else { "vazio" })), (Get-NextecAddressExample $Kind))
+        }
+        else {
+            if (Test-NextecAddress -Value $value -Kind $Kind) {
+                return $value
+            }
+            Write-Warn ("Endereço inválido: {0}. Use {1}." -f $value, (Get-NextecAddressExample $Kind))
+        }
+    }
+}
+
+function Read-NextecSlug {
+    # Kind cliente/label: minúsculas, números e _ (hífen e espaço viram _).
+    # Kind host: igual, mas mantém hífen (hostnames reais usam hífen).
+    # -AllowKeep: ENTER devolve "" para o chamador manter o valor atual.
+    param(
+        [Parameter(Mandatory=$true)][string]$Prompt,
+        [string]$Default = "",
+        [ValidateSet("cliente","label","host")][string]$Kind = "label",
+        [switch]$AllowKeep
+    )
+
+    while ($true) {
+        if ($AllowKeep) {
+            $raw = Read-Host ("{0} (ENTER mantém)" -f $Prompt)
+            if ([string]::IsNullOrWhiteSpace($raw)) { Write-Host ""; return "" }
+            $raw = $raw.Trim()
+        }
+        else {
+            $raw = Read-Required -Prompt $Prompt -Default $Default
+        }
+
+        $slug = if ($Kind -eq "host") { ConvertTo-Slug $raw } else { ConvertTo-ClienteSlug $raw }
+
+        if (-not [string]::IsNullOrWhiteSpace($slug) -and $slug -match '^[a-z0-9][a-z0-9_-]*$') {
+            if ($slug -cne $raw) {
+                Write-Info ("Será registrado como: {0}" -f $slug)
+            }
+            return $slug
+        }
+
+        Write-Warn ("Valor inválido: {0}. Use letras e números (acentos, espaços e símbolos são convertidos)." -f $raw)
+    }
+}
+
+function Read-NextecPattern {
+    param(
+        [Parameter(Mandatory=$true)][string]$Prompt,
+        [string]$Default = "",
+        [Parameter(Mandatory=$true)][string]$Pattern,
+        [Parameter(Mandatory=$true)][string]$Hint,
+        [switch]$Optional
+    )
+
+    while ($true) {
+        if ($Optional) {
+            $value = Read-Host ("{0} (ENTER para pular)" -f $Prompt)
+            if ([string]::IsNullOrWhiteSpace($value)) { Write-Host ""; return "" }
+            $value = $value.Trim()
+        }
+        else {
+            $value = Read-Required -Prompt $Prompt -Default $Default
+        }
+        if ($value -match $Pattern) { return $value }
+        Write-Warn ("Valor inválido: {0}. Use {1}." -f $value, $Hint)
+    }
 }
 
 function ConvertTo-AlloyEscapedString {
@@ -1703,27 +1871,14 @@ function Edit-IdentificationSettings {
     Write-Step "Identificação"
 
     Write-Info ("Cliente atual: {0}" -f $script:Cliente)
-    $cliente = Read-Host "Novo cliente (ENTER mantém)"
-    if (-not [string]::IsNullOrWhiteSpace($cliente)) {
-        $slug = ConvertTo-ClienteSlug $cliente
-        if ($slug -notmatch "^[a-z0-9][a-z0-9_]*$") {
-            throw ("Cliente inválido após normalização: {0}" -f $slug)
-        }
-        $script:Cliente = $slug
-    }
+    $slug = Read-NextecSlug -Prompt "Novo cliente" -Kind cliente -AllowKeep
+    if ($slug) { $script:Cliente = $slug }
 
     Write-Info ("Local atual: {0}" -f $script:Local)
-    $local = Read-Host "Novo local (ENTER mantém)"
-    if (-not [string]::IsNullOrWhiteSpace($local)) {
-        # Mesma validação da primeira instalação. Sem ela, uma entrada como
-        # "###" vira string vazia na normalização e o host chega ao NOC sem a
-        # label obrigatória, sem nada acusar.
-        $slugLocal = ConvertTo-Slug $local
-        if ([string]::IsNullOrWhiteSpace($slugLocal)) {
-            throw ("Local inválido após normalização: {0}" -f $local)
-        }
-        $script:Local = $slugLocal
-    }
+    # Read-NextecSlug repete a pergunta quando a entrada vira vazio na
+    # normalização (ex.: "###"), para o host nunca chegar ao NOC sem local.
+    $slugLocal = Read-NextecSlug -Prompt "Novo local" -Kind label -AllowKeep
+    if ($slugLocal) { $script:Local = $slugLocal }
 
     $ambientes = @("producao","homologacao","desenvolvimento","backup","teste")
     $indiceAmbiente = [Array]::IndexOf($ambientes, $script:Ambiente)
@@ -1736,14 +1891,8 @@ function Edit-IdentificationSettings {
     $script:Criticidade = $criticidades[(Read-Choice -Prompt "Criticidade" -Options $criticidades -Default ($indiceCriticidade + 1)) - 1]
 
     Write-Info ("Host atual: {0}" -f $script:HostLabel)
-    $hostLabel = Read-Host "Novo nome do host (ENTER mantém)"
-    if (-not [string]::IsNullOrWhiteSpace($hostLabel)) {
-        $slugHost = ConvertTo-Slug $hostLabel
-        if ([string]::IsNullOrWhiteSpace($slugHost)) {
-            throw ("Nome de host inválido após normalização: {0}" -f $hostLabel)
-        }
-        $script:HostLabel = $slugHost
-    }
+    $slugHost = Read-NextecSlug -Prompt "Novo nome do host" -Kind host -AllowKeep
+    if ($slugHost) { $script:HostLabel = $slugHost }
 }
 
 function Edit-LogSettings {
@@ -3207,8 +3356,8 @@ function Read-BlackboxTargets {
     $suffixByOption = @{ 1 = "ping"; 2 = "http"; 3 = "https"; 4 = "tcp"; 5 = "dns"; 6 = "content" }
 
     do {
-        $name = ConvertTo-Slug (Read-Required "Nome do alvo (ex.: fw_matriz)")
-        $address = Read-Required "IP, FQDN ou URL"
+        $name = Read-NextecSlug -Prompt "Nome do alvo (ex.: fw_matriz)" -Kind host
+        $address = Read-NextecAddress -Prompt "IP, FQDN ou URL" -Kind destino
 
         Write-Host "Tipo de teste (pode escolher mais de um, separados por vírgula, ex.: 1,2)" -ForegroundColor White
         for ($i = 0; $i -lt $probeOptions.Count; $i++) {
@@ -3810,7 +3959,7 @@ function Read-SnmpTargets {
         $name = ""
 
         while ([string]::IsNullOrWhiteSpace($name)) {
-            $name = ConvertTo-Slug (Read-Required "Nome do equipamento")
+            $name = Read-NextecSlug -Prompt "Nome do equipamento" -Kind host
 
             if ([string]::IsNullOrWhiteSpace($name)) {
                 Write-Warn "Nome inválido após normalização. Use letras, números, hífen ou sublinhado."
@@ -3823,7 +3972,7 @@ function Read-SnmpTargets {
             }
         }
 
-        $address = Read-Required "IP/FQDN SNMP"
+        $address = Read-NextecAddress -Prompt "IP/FQDN SNMP" -Kind host
 
         $authDefinition = Read-SnmpAuthDefinition -EquipmentName $name
         $auth = $authDefinition.Name
@@ -3841,7 +3990,7 @@ function Read-SnmpTargets {
         $typeChoice = Read-Choice -Prompt "Tipo do equipamento" -Options $typeOptions -Default 1
         $assetType = $typeOptions[$typeChoice - 1]
 
-        $system = ConvertTo-Slug (Read-Required -Prompt "Sistema/fabricante" -Default "network")
+        $system = Read-NextecSlug -Prompt "Sistema/fabricante" -Default "network" -Kind label
 
         $script:SnmpTargets += [pscustomobject]@{
             Name = $name
@@ -3902,8 +4051,8 @@ function Read-CustomExporters {
         }
 
         Write-Info $definition.Label
-        $target = Read-Required -Prompt "Target host:porta" -Default $definition.DefaultTarget
-        $service = ConvertTo-Slug (Read-Required -Prompt "Label servico" -Default $definition.DefaultService)
+        $target = Read-NextecAddress -Prompt "Target host:porta" -Default $definition.DefaultTarget -Kind hostport
+        $service = Read-NextecSlug -Prompt "Label servico" -Default $definition.DefaultService -Kind label
 
         $script:CustomExporters += [pscustomobject]@{
             Name = $definition.Key
@@ -3914,9 +4063,9 @@ function Read-CustomExporters {
 
     if ($selectedKeys -contains "custom") {
         do {
-            $name = ConvertTo-Slug (Read-Required "Nome do exporter")
-            $target = Read-Required -Prompt "Target host:porta" -Default ""
-            $service = ConvertTo-Slug (Read-Required -Prompt "Label servico" -Default $name)
+            $name = Read-NextecSlug -Prompt "Nome do exporter" -Kind label
+            $target = Read-NextecAddress -Prompt "Target host:porta" -Kind hostport
+            $service = Read-NextecSlug -Prompt "Label servico" -Default $name -Kind label
 
             $script:CustomExporters += [pscustomobject]@{
                 Name = $name
@@ -3951,8 +4100,7 @@ function Get-NextecConfiguration {
             throw "No modo silencioso, informe -Cliente."
         }
 
-        $rawCliente = Read-Required "Cliente (ex.: cliente_exemplo)"
-        $script:Cliente = ConvertTo-ClienteSlug $rawCliente
+        $script:Cliente = Read-NextecSlug -Prompt "Cliente, identificador da empresa e não do servidor (ex.: advocacia_martins)" -Kind cliente
     }
     else {
         $script:Cliente = ConvertTo-ClienteSlug $Cliente
@@ -3971,7 +4119,7 @@ function Get-NextecConfiguration {
         $script:HostLabel = ConvertTo-Slug $Inventory.Hostname
     } else {
         $detectedHost = ConvertTo-Slug $Inventory.Hostname
-        $script:HostLabel = ConvertTo-Slug (Read-Required -Prompt "Hostname para monitoramento" -Default $detectedHost)
+        $script:HostLabel = Read-NextecSlug -Prompt "Hostname para monitoramento" -Default $detectedHost -Kind host
     }
 
     $script:Ambiente = $Ambiente
@@ -3992,7 +4140,7 @@ function Get-NextecConfiguration {
         $ambienteChoice = Read-Choice -Prompt "Ambiente" -Options $ambienteOptions -Default 1
         $script:Ambiente = $ambienteOptions[$ambienteChoice - 1]
 
-        $script:Local = ConvertTo-Slug (Read-Required -Prompt "Local" -Default $Local)
+        $script:Local = Read-NextecSlug -Prompt "Local" -Default $Local -Kind label
 
         $criticidadeOptions = @("critico","alto","medio","baixo")
         $defaultCrit = [Array]::IndexOf($criticidadeOptions, $Criticidade) + 1
@@ -5247,16 +5395,20 @@ function Read-ColetaLinkDefinition {
     $operadora = ConvertTo-ColetaIniValue (Read-Required -Prompt "Operadora" -Default $nome)
     $tipo = ConvertTo-ColetaIniValue (Read-Required -Prompt "Tipo (fibra, radio, 4g, satelite, dedicado)" -Default "fibra")
     $suporte = ConvertTo-ColetaIniValue (Read-Host "Telefone/protocolo de suporte da operadora (ENTER para pular)")
-    $ipPublico = ConvertTo-ColetaIniValue (Read-Host "IP público fixo do link (ENTER se for dinâmico)")
-    $gateway = ConvertTo-ColetaIniValue (Read-Host "Gateway da operadora para testar (ENTER para pular)")
-    $alvos = ConvertTo-ColetaIniValue (Read-Required -Prompt "Destinos que saem por este link, separados por vírgula" -Default "8.8.8.8")
-    $origem = ConvertTo-ColetaIniValue (Read-Host "IP de origem neste servidor para este link (ENTER para pular)")
-    $firewall = ConvertTo-ColetaIniValue (Read-Host "Nome do firewall no NOC, para tráfego por SNMP (ENTER para pular)")
+    $ipPublico = Read-NextecAddress -Prompt "IP público fixo do link (dinâmico: deixe vazio)" -Kind ip -Optional
+    $gateway = Read-NextecAddress -Prompt "Gateway da operadora para testar" -Kind host -Optional
+    $alvos = Read-NextecAddress -Prompt "Destinos que saem por este link, separados por vírgula" -Default "8.8.8.8" -Kind host -List
+    while ($true) {
+        $origem = Read-NextecAddress -Prompt "IP de origem neste servidor para este link" -Kind ip -Optional
+        if (-not $origem -or (Get-NetIPAddress -IPAddress $origem -ErrorAction SilentlyContinue)) { break }
+        Write-Warn ("O IP {0} não existe neste servidor. Informe um IP local ou deixe vazio." -f $origem)
+    }
+    $firewall = ""
+    $firewallRaw = Read-Host "Nome do firewall no NOC, para tráfego por SNMP (ENTER para pular)"
+    if (-not [string]::IsNullOrWhiteSpace($firewallRaw)) { $firewall = ConvertTo-Slug $firewallRaw }
     $interface = ""
-    if ($firewall) { $interface = ConvertTo-ColetaIniValue (Read-Host "Interface WAN do link no firewall (ex.: igb1)") }
-
-    if ($origem -and -not (Get-NetIPAddress -IPAddress $origem -ErrorAction SilentlyContinue)) {
-        Write-Warn ("O IP de origem {0} não existe neste servidor; a medição deste link vai falhar até corrigir." -f $origem)
+    if ($firewall) {
+        $interface = Read-NextecPattern -Prompt "Interface WAN do link no firewall (ex.: igb1)" -Pattern '^[A-Za-z0-9._:/-]+$' -Hint "o nome como aparece no firewall, ex.: igb1, ether1, wan1"
     }
 
     return [pscustomobject]@{

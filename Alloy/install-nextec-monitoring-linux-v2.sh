@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.2.0
+# Versão: 2.3.0 (respostas validadas: valor inválido repete a pergunta)
 #
 # USO
 # ---
@@ -46,7 +46,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.2.0"
+INSTALLER_VERSION="2.3.0"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -83,7 +83,9 @@ BLUE='\033[0;34m'; CYAN='\033[0;36m'; WHITE='\033[0;37m'; BOLD='\033[1m'; DIM='\
 
 ok()   { echo -e "${GREEN}✔${NC}  $*"; }
 info() { echo -e "${CYAN}ℹ${NC}  $*"; }
-warn() { echo -e "${YELLOW}⚠${NC}  $*"; }
+# warn e err vão para stderr: assim não contaminam o valor de perguntas
+# chamadas dentro de $(...).
+warn() { echo -e "${YELLOW}⚠${NC}  $*" >&2; }
 err()  { echo -e "${RED}✖${NC} $*" >&2; }
 step() { echo -e "\n${BLUE}${BOLD}==>${NC} ${BOLD}$*${NC}"; }
 
@@ -151,25 +153,185 @@ print(re.sub(r"_+","_",v).strip("_"),end="")' "$input"
   fi
 }
 
+entrada_encerrada() {
+  # Sem terminal (entrada fechada), repetir a pergunta viraria laço infinito.
+  echo >&2
+  err "Entrada encerrada antes de responder. Rode o instalador em um terminal interativo."
+  exit 1
+}
+
 ask_required() {
   local prompt="$1" default="${2:-}" value
   while true; do
     if [[ -n "$default" ]]; then
-      read -r -p "$(echo -e "${CYAN}?${NC} ${prompt} [${default}]: ")" value
+      read -r -p "$(echo -e "${CYAN}?${NC} ${prompt} [${default}]: ")" value || entrada_encerrada
       value="${value:-$default}"
     else
-      read -r -p "$(echo -e "${CYAN}?${NC} ${prompt}: ")" value
+      read -r -p "$(echo -e "${CYAN}?${NC} ${prompt}: ")" value || entrada_encerrada
     fi
+    value="$(trim "$value")"
     [[ -n "$value" ]] && { printf '%s' "$value"; return; }
     warn "Campo obrigatório."
+  done
+}
+
+trim() {
+  local v="$1"
+  v="${v#"${v%%[![:space:]]*}"}"
+  v="${v%"${v##*[![:space:]]}"}"
+  printf '%s' "$v"
+}
+
+# ------------------------------------------------------------------------------
+# VALIDAÇÃO DE ENTRADAS
+# Toda resposta digitada passa por aqui: valor inválido gera aviso e a pergunta
+# é repetida. O instalador nunca encerra por erro de digitação.
+# ------------------------------------------------------------------------------
+RE_HOSTNAME='^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$'
+RE_IPV4='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'
+RE_URL='^https?://([^/:?#]+)(:([0-9]+))?([/?#].*)?$'
+RE_INTERFACE='^[A-Za-z0-9._:/-]+$'
+
+is_ipv4() {
+  [[ "$1" =~ $RE_IPV4 ]] || return 1
+  local octeto octetos=("${BASH_REMATCH[@]:1:4}")
+  for octeto in "${octetos[@]}"; do
+    (( 10#$octeto <= 255 )) || return 1
+  done
+}
+
+is_host() {
+  is_ipv4 "$1" && return 0
+  [[ "$1" =~ [A-Za-z] ]] || return 1   # só números e pontos tem que ser IP válido
+  [[ ${#1} -le 253 && "$1" =~ $RE_HOSTNAME ]]
+}
+
+is_port() {
+  [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+is_hostport() {
+  [[ "$1" == *:* ]] || return 1
+  is_host "${1%:*}" && is_port "${1##*:}"
+}
+
+is_destino() {
+  # Destino de sonda: URL http(s), host/IP ou host:porta.
+  if [[ "$1" =~ $RE_URL ]]; then
+    # Guarda as capturas antes: is_host usa =~ e sobrescreve BASH_REMATCH.
+    local url_host="${BASH_REMATCH[1]}" url_porta="${BASH_REMATCH[3]}"
+    is_host "$url_host" || return 1
+    [[ -z "$url_porta" ]] || is_port "$url_porta"
+    return
+  fi
+  is_host "$1" || is_hostport "$1"
+}
+
+address_example() {
+  case "$1" in
+    ip)       echo "ex.: 192.168.0.1";;
+    host)     echo "ex.: 192.168.0.1 ou fw.cliente.com.br";;
+    hostport) echo "ex.: 127.0.0.1:9121";;
+    destino)  echo "ex.: 192.168.0.1, cliente.com.br, https://cliente.com.br ou 10.0.0.5:3389";;
+  esac
+}
+
+address_valid() {
+  case "$1" in
+    ip)       is_ipv4 "$2";;
+    host)     is_host "$2";;
+    hostport) is_hostport "$2";;
+    destino)  is_destino "$2";;
+    *)        return 1;;
+  esac
+}
+
+# ask_address "Pergunta" "padrão" tipo [opcional 0/1] [lista 0/1]
+# tipo: ip, host, hostport ou destino. Lista aceita vários separados por vírgula.
+ask_address() {
+  local prompt="$1" default="${2:-}" kind="$3" optional="${4:-0}" list="${5:-0}"
+  local value item ok_all itens=() invalidos=()
+  while true; do
+    if [[ "$optional" == "1" ]]; then
+      read -r -p "$(echo -e "${CYAN}?${NC} ${prompt} (ENTER para pular): ")" value
+      value="$(trim "$value")"
+      [[ -z "$value" ]] && { printf ''; return 0; }
+    else
+      value="$(ask_required "$prompt" "$default")"
+    fi
+
+    if [[ "$list" == "1" ]]; then
+      itens=()
+      invalidos=()
+      IFS=',' read -r -a partes <<<"$value"
+      for item in "${partes[@]}"; do
+        item="$(trim "$item")"
+        [[ -z "$item" ]] && continue
+        if address_valid "$kind" "$item"; then itens+=("$item"); else invalidos+=("$item"); fi
+      done
+      if (( ${#invalidos[@]} == 0 && ${#itens[@]} > 0 )); then
+        local IFS=','
+        printf '%s' "${itens[*]}" | sed 's/,/, /g'
+        return 0
+      fi
+      warn "Endereço inválido: ${invalidos[*]:-vazio}. Use $(address_example "$kind"), separados por vírgula."
+    else
+      if address_valid "$kind" "$value"; then
+        printf '%s' "$value"
+        return 0
+      fi
+      warn "Endereço inválido: ${value}. Use $(address_example "$kind")."
+    fi
+  done
+}
+
+# ask_slug "Pergunta" "padrão" tipo
+# tipo cliente/label: minúsculas, números e _ (hífen e espaço viram _).
+# tipo host: igual, mas mantém hífen (hostnames reais usam hífen).
+ask_slug() {
+  local prompt="$1" default="${2:-}" kind="${3:-label}" raw slug
+  while true; do
+    raw="$(ask_required "$prompt" "$default")"
+    slug="$(normalize_slug "$raw")"
+    if [[ "$kind" != "host" ]]; then
+      slug="$(printf '%s' "$slug" | tr '-' '_' | sed -E 's/_+/_/g; s/^_+|_+$//g')"
+    fi
+    if [[ -n "$slug" && "$slug" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+      [[ "$slug" != "$raw" ]] && info "Será registrado como: ${slug}" >&2
+      printf '%s' "$slug"
+      return 0
+    fi
+    warn "Valor inválido: ${raw}. Use letras e números (acentos, espaços e símbolos são convertidos)." >&2
+  done
+}
+
+# nome_existe "nome" "${LISTA[@]}": verdadeiro se algum item "nome|..." já usa o nome.
+nome_existe() {
+  local nome="$1" item
+  shift
+  for item in "$@"; do
+    [[ "${item%%|*}" == "$nome" ]] && return 0
+  done
+  return 1
+}
+
+# ask_pattern "Pergunta" "padrão" 'regex' "dica"
+ask_pattern() {
+  local prompt="$1" default="${2:-}" regex="$3" dica="$4" value
+  while true; do
+    value="$(ask_required "$prompt" "$default")"
+    [[ "$value" =~ $regex ]] && { printf '%s' "$value"; return 0; }
+    warn "Valor inválido: ${value}. Use ${dica}."
   done
 }
 
 ask_secret() {
   local prompt="$1" value
   while true; do
-    read -r -s -p "$(echo -e "${CYAN}?${NC} ${prompt}: ")" value
-    echo
+    read -r -s -p "$(echo -e "${CYAN}?${NC} ${prompt}: ")" value || entrada_encerrada
+    # A quebra de linha vai para stderr: no stdout ela entraria na senha
+    # capturada por $(...) e o envio ao NOC daria 401.
+    echo >&2
     [[ -n "$value" ]] && { printf '%s' "$value"; return; }
     warn "Campo obrigatório."
   done
@@ -202,7 +364,7 @@ choose() {
   done
 
   while true; do
-    read -r -p "> " choice
+    read -r -p "> " choice || entrada_encerrada
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#options[@]} )); then
       CHOOSE_RESULT="$choice"
       return 0
@@ -232,7 +394,7 @@ configure_noc_destination() {
   [[ "${action,,}" != "d" ]] && return 0
 
   while true; do
-    read -r -p "?  Novo destino: " input
+    read -r -p "?  Novo destino: " input || entrada_encerrada
 
     input="${input#http://}"
     input="${input#https://}"
@@ -281,7 +443,7 @@ detect_os() {
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
     source /etc/os-release
-    INSTALLER_VERSION="2.2.0"
+    INSTALLER_VERSION="2.3.0"
     DISTRO_ID="${ID:-unknown}"
     DISTRO_LIKE="${ID_LIKE:-}"
     PRETTY_OS="${PRETTY_NAME:-$DISTRO_ID}"
@@ -607,7 +769,8 @@ ini_value() {
   local value="${1//$'\n'/ }"
   value="${value//[/(}"
   value="${value//]/)}"
-  printf '%s' "$value"
+  value="${value//|//}"
+  printf '%s' "$(trim "$value")"
 }
 
 collect_links_inputs() {
@@ -617,20 +780,38 @@ collect_links_inputs() {
   info "ou um IP de origem deste servidor que saia pela WAN do link."
   local nome papel choice operadora tipo suporte ip_publico gateway alvos origem firewall interface
   while true; do
-    nome="$(ini_value "$(ask_required "Nome do link (ex.: Cyberline Fibra)")")"
+    while true; do
+      nome="$(ini_value "$(ask_required "Nome do link (ex.: Cyberline Fibra)")")"
+      # Nome repetido vira seção [link:...] duplicada e a Coleta não inicia.
+      nome_existe "$nome" "${LINKS[@]}" || break
+      warn "Já existe um link chamado '${nome}'. Use outro nome."
+    done
     choose "Papel do link" "primario" "failover" "sdwan"
     choice="$CHOOSE_RESULT"
     case "$choice" in 1) papel=primario;; 2) papel=failover;; 3) papel=sdwan;; esac
     operadora="$(ini_value "$(ask_required "Operadora" "$nome")")"
     tipo="$(ini_value "$(ask_required "Tipo (fibra, radio, 4g, satelite, dedicado)" "fibra")")"
     read -r -p "Telefone/protocolo de suporte da operadora (ENTER para pular): " suporte
-    read -r -p "IP público fixo do link (ENTER se for dinâmico): " ip_publico
-    read -r -p "Gateway da operadora para testar (ENTER para pular): " gateway
-    alvos="$(ask_required "Destinos que saem por este link, separados por vírgula" "8.8.8.8")"
-    read -r -p "IP de origem neste servidor para este link (ENTER para pular): " origem
+    ip_publico="$(ask_address "IP público fixo do link (dinâmico: deixe vazio)" "" ip 1)"
+    gateway="$(ask_address "Gateway da operadora para testar" "" host 1)"
+    alvos="$(ask_address "Destinos que saem por este link, separados por vírgula" "8.8.8.8" host 0 1)"
+    while true; do
+      origem="$(ask_address "IP de origem neste servidor para este link" "" ip 1)"
+      [[ -z "$origem" ]] && break
+      ip -o addr show 2>/dev/null | grep -qw "inet ${origem}" && break
+      warn "O IP ${origem} não existe neste servidor. Informe um IP local ou deixe vazio."
+    done
+    firewall=""
     read -r -p "Nome do firewall no NOC, para tráfego por SNMP (ENTER para pular): " firewall
+    firewall="$(trim "$firewall")"
+    [[ -n "$firewall" ]] && firewall="$(normalize_slug "$firewall")"
     interface=""
-    [[ -n "$firewall" ]] && read -r -p "Interface WAN do link no firewall (ex.: igb1): " interface
+    while [[ -n "$firewall" ]]; do
+      read -r -p "Interface WAN do link no firewall (ex.: igb1): " interface
+      interface="$(trim "$interface")"
+      [[ "$interface" =~ $RE_INTERFACE ]] && break
+      warn "Interface inválida. Use o nome como aparece no firewall, ex.: igb1, ether1, wan1."
+    done
     LINKS+=("$(ini_value "$nome")|${papel}|$(ini_value "$operadora")|$(ini_value "$tipo")|$(ini_value "$suporte")|$(ini_value "$ip_publico")|$(ini_value "$gateway")|$(ini_value "$alvos")|$(ini_value "$origem")|$(ini_value "$firewall")|$(ini_value "$interface")")
     ok "Link adicionado: ${nome} (${papel})"
     ask_yes_no "Adicionar outro link?" n || break
@@ -1561,7 +1742,7 @@ resource_checklist() {
       done
 
       echo
-      read -r -p "> " input
+      read -r -p "> " input || entrada_encerrada
       [[ -z "${input//[[:space:]]/}" ]] && break
 
       # O script globalmente remove espaço do IFS. Aqui definimos IFS localmente
@@ -1776,7 +1957,7 @@ collect_inputs() {
   [[ "$CLIENTE" != "$raw" ]] && info "Cliente será registrado como: ${CLIENTE}"
 
   detected="$(normalize_slug "$(hostname -s 2>/dev/null || hostname)")"
-  HOST_LABEL="$(normalize_slug "$(ask_required "Hostname para monitoramento" "$detected")")"
+  HOST_LABEL="$(ask_slug "Hostname para monitoramento" "$detected" host)"
 
   choose "Ambiente" "producao" "homologacao" "desenvolvimento" "backup" "teste"
   choice="$CHOOSE_RESULT"
@@ -1785,7 +1966,7 @@ collect_inputs() {
     4) AMBIENTE=backup;; 5) AMBIENTE=teste;;
   esac
 
-  LOCAL="$(normalize_slug "$(ask_required "Local" "matriz")")"
+  LOCAL="$(ask_slug "Local" "matriz" label)"
 
   choose "Criticidade" "critico" "alto" "medio" "baixo"
   choice="$CHOOSE_RESULT"
@@ -1843,8 +2024,12 @@ collect_inputs() {
     step "Conectividade e disponibilidade (Blackbox)"
     while true; do
       local bn ba bm bt
-      bn="$(normalize_slug "$(ask_required "Nome do alvo (ex.: fw_matriz)")")"
-      ba="$(ask_required "IP, FQDN ou URL")"
+      while true; do
+        bn="$(ask_slug "Nome do alvo (ex.: fw_matriz)" "" host)"
+        nome_existe "$bn" "${BLACKBOX_TARGETS[@]}" || break
+        warn "Já existe um alvo chamado '${bn}'. Use outro nome."
+      done
+      ba="$(ask_address "IP, FQDN ou URL" "" destino)"
 
       choose "Tipo de teste" "ICMP/Ping" "HTTP/HTTPS 2xx" "TCP connect"
       choice="$CHOOSE_RESULT"
@@ -1866,16 +2051,20 @@ collect_inputs() {
 
     while true; do
       local sn sa sm sau st sos
-      sn="$(normalize_slug "$(ask_required "Nome do equipamento")")"
-      sa="$(ask_required "IP/FQDN SNMP")"
-      sm="$(ask_required "Módulo SNMP" "system,if_mib")"
-      sau="$(ask_required "Auth SNMP" "public_v2")"
+      while true; do
+        sn="$(ask_slug "Nome do equipamento" "" host)"
+        nome_existe "$sn" "${SNMP_TARGETS[@]}" || break
+        warn "Já existe um equipamento chamado '${sn}'. Use outro nome."
+      done
+      sa="$(ask_address "IP/FQDN SNMP" "" host)"
+      sm="$(ask_pattern "Módulo SNMP" "system,if_mib" '^[A-Za-z0-9_,-]+$' "nomes de módulo do snmp.yml separados por vírgula, sem espaço")"
+      sau="$(ask_pattern "Auth SNMP" "public_v2" '^[A-Za-z0-9_-]+$' "nome da auth do snmp.yml")"
 
       choose "Tipo" "firewall" "switch" "storage" "ap" "ups"
       choice="$CHOOSE_RESULT"
       case "$choice" in 1) st=firewall;; 2) st=switch;; 3) st=storage;; 4) st=ap;; 5) st=storage;; esac
 
-      sos="$(normalize_slug "$(ask_required "Sistema/fabricante" "network")")"
+      sos="$(ask_slug "Sistema/fabricante" "network" label)"
       SNMP_TARGETS+=("${sn}|${sa}|${sm}|${sau}|${st}|${sos}")
       ask_yes_no "Adicionar outro equipamento SNMP?" n || break
     done
@@ -1892,12 +2081,12 @@ collect_inputs() {
 
       if [[ -n "$EXPORTER_NAME" ]]; then
         cn="$EXPORTER_NAME"
-        ct="$(ask_required "Target host:porta" "$EXPORTER_DEFAULT_TARGET")"
-        cs="$(normalize_slug "$(ask_required "Label servico" "$EXPORTER_SERVICE_LABEL")")"
+        ct="$(ask_address "Target host:porta" "$EXPORTER_DEFAULT_TARGET" hostport)"
+        cs="$(ask_slug "Label servico" "$EXPORTER_SERVICE_LABEL" label)"
       else
-        cn="$(normalize_slug "$(ask_required "Nome do exporter")")"
-        ct="$(ask_required "Target host:porta")"
-        cs="$(normalize_slug "$(ask_required "Label servico" "$cn")")"
+        cn="$(ask_slug "Nome do exporter" "" label)"
+        ct="$(ask_address "Target host:porta" "" hostport)"
+        cs="$(ask_slug "Label servico" "$cn" label)"
       fi
 
       CUSTOM_EXPORTERS+=("${cn}|${ct}|${cs}")
