@@ -1727,6 +1727,10 @@ resource_checklist() {
       echo -e "${BOLD}Recursos adicionais${NC}"
       echo -e "${DIM}Digite números separados por espaço para marcar/desmarcar. ENTER confirma.${NC}"
       echo
+      if [[ "${MONITOR_SERVER:-0}" == "1" ]]; then
+        echo -e "  ${GREEN}[✓]${NC} Servidor: CPU, memória, discos, rede, load e uptime ${DIM}(sempre ativo, não precisa marcar)${NC}"
+        echo
+      fi
 
       local i
       for i in "${!labels[@]}"; do
@@ -1794,6 +1798,10 @@ resource_checklist() {
       echo -e "${BOLD}Recursos adicionais${NC}"
       echo -e "${DIM}Use ↑/↓ para navegar, ESPAÇO para marcar/desmarcar e ENTER para continuar.${NC}"
       echo
+      if [[ "${MONITOR_SERVER:-0}" == "1" ]]; then
+        echo -e "  ${GREEN}[✓]${NC} Servidor: CPU, memória, discos, rede, load e uptime ${DIM}(sempre ativo, não precisa marcar)${NC}"
+        echo
+      fi
 
       local i mark prefix suffix
       for i in "${!labels[@]}"; do
