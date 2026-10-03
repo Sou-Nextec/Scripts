@@ -137,7 +137,14 @@ need_systemd() {
 # ------------------------------------------------------------------------------
 normalize_slug() {
   local input="$1"
-  if command -v iconv >/dev/null 2>&1; then
+  # python3 remove acentos de forma confiável em qualquer locale; o iconv com
+  # //TRANSLIT troca "ó" por "?" no locale C ("cartório" viraria "cart_rio").
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import re,sys,unicodedata
+v=unicodedata.normalize("NFKD",sys.argv[1]).encode("ascii","ignore").decode().lower()
+v=re.sub(r"[^a-z0-9_-]+","_",v)
+print(re.sub(r"_+","_",v).strip("_"),end="")' "$input"
+  elif command -v iconv >/dev/null 2>&1; then
     printf '%s' "$input" | tr '[:upper:]' '[:lower:]' | iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null | sed -E 's/[^a-z0-9_-]+/_/g; s/^_+|_+$//g; s/_+/_/g'
   else
     printf '%s' "$input" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/_/g; s/^_+|_+$//g; s/_+/_/g'
@@ -1761,10 +1768,12 @@ collect_inputs() {
 
   while true; do
     raw="$(ask_required "Cliente, identificador da empresa e não do servidor (ex.: advocacia_martins)")"
-    CLIENTE="$(normalize_slug "$raw")"
+    # O rótulo cliente só aceita minúsculas, números e _: hífen e espaço viram _.
+    CLIENTE="$(normalize_slug "$raw" | tr '-' '_' | sed -E 's/_+/_/g; s/^_+|_+$//g')"
     [[ "$CLIENTE" =~ ^[a-z0-9_]+$ ]] && break
-    warn "Cliente inválido: ${CLIENTE}. Use minúsculas, números e _ (sem hífen). Tente de novo."
+    warn "Cliente inválido: ${raw}. Use letras, números e _. Tente de novo."
   done
+  [[ "$CLIENTE" != "$raw" ]] && info "Cliente será registrado como: ${CLIENTE}"
 
   detected="$(normalize_slug "$(hostname -s 2>/dev/null || hostname)")"
   HOST_LABEL="$(normalize_slug "$(ask_required "Hostname para monitoramento" "$detected")")"

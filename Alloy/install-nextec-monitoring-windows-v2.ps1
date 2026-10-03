@@ -836,6 +836,16 @@ function ConvertTo-Slug {
     return $result
 }
 
+function ConvertTo-ClienteSlug {
+    # O rótulo cliente só aceita minúsculas, números e _ (padrão de labels):
+    # hífen vira _ para "grupo-alves-de-faria" virar "grupo_alves_de_faria".
+    param([Parameter(Mandatory=$true)][string]$Value)
+
+    $slug = (ConvertTo-Slug $Value) -replace "-", "_"
+    $slug = $slug -replace "_+", "_"
+    return $slug.Trim("_")
+}
+
 function ConvertTo-AlloyEscapedString {
     param([AllowEmptyString()][string]$Value)
 
@@ -1695,8 +1705,8 @@ function Edit-IdentificationSettings {
     Write-Info ("Cliente atual: {0}" -f $script:Cliente)
     $cliente = Read-Host "Novo cliente (ENTER mantém)"
     if (-not [string]::IsNullOrWhiteSpace($cliente)) {
-        $slug = ConvertTo-Slug $cliente
-        if ($slug -notmatch "^[a-z0-9][a-z0-9_-]*$") {
+        $slug = ConvertTo-ClienteSlug $cliente
+        if ($slug -notmatch "^[a-z0-9][a-z0-9_]*$") {
             throw ("Cliente inválido após normalização: {0}" -f $slug)
         }
         $script:Cliente = $slug
@@ -3942,16 +3952,15 @@ function Get-NextecConfiguration {
         }
 
         $rawCliente = Read-Required "Cliente (ex.: cliente_exemplo)"
-        $script:Cliente = ConvertTo-Slug $rawCliente
+        $script:Cliente = ConvertTo-ClienteSlug $rawCliente
     }
     else {
-        $script:Cliente = ConvertTo-Slug $Cliente
+        $script:Cliente = ConvertTo-ClienteSlug $Cliente
     }
 
-    # Aceita hífen porque ConvertTo-Slug preserva hífen. As duas regras
-    # precisam concordar, senão nomes como "Cartorio-Bruno" são normalizados e
-    # rejeitados em seguida.
-    if ($script:Cliente -notmatch "^[a-z0-9][a-z0-9_-]*$") {
+    # ConvertTo-ClienteSlug troca hífen por _, então "Cartorio-Bruno" vira
+    # "cartorio_bruno" e passa nesta regra (a mesma do padrão de labels).
+    if ($script:Cliente -notmatch "^[a-z0-9][a-z0-9_]*$") {
         throw ("Cliente inválido após normalização: {0}" -f $script:Cliente)
     }
 
