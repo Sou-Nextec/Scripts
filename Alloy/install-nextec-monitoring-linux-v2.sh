@@ -1759,9 +1759,12 @@ collect_inputs() {
   step "Identificação"
   local raw detected choice
 
-  raw="$(ask_required "Cliente (ex.: advocacia_martins)")"
-  CLIENTE="$(normalize_slug "$raw")"
-  [[ "$CLIENTE" =~ ^[a-z0-9_]+$ ]] || { err "Cliente inválido: ${CLIENTE}"; exit 1; }
+  while true; do
+    raw="$(ask_required "Cliente, identificador da empresa e não do servidor (ex.: advocacia_martins)")"
+    CLIENTE="$(normalize_slug "$raw")"
+    [[ "$CLIENTE" =~ ^[a-z0-9_]+$ ]] && break
+    warn "Cliente inválido: ${CLIENTE}. Use minúsculas, números e _ (sem hífen). Tente de novo."
+  done
 
   detected="$(normalize_slug "$(hostname -s 2>/dev/null || hostname)")"
   HOST_LABEL="$(normalize_slug "$(ask_required "Hostname para monitoramento" "$detected")")"
