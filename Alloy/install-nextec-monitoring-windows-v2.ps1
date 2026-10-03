@@ -36,6 +36,9 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.14.1 O menu de instalação existente mostra a versão deste instalador,
+           a versão que gerou o config.alloy atual e as versões da Coleta
+           Complementar e do atualizador instalados.
     2.14.0 Atualizador automático Nextec: o instalador passa a instalar a
            tarefa NextecAtualizador (SYSTEM, de madrugada), que aplica
            versões publicadas e assinadas pela Nextec, em ondas e com volta
@@ -242,7 +245,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.14.0"
+$InstallerVersion = "2.14.1"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -1329,10 +1332,41 @@ function Show-MaintenanceStatus {
     $serviceLabel = if ($null -ne $service) { $service.Status } else { "não encontrado" }
     $configLabel = if ($configExists) { $ConfigFile } else { "não encontrada" }
 
-    Write-Info ("Binário Alloy: {0}" -f $versionLabel)
-    Write-Info ("Caminho:       {0}" -f $AlloyExe)
-    Write-Info ("Serviço:       {0} ({1})" -f $script:AlloyServiceName, $serviceLabel)
-    Write-Info ("Configuração:  {0}" -f $configLabel)
+    # Versões lidas do texto dos arquivos (nada é executado).
+    $versaoConfig = Get-VersaoNoArquivo -Caminho $ConfigFile -Padrao '(?m)^\s*//\s*nextec:versao\s*=\s*(\S+)'
+    $versaoColeta = Get-VersaoNoArquivo -Caminho $ColetaScript -Padrao '(?m)^\$Versao\s*=\s*"([^"]+)"'
+    $versaoAtualizador = Get-VersaoNoArquivo -Caminho $AtualizadorScript -Padrao '(?m)^\$script:Versao\s*=\s*"([^"]+)"'
+
+    Write-Info ("Este instalador: {0}" -f $InstallerVersion)
+    Write-Info ("Config gerada:   {0}" -f $(if ($versaoConfig) { "versão $versaoConfig" } elseif ($configExists) { "versão não identificada (anterior à 2.x)" } else { "sem configuração" }))
+    Write-Info ("Binário Alloy:   {0}" -f $versionLabel)
+    Write-Info ("Caminho:         {0}" -f $AlloyExe)
+    Write-Info ("Serviço:         {0} ({1})" -f $script:AlloyServiceName, $serviceLabel)
+    Write-Info ("Configuração:    {0}" -f $configLabel)
+    Write-Info ("Coleta:          {0}" -f $(if ($versaoColeta) { $versaoColeta } else { "não instalada" }))
+    Write-Info ("Atualizador:     {0}" -f $(if ($versaoAtualizador) { $versaoAtualizador } else { "não instalado" }))
+}
+
+function Get-VersaoNoArquivo {
+    param(
+        [string]$Caminho,
+        [string]$Padrao
+    )
+
+    if ([string]::IsNullOrEmpty($Caminho) -or -not (Test-Path -LiteralPath $Caminho -PathType Leaf)) {
+        return ""
+    }
+
+    try {
+        $m = [Regex]::Match([IO.File]::ReadAllText($Caminho), $Padrao)
+        if ($m.Success) {
+            return $m.Groups[1].Value
+        }
+    }
+    catch {
+    }
+
+    return ""
 }
 
 function Update-AlloyBinaryOnly {

@@ -1,10 +1,10 @@
 # Atualizador automático Nextec
 
-Mantém o monitoramento de todas as máquinas na versão publicada pela Nextec, sem ninguém entrar em cada uma. O instalador (Linux 2.4.0+, Windows 2.14.0+) instala o atualizador junto com o Alloy.
+Mantém o monitoramento de todas as máquinas na versão publicada pela Nextec, sem ninguém entrar em cada uma. O instalador (Linux 2.4.0+, Windows 2.14.0+) instala o atualizador junto com o Alloy. Histórico de versões em [`../CHANGELOG.md`](../CHANGELOG.md).
 
 ## Como funciona
 
-1. Todo dia, de madrugada (01h às 05h, com atraso aleatório por máquina), o atualizador baixa `manifesto.json` e `manifesto.json.sig` desta pasta, na branch `main`.
+1. Todo dia, de madrugada (01h às 05h no horário de Brasília, com atraso aleatório por máquina; no Linux o fuso fica fixo no timer, no Windows vale o relógio do Windows), o atualizador baixa `manifesto.json` e `manifesto.json.sig` desta pasta, na branch `main`.
 2. Confere a assinatura RSA 4096 com as chaves públicas gravadas **dentro do próprio atualizador**. Sem assinatura válida, nada é aplicado.
 3. Recusa manifesto vencido, manifesto com sequência menor que a já aceita e manifesto com a mesma sequência e conteúdo diferente.
 4. Respeita a pausa (`pausa.json`) e a onda da máquina.

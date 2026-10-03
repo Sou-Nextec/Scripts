@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.4.0 (atualizador automático: respostas gravadas e modo --atualizar)
+# Versão: 2.5.0 (menu de manutenção em instalação existente; atualizador no horário de Brasília)
 #
 # USO
 # ---
-#   sudo bash install-nextec-monitoring-linux-v2.sh                   instalação completa
+#   sudo bash install-nextec-monitoring-linux-v2.sh                   instalação completa;
+#     em servidor já instalado, abre o menu de manutenção (ver e alterar a
+#     configuração, reconfigurar tudo, atualizar o Alloy, validar e reiniciar)
 #   sudo bash install-nextec-monitoring-linux-v2.sh --somente-coleta  só a Coleta
 #     Complementar, para servidor cujo Alloy roda fora deste instalador
 #     (ex.: o servidor da central, coletado pelo Alloy da stack)
@@ -54,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.4.0"
+INSTALLER_VERSION="2.5.0"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -89,6 +91,17 @@ ATUALIZADOR_SERVICE="/etc/systemd/system/nextec-atualizador.service"
 ATUALIZADOR_TIMER="/etc/systemd/system/nextec-atualizador.timer"
 # 1 quando roda em --atualizar: nenhuma pergunta, nada de credencial nova.
 MODO_ATUALIZACAO=0
+# Menu de manutenção (instalação existente). EDICAO=1 aplica uma alteração
+# pontual: credenciais que não foram alteradas ficam como estão.
+EDICAO=0
+NOVAS_CREDENCIAIS=0
+DB_REDEFINIDO=0
+CHECKLIST_DO_ESTADO=0
+ESTADO_CARREGADO=0
+ESTADO_INSTALADOR_VERSAO=""
+SEGUIR_INSTALACAO=1
+# Listas preenchidas pelas perguntas ou pelas respostas gravadas.
+LINKS=(); BLACKBOX_TARGETS=(); SNMP_TARGETS=(); CUSTOM_EXPORTERS=(); DATABASE_TARGETS=(); DETECTED_DATABASES=()
 
 # O pacote oficial usa /etc/default/alloy em Debian. No fallback binário também
 # adotamos o mesmo local para manter um único padrão de manutenção.
@@ -103,6 +116,10 @@ BLUE='\033[0;34m'; CYAN='\033[0;36m'; WHITE='\033[0;37m'; BOLD='\033[1m'; DIM='\
 if [[ "${1:-}" == "--atualizar" ]]; then
   RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; WHITE=''; BOLD=''; DIM=''; NC=''
 fi
+
+# Locale UTF-8 para ${#texto} contar caracteres (e não bytes) no alinhamento
+# do resumo, mesmo quando o terminal chega com LANG vazio (locale C).
+LOCALE_UTF8="$(locale -a 2>/dev/null | grep -m1 -iE '^(c|en_us)\.utf-?8$' || true)"
 
 ok()   { echo -e "${GREEN}✔${NC}  $*"; }
 info() { echo -e "${CYAN}ℹ${NC}  $*"; }
@@ -155,7 +172,7 @@ banner() {
 |_| \_|_____/_/\_\ |_| |_____\____|
 TXT
   echo
-  echo -e "${NC}${BOLD}NOC Monitoring Installer, Linux${NC}"
+  echo -e "${NC}${BOLD}NOC Monitoring Installer, Linux${NC}  ${DIM}v${INSTALLER_VERSION}${NC}"
   echo -e "Destino: ${CYAN}${NOC_HOST}${NC}\n"
 }
 
@@ -416,6 +433,41 @@ choose() {
 }
 
 
+# choose_padrao "Pergunta" N opções...: igual a choose, mas ENTER escolhe a opção N.
+choose_padrao() {
+  local prompt="$1" padrao="$2"; shift 2
+  local options=("$@") choice i marca
+
+  echo -e "${CYAN}?${NC} ${BOLD}${prompt}${NC} ${DIM}[ENTER = ${padrao}]${NC}"
+  for i in "${!options[@]}"; do
+    marca=" "
+    (( i + 1 == padrao )) && marca="›"
+    printf '  %b%s%d%b  %s\n' "$CYAN" "$marca" "$((i+1))" "$NC" "${options[$i]}"
+  done
+
+  while true; do
+    read -r -p "$(echo -e "${CYAN}›${NC} ")" choice || entrada_encerrada
+    choice="$(trim "$choice")"
+    [[ -z "$choice" ]] && choice="$padrao"
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#options[@]} )); then
+      CHOOSE_RESULT="$choice"
+      return 0
+    fi
+    warn "Opção inválida."
+  done
+}
+
+# indice_de "valor" opções...: posição (a partir de 1) do valor na lista; 1 se não achar.
+indice_de() {
+  local valor="$1" i=1 item
+  shift
+  for item in "$@"; do
+    [[ "$item" == "$valor" ]] && { echo "$i"; return 0; }
+    i=$((i+1))
+  done
+  echo 1
+}
+
 # ------------------------------------------------------------------------------
 # DESTINO DO MONITORAMENTO E FORMATAÇÃO DO RESUMO
 # ------------------------------------------------------------------------------
@@ -423,8 +475,9 @@ choose() {
 configure_noc_destination() {
   local action input
 
-  # O NOC da Nextec é o destino padrão e não exige confirmação.
-  NOC_HOST="${DEFAULT_NOC_HOST}"
+  # O NOC da Nextec é o destino padrão e não exige confirmação. Na alteração
+  # de uma instalação existente, o destino atual é mantido como padrão.
+  NOC_HOST="${NOC_HOST:-$DEFAULT_NOC_HOST}"
   RW_URL="https://${NOC_HOST}/api/v1/write"
   LOKI_URL="https://${NOC_HOST}/loki/api/v1/push"
 
@@ -456,6 +509,7 @@ configure_noc_destination() {
 }
 
 summary_row() {
+  [[ -n "$LOCALE_UTF8" ]] && local LC_ALL="$LOCALE_UTF8"
   local label="$1"
   local value="$2"
   local width=30
@@ -1158,6 +1212,13 @@ configure_service_env() {
     ok "Credenciais mantidas em ${ENV_FILE}."
     return 0
   fi
+  # Alteração pelo menu de manutenção: só grava o que foi alterado.
+  if [[ "$EDICAO" == "1" ]]; then
+    gravar_credenciais_edicao
+    configure_service_groups
+    ok "Credenciais em ${ENV_FILE} preservadas; só o que foi alterado foi gravado."
+    return 0
+  fi
 
   append_env_var "NEXTEC_RW_USERNAME" "$RW_USERNAME"
   append_env_var "NEXTEC_RW_PASSWORD" "$RW_PASSWORD"
@@ -1766,6 +1827,10 @@ prepare_snmp_config() {
   fi
 
   step "Preparando configuração SNMP"
+  if [[ "$EDICAO" == "1" && -f "$SNMP_FILE" ]] && ask_yes_no "Manter o snmp.yml atual (${SNMP_FILE})?" s; then
+    ok "snmp.yml mantido em ${SNMP_FILE}."
+    return 0
+  fi
   warn "SNMP exige um snmp.yml homologado com módulos e autenticações compatíveis."
 
   local src
@@ -1892,23 +1957,34 @@ resource_checklist() {
     "Acessos ao servidor (logins com origem, alerta de acesso privilegiado)"
   )
   local -a details=("" "" "" "" "" "" "recomendado" "" "recomendado" "recomendado")
+  # Na alteração de uma instalação existente, o checklist abre com o que já está ligado.
+  local do_estado="${CHECKLIST_DO_ESTADO:-0}"
+  if [[ "$do_estado" == "1" ]]; then
+    selected=("${ENABLE_DOCKER:-0}" "${ENABLE_LOGS:-0}" "${ENABLE_DATABASES:-0}" "${ENABLE_SNMP:-0}"
+              "${ENABLE_BLACKBOX:-0}" "${ENABLE_EXPORTERS:-0}" "${ENABLE_INTERNET:-0}" "${ENABLE_LINKS:-0}"
+              "${ENABLE_VELOCIDADE:-0}" "${ENABLE_ACESSOS:-0}")
+    details[6]=""; details[8]=""; details[9]=""
+  fi
 
   if [[ "$DOCKER_DETECTED" == "1" && "${DOCKER_DAEMON_AVAILABLE:-0}" == "1" ]]; then
-    selected[0]=1
+    [[ "$do_estado" == "1" ]] || selected[0]=1
     details[0]="detectado"
   elif [[ "$DOCKER_DETECTED" == "1" ]]; then
     disabled[0]=1
+    selected[0]=0
     details[0]="detectado, daemon indisponível"
   else
     disabled[0]=1
+    selected[0]=0
     details[0]="não detectado"
   fi
 
   if [[ "$db_available" == "1" ]]; then
-    selected[2]=1
+    [[ "$do_estado" == "1" ]] || selected[2]=1
     details[2]="${#DETECTED_DATABASES[@]} detectado(s): ${DETECTED_DATABASES[*]}"
   else
     disabled[2]=1
+    selected[2]=0
     details[2]="nenhum PostgreSQL, MySQL/MariaDB ou SQL Server detectado"
   fi
 
@@ -2147,14 +2223,92 @@ select_specialized_exporter() {
   esac
 }
 
-collect_inputs() {
-  configure_noc_destination
+collect_blackbox_targets() {
+  local choice
+  step "Conectividade e disponibilidade (Blackbox)"
+  while true; do
+    local bn ba bm bt
+    while true; do
+      bn="$(ask_slug "Nome do alvo (ex.: fw_matriz)" "" host)"
+      nome_existe "$bn" "${BLACKBOX_TARGETS[@]}" || break
+      warn "Já existe um alvo chamado '${bn}'. Use outro nome."
+    done
+    ba="$(ask_address "IP, FQDN ou URL" "" destino)"
 
-  step "Identificação"
-  local raw detected choice
+    choose "Tipo de teste" "ICMP/Ping" "HTTP/HTTPS 2xx" "TCP connect"
+    choice="$CHOOSE_RESULT"
+    case "$choice" in 1) bm=icmp_ipv4;; 2) bm=http_2xx;; 3) bm=tcp_connect;; esac
+
+    choose "Tipo do ativo" "firewall" "switch" "link" "aplicacao" "storage"
+    choice="$CHOOSE_RESULT"
+    case "$choice" in 1) bt=firewall;; 2) bt=switch;; 3) bt=link;; 4) bt=aplicacao;; 5) bt=storage;; esac
+
+    BLACKBOX_TARGETS+=("${bn}|${ba}|${bm}|${bt}")
+    ask_yes_no "Adicionar outro alvo de conectividade/disponibilidade?" n || break
+  done
+}
+
+collect_snmp_targets() {
+  local choice
+  step "Targets SNMP"
+  info "Nesta versão, módulo e auth precisam existir no snmp.yml homologado."
+  info "O catálogo automático por fabricante, FortiGate, SonicWall, pfSense, MikroTik etc., será integrado depois."
 
   while true; do
-    raw="$(ask_required "Cliente, identificador da empresa e não do servidor (ex.: advocacia_martins)")"
+    local sn sa sm sau st sos
+    while true; do
+      sn="$(ask_slug "Nome do equipamento" "" host)"
+      nome_existe "$sn" "${SNMP_TARGETS[@]}" || break
+      warn "Já existe um equipamento chamado '${sn}'. Use outro nome."
+    done
+    sa="$(ask_address "IP/FQDN SNMP" "" host)"
+    sm="$(ask_pattern "Módulo SNMP" "system,if_mib" '^[A-Za-z0-9_,-]+$' "nomes de módulo do snmp.yml separados por vírgula, sem espaço")"
+    sau="$(ask_pattern "Auth SNMP" "public_v2" '^[A-Za-z0-9_-]+$' "nome da auth do snmp.yml")"
+
+    choose "Tipo" "firewall" "switch" "storage" "ap" "ups"
+    choice="$CHOOSE_RESULT"
+    case "$choice" in 1) st=firewall;; 2) st=switch;; 3) st=storage;; 4) st=ap;; 5) st=ups;; esac
+
+    sos="$(ask_slug "Sistema/fabricante" "network" label)"
+    SNMP_TARGETS+=("${sn}|${sa}|${sm}|${sau}|${st}|${sos}")
+    ask_yes_no "Adicionar outro equipamento SNMP?" n || break
+  done
+}
+
+collect_custom_exporters() {
+  echo
+  echo -e "${BOLD}Exporters adicionais${NC}"
+  echo -e "${DIM}Use somente para exporter/endpoint Prometheus que já esteja ativo.${NC}"
+
+  while true; do
+    local cn ct cs
+    select_specialized_exporter
+
+    if [[ -n "$EXPORTER_NAME" ]]; then
+      cn="$EXPORTER_NAME"
+      ct="$(ask_address "Target host:porta" "$EXPORTER_DEFAULT_TARGET" hostport)"
+      cs="$(ask_slug "Label servico" "$EXPORTER_SERVICE_LABEL" label)"
+    else
+      cn="$(ask_slug "Nome do exporter" "" label)"
+      ct="$(ask_address "Target host:porta" "" hostport)"
+      cs="$(ask_slug "Label servico" "$cn" label)"
+    fi
+
+    CUSTOM_EXPORTERS+=("${cn}|${ct}|${cs}")
+    ok "Integração adicionada: ${cn} -> ${ct} (servico=${cs})"
+
+    ask_yes_no "Adicionar outro exporter?" n || break
+  done
+}
+
+# Identificação. Com uma instalação existente carregada, as respostas atuais
+# viram o padrão de cada pergunta (ENTER mantém).
+collect_identification() {
+  step "Identificação"
+  local raw detected
+
+  while true; do
+    raw="$(ask_required "Cliente, identificador da empresa e não do servidor (ex.: advocacia_martins)" "${CLIENTE:-}")"
     # O rótulo cliente só aceita minúsculas, números e _: hífen e espaço viram _.
     CLIENTE="$(normalize_slug "$raw" | tr '-' '_' | sed -E 's/_+/_/g; s/^_+|_+$//g')"
     [[ "$CLIENTE" =~ ^[a-z0-9_]+$ ]] && break
@@ -2162,23 +2316,25 @@ collect_inputs() {
   done
   [[ "$CLIENTE" != "$raw" ]] && info "Cliente será registrado como: ${CLIENTE}"
 
-  detected="$(normalize_slug "$(hostname -s 2>/dev/null || hostname)")"
+  detected="${HOST_LABEL:-$(normalize_slug "$(hostname -s 2>/dev/null || hostname)")}"
   HOST_LABEL="$(ask_slug "Hostname para monitoramento" "$detected" host)"
 
-  choose "Ambiente" "producao" "homologacao" "desenvolvimento" "backup" "teste"
-  choice="$CHOOSE_RESULT"
-  case "$choice" in
-    1) AMBIENTE=producao;; 2) AMBIENTE=homologacao;; 3) AMBIENTE=desenvolvimento;;
-    4) AMBIENTE=backup;; 5) AMBIENTE=teste;;
-  esac
+  local ambientes=(producao homologacao desenvolvimento backup teste)
+  choose_padrao "Ambiente" "$(indice_de "${AMBIENTE:-producao}" "${ambientes[@]}")" "${ambientes[@]}"
+  AMBIENTE="${ambientes[$((CHOOSE_RESULT-1))]}"
 
-  LOCAL="$(ask_slug "Local" "matriz" label)"
+  LOCAL="$(ask_slug "Local" "${LOCAL:-matriz}" label)"
 
-  choose "Criticidade" "critico" "alto" "medio" "baixo"
-  choice="$CHOOSE_RESULT"
-  case "$choice" in
-    1) CRITICIDADE=critico;; 2) CRITICIDADE=alto;; 3) CRITICIDADE=medio;; 4) CRITICIDADE=baixo;;
-  esac
+  local criticidades=(critico alto medio baixo)
+  choose_padrao "Criticidade" "$(indice_de "${CRITICIDADE:-critico}" "${criticidades[@]}")" "${criticidades[@]}"
+  CRITICIDADE="${criticidades[$((CHOOSE_RESULT-1))]}"
+  return 0
+}
+
+collect_inputs() {
+  configure_noc_destination
+  collect_identification
+  local choice
 
   step "Função deste Alloy"
   choose "Selecione o modo" "Servidor monitorado" "Collector de rede" "Servidor + Collector de rede"
@@ -2227,81 +2383,9 @@ collect_inputs() {
     collect_database_inputs
   fi
 
-  if [[ "$ENABLE_BLACKBOX" == "1" ]]; then
-    step "Conectividade e disponibilidade (Blackbox)"
-    while true; do
-      local bn ba bm bt
-      while true; do
-        bn="$(ask_slug "Nome do alvo (ex.: fw_matriz)" "" host)"
-        nome_existe "$bn" "${BLACKBOX_TARGETS[@]}" || break
-        warn "Já existe um alvo chamado '${bn}'. Use outro nome."
-      done
-      ba="$(ask_address "IP, FQDN ou URL" "" destino)"
-
-      choose "Tipo de teste" "ICMP/Ping" "HTTP/HTTPS 2xx" "TCP connect"
-      choice="$CHOOSE_RESULT"
-      case "$choice" in 1) bm=icmp_ipv4;; 2) bm=http_2xx;; 3) bm=tcp_connect;; esac
-
-      choose "Tipo do ativo" "firewall" "switch" "link" "aplicacao" "storage"
-      choice="$CHOOSE_RESULT"
-      case "$choice" in 1) bt=firewall;; 2) bt=switch;; 3) bt=link;; 4) bt=aplicacao;; 5) bt=storage;; esac
-
-      BLACKBOX_TARGETS+=("${bn}|${ba}|${bm}|${bt}")
-      ask_yes_no "Adicionar outro alvo de conectividade/disponibilidade?" n || break
-    done
-  fi
-
-  if [[ "$ENABLE_SNMP" == "1" ]]; then
-    step "Targets SNMP"
-    info "Nesta versão, módulo e auth precisam existir no snmp.yml homologado."
-    info "O catálogo automático por fabricante, FortiGate, SonicWall, pfSense, MikroTik etc., será integrado depois."
-
-    while true; do
-      local sn sa sm sau st sos
-      while true; do
-        sn="$(ask_slug "Nome do equipamento" "" host)"
-        nome_existe "$sn" "${SNMP_TARGETS[@]}" || break
-        warn "Já existe um equipamento chamado '${sn}'. Use outro nome."
-      done
-      sa="$(ask_address "IP/FQDN SNMP" "" host)"
-      sm="$(ask_pattern "Módulo SNMP" "system,if_mib" '^[A-Za-z0-9_,-]+$' "nomes de módulo do snmp.yml separados por vírgula, sem espaço")"
-      sau="$(ask_pattern "Auth SNMP" "public_v2" '^[A-Za-z0-9_-]+$' "nome da auth do snmp.yml")"
-
-      choose "Tipo" "firewall" "switch" "storage" "ap" "ups"
-      choice="$CHOOSE_RESULT"
-      case "$choice" in 1) st=firewall;; 2) st=switch;; 3) st=storage;; 4) st=ap;; 5) st=storage;; esac
-
-      sos="$(ask_slug "Sistema/fabricante" "network" label)"
-      SNMP_TARGETS+=("${sn}|${sa}|${sm}|${sau}|${st}|${sos}")
-      ask_yes_no "Adicionar outro equipamento SNMP?" n || break
-    done
-  fi
-
-  if [[ "$ENABLE_EXPORTERS" == "1" ]]; then
-    echo
-    echo -e "${BOLD}Exporters adicionais${NC}"
-    echo -e "${DIM}Use somente para exporter/endpoint Prometheus que já esteja ativo.${NC}"
-
-    while true; do
-      local cn ct cs
-      select_specialized_exporter
-
-      if [[ -n "$EXPORTER_NAME" ]]; then
-        cn="$EXPORTER_NAME"
-        ct="$(ask_address "Target host:porta" "$EXPORTER_DEFAULT_TARGET" hostport)"
-        cs="$(ask_slug "Label servico" "$EXPORTER_SERVICE_LABEL" label)"
-      else
-        cn="$(ask_slug "Nome do exporter" "" label)"
-        ct="$(ask_address "Target host:porta" "" hostport)"
-        cs="$(ask_slug "Label servico" "$cn" label)"
-      fi
-
-      CUSTOM_EXPORTERS+=("${cn}|${ct}|${cs}")
-      ok "Integração adicionada: ${cn} -> ${ct} (servico=${cs})"
-
-      ask_yes_no "Adicionar outro exporter?" n || break
-    done
-  fi
+  [[ "$ENABLE_BLACKBOX" == "1" ]] && collect_blackbox_targets
+  [[ "$ENABLE_SNMP" == "1" ]] && collect_snmp_targets
+  [[ "$ENABLE_EXPORTERS" == "1" ]] && collect_custom_exporters
 
   if [[ "$ENABLE_LINKS" == "1" ]]; then
     collect_links_inputs
@@ -2325,8 +2409,16 @@ collect_inputs() {
   fi
 }
 
+# show_plan ["pergunta de confirmação" | --resumo]
 show_plan() {
-  step "Resumo antes da instalação"
+  local confirmacao="${1:-Confirmar instalação e configuração?}"
+  if [[ "$confirmacao" == "--resumo" ]]; then
+    step "Configuração atual (ainda não gravada)"
+  elif [[ "$EDICAO" == "1" ]]; then
+    step "Resumo antes de aplicar as alterações"
+  else
+    step "Resumo antes da instalação"
+  fi
 
   summary_row "Cliente:" "$CLIENTE"
   summary_row "SO:" "$OS_FAMILY"
@@ -2349,10 +2441,13 @@ show_plan() {
   summary_row "Acessos (logins):" "$([[ "${ENABLE_ACESSOS:-0}" == 1 ]] && echo sim || echo não)"
 
   echo
-  ask_yes_no "Confirmar instalação e configuração?" s || { warn "Cancelado."; exit 0; }
+  [[ "$confirmacao" == "--resumo" ]] && return 0
+  ask_yes_no "$confirmacao" s || { warn "Cancelado. Nada foi gravado."; exit 0; }
 }
 
 final_summary() {
+  [[ -n "$LOCALE_UTF8" ]] && local LC_ALL="$LOCALE_UTF8"
+  local titulo="✔  ${1:-INSTALAÇÃO CONCLUÍDA}"
   local alloy_estado="ativo" cor_alloy="$GREEN"
   systemctl is-active --quiet alloy || { alloy_estado="parado"; cor_alloy="$RED"; }
 
@@ -2367,7 +2462,9 @@ final_summary() {
 
   echo
   echo -e "${GREEN}${BOLD}  ╔══════════════════════════════════════════════════════╗${NC}"
-  echo -e "${GREEN}${BOLD}  ║               ✔  INSTALAÇÃO CONCLUÍDA                ║${NC}"
+  local esq=$(( (54 - ${#titulo}) / 2 )) dir
+  dir=$(( 54 - ${#titulo} - esq ))
+  echo -e "${GREEN}${BOLD}  ║$(printf '%*s' "$esq" '')${titulo}$(printf '%*s' "$dir" '')║${NC}"
   echo -e "${GREEN}${BOLD}  ╚══════════════════════════════════════════════════════╝${NC}"
 
   secao "Identificação"
@@ -2400,7 +2497,7 @@ final_summary() {
 
   secao "Atualização automática"
   if systemctl is-enabled --quiet nextec-atualizador.timer 2>/dev/null; then
-    campo "Atualizador" "ligado, todo dia de madrugada" "$GREEN"
+    campo "Atualizador" "ligado, todo dia entre 01h e 05h (Brasília)" "$GREEN"
   else
     campo "Atualizador" "não instalado" "$YELLOW"
   fi
@@ -2495,6 +2592,8 @@ carregar_estado_instalacao() {
       MODO)
         [[ "$valor" =~ ^(completo|somente_coleta)$ ]] || { err "MODO inválido."; return 1; }
         MODO_INSTALACAO="$valor" ;;
+      INSTALADOR_VERSAO)
+        [[ "$valor" =~ ^[0-9]+(\.[0-9]+)*$ ]] && ESTADO_INSTALADOR_VERSAO="$valor" ;;
       MONITOR_SERVER|COLLECTOR|ENABLE_LOGS|ENABLE_DOCKER|ENABLE_DATABASES|ENABLE_BLACKBOX|ENABLE_SNMP|ENABLE_EXPORTERS|ENABLE_INTERNET|ENABLE_LINKS|ENABLE_VELOCIDADE|ENABLE_ACESSOS)
         [[ "$valor" =~ ^[01]$ ]] || { err "Valor inválido de ${chave}."; return 1; }
         printf -v "$chave" '%s' "$valor" ;;
@@ -2566,15 +2665,24 @@ PrivateTmp=true
 # Maior que a soma dos limites internos (instalador, saúde, volta automática).
 TimeoutStartSec=2h
 EOF
-  # Madrugada, com atraso aleatório de até 4h por servidor (01h às 05h), para
-  # a frota não atualizar toda no mesmo minuto. Persistent recupera execução
-  # perdida com a máquina desligada.
-  cat > "$ATUALIZADOR_TIMER" <<'EOF'
+  # Madrugada no horário de Brasília, com atraso aleatório de até 4h por
+  # servidor (01h às 05h), para a frota não atualizar toda no mesmo minuto.
+  # O fuso vai no próprio OnCalendar (systemd 235+): servidor em nuvem fora do
+  # Brasil (ex.: Contabo, CEST) também atualiza de madrugada aqui. Persistent
+  # recupera execução perdida com a máquina desligada.
+  local quando="*-*-* 01:00:00" sd_versao
+  sd_versao="$(systemctl --version 2>/dev/null | awk 'NR==1 {print $2}')"
+  if [[ "$sd_versao" =~ ^[0-9]+$ ]] && (( sd_versao >= 235 )) && [[ -f /usr/share/zoneinfo/America/Sao_Paulo ]]; then
+    quando+=" America/Sao_Paulo"
+  else
+    warn "systemd ${sd_versao:-?} sem fuso no timer: o atualizador usa o fuso deste servidor ($(date +%Z))."
+  fi
+  cat > "$ATUALIZADOR_TIMER" <<EOF
 [Unit]
 Description=Atualizador automático do monitoramento Nextec (diário, de madrugada)
 
 [Timer]
-OnCalendar=*-*-* 01:00:00
+OnCalendar=${quando}
 RandomizedDelaySec=4h
 Persistent=true
 AccuracySec=1min
@@ -2585,6 +2693,456 @@ EOF
   systemctl daemon-reload
   systemctl enable --now nextec-atualizador.timer >/dev/null 2>&1 || warn "Não foi possível ligar o timer do atualizador."
   ok "Atualizador $(python3 "$ATUALIZADOR_BIN" versao 2>/dev/null || echo instalado) com timer diário de madrugada."
+}
+
+# ------------------------------------------------------------------------------
+# INSTALAÇÃO EXISTENTE: MENU DE MANUTENÇÃO
+# ------------------------------------------------------------------------------
+# Rodar o instalador num servidor que já tem o Alloy não refaz tudo do zero:
+# mostra o que está instalado (com as versões) e oferece alterar só o que for
+# preciso, a partir das respostas gravadas em ${ESTADO_INSTALACAO}. Credenciais
+# que não foram alteradas ficam como estão em ${ENV_FILE}.
+instalacao_existente() {
+  [[ -f "$CONFIG_FILE" ]] && command -v alloy >/dev/null 2>&1 && systemctl cat alloy.service >/dev/null 2>&1
+}
+
+env_tem_chave() {
+  [[ -f "$ENV_FILE" ]] && grep -qE "^${1}=" "$ENV_FILE"
+}
+
+# remover_env_var 'REGEX_DA_CHAVE': apaga do ${ENV_FILE} as linhas dessa chave.
+remover_env_var() {
+  [[ -f "$ENV_FILE" ]] || return 0
+  local tmp
+  tmp="$(mktemp)"
+  grep -vE "^(${1})=" "$ENV_FILE" > "$tmp" || true
+  install -m 0600 "$tmp" "$ENV_FILE"
+  rm -f "$tmp"
+}
+
+# Copia a credencial do remote_write para o Loki sem ler a senha: só troca o
+# nome da chave na linha já gravada (o valor continua com o mesmo escape).
+copiar_credencial_rw_para_loki() {
+  local tmp
+  tmp="$(mktemp)"
+  grep -vE '^NEXTEC_LOKI_(USERNAME|PASSWORD)=' "$ENV_FILE" > "$tmp" || true
+  sed -n -e 's/^NEXTEC_RW_USERNAME=/NEXTEC_LOKI_USERNAME=/p' \
+         -e 's/^NEXTEC_RW_PASSWORD=/NEXTEC_LOKI_PASSWORD=/p' "$ENV_FILE" >> "$tmp"
+  install -m 0600 "$tmp" "$ENV_FILE"
+  rm -f "$tmp"
+}
+
+desligar_coleta_complementar() {
+  systemctl cat coleta-complementar.service >/dev/null 2>&1 || return 0
+  systemctl disable --now coleta-complementar >/dev/null 2>&1 || true
+  info "Coleta Complementar desligada: nenhum módulo dela está ativo."
+}
+
+estado_servico() {
+  case "$(systemctl is-active "$1" 2>/dev/null || true)" in
+    active) echo "ativo" ;;
+    activating|reloading) echo "iniciando" ;;
+    failed) echo "com falha" ;;
+    *) echo "parado" ;;
+  esac
+}
+
+versao_pacote_nextec() {
+  local estado="/var/lib/nextec-atualizador/estado.json"
+  [[ -f "$estado" ]] || { echo "nenhum"; return 0; }
+  python3 -c 'import json,sys
+try:
+    print(json.load(open(sys.argv[1])).get("versao_instalada") or "nenhum")
+except Exception:
+    print("não identificada")' "$estado" 2>/dev/null || echo "não identificada"
+}
+
+mostrar_status_instalacao() {
+  step "Instalação existente detectada"
+  local quando=""
+  summary_row "Este instalador:" "v${INSTALLER_VERSION}"
+  if [[ "$ESTADO_CARREGADO" == "1" ]]; then
+    quando="$(sed -n 's/^# Respostas da instalação Nextec (\(.*\))\.$/\1/p' "$ESTADO_INSTALACAO" | head -n1)"
+    [[ -n "$quando" ]] && quando="$(date -d "$quando" '+%d/%m/%Y %H:%M' 2>/dev/null || echo "$quando")"
+    summary_row "Instalado com:" "v${ESTADO_INSTALADOR_VERSAO:-?}${quando:+ em ${quando}}"
+    summary_row "Cliente:" "${CLIENTE:-?}"
+    summary_row "Host:" "${HOST_LABEL:-?}"
+  else
+    summary_row "Instalado com:" "versão anterior à 2.4.0 (sem respostas gravadas)"
+  fi
+
+  local alloy_v coleta="não instalada" atualizador="não instalado"
+  alloy_v="$(alloy_versao_instalada)"
+  summary_row "Grafana Alloy:" "${alloy_v:-versão não identificada} ($(estado_servico alloy))"
+  if [[ -f "$COLETA_BIN" ]]; then
+    coleta="$(python3 "$COLETA_BIN" versao 2>/dev/null || echo '?') ($(estado_servico coleta-complementar))"
+  fi
+  summary_row "Coleta Complementar:" "$coleta"
+  if [[ -f "$ATUALIZADOR_BIN" ]]; then
+    atualizador="$(python3 "$ATUALIZADOR_BIN" versao 2>/dev/null || echo '?')"
+    systemctl is-enabled --quiet nextec-atualizador.timer 2>/dev/null && atualizador+=" (ligado)" || atualizador+=" (timer desligado)"
+  fi
+  summary_row "Atualizador:" "$atualizador"
+  summary_row "Pacote Nextec aplicado:" "$(versao_pacote_nextec)"
+
+  if [[ "$ESTADO_CARREGADO" == "1" ]]; then
+    local ligados=()
+    [[ "${MONITOR_SERVER:-0}" == 1 ]] && ligados+=("servidor")
+    [[ "${ENABLE_LOGS:-0}" == 1 ]] && ligados+=("logs")
+    [[ "${ENABLE_DOCKER:-0}" == 1 ]] && ligados+=("docker")
+    [[ "${ENABLE_DATABASES:-0}" == 1 ]] && ligados+=("bancos")
+    [[ "${ENABLE_BLACKBOX:-0}" == 1 ]] && ligados+=("conectividade")
+    [[ "${ENABLE_SNMP:-0}" == 1 ]] && ligados+=("snmp")
+    [[ "${ENABLE_EXPORTERS:-0}" == 1 ]] && ligados+=("exporters")
+    [[ "${ENABLE_INTERNET:-0}" == 1 ]] && ligados+=("internet")
+    [[ "${ENABLE_LINKS:-0}" == 1 ]] && ligados+=("links")
+    [[ "${ENABLE_VELOCIDADE:-0}" == 1 ]] && ligados+=("velocidade")
+    [[ "${ENABLE_ACESSOS:-0}" == 1 ]] && ligados+=("acessos")
+    local IFS=','
+    summary_row "Coletas ligadas:" "$(printf '%s' "${ligados[*]:-nenhuma}" | sed 's/,/, /g')"
+  fi
+  echo
+}
+
+# descrever_item "a|b|...": "a (b)", para listar alvos, links e exporters.
+descrever_item() {
+  local a b
+  IFS='|' read -r a b _ <<<"$1"
+  printf '%s (%s)' "$a" "$b"
+}
+
+# editar_lista NOME_DO_ARRAY "Título" função_que_cadastra VARIAVEL_ENABLE
+# Lista os itens e permite adicionar, remover um ou refazer a lista. Lista
+# vazia desliga o recurso; lista com item liga.
+editar_lista() {
+  local -n _lista="$1"
+  local titulo="$2" coletor="$3" flag="$4" i escolha
+  while true; do
+    step "$titulo"
+    if (( ${#_lista[@]} == 0 )); then
+      info "Nenhum item cadastrado."
+    else
+      for i in "${!_lista[@]}"; do
+        printf '  %b%d%b  %s\n' "$CYAN" "$((i+1))" "$NC" "$(descrever_item "${_lista[$i]}")"
+      done
+    fi
+    echo
+    choose_padrao "O que deseja fazer?" 1 "Voltar" "Adicionar" "Remover um item" "Apagar todos e cadastrar de novo"
+    case "$CHOOSE_RESULT" in
+      1) break ;;
+      2) "$coletor" ;;
+      3)
+        if (( ${#_lista[@]} == 0 )); then
+          warn "Não há item para remover."
+          continue
+        fi
+        while true; do
+          read -r -p "$(pergunta "Número do item a remover" "" "ENTER cancela")" escolha || entrada_encerrada
+          escolha="$(trim "$escolha")"
+          [[ -z "$escolha" ]] && break
+          if [[ "$escolha" =~ ^[0-9]+$ ]] && (( escolha >= 1 && escolha <= ${#_lista[@]} )); then
+            ok "Removido: $(descrever_item "${_lista[$((escolha-1))]}")"
+            _lista=("${_lista[@]:0:$((escolha-1))}" "${_lista[@]:$escolha}")
+            break
+          fi
+          warn "Número inválido."
+        done
+        ;;
+      4) _lista=(); "$coletor" ;;
+    esac
+  done
+  if (( ${#_lista[@]} > 0 )); then
+    printf -v "$flag" '%s' 1
+  else
+    printf -v "$flag" '%s' 0
+    info "Lista vazia: recurso desligado."
+  fi
+  return 0
+}
+
+editar_recursos() {
+  local db_antes="${ENABLE_DATABASES:-0}"
+  CHECKLIST_DO_ESTADO=1
+  resource_checklist
+  CHECKLIST_DO_ESTADO=0
+
+  if [[ "$ENABLE_DATABASES" == "1" && "$db_antes" != "1" ]]; then
+    collect_database_inputs
+    DB_REDEFINIDO=1
+    (( ${#DATABASE_TARGETS[@]} > 0 )) || ENABLE_DATABASES=0
+  fi
+  [[ "$ENABLE_DATABASES" == "1" ]] || DATABASE_TARGETS=()
+
+  if [[ "$ENABLE_BLACKBOX" == "1" ]]; then
+    (( ${#BLACKBOX_TARGETS[@]} > 0 )) || collect_blackbox_targets
+  else
+    BLACKBOX_TARGETS=()
+  fi
+  if [[ "$ENABLE_SNMP" == "1" ]]; then
+    (( ${#SNMP_TARGETS[@]} > 0 )) || collect_snmp_targets
+  else
+    SNMP_TARGETS=()
+  fi
+  if [[ "$ENABLE_EXPORTERS" == "1" ]]; then
+    (( ${#CUSTOM_EXPORTERS[@]} > 0 )) || collect_custom_exporters
+  else
+    CUSTOM_EXPORTERS=()
+  fi
+  if [[ "$ENABLE_LINKS" == "1" ]]; then
+    (( ${#LINKS[@]} > 0 )) || collect_links_inputs
+  else
+    LINKS=()
+  fi
+  return 0
+}
+
+editar_bancos() {
+  if [[ "${ENABLE_DATABASES:-0}" != "1" ]]; then
+    warn "Banco de dados está desligado. Ligue em \"Recursos\" primeiro."
+    return 0
+  fi
+  step "Bancos de dados"
+  local item
+  for item in "${DATABASE_TARGETS[@]}"; do echo "  • ${item%%|*}"; done
+  info "As credenciais (DSN) não são exibidas; ficam em ${ENV_FILE}."
+  ask_yes_no "Cadastrar as credenciais dos bancos de novo?" n || return 0
+  collect_database_inputs
+  DB_REDEFINIDO=1
+  if (( ${#DATABASE_TARGETS[@]} == 0 )); then
+    ENABLE_DATABASES=0
+    info "Nenhum banco confirmado: coleta de banco desligada."
+  fi
+  return 0
+}
+
+editar_credenciais() {
+  step "Credenciais do NOC"
+  info "Use a credencial cadastrada no NOC para autorizar o envio deste cliente."
+  RW_USERNAME="$(ask_required "Usuário do remote_write")"
+  RW_PASSWORD="$(ask_secret "Senha do remote_write")"
+  if ask_yes_no "Usar a mesma credencial do remote_write no Loki (logs e eventos)?" s; then
+    LOKI_USERNAME="$RW_USERNAME"
+    LOKI_PASSWORD="$RW_PASSWORD"
+  else
+    LOKI_USERNAME="$(ask_required "Usuário do Loki")"
+    LOKI_PASSWORD="$(ask_secret "Senha do Loki")"
+  fi
+  NOVAS_CREDENCIAIS=1
+}
+
+# Logs ou eventos ligados agora num servidor que nunca enviou ao Loki: falta a
+# credencial dele. Pergunta antes de aplicar, para não gerar config sem senha.
+preparar_credenciais_edicao() {
+  LOKI_COPIAR_RW=0
+  LOKI_NOVA=0
+  [[ "$NOVAS_CREDENCIAIS" == "1" ]] && return 0
+  needs_loki || return 0
+  env_tem_chave NEXTEC_LOKI_USERNAME && return 0
+  step "Credencial do Loki"
+  info "Este servidor ainda não envia logs/eventos e não tem credencial do Loki."
+  if ask_yes_no "Usar a mesma credencial do remote_write no Loki?" s; then
+    LOKI_COPIAR_RW=1
+  else
+    LOKI_USERNAME="$(ask_required "Usuário do Loki")"
+    LOKI_PASSWORD="$(ask_secret "Senha do Loki")"
+    LOKI_NOVA=1
+  fi
+}
+
+gravar_credenciais_edicao() {
+  if [[ "$NOVAS_CREDENCIAIS" == "1" ]]; then
+    append_env_var "NEXTEC_RW_USERNAME" "$RW_USERNAME"
+    append_env_var "NEXTEC_RW_PASSWORD" "$RW_PASSWORD"
+    append_env_var "NEXTEC_LOKI_USERNAME" "$LOKI_USERNAME"
+    append_env_var "NEXTEC_LOKI_PASSWORD" "$LOKI_PASSWORD"
+  elif [[ "${LOKI_COPIAR_RW:-0}" == "1" ]]; then
+    copiar_credencial_rw_para_loki
+  elif [[ "${LOKI_NOVA:-0}" == "1" ]]; then
+    append_env_var "NEXTEC_LOKI_USERNAME" "$LOKI_USERNAME"
+    append_env_var "NEXTEC_LOKI_PASSWORD" "$LOKI_PASSWORD"
+  fi
+
+  if [[ "${ENABLE_DATABASES:-0}" != "1" ]]; then
+    remover_env_var 'NEXTEC_DB_DSN_[0-9]+'
+  elif [[ "$DB_REDEFINIDO" == "1" ]]; then
+    remover_env_var 'NEXTEC_DB_DSN_[0-9]+'
+    local idx=0 item db_type db_dsn
+    for item in "${DATABASE_TARGETS[@]}"; do
+      IFS='|' read -r db_type db_dsn <<<"$item"
+      idx=$((idx+1))
+      append_env_var "NEXTEC_DB_DSN_${idx}" "$db_dsn"
+    done
+  fi
+  append_env_var "CUSTOM_ARGS" "--server.http.listen-addr=127.0.0.1:12345"
+}
+
+aplicar_edicao() {
+  EDICAO=1
+  preparar_credenciais_edicao
+  show_plan "Aplicar estas alterações neste servidor?"
+
+  check_connectivity || warn "Conectividade com o NOC falhou; as alterações serão aplicadas mesmo assim."
+  install_coleta_complementar
+  coleta_enabled || desligar_coleta_complementar
+  prepare_snmp_config
+  write_blackbox_config
+  configure_service_env
+  generate_config
+  validate_and_start
+  rm -f "${CONFIG_FILE}.nextec-preinstall"
+  salvar_estado_instalacao completo
+  install_atualizador
+  final_summary "ALTERAÇÕES APLICADAS"
+}
+
+menu_alterar() {
+  detect_docker
+  detect_databases
+  local alterou=0 rotulo
+  local opcoes=(
+    "Identificação (cliente, host, ambiente, local, criticidade)"
+    "Recursos (ligar e desligar coletas)"
+    "Bancos de dados (credenciais)"
+    "Alvos de conectividade (Blackbox)"
+    "Equipamentos SNMP"
+    "Exporters adicionais"
+    "Links de internet"
+    "Credenciais do NOC"
+    "Destino do NOC"
+    "Ver o resumo atual"
+    "Gravar e aplicar as alterações"
+    "Sair sem gravar"
+  )
+  while true; do
+    step "Alterar a configuração"
+    choose_padrao "O que deseja alterar?" 11 "${opcoes[@]}"
+    rotulo="${opcoes[$((CHOOSE_RESULT-1))]}"
+    case "$rotulo" in
+      Identificação*) collect_identification; alterou=1 ;;
+      Recursos*) editar_recursos; alterou=1 ;;
+      Bancos*) editar_bancos; alterou=1 ;;
+      Alvos*)
+        editar_lista BLACKBOX_TARGETS "Alvos de conectividade (Blackbox)" collect_blackbox_targets ENABLE_BLACKBOX
+        [[ "$ENABLE_BLACKBOX" == "1" ]] && COLLECTOR=1
+        alterou=1 ;;
+      Equipamentos*)
+        editar_lista SNMP_TARGETS "Equipamentos SNMP" collect_snmp_targets ENABLE_SNMP
+        [[ "$ENABLE_SNMP" == "1" ]] && COLLECTOR=1
+        alterou=1 ;;
+      Exporters*) editar_lista CUSTOM_EXPORTERS "Exporters adicionais" collect_custom_exporters ENABLE_EXPORTERS; alterou=1 ;;
+      Links*)
+        editar_lista LINKS "Links de internet" collect_links_inputs ENABLE_LINKS
+        [[ "$ENABLE_LINKS" == "1" ]] && ENABLE_INTERNET=1
+        alterou=1 ;;
+      Credenciais*) editar_credenciais; alterou=1 ;;
+      Destino*) configure_noc_destination; alterou=1 ;;
+      Ver*) show_plan --resumo ;;
+      Gravar*)
+        if [[ "$alterou" != "1" ]]; then
+          info "Nada foi alterado."
+          return 0
+        fi
+        aplicar_edicao
+        return 0 ;;
+      Sair*)
+        [[ "$alterou" == "1" ]] && warn "Alterações descartadas; nada foi gravado no servidor."
+        return 0 ;;
+    esac
+  done
+}
+
+atualizar_somente_alloy() {
+  local antes depois
+  antes="$(alloy_versao_instalada)"
+  mkdir -p "$BACKUP_DIR"
+  cp -a "$CONFIG_FILE" "${CONFIG_FILE}.nextec-preinstall"
+  cp -a "$CONFIG_FILE" "$BACKUP_DIR/config.alloy.$(date +%Y%m%d-%H%M%S)"
+  install_alloy
+  # O pacote não deve trocar o config.alloy, mas se trocar a configuração da
+  # Nextec volta antes de validar.
+  if ! cmp -s "$CONFIG_FILE" "${CONFIG_FILE}.nextec-preinstall"; then
+    cp -a "${CONFIG_FILE}.nextec-preinstall" "$CONFIG_FILE"
+    warn "O pacote alterou o config.alloy; a configuração da Nextec foi restaurada."
+  fi
+  validate_and_start
+  rm -f "${CONFIG_FILE}.nextec-preinstall"
+  depois="$(alloy_versao_instalada)"
+  ok "Grafana Alloy: ${antes:-?} → ${depois:-?}. Configuração mantida."
+  if [[ -f "$ATUALIZADOR_BIN" ]]; then
+    info "O atualizador automático mantém a versão do Alloy definida pela Nextec: na próxima versão publicada ele pode trocar esta."
+  fi
+}
+
+validar_e_reiniciar() {
+  cp -a "$CONFIG_FILE" "${CONFIG_FILE}.nextec-preinstall"
+  validate_and_start
+  rm -f "${CONFIG_FILE}.nextec-preinstall"
+  if systemctl is-enabled --quiet coleta-complementar 2>/dev/null; then
+    systemctl restart coleta-complementar
+    ok "Coleta Complementar reiniciada."
+    python3 "$COLETA_BIN" verificar || warn "A verificação da Coleta Complementar apontou problemas (ver acima)."
+  fi
+  ok "Manutenção concluída."
+}
+
+# Servidor no modo somente coleta (Alloy fora deste instalador): não instala o
+# Alloy por cima sem o operador pedir.
+menu_somente_coleta_existente() {
+  step "Servidor no modo somente Coleta Complementar"
+  info "O Alloy deste servidor roda fora deste instalador (ex.: Alloy da stack)."
+  choose_padrao "O que deseja fazer?" 3 \
+    "Alterar a Coleta Complementar (mantém o modo somente coleta)" \
+    "Instalar o Grafana Alloy completo neste servidor" \
+    "Cancelar"
+  case "$CHOOSE_RESULT" in
+    1) main_somente_coleta; SEGUIR_INSTALACAO=0 ;;
+    2) SEGUIR_INSTALACAO=1 ;;
+    3) info "Nada foi alterado."; SEGUIR_INSTALACAO=0 ;;
+  esac
+}
+
+# Define SEGUIR_INSTALACAO: 1 segue para o fluxo completo, 0 encerra.
+menu_manutencao() {
+  SEGUIR_INSTALACAO=1
+  ESTADO_CARREGADO=0
+  if ! instalacao_existente; then
+    if [[ -f "$ESTADO_INSTALACAO" ]] && grep -qx 'MODO=somente_coleta' "$ESTADO_INSTALACAO"; then
+      menu_somente_coleta_existente
+    fi
+    return 0
+  fi
+
+  detect_os
+  if [[ -f "$ESTADO_INSTALACAO" ]] && carregar_estado_instalacao; then
+    ESTADO_CARREGADO=1
+  fi
+  mostrar_status_instalacao
+
+  local opcoes=() rotulo
+  if [[ "$ESTADO_CARREGADO" == "1" ]]; then
+    opcoes+=("Ver e alterar a configuração atual")
+  else
+    info "Sem respostas gravadas: rode \"Reconfigurar tudo\" uma vez; depois a alteração pontual fica disponível."
+  fi
+  opcoes+=(
+    "Reconfigurar tudo, fluxo completo (identificação, recursos, credenciais)"
+    "Atualizar o Grafana Alloy, mantendo a configuração"
+    "Validar a configuração e reiniciar os serviços"
+    "Cancelar"
+  )
+  # O padrão é Cancelar: as outras opções mexem num servidor em produção, e
+  # ENTER não deve disparar isso.
+  choose_padrao "O que deseja fazer?" "${#opcoes[@]}" "${opcoes[@]}"
+  rotulo="${opcoes[$((CHOOSE_RESULT-1))]}"
+  SEGUIR_INSTALACAO=0
+  case "$rotulo" in
+    Ver*) menu_alterar ;;
+    Reconfigurar*) SEGUIR_INSTALACAO=1 ;;
+    Atualizar*) atualizar_somente_alloy ;;
+    Validar*) validar_e_reiniciar ;;
+    Cancelar) info "Nada foi alterado." ;;
+  esac
+  return 0
 }
 
 main_atualizar() {
@@ -2629,35 +3187,60 @@ main_somente_coleta() {
 
   step "Somente Coleta Complementar"
   info "Este modo não instala nem altera o Alloy deste servidor."
+  # Já instalado neste modo: as respostas atuais viram o padrão (ENTER mantém).
+  local tem_estado=0
+  if [[ -f "$ESTADO_INSTALACAO" ]] && grep -qx 'MODO=somente_coleta' "$ESTADO_INSTALACAO" && carregar_estado_instalacao; then
+    tem_estado=1
+    info "Respostas atuais carregadas: ENTER mantém cada uma."
+  fi
+  sn() { [[ "$tem_estado" == "1" ]] && { [[ "${1:-0}" == "1" ]] && echo s || echo n; } || echo "$2"; }
+  local p_internet p_links p_velocidade p_docker p_acessos
+  p_internet="$(sn "${ENABLE_INTERNET:-0}" s)"
+  p_links="$(sn "${ENABLE_LINKS:-0}" n)"
+  p_velocidade="$(sn "${ENABLE_VELOCIDADE:-0}" s)"
+  p_docker="$(sn "${ENABLE_DOCKER:-0}" s)"
+  p_acessos="$(sn "${ENABLE_ACESSOS:-0}" s)"
+
   local raw detected
   while true; do
-    raw="$(ask_required "Cliente, identificador da empresa (ex.: nextec)")"
+    raw="$(ask_required "Cliente, identificador da empresa (ex.: nextec)" "${CLIENTE:-}")"
     CLIENTE="$(normalize_slug "$raw" | tr '-' '_' | sed -E 's/_+/_/g; s/^_+|_+$//g')"
     [[ "$CLIENTE" =~ ^[a-z0-9_]+$ ]] && break
     warn "Cliente inválido: ${raw}. Use letras, números e _. Tente de novo."
   done
-  detected="$(normalize_slug "$(hostname -s 2>/dev/null || hostname)")"
+  detected="${HOST_LABEL:-$(normalize_slug "$(hostname -s 2>/dev/null || hostname)")}"
   HOST_LABEL="$(ask_slug "Hostname para monitoramento" "$detected" host)"
   ENABLE_INTERNET=0
   ENABLE_LINKS=0
   ENABLE_VELOCIDADE=0
   ENABLE_DOCKER=0
   ENABLE_ACESSOS=0
-  LINKS=()
 
-  ask_yes_no "Medir a internet (status, DNS e IP público)?" s && ENABLE_INTERNET=1
-  ask_yes_no "Cadastrar links de internet (local com mais de um link)?" n && { ENABLE_LINKS=1; ENABLE_INTERNET=1; }
-  ask_yes_no "Teste de velocidade a cada 30 minutos?" s && ENABLE_VELOCIDADE=1
-  if [[ "$DOCKER_DETECTED" == "1" ]]; then
-    ask_yes_no "Coletar Docker (estado, consumo, health e eventos)?" s && ENABLE_DOCKER=1
+  ask_yes_no "Medir a internet (status, DNS e IP público)?" "$p_internet" && ENABLE_INTERNET=1
+  if ask_yes_no "Cadastrar links de internet (local com mais de um link)?" "$p_links"; then
+    ENABLE_LINKS=1
+    ENABLE_INTERNET=1
+  else
+    LINKS=()
   fi
-  ask_yes_no "Registrar acessos ao servidor (logins com origem)?" s && ENABLE_ACESSOS=1
+  ask_yes_no "Teste de velocidade a cada 30 minutos?" "$p_velocidade" && ENABLE_VELOCIDADE=1
+  if [[ "$DOCKER_DETECTED" == "1" ]]; then
+    ask_yes_no "Coletar Docker (estado, consumo, health e eventos)?" "$p_docker" && ENABLE_DOCKER=1
+  fi
+  ask_yes_no "Registrar acessos ao servidor (logins com origem)?" "$p_acessos" && ENABLE_ACESSOS=1
 
   if ! coleta_enabled; then
     warn "Nenhum módulo escolhido. Nada a fazer."
+    desligar_coleta_complementar
     exit 0
   fi
-  [[ "$ENABLE_LINKS" == "1" ]] && collect_links_inputs
+  if [[ "$ENABLE_LINKS" == "1" ]]; then
+    if (( ${#LINKS[@]} > 0 )); then
+      editar_lista LINKS "Links de internet" collect_links_inputs ENABLE_LINKS
+    else
+      collect_links_inputs
+    fi
+  fi
 
   install_coleta_complementar
   install_atualizador
@@ -2674,6 +3257,8 @@ main() {
   banner
   need_root
   need_systemd
+  menu_manutencao
+  [[ "$SEGUIR_INSTALACAO" == "1" ]] || return 0
   RW_URL="https://${NOC_HOST}/api/v1/write"
   LOKI_URL="https://${NOC_HOST}/loki/api/v1/push"
 
@@ -2691,6 +3276,7 @@ main() {
 
   install_alloy
   install_coleta_complementar
+  coleta_enabled || desligar_coleta_complementar
   prepare_snmp_config
   write_blackbox_config
   configure_service_env
