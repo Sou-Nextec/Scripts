@@ -332,6 +332,10 @@ ask_secret() {
     # A quebra de linha vai para stderr: no stdout ela entraria na senha
     # capturada por $(...) e o envio ao NOC daria 401.
     echo >&2
+    if [[ "$value" =~ [[:cntrl:]] ]]; then
+      warn "A credencial não pode ter caracteres de controle. Digite de novo."
+      continue
+    fi
     [[ -n "$value" ]] && { printf '%s' "$value"; return; }
     warn "Campo obrigatório."
   done
@@ -638,6 +642,8 @@ install_alloy_apt() {
   chmod 0644 /etc/apt/keyrings/grafana.asc
   echo "deb [signed-by=/etc/apt/keyrings/grafana.asc] https://apt.grafana.com stable main" > /etc/apt/sources.list.d/grafana.list
   apt-get update -y
+  # Conclui instalação interrompida por uma falha anterior, se houver.
+  dpkg --configure -a || true
   apt-get install -y alloy
 }
 
@@ -718,8 +724,40 @@ EOF
   rm -rf "$tmpdir"
 }
 
+# O pacote do Alloy (Debian/RPM) carrega /etc/default/alloy como script de shell
+# nos próprios scripts de instalação. Uma linha fora do formato CHAVE=valor (ex.:
+# senha quebrada em duas linhas por versões antigas deste instalador) vira
+# comando e derruba a atualização do pacote. Aqui o arquivo é conferido sem ser
+# executado e, se tiver linha inválida, é refeito; as credenciais são gravadas
+# de novo mais adiante pelo próprio instalador.
+sanitize_env_file() {
+  [[ -f "$ENV_FILE" ]] || return 0
+  local linha invalido=0
+  local re_linha='^[A-Za-z_][A-Za-z0-9_]*=("([^"\\]|\\.)*"|'"'"'[^'"'"']*'"'"'|[^[:space:]"'"'"'`$]*)$'
+  while IFS= read -r linha || [[ -n "$linha" ]]; do
+    linha="${linha%$'\r'}"
+    [[ -z "${linha//[[:space:]]/}" || "$linha" =~ ^[[:space:]]*# ]] && continue
+    [[ "$linha" =~ $re_linha ]] || { invalido=1; break; }
+  done < "$ENV_FILE"
+  (( invalido == 0 )) && return 0
+
+  local copia="${ENV_FILE}.invalido-$(date +%Y%m%d-%H%M%S)"
+  cp -a "$ENV_FILE" "$copia"
+  chmod 0600 "$copia"
+  cat > "$ENV_FILE" <<'EOF'
+# Grafana Alloy. Refeito pelo instalador Nextec porque o arquivo anterior tinha
+# linha inválida; credenciais e argumentos são gravados abaixo pelo instalador.
+CONFIG_FILE="/etc/alloy/config.alloy"
+CUSTOM_ARGS=""
+RESTART_ON_UPGRADE=true
+EOF
+  chmod 0600 "$ENV_FILE"
+  warn "${ENV_FILE} tinha linha inválida e foi refeito (cópia protegida em ${copia}; apague depois de concluir)."
+}
+
 install_alloy() {
   step "Instalando Grafana Alloy"
+  sanitize_env_file
   install_prerequisites
 
   case "$PKG_FAMILY" in
@@ -739,10 +777,21 @@ install_alloy() {
 # ------------------------------------------------------------------------------
 append_env_var() {
   local key="$1" value="$2" tmp escaped
+  # Quebra de linha dentro do valor quebra o arquivo: o pacote do Alloy executa
+  # a linha seguinte como comando. Remove nas pontas e recusa no meio.
+  value="${value#$'\n'}"; value="${value%$'\n'}"; value="${value//$'\r'/}"
+  if [[ "$value" == *$'\n'* ]]; then
+    err "O valor de ${key} contém quebra de linha. Rode o instalador de novo e digite a credencial em uma linha."
+    exit 1
+  fi
   tmp="$(mktemp)"
   [[ -f "$ENV_FILE" ]] && grep -vE "^${key}=" "$ENV_FILE" > "$tmp" || true
+  # Aspas duplas com \, ", $ e ` escapados: valor literal tanto para o shell
+  # (scripts do pacote) quanto para o systemd (EnvironmentFile).
   escaped="${value//\\/\\\\}"
   escaped="${escaped//\"/\\\"}"
+  escaped="${escaped//\$/\\\$}"
+  escaped="${escaped//\`/\\\`}"
   printf '%s="%s"\n' "$key" "$escaped" >> "$tmp"
   install -m 0600 "$tmp" "$ENV_FILE"
   rm -f "$tmp"
