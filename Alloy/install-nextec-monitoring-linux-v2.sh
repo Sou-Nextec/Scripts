@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.0.0
+# Versão: 2.1.0
 #
 # OBJETIVO
 # -------
@@ -20,6 +20,9 @@
 #    o componente continua se chamando blackbox, seguindo a nomenclatura Grafana.
 # 6. Antes de reiniciar o Alloy, o instalador executa `alloy fmt` e `alloy validate`.
 # 7. Em caso de falha após alterar uma instalação existente, há rollback do config.
+# 8. O que o Alloy não coleta sozinho (internet, links, estado e eventos do
+#    Docker, teste de velocidade) fica com a Coleta Complementar Nextec, baixada
+#    do repositório Scripts. Ela só grava arquivos locais; quem envia é o Alloy.
 #
 # DISTRIBUIÇÕES
 # ------------
@@ -36,7 +39,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.0.0"
+INSTALLER_VERSION="2.1.0"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -47,6 +50,19 @@ CONFIG_FILE="${CONFIG_DIR}/config.alloy"
 BACKUP_DIR="${CONFIG_DIR}/backup"
 BLACKBOX_FILE="${CONFIG_DIR}/blackbox.yml"
 SNMP_FILE="${CONFIG_DIR}/snmp.yml"
+
+# Coleta Complementar Nextec: completa o que o Alloy não coleta sozinho.
+# COLETA_URL pode ser sobrescrita por variável de ambiente para testar uma branch.
+COLETA_URL="${COLETA_URL:-https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Alloy/coleta-complementar/coleta-complementar.py}"
+COLETA_BIN="/usr/local/lib/nextec/coleta-complementar.py"
+COLETA_CONFIG_DIR="/etc/coleta-complementar"
+COLETA_CONFIG="${COLETA_CONFIG_DIR}/coleta-complementar.ini"
+COLETA_DADOS="/var/lib/coleta-complementar"
+COLETA_TEXTFILE="${COLETA_DADOS}/textfile"
+COLETA_EVENTOS="/var/log/coleta-complementar/eventos.jsonl"
+COLETA_SERVICE="/etc/systemd/system/coleta-complementar.service"
+SPEEDTEST_CLI_VERSION="1.2.0"
+SPEEDTEST_BIN="/usr/local/bin/speedtest"
 
 # O pacote oficial usa /etc/default/alloy em Debian. No fallback binário também
 # adotamos o mesmo local para manter um único padrão de manutenção.
@@ -251,7 +267,7 @@ detect_os() {
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
     source /etc/os-release
-    INSTALLER_VERSION="2.0.0"
+    INSTALLER_VERSION="2.1.0"
     DISTRO_ID="${ID:-unknown}"
     DISTRO_LIKE="${ID_LIKE:-}"
     PRETTY_OS="${PRETTY_NAME:-$DISTRO_ID}"
@@ -556,13 +572,229 @@ append_env_var() {
   rm -f "$tmp"
 }
 
+# ------------------------------------------------------------------------------
+# COLETA COMPLEMENTAR NEXTEC
+# ------------------------------------------------------------------------------
+# O Alloy coleta recursos, logs e sondas. O que ele não faz sozinho fica com a
+# Coleta Complementar: internet e links (status, failover, causa das quedas),
+# estado e eventos do Docker e teste de velocidade. Ela grava métricas em
+# ${COLETA_TEXTFILE} e eventos em ${COLETA_EVENTOS}; o Alloy lê e envia.
+coleta_enabled() {
+  [[ "${ENABLE_INTERNET:-0}" == "1" || "${ENABLE_LINKS:-0}" == "1" || \
+     "${ENABLE_VELOCIDADE:-0}" == "1" || "${ENABLE_DOCKER:-0}" == "1" ]]
+}
+
+needs_loki() {
+  [[ "${ENABLE_LOGS:-0}" == "1" ]] || coleta_enabled
+}
+
+ini_value() {
+  # Remove quebras de linha e colchetes, que quebrariam o arquivo INI.
+  local value="${1//$'\n'/ }"
+  value="${value//[/(}"
+  value="${value//]/)}"
+  printf '%s' "$value"
+}
+
+collect_links_inputs() {
+  step "Links de internet"
+  info "Cada link precisa de pelo menos um destino que saia SOMENTE por ele."
+  info "Use uma rota por link no firewall (ex.: 8.8.8.8 pelo link 1, 1.1.1.1 pelo link 2),"
+  info "ou um IP de origem deste servidor que saia pela WAN do link."
+  local nome papel choice operadora tipo suporte ip_publico gateway alvos origem firewall interface
+  while true; do
+    nome="$(ini_value "$(ask_required "Nome do link (ex.: Cyberline Fibra)")")"
+    choose "Papel do link" "primario" "failover" "sdwan"
+    choice="$CHOOSE_RESULT"
+    case "$choice" in 1) papel=primario;; 2) papel=failover;; 3) papel=sdwan;; esac
+    operadora="$(ini_value "$(ask_required "Operadora" "$nome")")"
+    tipo="$(ini_value "$(ask_required "Tipo (fibra, radio, 4g, satelite, dedicado)" "fibra")")"
+    read -r -p "Telefone/protocolo de suporte da operadora (ENTER para pular): " suporte
+    read -r -p "IP público fixo do link (ENTER se for dinâmico): " ip_publico
+    read -r -p "Gateway da operadora para testar (ENTER para pular): " gateway
+    alvos="$(ask_required "Destinos que saem por este link, separados por vírgula" "8.8.8.8")"
+    read -r -p "IP de origem neste servidor para este link (ENTER para pular): " origem
+    read -r -p "Nome do firewall no NOC, para tráfego por SNMP (ENTER para pular): " firewall
+    interface=""
+    [[ -n "$firewall" ]] && read -r -p "Interface WAN do link no firewall (ex.: igb1): " interface
+    LINKS+=("$(ini_value "$nome")|${papel}|$(ini_value "$operadora")|$(ini_value "$tipo")|$(ini_value "$suporte")|$(ini_value "$ip_publico")|$(ini_value "$gateway")|$(ini_value "$alvos")|$(ini_value "$origem")|$(ini_value "$firewall")|$(ini_value "$interface")")
+    ok "Link adicionado: ${nome} (${papel})"
+    ask_yes_no "Adicionar outro link?" n || break
+  done
+}
+
+write_coleta_config() {
+  mkdir -p "$COLETA_CONFIG_DIR"
+  if [[ -f "$COLETA_CONFIG" ]] && (( ${#LINKS[@]} == 0 )); then
+    # Reconfiguração sem links novos: preserva os links e limites já ajustados
+    # e só atualiza quais módulos estão ligados.
+    cp -a "$COLETA_CONFIG" "${COLETA_CONFIG}.$(date +%Y%m%d-%H%M%S).bak"
+    python3 - "$COLETA_CONFIG" "$ENABLE_INTERNET" "$ENABLE_DOCKER" "$ENABLE_VELOCIDADE" <<'PY'
+import configparser, sys
+caminho, internet, docker, velocidade = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+config = configparser.ConfigParser(interpolation=None)
+config.optionxform = str
+config.read(caminho, encoding="utf-8")
+for secao, ligado in (("internet", internet), ("docker", docker), ("velocidade", velocidade)):
+    if not config.has_section(secao):
+        config.add_section(secao)
+    config[secao]["ativo"] = "sim" if ligado == "1" else "nao"
+with open(caminho, "w", encoding="utf-8") as arquivo:
+    config.write(arquivo)
+PY
+    ok "Configuração da Coleta Complementar preservada (${COLETA_CONFIG})."
+    return 0
+  fi
+
+  [[ -f "$COLETA_CONFIG" ]] && cp -a "$COLETA_CONFIG" "${COLETA_CONFIG}.$(date +%Y%m%d-%H%M%S).bak"
+  {
+    cat <<EOF
+; Coleta Complementar Nextec
+; Gerado pelo instalador ${INSTALLER_VERSION} em $(date '+%d/%m/%Y %H:%M').
+; Depois de alterar: systemctl restart coleta-complementar
+; Manual completo: Confluence NXTDOC, "Coleta Complementar Nextec".
+
+[geral]
+; Intervalo entre medições de internet e links, em segundos (mínimo 10).
+intervalo_links_segundos = 15
+; Acima destes limites o link fica "degradado".
+limite_latencia_ms = 150
+limite_perda_percentual = 5
+
+[internet]
+; Links configurados abaixo mantêm este módulo ligado mesmo com "nao".
+ativo = $([[ "$ENABLE_INTERNET" == 1 ]] && echo sim || echo nao)
+; Destinos testados pela saída padrão do servidor.
+alvos = 1.1.1.1, 8.8.8.8
+; Firewall/gateway da rede local. Vazio: usa o gateway padrão do servidor.
+firewall =
+; Servidores DNS testados ("sistema" usa o DNS configurado no servidor).
+dns_servidores = sistema, 1.1.1.1, 8.8.8.8
+dns_nome = google.com
+
+[docker]
+ativo = $([[ "$ENABLE_DOCKER" == 1 ]] && echo sim || echo nao)
+
+[velocidade]
+ativo = $([[ "$ENABLE_VELOCIDADE" == 1 ]] && echo sim || echo nao)
+intervalo_minutos = 30
+EOF
+    local item nome papel operadora tipo suporte ip_publico gateway alvos origem firewall interface
+    for item in "${LINKS[@]}"; do
+      IFS='|' read -r nome papel operadora tipo suporte ip_publico gateway alvos origem firewall interface <<<"$item"
+      cat <<EOF
+
+[link:${nome}]
+papel = ${papel}
+operadora = ${operadora}
+tipo = ${tipo}
+suporte = ${suporte}
+ip_publico = ${ip_publico}
+gateway = ${gateway}
+alvos = ${alvos}
+origem = ${origem}
+firewall = ${firewall}
+interface_firewall = ${interface}
+teste_velocidade = nao
+EOF
+    done
+  } > "$COLETA_CONFIG"
+  chmod 0644 "$COLETA_CONFIG"
+  ok "Configuração da Coleta Complementar criada em ${COLETA_CONFIG}."
+}
+
+install_speedtest_cli() {
+  [[ "$ENABLE_VELOCIDADE" == "1" ]] || return 0
+  if [[ -x "$SPEEDTEST_BIN" ]]; then
+    info "Speedtest CLI já instalado."
+    return 0
+  fi
+  local arch tmp
+  case "$(uname -m)" in
+    x86_64|amd64) arch="x86_64";;
+    aarch64|arm64) arch="aarch64";;
+    *) warn "Arquitetura sem Speedtest CLI; teste de velocidade desligado."; ENABLE_VELOCIDADE=0; return 0;;
+  esac
+  tmp="$(mktemp -d)"
+  if curl -fsSL "https://install.speedtest.net/app/cli/ookla-speedtest-${SPEEDTEST_CLI_VERSION}-linux-${arch}.tgz" -o "${tmp}/speedtest.tgz" \
+     && tar -xzf "${tmp}/speedtest.tgz" -C "$tmp" speedtest; then
+    install -m 0755 "${tmp}/speedtest" "$SPEEDTEST_BIN"
+    ok "Speedtest CLI instalado em ${SPEEDTEST_BIN}."
+  else
+    warn "Não foi possível baixar o Speedtest CLI; teste de velocidade desligado."
+    ENABLE_VELOCIDADE=0
+  fi
+  rm -rf "$tmp"
+}
+
+install_coleta_complementar() {
+  coleta_enabled || return 0
+  step "Instalando a Coleta Complementar Nextec"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    info "Instalando python3..."
+    case "$PKG_FAMILY" in
+      apt) apt-get install -y -q python3 >/dev/null;;
+      dnf|yum) "$PKG_FAMILY" install -y -q python3 >/dev/null;;
+      zypper) zypper -q -n install python3 >/dev/null;;
+      *) err "python3 não encontrado e não há gerenciador de pacotes conhecido."; exit 1;;
+    esac
+  fi
+  if ! command -v ping >/dev/null 2>&1 || ! command -v traceroute >/dev/null 2>&1; then
+    case "$PKG_FAMILY" in
+      apt) apt-get install -y -q iputils-ping traceroute >/dev/null || true;;
+      dnf|yum) "$PKG_FAMILY" install -y -q iputils traceroute >/dev/null || true;;
+      zypper) zypper -q -n install iputils traceroute >/dev/null || true;;
+    esac
+  fi
+
+  install_speedtest_cli
+
+  local tmp
+  tmp="$(mktemp)"
+  curl -fsSL "$COLETA_URL" -o "$tmp" || { err "Falha ao baixar a Coleta Complementar de ${COLETA_URL}"; exit 1; }
+  python3 -m py_compile "$tmp" || { err "Arquivo baixado da Coleta Complementar é inválido."; exit 1; }
+  install -D -m 0755 "$tmp" "$COLETA_BIN"
+  rm -f "$tmp"
+  ok "Coleta Complementar $(python3 "$COLETA_BIN" versao) instalada em ${COLETA_BIN}."
+
+  write_coleta_config
+  install -d -m 0755 "$COLETA_DADOS" "$COLETA_TEXTFILE" "$(dirname "$COLETA_EVENTOS")"
+
+  cat > "$COLETA_SERVICE" <<EOF
+[Unit]
+Description=Coleta Complementar Nextec (internet, links, Docker e velocidade)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 ${COLETA_BIN} executar
+Restart=always
+RestartSec=10
+# Roda como root: precisa de ping com IP de origem e do socket do Docker.
+# Só grava em ${COLETA_DADOS} e $(dirname "$COLETA_EVENTOS").
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now coleta-complementar >/dev/null 2>&1
+  systemctl restart coleta-complementar
+  python3 "$COLETA_BIN" verificar || warn "A verificação da Coleta Complementar apontou problemas (ver acima)."
+}
+
 configure_service_env() {
   step "Configurando credenciais e segurança local"
 
   append_env_var "NEXTEC_RW_USERNAME" "$RW_USERNAME"
   append_env_var "NEXTEC_RW_PASSWORD" "$RW_PASSWORD"
 
-  if [[ "$ENABLE_LOGS" == "1" ]]; then
+  if needs_loki; then
     append_env_var "NEXTEC_LOKI_USERNAME" "$LOKI_USERNAME"
     append_env_var "NEXTEC_LOKI_PASSWORD" "$LOKI_PASSWORD"
   fi
@@ -781,28 +1013,144 @@ prometheus.scrape "system" {
 EOF
     fi
 
+    if needs_loki; then
+      cat <<EOF
+
+// -----------------------------------------------------------------------------
+// ENVIO DE LOGS E EVENTOS PARA O LOKI DO NOC
+// -----------------------------------------------------------------------------
+loki.write "nextec" {
+  endpoint {
+    url = "${LOKI_URL}"
+    basic_auth {
+      username = sys.env("NEXTEC_LOKI_USERNAME")
+      password = sys.env("NEXTEC_LOKI_PASSWORD")
+    }
+  }
+}
+EOF
+    fi
+
     if [[ "$ENABLE_DOCKER" == "1" ]]; then
-      cat <<'EOF'
+      cat <<EOF
 
 // -----------------------------------------------------------------------------
 // DOCKER / CONTAINERS
-// cAdvisor é embutido no Alloy. Não existe container cAdvisor separado.
+// Estado, consumo (CPU, memória, rede, disco), health, configuração e eventos
+// vêm da Coleta Complementar, lendo a API do Docker. O cAdvisor embutido no
+// Alloy não é usado: no Docker com armazenamento de imagens do containerd
+// (instalações recentes do Docker) ele não enxerga nenhum container.
+// Aqui fica só a coleta dos logs dos containers, com os rótulos container e
+// stack (projeto do compose; avulso quando não há).
 // O usuário alloy precisa conseguir acessar o socket Docker.
 // -----------------------------------------------------------------------------
-prometheus.exporter.cadvisor "docker" {
-  docker_host            = "unix:///var/run/docker.sock"
-  storage_duration       = "5m"
-  store_container_labels = false
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "containers_logs" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    regex         = "^\$"
+    target_label  = "stack"
+    replacement   = "avulso"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    regex         = "(.+)"
+    target_label  = "stack"
+  }
+}
+
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers_logs.output
+  forward_to = [loki.write.nextec.receiver]
+  labels = {
+    cliente="$(alloy_escape "$CLIENTE")", host="$(alloy_escape "$HOST_LABEL")", servico="docker",
+    tipo="container", ambiente="$(alloy_escape "$AMBIENTE")", os="linux", origem="alloy",
+    criticidade="$(alloy_escape "$CRITICIDADE")", local="$(alloy_escape "$LOCAL")",
+  }
 }
 EOF
-      write_common_relabels 'prometheus.exporter.cadvisor.docker.targets' 'docker_labels' 'docker' 'container' 'linux' 'cadvisor'
-      cat <<'EOF'
+    fi
 
-prometheus.scrape "docker" {
-  targets         = discovery.relabel.docker_labels.output
+    if coleta_enabled; then
+      cat <<EOF
+
+// -----------------------------------------------------------------------------
+// COLETA COMPLEMENTAR NEXTEC
+// Métricas: arquivos .prom em ${COLETA_TEXTFILE}.
+// Eventos: ${COLETA_EVENTOS}, um JSON por linha.
+// honor_labels mantém rótulos próprios das métricas (ex.: tipo do link).
+// -----------------------------------------------------------------------------
+prometheus.exporter.unix "coleta_complementar" {
+  set_collectors = ["textfile"]
+
+  textfile {
+    directory = "${COLETA_TEXTFILE}"
+  }
+}
+EOF
+      write_common_relabels 'prometheus.exporter.unix.coleta_complementar.targets' 'coleta_complementar_labels' 'coleta_complementar' 'servidor' 'linux' 'alloy'
+      cat <<EOF
+
+prometheus.scrape "coleta_complementar" {
+  targets         = discovery.relabel.coleta_complementar_labels.output
   forward_to      = [prometheus.remote_write.nextec.receiver]
-  scrape_interval = "30s"
-  scrape_timeout  = "15s"
+  job_name        = "integrations/coleta_complementar"
+  honor_labels    = true
+  scrape_interval = "15s"
+  scrape_timeout  = "10s"
+}
+
+loki.source.file "coleta_complementar" {
+  targets = [{
+    "__path__"  = "${COLETA_EVENTOS}",
+    cliente     = "$(alloy_escape "$CLIENTE")",
+    host        = "$(alloy_escape "$HOST_LABEL")",
+    servico     = "coleta_complementar",
+    ambiente    = "$(alloy_escape "$AMBIENTE")",
+    os          = "linux",
+    origem      = "alloy",
+    criticidade = "$(alloy_escape "$CRITICIDADE")",
+    local       = "$(alloy_escape "$LOCAL")",
+  }]
+  forward_to    = [loki.process.coleta_complementar.receiver]
+  tail_from_end = true
+}
+
+loki.process "coleta_complementar" {
+  forward_to = [loki.write.nextec.receiver]
+
+  stage.json {
+    expressions = {
+      tipo      = "",
+      categoria = "",
+      link      = "",
+      ts        = "",
+    }
+  }
+
+  stage.labels {
+    values = {
+      tipo      = "",
+      categoria = "",
+      link      = "",
+    }
+  }
+
+  stage.timestamp {
+    source = "ts"
+    format = "RFC3339"
+  }
 }
 EOF
     fi
@@ -815,17 +1163,8 @@ EOF
 // -----------------------------------------------------------------------------
 // LOGS DO SISTEMA, OPCIONAL
 // Não fazem parte do perfil mínimo de métricas do servidor.
+// O loki.write "nextec" é gerado no bloco de envio, mais acima.
 // -----------------------------------------------------------------------------
-loki.write "nextec" {
-  endpoint {
-    url = "${LOKI_URL}"
-    basic_auth {
-      username = sys.env("NEXTEC_LOKI_USERNAME")
-      password = sys.env("NEXTEC_LOKI_PASSWORD")
-    }
-  }
-}
-
 loki.relabel "journal" {
   forward_to = []
 
@@ -1147,8 +1486,8 @@ resource_checklist() {
   (( ${#DETECTED_DATABASES[@]} > 0 )) && db_available=1
 
   # Estado inicial recomendado.
-  local -a selected=(0 0 0 0 0 0)
-  local -a disabled=(0 0 0 0 0 0)
+  local -a selected=(0 0 0 0 0 0 1 0 1)
+  local -a disabled=(0 0 0 0 0 0 0 0 0)
   local -a labels=(
     "Docker / containers"
     "Logs do sistema, warning/error/critical"
@@ -1156,8 +1495,11 @@ resource_checklist() {
     "SNMP, firewalls/switches/UPS/APs"
     "Conectividade e disponibilidade (Blackbox), ping/HTTP/TCP"
     "Exporters adicionais"
+    "Internet e DNS (saída padrão, IP público, diagnóstico)"
+    "Links de internet (mais de um link neste local)"
+    "Teste de velocidade (Speedtest)"
   )
-  local -a details=("" "" "" "" "" "")
+  local -a details=("" "" "" "" "" "" "recomendado" "" "recomendado")
 
   if [[ "$DOCKER_DETECTED" == "1" && "${DOCKER_DAEMON_AVAILABLE:-0}" == "1" ]]; then
     selected[0]=1
@@ -1215,7 +1557,7 @@ resource_checklist() {
 
       for token in "${tokens[@]}"; do
         [[ -z "$token" ]] && continue
-        if [[ "$token" =~ ^[1-6]$ ]]; then
+        if [[ "$token" =~ ^[1-9]$ ]]; then
           local idx=$((token-1))
           if [[ "${disabled[$idx]}" == "1" ]]; then
             warn "${labels[$idx]} não está disponível neste host."
@@ -1223,7 +1565,7 @@ resource_checklist() {
             [[ "${selected[$idx]}" == "1" ]] && selected[$idx]=0 || selected[$idx]=1
           fi
         else
-          warn "Opção inválida: ${token}. Use números de 1 a 6."
+          warn "Opção inválida: ${token}. Use números de 1 a 9."
         fi
       done
     done
@@ -1345,6 +1687,11 @@ resource_checklist() {
   ENABLE_SNMP="${selected[3]}"
   ENABLE_BLACKBOX="${selected[4]}"
   ENABLE_EXPORTERS="${selected[5]}"
+  ENABLE_INTERNET="${selected[6]}"
+  ENABLE_LINKS="${selected[7]}"
+  ENABLE_VELOCIDADE="${selected[8]}"
+  # Links dependem do módulo de internet (mesmo laço de medição).
+  [[ "$ENABLE_LINKS" == "1" ]] && ENABLE_INTERNET=1
 
   if [[ "$ENABLE_SNMP" == "1" || "$ENABLE_BLACKBOX" == "1" ]]; then
     COLLECTOR=1
@@ -1444,6 +1791,10 @@ collect_inputs() {
   ENABLE_BLACKBOX=0
   ENABLE_SNMP=0
   ENABLE_EXPORTERS=0
+  ENABLE_INTERNET=0
+  ENABLE_LINKS=0
+  ENABLE_VELOCIDADE=0
+  LINKS=()
   BLACKBOX_TARGETS=()
   SNMP_TARGETS=()
   CUSTOM_EXPORTERS=()
@@ -1537,14 +1888,18 @@ collect_inputs() {
     done
   fi
 
+  if [[ "$ENABLE_LINKS" == "1" ]]; then
+    collect_links_inputs
+  fi
+
   step "Credenciais do NOC"
   info "Use a credencial cadastrada no NOC para autorizar o envio deste cliente."
   RW_USERNAME="$(ask_required "Usuário do remote_write")"
   RW_PASSWORD="$(ask_secret "Senha do remote_write")"
 
-  if [[ "$ENABLE_LOGS" == "1" ]]; then
+  if needs_loki; then
     echo
-    info "Credencial do Loki:"
+    info "Credencial do Loki (logs e eventos):"
     if ask_yes_no "Usar a mesma credencial do remote_write no Loki?" s; then
       LOKI_USERNAME="$RW_USERNAME"
       LOKI_PASSWORD="$RW_PASSWORD"
@@ -1573,6 +1928,9 @@ show_plan() {
   summary_row "Conectividade (Blackbox):" "$([[ "$ENABLE_BLACKBOX" == 1 ]] && echo "sim (${#BLACKBOX_TARGETS[@]})" || echo não)"
   summary_row "SNMP:" "$([[ "$ENABLE_SNMP" == 1 ]] && echo "sim (${#SNMP_TARGETS[@]})" || echo não)"
   summary_row "Exporters adicionais:" "${#CUSTOM_EXPORTERS[@]}"
+  summary_row "Internet e DNS:" "$([[ "$ENABLE_INTERNET" == 1 ]] && echo sim || echo não)"
+  summary_row "Links de internet:" "$([[ "$ENABLE_LINKS" == 1 ]] && echo "sim (${#LINKS[@]})" || echo não)"
+  summary_row "Teste de velocidade:" "$([[ "$ENABLE_VELOCIDADE" == 1 ]] && echo sim || echo não)"
 
   echo
   ask_yes_no "Confirmar instalação e configuração?" s || { warn "Cancelado."; exit 0; }
@@ -1589,7 +1947,8 @@ final_summary() {
   echo "UI local: http://127.0.0.1:12345"
   echo "Métricas: ${RW_URL}"
   [[ "$ENABLE_LOGS" == 1 ]] && echo "Logs: ${LOKI_URL}"
-  [[ "$ENABLE_DOCKER" == 1 ]] && echo "Docker: habilitado via prometheus.exporter.cadvisor"
+  [[ "$ENABLE_DOCKER" == 1 ]] && echo "Docker: logs pelo Alloy; estado, consumo e eventos pela Coleta Complementar"
+  coleta_enabled && echo "Coleta Complementar: ${COLETA_CONFIG} (systemctl status coleta-complementar)"
   (( ${#DATABASE_TARGETS[@]} > 0 )) && echo "Banco(s): ${#DATABASE_TARGETS[@]} integração(ões)/detecção(ões) registrada(s)"
 
   echo
@@ -1598,6 +1957,7 @@ final_summary() {
   echo "  journalctl -u alloy -f"
   echo "  alloy validate ${CONFIG_FILE}"
   echo "  curl http://127.0.0.1:12345/-/ready"
+  coleta_enabled && echo "  python3 ${COLETA_BIN} verificar"
 
   warn "Valide no NOC a chegada de cliente=\"${CLIENTE}\" e host=\"${HOST_LABEL}\"."
 }
@@ -1622,6 +1982,7 @@ main() {
   }
 
   install_alloy
+  install_coleta_complementar
   prepare_snmp_config
   write_blackbox_config
   configure_service_env

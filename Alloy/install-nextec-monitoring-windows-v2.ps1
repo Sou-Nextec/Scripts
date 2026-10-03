@@ -36,6 +36,14 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.12.0 Coleta Complementar Nextec: monitoramento de internet (status,
+           DNS, IP público, diagnóstico) e de cada link do local (failover,
+           gateway da operadora, causa das quedas). Arquivo único baixado do
+           repositório Scripts, roda por tarefa agendada e grava arquivos que
+           o próprio Alloy envia. Oferecida em qualquer modo, não só collector.
+           O .prom do Speedtest passa a terminar com quebra de linha, exigida
+           pelo coletor textfile.
+
     2.11.0 Corrige o registro da tarefa do Speedtest. O gatilho usava
            [TimeSpan]::MaxValue como duracao da repeticao, o que gera
            "P99999999DT23H59M59S" e faz o agendador recusar a tarefa com
@@ -143,6 +151,10 @@ param(
     # sozinho, sem passo manual. Exige -Modo collector, servidor_collector ou
     # estacao_collector.
     [switch]$EnableInternet,
+    # [Modo Silencioso] Liga a Coleta Complementar (internet, DNS, IP público
+    # e diagnóstico). Links ficam no arquivo coleta-complementar.ini; se ele já
+    # existir, é preservado.
+    [switch]$EnableColeta,
     # [Modo Silencioso] Intervalo em minutos entre execuções do teste de
     # velocidade. Padrão 30min: um link residencial não deve ser saturado por
     # um teste de banda a cada poucos minutos.
@@ -206,7 +218,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.11.0"
+$InstallerVersion = "2.12.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -255,6 +267,18 @@ $SpeedtestMetricsDir = Join-Path $SpeedtestDir "textfile"
 $SpeedtestMetricsFile = Join-Path $SpeedtestMetricsDir "nextec_speedtest.prom"
 $SpeedtestRunnerScript = Join-Path $SpeedtestDir "Invoke-NextecSpeedtest.ps1"
 $SpeedtestTaskName = "NextecSpeedtest"
+
+# Coleta Complementar Nextec (internet e links). Arquivo único baixado do
+# repositório Scripts; roda por tarefa agendada como SYSTEM e só grava
+# arquivos locais (métricas .prom e eventos em JSON). Quem envia é o Alloy.
+# NEXTEC_COLETA_URL permite testar uma branch sem alterar o instalador.
+$ColetaUrl = if ($env:NEXTEC_COLETA_URL) { $env:NEXTEC_COLETA_URL } else { "https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Alloy/coleta-complementar/coleta-complementar.ps1" }
+$ColetaDir = Join-Path $ProgramDataDir "coleta-complementar"
+$ColetaScript = Join-Path $ColetaDir "coleta-complementar.ps1"
+$ColetaConfig = Join-Path $ColetaDir "coleta-complementar.ini"
+$ColetaTextfileDir = Join-Path $ColetaDir "textfile"
+$ColetaEventos = Join-Path $ColetaDir "eventos.jsonl"
+$ColetaTaskName = "NextecColetaComplementar"
 # Versão pinada do Ookla Speedtest CLI. Checar a versão mais recente em
 # https://www.speedtest.net/apps/cli antes de trocar; um ZIP inexistente
 # nessa URL derruba a instalação do zero, não fica em modo degradado.
@@ -303,6 +327,9 @@ $script:EnableExportersResolved = $false
 $script:SelectedExporterKeys = [string[]]@()
 $script:EnableInternetResolved = $false
 $script:InternetIntervalMinutesResolved = 30
+$script:EnableColetaResolved = $false
+$script:EnableLinksResolved = $false
+$script:ColetaLinks = @()
 
 # Intervalo de sondagem dos alvos Blackbox. 60s é o padrão histórico e serve
 # para "o site está no ar". Para medir disponibilidade de link, latência e
@@ -1405,6 +1432,7 @@ function Read-CurrentAlloyConfiguration {
         CustomExporters          = $customExporters
         EnableInternet           = $enableInternet
         InternetIntervalMinutes  = $internetIntervalMinutes
+        EnableColeta             = ($content -match 'prometheus\.exporter\.windows\s+"coleta_complementar"')
         BlackboxIntervalSeconds  = $blackboxIntervalSeconds
         Modificado               = (Get-Item -LiteralPath $ConfigFile).LastWriteTime
         Arquivo                  = $ConfigFile
@@ -1513,6 +1541,15 @@ function Show-CurrentConfiguration {
         Write-Field -Label "Internet" -Value "não monitorada" -ValueColor DarkGray
     }
 
+    if ($c.EnableColeta) {
+        $linksAtuais = @(Get-ColetaLinksFromIni)
+        $textoLinks = if ($linksAtuais.Count -gt 0) { ($linksAtuais | ForEach-Object { $_.nome }) -join ", " } else { "nenhum link cadastrado" }
+        Write-Field -Label "Coleta Complementar" -Value ("internet; links: {0}" -f $textoLinks)
+    }
+    else {
+        Write-Field -Label "Coleta Complementar" -Value "desligada" -ValueColor DarkGray
+    }
+
     if ($c.BlackboxTargets.Count -gt 0) {
         Write-Section ("Conectividade, Blackbox ({0} alvo(s))" -f $c.BlackboxTargets.Count)
         Write-Host ("    {0,-18} {1,-28} {2,-16} {3}" -f "NOME", "ENDEREÇO", "MÓDULO", "TIPO") -ForegroundColor DarkGray
@@ -1577,6 +1614,9 @@ function Import-CurrentConfiguration {
     $script:EnableBlackboxResolved     = ($c.BlackboxTargets.Count -gt 0)
     $script:EnableSnmpResolved         = ($c.SnmpTargets.Count -gt 0)
     $script:EnableInternetResolved     = $c.EnableInternet
+    $script:EnableColetaResolved       = [bool]$c.EnableColeta
+    if ($script:EnableColetaResolved) { Import-ColetaLinks }
+    $script:EnableLinksResolved        = ($script:ColetaLinks.Count -gt 0)
 
     if ($script:EnableInternetResolved) {
         $script:InternetIntervalMinutesResolved = $c.InternetIntervalMinutes
@@ -1641,6 +1681,7 @@ function Save-ReconfiguredAlloy {
     New-BlackboxConfiguration
     Install-SnmpConfiguration
     Install-InternetMonitoring
+    Install-ColetaComplementar
     New-AlloyConfiguration -Inventory $Inventory
     Format-AndValidateAlloyConfiguration
     Restart-AlloyService
@@ -1711,7 +1752,7 @@ function Edit-LogSettings {
 
     # A credencial do Loki só é necessária quando algum log é coletado, e pode
     # não existir se o host nunca enviou log até agora.
-    if (($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved) -and
+    if ((Test-NextecNeedsLoki) -and
         [string]::IsNullOrWhiteSpace($script:LokiUsername)) {
         Write-Info "Este host ainda não tem credencial de Loki gravada."
         Read-NocCredentials
@@ -2184,6 +2225,7 @@ function Invoke-ConfigurationMenu {
         # criava um beco: o item só existia se o host já tivesse algum alvo, e
         # era justamente por esse item que se ativava o primeiro.
         [void]$opcoes.Add("Internet (Speedtest)")
+        [void]$opcoes.Add("Internet e links (Coleta Complementar)")
         [void]$opcoes.Add("Exporters adicionais")
 
         [void]$opcoes.Add("Credenciais do NOC")
@@ -2202,6 +2244,7 @@ function Invoke-ConfigurationMenu {
             "Alvos de conectividade (Blackbox)" { Edit-BlackboxTargets; $alterou = $true }
             "Alvos SNMP" { Edit-SnmpTargets; $alterou = $true }
             "Internet (Speedtest)" { Edit-InternetSettings; $alterou = $true }
+            "Internet e links (Coleta Complementar)" { Edit-ColetaSettings; $alterou = $true }
             "Exporters adicionais" { Edit-CustomExporters; $alterou = $true }
             "Credenciais do NOC" {
                 # Limpa o que veio do registro para que Read-NocCredentials
@@ -2958,6 +3001,7 @@ function Read-ResourceChecklist {
     $script:EnableExportersResolved = $EnableExporters.IsPresent
     $script:EnableInternetResolved = $EnableInternet.IsPresent
     $script:InternetIntervalMinutesResolved = $InternetIntervalMinutes
+    $script:EnableColetaResolved = $EnableColeta.IsPresent
     $script:SelectedHostFeatureKeys = [string[]]@()
     $script:SelectedExporterKeys = [string[]]@()
 
@@ -2986,6 +3030,12 @@ function Read-ResourceChecklist {
         # e registra a tarefa agendada. Não pede nada além de marcar aqui.
         $items.Add((New-NextecChecklistItem -Key "internet" -Label "Internet (Speedtest), disponibilidade, latência, download e upload" -Selected $script:EnableInternetResolved))
     }
+
+    # Coleta Complementar: vale para qualquer modo. Internet vem marcada por
+    # padrão na instalação interativa; links só quando o local tem mais de um.
+    $padraoColeta = $script:EnableColetaResolved -or (-not $Silent)
+    $items.Add((New-NextecChecklistItem -Key "coleta" -Label "Internet: status, DNS, IP público e diagnóstico das quedas" -Selected $padraoColeta))
+    $items.Add((New-NextecChecklistItem -Key "links" -Label "Links de internet (mais de um link neste local)" -Selected $script:EnableLinksResolved))
 
     # "Exporters adicionais" agora é uma categoria em árvore: ESPAÇO/ENTER
     # expande e mostra o catálogo de exporters como filhos selecionáveis,
@@ -3049,6 +3099,12 @@ function Read-ResourceChecklist {
     $script:EnableInternetResolved = ($selectedKeys -contains "internet")
     if ($script:EnableInternetResolved) {
         $script:InternetIntervalMinutesResolved = $InternetIntervalMinutes
+    }
+    $script:EnableColetaResolved = ($selectedKeys -contains "coleta")
+    $script:EnableLinksResolved = ($selectedKeys -contains "links")
+    if ($script:EnableLinksResolved -and -not $script:EnableColetaResolved) {
+        Write-Info "Links usam a mesma medição da internet; a coleta de internet foi ligada junto."
+        $script:EnableColetaResolved = $true
     }
 
     $featureKeys = New-Object System.Collections.Generic.List[string]
@@ -4003,6 +4059,8 @@ function Get-NextecConfiguration {
     }
 
     Read-ResourceChecklist -MonitorHost $script:MonitorHost -Collector $script:Collector -DetectedFeatures @($script:DetectedHostFeatures)
+    if ($script:EnableColetaResolved) { Import-ColetaLinks }
+    if ($script:EnableLinksResolved -and -not $Silent) { Edit-ColetaLinks }
     Read-BlackboxTargets
     Read-SnmpTargets
     Read-CustomExporters
@@ -4033,7 +4091,7 @@ function Read-NocCredentials {
     $script:RwUsername = $rwUser
     $script:RwPassword = $rwPassword
 
-    if (-not ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved)) {
+    if (-not (Test-NextecNeedsLoki)) {
         return
     }
 
@@ -4101,6 +4159,8 @@ function Show-Plan {
         Write-Host ("  {0,-27} {1}" -f "Internet (Speedtest):", $(if ($script:EnableInternetResolved) { "sim (a cada $($script:InternetIntervalMinutesResolved) min)" } else { "não" }))
     }
 
+    Write-Host ("  {0,-27} {1}" -f "Internet (Coleta):", $(if ($script:EnableColetaResolved) { "sim" } else { "não" }))
+    Write-Host ("  {0,-27} {1}" -f "Links de internet:", $(if ($script:ColetaLinks.Count -gt 0) { "sim ($($script:ColetaLinks.Count))" } else { "não" }))
     Write-Host ("  {0,-27} {1}" -f "Exporters adicionais:", $script:CustomExporters.Count)
 
     if (-not $Silent) {
@@ -4574,7 +4634,7 @@ function Set-AlloyServiceEnvironment {
     $environment.Add(("NEXTEC_RW_USERNAME={0}" -f $script:RwUsername))
     $environment.Add(("NEXTEC_RW_PASSWORD={0}" -f $script:RwPassword))
 
-    if ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved) {
+    if (Test-NextecNeedsLoki) {
         $environment.Add(("NEXTEC_LOKI_USERNAME={0}" -f $script:LokiUsername))
         $environment.Add(("NEXTEC_LOKI_PASSWORD={0}" -f $script:LokiPassword))
     }
@@ -4936,8 +4996,35 @@ catch {
 # COM BOM, e o parser do formato texto do Prometheus lê o BOM como parte do
 # primeiro nome de métrica, descartando o arquivo inteiro com
 # "invalid metric name".
-[IO.File]::WriteAllText($tempFile, ($lines -join "`n"), (New-Object Text.UTF8Encoding($false)))
+[IO.File]::WriteAllText($tempFile, (($lines -join "`n") + "`n"), (New-Object Text.UTF8Encoding($false)))
 Move-Item -LiteralPath $tempFile -Destination $metricsFile -Force
+
+# Histórico dos testes no NOC: com a Coleta Complementar instalada, cada teste
+# vira um evento no mesmo arquivo que o Alloy já envia ao Loki.
+$eventsFile = "__NEXTEC_COLETA_EVENTOS__"
+if (Test-Path -LiteralPath (Split-Path -Parent $eventsFile)) {
+    $sucesso = ($lines -contains "nextec_speedtest_up 1")
+    $evento = [ordered]@{
+        ts        = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+        tipo      = "links_evento"
+        categoria = "velocidade"
+        evento    = "teste_velocidade"
+        nivel     = if ($sucesso) { "info" } else { "aviso" }
+    }
+    if ($sucesso) {
+        $evento.download_mbps = [math]::Round($downloadBps / 1e6, 1)
+        $evento.upload_mbps   = [math]::Round($uploadBps / 1e6, 1)
+        $evento.latencia_ms   = [math]::Round($latencyMs, 1)
+        $evento.detalhe       = $serverName
+    }
+    else {
+        $evento.detalhe = "teste falhou"
+    }
+    try {
+        [IO.File]::AppendAllText($eventsFile, (($evento | ConvertTo-Json -Compress) + "`n"), (New-Object Text.UTF8Encoding($false)))
+    }
+    catch { }
+}
 '@
 
     # Valor puro, sem ConvertTo-AlloyEscapedString: aquela função escapa para
@@ -4946,6 +5033,7 @@ Move-Item -LiteralPath $tempFile -Destination $metricsFile -Force
     # há nada para escapar aqui.
     $runnerContent = $runnerContent.Replace("__NEXTEC_SPEEDTEST_EXE__", $SpeedtestExe)
     $runnerContent = $runnerContent.Replace("__NEXTEC_SPEEDTEST_METRICS_FILE__", $SpeedtestMetricsFile)
+    $runnerContent = $runnerContent.Replace("__NEXTEC_COLETA_EVENTOS__", $ColetaEventos)
 
     [IO.File]::WriteAllText(
         $SpeedtestRunnerScript,
@@ -5061,6 +5149,297 @@ function Install-InternetMonitoring {
     }
     catch {
         Write-Warn ("Primeiro teste de velocidade falhou, mas a tarefa agendada ({0} em {1} min) segue tentando: {2}" -f $SpeedtestTaskName, $script:InternetIntervalMinutesResolved, $_.Exception.Message)
+    }
+}
+
+# ==============================================================================
+# COLETA COMPLEMENTAR NEXTEC (INTERNET E LINKS)
+# ==============================================================================
+#
+# O Alloy coleta o servidor, os logs e as sondas. O que ele não faz sozinho
+# (status consolidado da internet, IP público, link em uso, causa das quedas)
+# fica com a Coleta Complementar: um arquivo único baixado do repositório
+# Scripts, executado por tarefa agendada como SYSTEM. Ela só grava arquivos:
+# métricas em $ColetaTextfileDir e eventos em $ColetaEventos. Quem envia ao
+# NOC é o próprio Alloy, com a mesma credencial e os mesmos rótulos.
+#
+# O coleta-complementar.ini é a fonte da verdade dos links: a reconfiguração
+# lê dali, e ajustes feitos à mão em [geral] e [internet] são preservados.
+
+function Test-NextecNeedsLoki {
+    return ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved -or $script:EnableColetaResolved)
+}
+
+function Read-ColetaIniFile {
+    param([Parameter(Mandatory=$true)][string]$Caminho)
+
+    $secoes = [ordered]@{}
+    if (-not (Test-Path -LiteralPath $Caminho -PathType Leaf)) { return $secoes }
+
+    $atual = $null
+    foreach ($linhaBruta in [IO.File]::ReadAllLines($Caminho, (New-Object Text.UTF8Encoding($false)))) {
+        $linha = ($linhaBruta -replace '\s[;#].*$', '').Trim()
+        if ($linha -eq "" -or $linha.StartsWith(";") -or $linha.StartsWith("#")) { continue }
+        if ($linha -match '^\[(.+)\]$') {
+            $atual = $Matches[1].Trim()
+            $secoes[$atual] = [ordered]@{}
+            continue
+        }
+        if ($null -ne $atual -and $linha -match '^([^=]+)=(.*)$') {
+            $secoes[$atual][$Matches[1].Trim()] = $Matches[2].Trim()
+        }
+    }
+    return $secoes
+}
+
+function Get-ColetaLinksFromIni {
+    $ini = Read-ColetaIniFile -Caminho $ColetaConfig
+    $links = New-Object System.Collections.Generic.List[object]
+    foreach ($nomeSecao in $ini.Keys) {
+        if ($nomeSecao -notmatch '^link:(.+)$') { continue }
+        $secao = $ini[$nomeSecao]
+        $valor = { param($chave, $padrao) if ($secao.Contains($chave)) { [string]$secao[$chave] } else { $padrao } }
+        $links.Add([pscustomobject]@{
+            nome               = $Matches[1].Trim()
+            papel              = & $valor "papel" "primario"
+            operadora          = & $valor "operadora" ""
+            tipo               = & $valor "tipo" ""
+            suporte            = & $valor "suporte" ""
+            ip_publico         = & $valor "ip_publico" ""
+            gateway            = & $valor "gateway" ""
+            alvos              = & $valor "alvos" ""
+            origem             = & $valor "origem" ""
+            firewall           = & $valor "firewall" ""
+            interface_firewall = & $valor "interface_firewall" ""
+        })
+    }
+    return $links.ToArray()
+}
+
+function Import-ColetaLinks {
+    $script:ColetaLinks = @(Get-ColetaLinksFromIni)
+}
+
+function ConvertTo-ColetaIniValue {
+    param([string]$Valor)
+    # Colchetes e quebras de linha quebrariam o arquivo INI.
+    if ($null -eq $Valor) { return "" }
+    return ($Valor -replace "[\r\n]+", " " -replace "\[", "(" -replace "\]", ")").Trim()
+}
+
+function Read-ColetaLinkDefinition {
+    Write-Info "O destino de cada link precisa sair SOMENTE por ele: use uma rota por link"
+    Write-Info "no firewall (ex.: 8.8.8.8 pelo link 1, 1.1.1.1 pelo link 2) ou um IP de origem"
+    Write-Info "deste servidor que saia pela WAN do link."
+
+    $nome = ConvertTo-ColetaIniValue (Read-Required -Prompt "Nome do link (ex.: Cyberline Fibra)")
+    $papelEscolha = Read-Choice -Prompt "Papel do link" -Options @("primario", "failover", "sdwan") -Default 1
+    $papel = @("primario", "failover", "sdwan")[$papelEscolha - 1]
+    $operadora = ConvertTo-ColetaIniValue (Read-Required -Prompt "Operadora" -Default $nome)
+    $tipo = ConvertTo-ColetaIniValue (Read-Required -Prompt "Tipo (fibra, radio, 4g, satelite, dedicado)" -Default "fibra")
+    $suporte = ConvertTo-ColetaIniValue (Read-Host "Telefone/protocolo de suporte da operadora (ENTER para pular)")
+    $ipPublico = ConvertTo-ColetaIniValue (Read-Host "IP público fixo do link (ENTER se for dinâmico)")
+    $gateway = ConvertTo-ColetaIniValue (Read-Host "Gateway da operadora para testar (ENTER para pular)")
+    $alvos = ConvertTo-ColetaIniValue (Read-Required -Prompt "Destinos que saem por este link, separados por vírgula" -Default "8.8.8.8")
+    $origem = ConvertTo-ColetaIniValue (Read-Host "IP de origem neste servidor para este link (ENTER para pular)")
+    $firewall = ConvertTo-ColetaIniValue (Read-Host "Nome do firewall no NOC, para tráfego por SNMP (ENTER para pular)")
+    $interface = ""
+    if ($firewall) { $interface = ConvertTo-ColetaIniValue (Read-Host "Interface WAN do link no firewall (ex.: igb1)") }
+
+    if ($origem -and -not (Get-NetIPAddress -IPAddress $origem -ErrorAction SilentlyContinue)) {
+        Write-Warn ("O IP de origem {0} não existe neste servidor; a medição deste link vai falhar até corrigir." -f $origem)
+    }
+
+    return [pscustomobject]@{
+        nome = $nome; papel = $papel; operadora = $operadora; tipo = $tipo; suporte = $suporte
+        ip_publico = $ipPublico; gateway = $gateway; alvos = $alvos; origem = $origem
+        firewall = $firewall; interface_firewall = $interface
+    }
+}
+
+function Edit-ColetaLinks {
+    Write-Step "Links de internet"
+
+    while ($true) {
+        if ($script:ColetaLinks.Count -gt 0) {
+            Write-Host ("    {0,-24} {1,-10} {2,-18} {3}" -f "LINK", "PAPEL", "IP PÚBLICO", "DESTINOS") -ForegroundColor DarkGray
+            foreach ($link in $script:ColetaLinks) {
+                Write-Host ("    {0,-24} {1,-10} {2,-18} {3}" -f $link.nome, $link.papel, $link.ip_publico, $link.alvos)
+            }
+            Write-Host ""
+        }
+        else {
+            Write-Info "Nenhum link cadastrado."
+        }
+
+        $opcoes = @("Adicionar link", "Remover link", "Concluir")
+        $escolha = Read-Choice -Prompt "Links" -Options $opcoes -Default $(if ($script:ColetaLinks.Count -eq 0) { 1 } else { 3 })
+
+        switch ($escolha) {
+            1 {
+                $novo = Read-ColetaLinkDefinition
+                $script:ColetaLinks = @(@($script:ColetaLinks | Where-Object { $_.nome -ne $novo.nome }) + $novo)
+                Write-Ok ("Link {0} ({1}) registrado." -f $novo.nome, $novo.papel)
+            }
+            2 {
+                if ($script:ColetaLinks.Count -eq 0) { continue }
+                $indice = Read-Choice -Prompt "Qual link remover?" -Options @($script:ColetaLinks | ForEach-Object { $_.nome }) -Default 1
+                $removido = $script:ColetaLinks[$indice - 1].nome
+                $script:ColetaLinks = @($script:ColetaLinks | Where-Object { $_.nome -ne $removido })
+                Write-Ok ("Link {0} removido." -f $removido)
+            }
+            3 {
+                $script:EnableLinksResolved = ($script:ColetaLinks.Count -gt 0)
+                return
+            }
+        }
+    }
+}
+
+function Write-ColetaConfig {
+    <#
+        Regrava o coleta-complementar.ini. [geral] e [internet] mantêm o que já
+        estava no arquivo (inclusive ajustes feitos à mão); os links vêm de
+        $script:ColetaLinks.
+    #>
+    $existente = Read-ColetaIniFile -Caminho $ColetaConfig
+    $geral = [ordered]@{ intervalo_links_segundos = "15"; limite_latencia_ms = "150"; limite_perda_percentual = "5" }
+    $internet = [ordered]@{ alvos = "1.1.1.1, 8.8.8.8"; firewall = ""; dns_servidores = "sistema, 1.1.1.1, 8.8.8.8"; dns_nome = "google.com" }
+    foreach ($par in @(@("geral", $geral), @("internet", $internet))) {
+        if ($existente.Contains($par[0])) {
+            foreach ($chave in $existente[$par[0]].Keys) { $par[1][$chave] = $existente[$par[0]][$chave] }
+        }
+    }
+
+    $linhas = New-Object System.Collections.Generic.List[string]
+    $linhas.Add("; Coleta Complementar Nextec")
+    $linhas.Add(("; Gerado pelo instalador {0} em {1}." -f $InstallerVersion, (Get-Date -Format "dd/MM/yyyy HH:mm")))
+    $linhas.Add("; Depois de alterar: Restart-ScheduledTask -TaskName $ColetaTaskName (ou reiniciar o servidor).")
+    $linhas.Add("; Manual completo: Confluence NXTDOC, ""Coleta Complementar Nextec"".")
+    $linhas.Add("")
+    $linhas.Add("[geral]")
+    foreach ($chave in $geral.Keys) { $linhas.Add(("{0} = {1}" -f $chave, $geral[$chave])) }
+    $linhas.Add("")
+    $linhas.Add("[internet]")
+    foreach ($chave in $internet.Keys) { $linhas.Add(("{0} = {1}" -f $chave, $internet[$chave])) }
+
+    foreach ($link in $script:ColetaLinks) {
+        $linhas.Add("")
+        $linhas.Add(("[link:{0}]" -f $link.nome))
+        foreach ($chave in @("papel", "operadora", "tipo", "suporte", "ip_publico", "gateway", "alvos", "origem", "firewall", "interface_firewall")) {
+            $linhas.Add(("{0} = {1}" -f $chave, $link.$chave))
+        }
+        $linhas.Add("teste_velocidade = nao")
+    }
+
+    if (Test-Path -LiteralPath $ColetaConfig) {
+        Copy-Item -LiteralPath $ColetaConfig -Destination ("{0}.{1}.bak" -f $ColetaConfig, (Get-Date -Format "yyyyMMdd-HHmmss")) -Force
+    }
+    [IO.File]::WriteAllText($ColetaConfig, (($linhas -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($false)))
+}
+
+function Register-ColetaScheduledTask {
+    <#
+        A Coleta roda em laço contínuo. A tarefa sobe na inicialização e tem um
+        segundo gatilho a cada 5 minutos com "ignorar nova instância": se o
+        processo cair por qualquer motivo, volta em no máximo 5 minutos, sem
+        nunca rodar duas cópias ao mesmo tempo.
+    #>
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Acao executar' -f $ColetaScript)
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
+        -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+
+    $gatilhos = @(
+        (New-ScheduledTaskTrigger -AtStartup),
+        (New-SpeedtestTrigger -Inicio ((Get-Date).AddMinutes(1)) -Intervalo (New-TimeSpan -Minutes 5))
+    )
+
+    Register-ScheduledTask -TaskName $ColetaTaskName -Action $action -Trigger $gatilhos `
+        -Principal $principal -Settings $settings -Force | Out-Null
+}
+
+function Stop-ColetaComplementar {
+    if (Get-ScheduledTask -TaskName $ColetaTaskName -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask -TaskName $ColetaTaskName -ErrorAction SilentlyContinue
+    }
+    # Stop-ScheduledTask nem sempre encerra o powershell.exe filho.
+    Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like ('*{0}*' -f $ColetaScript) } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+}
+
+function Install-ColetaComplementar {
+    if (-not $script:EnableColetaResolved) {
+        # Desligando numa reconfiguração: para e remove a tarefa, mas mantém o
+        # .ini (links cadastrados) para uma eventual religação.
+        if (Get-ScheduledTask -TaskName $ColetaTaskName -ErrorAction SilentlyContinue) {
+            Stop-ColetaComplementar
+            Unregister-ScheduledTask -TaskName $ColetaTaskName -Confirm:$false
+            Get-ChildItem -LiteralPath $ColetaTextfileDir -Filter "*.prom" -ErrorAction SilentlyContinue | Remove-Item -Force
+            Write-Info "Coleta Complementar desligada."
+        }
+        return
+    }
+
+    Write-Step "Coleta Complementar (internet e links)"
+
+    foreach ($pasta in @($ColetaDir, $ColetaTextfileDir)) {
+        if (-not (Test-Path -LiteralPath $pasta)) { New-Item -ItemType Directory -Path $pasta -Force | Out-Null }
+    }
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $temporario = Join-Path $env:TEMP ("coleta-complementar-{0}.ps1" -f [guid]::NewGuid().ToString("N"))
+    try {
+        Invoke-WebRequest -Uri $ColetaUrl -OutFile $temporario -UseBasicParsing
+        $erros = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile($temporario, [ref]$null, [ref]$erros)
+        if ($erros -and $erros.Count -gt 0) {
+            throw ("Arquivo baixado da Coleta Complementar tem erro de sintaxe: {0}" -f $erros[0].Message)
+        }
+        Stop-ColetaComplementar
+        Copy-Item -LiteralPath $temporario -Destination $ColetaScript -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $temporario -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-ColetaConfig
+    Register-ColetaScheduledTask
+    Start-ScheduledTask -TaskName $ColetaTaskName
+
+    $versao = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ColetaScript -Acao versao
+    Write-Ok ("Coleta Complementar {0} instalada; {1} link(s) cadastrado(s)." -f ($versao | Select-Object -Last 1), $script:ColetaLinks.Count)
+
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ColetaScript -Acao verificar | ForEach-Object { Write-Info $_ }
+}
+
+function Edit-ColetaSettings {
+    Write-Step "Internet e links (Coleta Complementar)"
+
+    if ($script:EnableColetaResolved) {
+        Write-Info ("Ligada. Configuração em {0}." -f $ColetaConfig)
+    }
+    else {
+        Write-Info "Desligada."
+    }
+
+    $script:EnableColetaResolved = Read-YesNo -Prompt "Monitorar a internet deste local (status, DNS, IP público, diagnóstico)?" -Default $true
+    if (-not $script:EnableColetaResolved) {
+        $script:EnableLinksResolved = $false
+        return
+    }
+
+    if ($script:ColetaLinks.Count -eq 0) { Import-ColetaLinks }
+    if (Read-YesNo -Prompt "Cadastrar ou alterar links de internet?" -Default ($script:ColetaLinks.Count -eq 0)) {
+        Edit-ColetaLinks
+    }
+
+    if ((Test-NextecNeedsLoki) -and [string]::IsNullOrWhiteSpace($script:LokiUsername)) {
+        Write-Info "Os eventos da Coleta Complementar vão para o Loki; este host ainda não tem credencial."
+        Read-NocCredentials
     }
 }
 
@@ -5393,8 +5772,48 @@ function New-AlloyConfiguration {
         [void]$builder.AppendLine("")
     }
 
-    if ($script:MonitorHost -and ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved)) {
-        [void]$builder.AppendLine("// Logs Windows")
+    if ($script:EnableColetaResolved) {
+        # Exporter próprio só com o textfile da Coleta Complementar. Separado
+        # do "system" para valer em qualquer modo e para poder usar
+        # honor_labels: as métricas trazem rótulos próprios (tipo do link,
+        # tipo de espaço) que não podem ser sobrescritos pelos rótulos do host.
+        [void]$builder.AppendLine("// Coleta Complementar Nextec: internet e links")
+        [void]$builder.AppendLine('prometheus.exporter.windows "coleta_complementar" {')
+        [void]$builder.AppendLine('  enabled_collectors = ["textfile"]')
+        [void]$builder.AppendLine("")
+        [void]$builder.AppendLine("  textfile {")
+        [void]$builder.AppendLine(('    text_file_directory = "{0}"' -f (ConvertTo-AlloyEscapedString $ColetaTextfileDir)))
+        [void]$builder.AppendLine("  }")
+        [void]$builder.AppendLine("}")
+        [void]$builder.AppendLine("")
+        [void]$builder.AppendLine('discovery.relabel "coleta_complementar_labels" {')
+        [void]$builder.AppendLine("  targets = prometheus.exporter.windows.coleta_complementar.targets")
+        [void]$builder.AppendLine("")
+        Add-AlloyRelabelRule -Builder $builder -Target "instance" -Replacement $script:HostLabel
+        Add-AlloyRelabelRule -Builder $builder -Target "host" -Replacement $script:HostLabel
+        Add-AlloyRelabelRule -Builder $builder -Target "cliente" -Replacement $script:Cliente
+        Add-AlloyRelabelRule -Builder $builder -Target "servico" -Replacement "coleta_complementar"
+        Add-AlloyRelabelRule -Builder $builder -Target "tipo" -Replacement $script:TipoLabel
+        Add-AlloyRelabelRule -Builder $builder -Target "ambiente" -Replacement $script:Ambiente
+        Add-AlloyRelabelRule -Builder $builder -Target "os" -Replacement "windows"
+        Add-AlloyRelabelRule -Builder $builder -Target "origem" -Replacement "alloy"
+        Add-AlloyRelabelRule -Builder $builder -Target "criticidade" -Replacement $script:Criticidade
+        Add-AlloyRelabelRule -Builder $builder -Target "local" -Replacement $script:Local
+        [void]$builder.AppendLine("}")
+        [void]$builder.AppendLine("")
+        [void]$builder.AppendLine('prometheus.scrape "coleta_complementar" {')
+        [void]$builder.AppendLine("  targets         = discovery.relabel.coleta_complementar_labels.output")
+        [void]$builder.AppendLine("  forward_to      = [prometheus.relabel.filtro_nextec.receiver]")
+        [void]$builder.AppendLine('  job_name        = "integrations/coleta_complementar"')
+        [void]$builder.AppendLine("  honor_labels    = true")
+        [void]$builder.AppendLine('  scrape_interval = "15s"')
+        [void]$builder.AppendLine('  scrape_timeout  = "10s"')
+        [void]$builder.AppendLine("}")
+        [void]$builder.AppendLine("")
+    }
+
+    if (($script:MonitorHost -and ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved)) -or $script:EnableColetaResolved) {
+        [void]$builder.AppendLine("// Logs Windows e eventos da Coleta Complementar")
         [void]$builder.AppendLine('loki.write "nextec" {')
         [void]$builder.AppendLine("  endpoint {")
         [void]$builder.AppendLine(('    url = "{0}"' -f (ConvertTo-AlloyEscapedString $script:LokiUrl)))
@@ -5513,6 +5932,44 @@ function New-AlloyConfiguration {
             [void]$builder.AppendLine("}")
             [void]$builder.AppendLine("")
         }
+    }
+
+    if ($script:EnableColetaResolved) {
+        # Um JSON por linha. tipo, categoria e link viram rótulos porque os
+        # painéis filtram por eles; o restante fica no corpo (| json).
+        [void]$builder.AppendLine('loki.source.file "coleta_complementar" {')
+        [void]$builder.AppendLine("  targets = [{")
+        [void]$builder.AppendLine(('    "__path__"  = "{0}",' -f (ConvertTo-AlloyEscapedString $ColetaEventos)))
+        [void]$builder.AppendLine(('    cliente     = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Cliente)))
+        [void]$builder.AppendLine(('    host        = "{0}",' -f (ConvertTo-AlloyEscapedString $script:HostLabel)))
+        [void]$builder.AppendLine('    servico     = "coleta_complementar",')
+        [void]$builder.AppendLine(('    ambiente    = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Ambiente)))
+        [void]$builder.AppendLine('    os          = "windows",')
+        [void]$builder.AppendLine('    origem      = "alloy",')
+        [void]$builder.AppendLine(('    criticidade = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Criticidade)))
+        [void]$builder.AppendLine(('    local       = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Local)))
+        [void]$builder.AppendLine("  }]")
+        [void]$builder.AppendLine("  forward_to    = [loki.process.coleta_complementar.receiver]")
+        [void]$builder.AppendLine("  tail_from_end = true")
+        [void]$builder.AppendLine("}")
+        [void]$builder.AppendLine("")
+        [void]$builder.AppendLine('loki.process "coleta_complementar" {')
+        [void]$builder.AppendLine("  forward_to = [loki.write.nextec.receiver]")
+        [void]$builder.AppendLine("")
+        [void]$builder.AppendLine("  stage.json {")
+        [void]$builder.AppendLine('    expressions = { tipo = "", categoria = "", link = "", ts = "" }')
+        [void]$builder.AppendLine("  }")
+        [void]$builder.AppendLine("")
+        [void]$builder.AppendLine("  stage.labels {")
+        [void]$builder.AppendLine('    values = { tipo = "", categoria = "", link = "" }')
+        [void]$builder.AppendLine("  }")
+        [void]$builder.AppendLine("")
+        [void]$builder.AppendLine("  stage.timestamp {")
+        [void]$builder.AppendLine('    source = "ts"')
+        [void]$builder.AppendLine('    format = "RFC3339"')
+        [void]$builder.AppendLine("  }")
+        [void]$builder.AppendLine("}")
+        [void]$builder.AppendLine("")
     }
 
     if ($script:EnableBlackboxResolved) {
@@ -5763,7 +6220,7 @@ function Format-AndValidateAlloyConfiguration {
             [Environment]::SetEnvironmentVariable("NEXTEC_RW_PASSWORD", $script:RwPassword, "Process")
         }
 
-        if ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved) {
+        if (Test-NextecNeedsLoki) {
             if (-not [string]::IsNullOrEmpty($script:LokiUsername)) {
                 [Environment]::SetEnvironmentVariable("NEXTEC_LOKI_USERNAME", $script:LokiUsername, "Process")
                 [Environment]::SetEnvironmentVariable("NEXTEC_LOKI_PASSWORD", $script:LokiPassword, "Process")
@@ -5969,6 +6426,10 @@ function Restore-Configuration {
         # A tarefa agendada é criada antes da validação do config.alloy. Se a
         # instalação foi revertida, deixá-la ativa produz um teste de
         # velocidade a cada 30 minutos num host que não coleta o resultado.
+        if ($script:EnableColetaResolved -and -not $restored) {
+            Unregister-ScheduledTask -TaskName $ColetaTaskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+
         if ($script:EnableInternetResolved -and -not $restored) {
             try {
                 Unregister-ScheduledTask -TaskName $SpeedtestTaskName -Confirm:$false -ErrorAction SilentlyContinue
@@ -6051,8 +6512,8 @@ function Show-FinalSummary {
     Write-Host ("Configuração:   {0}" -f $ConfigFile)
     Write-Host ("Métricas:       {0}" -f $script:RemoteWriteUrl)
 
-    if ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved) {
-        Write-Host ("Logs:           {0}" -f $script:LokiUrl)
+    if (Test-NextecNeedsLoki) {
+        Write-Host ("Logs e eventos: {0}" -f $script:LokiUrl)
     }
 
     if ($script:MonitorHost) {
@@ -6072,6 +6533,10 @@ function Show-FinalSummary {
 
     if ($script:EnableInternetResolved) {
         Write-Host ("Internet:       Speedtest a cada {0} min ({1})" -f $script:InternetIntervalMinutesResolved, $SpeedtestMetricsFile)
+    }
+
+    if ($script:EnableColetaResolved) {
+        Write-Host ("Coleta:         {0} link(s), configuração em {1}" -f $script:ColetaLinks.Count, $ColetaConfig)
     }
 
     if ($script:CustomExporters.Count -gt 0) {
@@ -6168,6 +6633,14 @@ function Invoke-NextecInstaller {
                 Install-InternetMonitoring
             } -AoFalhar {
                 $script:EnableInternetResolved = $false
+            } | Out-Null
+        }
+
+        if ($script:EnableColetaResolved) {
+            Invoke-NextecOptionalStep -Nome "Coleta Complementar (internet e links)" -Acao {
+                Install-ColetaComplementar
+            } -AoFalhar {
+                $script:EnableColetaResolved = $false
             } | Out-Null
         }
 
