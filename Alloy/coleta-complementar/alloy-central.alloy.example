@@ -37,6 +37,12 @@ prometheus.exporter.unix "coleta_<host_sem_hifen>" {
 discovery.relabel "coleta_<host_sem_hifen>" {
   targets = prometheus.exporter.unix.coleta_<host_sem_hifen>.targets
 
+  // O alvo do exporter já traz job=integrations/unix, que prevalece sobre
+  // job_name do scrape: o job da Coleta é fixado aqui.
+  rule {
+    target_label = "job"
+    replacement  = "integrations/coleta_complementar"
+  }
   rule {
     target_label = "instance"
     replacement  = "<host>"

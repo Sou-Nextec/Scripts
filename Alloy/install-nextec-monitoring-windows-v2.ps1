@@ -5979,6 +5979,9 @@ function New-AlloyConfiguration {
         Add-AlloyRelabelRule -Builder $builder -Target "instance" -Replacement $script:HostLabel
         Add-AlloyRelabelRule -Builder $builder -Target "host" -Replacement $script:HostLabel
         Add-AlloyRelabelRule -Builder $builder -Target "cliente" -Replacement $script:Cliente
+        # O alvo do exporter já traz job=integrations/windows, que prevalece
+        # sobre job_name do scrape: o job da Coleta é fixado aqui.
+        Add-AlloyRelabelRule -Builder $builder -Target "job" -Replacement "integrations/coleta_complementar"
         Add-AlloyRelabelRule -Builder $builder -Target "servico" -Replacement "coleta_complementar"
         Add-AlloyRelabelRule -Builder $builder -Target "tipo" -Replacement $script:TipoLabel
         Add-AlloyRelabelRule -Builder $builder -Target "ambiente" -Replacement $script:Ambiente
@@ -6680,78 +6683,100 @@ function Show-FinalSummary {
     # coisa que só aparece semanas depois, quando alguém sente falta do dado.
     $comPendencia = ($script:EtapasComFalha.Count -gt 0)
     $cor = if ($comPendencia) { [ConsoleColor]::Yellow } else { [ConsoleColor]::Green }
-    $titulo = if ($comPendencia) { "        INSTALAÇÃO CONCLUÍDA COM PENDÊNCIAS" } else { "                 INSTALAÇÃO CONCLUÍDA" }
+
+    $titulo = if ($comPendencia) { "INSTALAÇÃO CONCLUÍDA COM PENDÊNCIAS" } else { "INSTALAÇÃO CONCLUÍDA" }
+    $linha = "=" * 58
 
     Write-Host ""
-    Write-Host "============================================================" -ForegroundColor $cor
-    Write-Host $titulo -ForegroundColor $cor
-    Write-Host "============================================================" -ForegroundColor $cor
-    Write-Host ("Cliente:        {0}" -f $script:Cliente)
-    Write-Host ("Host:           {0}" -f $script:HostLabel)
-    Write-Host ("Sistema:        {0}" -f $Inventory.Caption)
-    Write-Host ("Tipo:           {0}" -f $Inventory.Generation)
-    Write-Host ("Modo:           {0}" -f $script:ResolvedMode)
+    Write-Host ("  {0}" -f $linha) -ForegroundColor $cor
+    Write-Host ("  {0}" -f $titulo.PadLeft([int](29 + $titulo.Length / 2))) -ForegroundColor $cor
+    Write-Host ("  {0}" -f $linha) -ForegroundColor $cor
+
     # Estado real do serviço. O resumo é o que o técnico usa para encerrar o
     # atendimento, então não pode afirmar nada que não tenha sido verificado.
     $alloyService = Get-AlloyService
     $alloyStatus = if ($null -ne $alloyService) { [string]$alloyService.Status } else { "não encontrado" }
-    Write-Host ("Alloy:          {0}" -f $alloyStatus)
-    Write-Host ("Configuração:   {0}" -f $ConfigFile)
-    Write-Host ("Métricas:       {0}" -f $script:RemoteWriteUrl)
+    $corAlloy = if ($alloyStatus -eq "Running") { [ConsoleColor]::Green } else { [ConsoleColor]::Red }
 
+    Write-Section "Identificação"
+    Write-Field -Label "Cliente" -Value $script:Cliente -ValueColor White -Width 18
+    Write-Field -Label "Host" -Value $script:HostLabel -ValueColor White -Width 18
+    Write-Field -Label "Sistema" -Value $Inventory.Caption -Width 18
+    Write-Field -Label "Modo" -Value $script:ResolvedMode -Width 18
+    Write-Field -Label "Alloy" -Value $alloyStatus -ValueColor $corAlloy -Width 18
+
+    Write-Section "Envio para o NOC"
+    Write-Field -Label "Métricas" -Value $script:RemoteWriteUrl -Width 18
     if (Test-NextecNeedsLoki) {
-        Write-Host ("Logs e eventos: {0}" -f $script:LokiUrl)
+        Write-Field -Label "Logs e eventos" -Value $script:LokiUrl -Width 18
     }
 
+    Write-Section "Coletas ligadas"
     if ($script:MonitorHost) {
+        Write-Field -Label "Servidor" -Value "CPU, memória, discos, rede, serviços" -ValueColor Green -Width 18
         $selectedFeatures = @($script:DetectedHostFeatures | Where-Object { $script:SelectedHostFeatureKeys -contains $_.Key })
         if ($selectedFeatures.Count -gt 0) {
-            Write-Host ("Recursos:       {0}" -f (($selectedFeatures | ForEach-Object { $_.Label }) -join ", "))
+            Write-Field -Label "Recursos" -Value (($selectedFeatures | ForEach-Object { $_.Label }) -join ", ") -ValueColor Green -Width 18
         }
     }
-
     if ($script:EnableBlackboxResolved) {
-        Write-Host ("Conectividade:   {0} alvo(s)" -f $script:BlackboxTargets.Count)
+        Write-Field -Label "Conectividade" -Value ("{0} alvo(s)" -f $script:BlackboxTargets.Count) -ValueColor Green -Width 18
     }
-
     if ($script:EnableSnmpResolved) {
-        Write-Host ("SNMP:           {0} alvo(s)" -f $script:SnmpTargets.Count)
+        Write-Field -Label "SNMP" -Value ("{0} equipamento(s)" -f $script:SnmpTargets.Count) -ValueColor Green -Width 18
     }
-
     if ($script:EnableInternetResolved) {
-        Write-Host ("Internet:       Speedtest a cada {0} min ({1})" -f $script:InternetIntervalMinutesResolved, $SpeedtestMetricsFile)
+        Write-Field -Label "Velocidade" -Value ("Speedtest a cada {0} min" -f $script:InternetIntervalMinutesResolved) -ValueColor Green -Width 18
     }
-
     if ($script:EnableColetaResolved) {
-        Write-Host ("Coleta:         {0} link(s), configuração em {1}" -f $script:ColetaLinks.Count, $ColetaConfig)
+        Write-Field -Label "Internet e links" -Value ("Coleta Complementar, {0} link(s)" -f $script:ColetaLinks.Count) -ValueColor Green -Width 18
     }
-
     if ($script:CustomExporters.Count -gt 0) {
-        Write-Host ("Exporters:      {0}" -f $script:CustomExporters.Count)
+        Write-Field -Label "Exporters" -Value ([string]$script:CustomExporters.Count) -ValueColor Green -Width 18
     }
 
-    Write-Host ("Log instalador: {0}" -f $script:InstallerLog)
+    Write-Section "Arquivos"
+    Write-Field -Label "Configuração" -Value $ConfigFile -Width 18
+    if ($script:EnableInternetResolved) {
+        Write-Field -Label "Speedtest" -Value $SpeedtestMetricsFile -Width 18
+    }
+    if ($script:EnableColetaResolved) {
+        Write-Field -Label "Coleta" -Value $ColetaConfig -Width 18
+    }
+    Write-Field -Label "Log do instalador" -Value $script:InstallerLog -Width 18
 
     if ($comPendencia) {
         Write-Host ""
-        Write-Host "PENDÊNCIAS" -ForegroundColor Yellow
-        Write-Host "O host está sendo monitorado, mas estes itens não puderam ser" -ForegroundColor Yellow
-        Write-Host "configurados. Rode o instalador de novo e use a opção" -ForegroundColor Yellow
-        Write-Host "'Ver e alterar a configuração atual' para tentar só o que faltou." -ForegroundColor Yellow
+        Write-Host "  PENDÊNCIAS" -ForegroundColor Yellow
+        Write-Host "  O host está sendo monitorado, mas estes itens não puderam ser" -ForegroundColor Yellow
+        Write-Host "  configurados. Rode o instalador de novo e use a opção" -ForegroundColor Yellow
+        Write-Host "  'Ver e alterar a configuração atual' para tentar só o que faltou." -ForegroundColor Yellow
         Write-Host ""
 
         foreach ($etapa in $script:EtapasComFalha) {
-            Write-Host ("  - {0}" -f $etapa.Nome) -ForegroundColor Yellow
-            Write-Host ("      {0}" -f $etapa.Erro) -ForegroundColor DarkGray
+            Write-Host ("    - {0}" -f $etapa.Nome) -ForegroundColor Yellow
+            Write-Host ("        {0}" -f $etapa.Erro) -ForegroundColor DarkGray
         }
     }
 
+    Write-Section "Diagnóstico"
+    $comandos = @(
+        'Get-Service Alloy',
+        ('& "{0}" validate "{1}"' -f $AlloyExe, $ConfigFile),
+        'Invoke-WebRequest http://127.0.0.1:12345/-/ready -UseBasicParsing',
+        'Get-WinEvent -LogName Application | Where-Object ProviderName -Match "Alloy|Grafana" | Select-Object -First 20'
+    )
+    if ($script:EnableColetaResolved) {
+        $comandos += ('powershell -ExecutionPolicy Bypass -File "{0}" -Acao verificar' -f (Join-Path $ColetaDir "coleta-complementar.ps1"))
+    }
+    foreach ($comando in $comandos) {
+        Write-Host "    > " -ForegroundColor Cyan -NoNewline
+        Write-Host $comando
+    }
+
     Write-Host ""
-    Write-Host "Diagnóstico:"
-    Write-Host '  Get-Service Alloy'
-    Write-Host ('  & "{0}" validate "{1}"' -f $AlloyExe, $ConfigFile)
-    Write-Host '  Invoke-WebRequest http://127.0.0.1:12345/-/ready -UseBasicParsing'
-    Write-Host '  Get-WinEvent -LogName Application | Where-Object ProviderName -Match "Alloy|Grafana" | Select-Object -First 20'
+    Write-Host "  Próximo passo: " -ForegroundColor Yellow -NoNewline
+    Write-Host ("confira no NOC (Explore) os dados de cliente=""{0}"" e host=""{1}""." -f $script:Cliente, $script:HostLabel)
 }
 
 # ==============================================================================

@@ -1040,6 +1040,9 @@ Restart=always
 RestartSec=10
 # Roda como root: precisa de ping com IP de origem e do socket do Docker.
 # Só grava em ${COLETA_DADOS} e $(dirname "$COLETA_EVENTOS").
+# O Speedtest CLI grava o aceite da licença em \$HOME/.config; com ProtectHome
+# o /root fica inacessível, então o HOME do serviço fica na pasta de dados.
+Environment=HOME=${COLETA_DADOS}
 ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
@@ -1096,7 +1099,7 @@ configure_service_env() {
 # GERADORES DE LABELS E CONFIGURAÇÃO ALLOY
 # ------------------------------------------------------------------------------
 write_common_relabels() {
-  local src="$1" name="$2" service="$3" type="$4" os="$5" origin="${6:-alloy}"
+  local src="$1" name="$2" service="$3" type="$4" os="$5" origin="${6:-alloy}" job="${7:-}"
 
   # IMPORTANTE PARA MANUTENÇÃO:
   # No Alloy/River, mantenha um atributo por linha dentro de cada bloco rule.
@@ -1109,6 +1112,16 @@ discovery.relabel "${name}" {
     target_label = "instance"
     replacement  = "$(alloy_escape "$HOST_LABEL")"
   }
+EOF
+  # O alvo do exporter já traz job (ex.: integrations/unix), que prevalece
+  # sobre job_name do scrape; quando informado, o job é fixado aqui.
+  [[ -n "$job" ]] && cat <<EOF
+  rule {
+    target_label = "job"
+    replacement  = "${job}"
+  }
+EOF
+  cat <<EOF
   rule {
     target_label = "host"
     replacement  = "$(alloy_escape "$HOST_LABEL")"
@@ -1365,7 +1378,7 @@ prometheus.exporter.unix "coleta_complementar" {
   }
 }
 EOF
-      write_common_relabels 'prometheus.exporter.unix.coleta_complementar.targets' 'coleta_complementar_labels' 'coleta_complementar' 'servidor' 'linux' 'alloy'
+      write_common_relabels 'prometheus.exporter.unix.coleta_complementar.targets' 'coleta_complementar_labels' 'coleta_complementar' 'servidor' 'linux' 'alloy' 'integrations/coleta_complementar'
       cat <<EOF
 
 prometheus.scrape "coleta_complementar" {
@@ -2224,29 +2237,60 @@ show_plan() {
 }
 
 final_summary() {
-  echo
-  echo -e "${GREEN}${BOLD}============================================================${NC}"
-  echo -e "${GREEN}${BOLD}              INSTALAÇÃO CONCLUÍDA${NC}"
-  echo -e "${GREEN}${BOLD}============================================================${NC}"
-  echo -e "Cliente: ${BOLD}${CLIENTE}${NC}   Host: ${BOLD}${HOST_LABEL}${NC}   Alloy: ${GREEN}ativo${NC}"
-  echo "Configuração: ${CONFIG_FILE}"
-  echo "Segredos: ${ENV_FILE}"
-  echo "UI local: http://127.0.0.1:12345"
-  echo "Métricas: ${RW_URL}"
-  [[ "$ENABLE_LOGS" == 1 ]] && echo "Logs: ${LOKI_URL}"
-  [[ "$ENABLE_DOCKER" == 1 ]] && echo "Docker: logs pelo Alloy; estado, consumo e eventos pela Coleta Complementar"
-  coleta_enabled && echo "Coleta Complementar: ${COLETA_CONFIG} (systemctl status coleta-complementar)"
-  (( ${#DATABASE_TARGETS[@]} > 0 )) && echo "Banco(s): ${#DATABASE_TARGETS[@]} integração(ões)/detecção(ões) registrada(s)"
+  local alloy_estado="ativo" cor_alloy="$GREEN"
+  systemctl is-active --quiet alloy || { alloy_estado="parado"; cor_alloy="$RED"; }
+
+  # Preenchimento por ${#}, que conta caracteres (printf %-Ns conta bytes e
+  # desalinha rótulos acentuados).
+  campo() {
+    local pad=$(( 23 - ${#1} )); (( pad < 1 )) && pad=1
+    printf '    %b%s%b%*s%b%s%b\n' "$DIM" "$1" "$NC" "$pad" '' "${3:-$NC}" "$2" "$NC"
+  }
+  secao() { echo; echo -e "  ${BLUE}${BOLD}$1${NC}"; }
+  comando() { echo -e "    ${CYAN}\$${NC} $1"; }
 
   echo
-  echo "Diagnóstico para manutenção:"
-  echo "  systemctl status alloy"
-  echo "  journalctl -u alloy -f"
-  echo "  alloy validate ${CONFIG_FILE}"
-  echo "  curl http://127.0.0.1:12345/-/ready"
-  coleta_enabled && echo "  python3 ${COLETA_BIN} verificar"
+  echo -e "${GREEN}${BOLD}  ╔══════════════════════════════════════════════════════╗${NC}"
+  echo -e "${GREEN}${BOLD}  ║               ✔  INSTALAÇÃO CONCLUÍDA                ║${NC}"
+  echo -e "${GREEN}${BOLD}  ╚══════════════════════════════════════════════════════╝${NC}"
 
-  warn "Valide no NOC a chegada de cliente=\"${CLIENTE}\" e host=\"${HOST_LABEL}\"."
+  secao "Identificação"
+  campo "Cliente" "$CLIENTE" "$BOLD"
+  campo "Host" "$HOST_LABEL" "$BOLD"
+  campo "Alloy" "$alloy_estado" "$cor_alloy"
+
+  secao "Envio para o NOC"
+  campo "Métricas" "$RW_URL"
+  needs_loki && campo "Logs e eventos" "$LOKI_URL"
+
+  secao "Coletas ligadas"
+  campo "Servidor" "CPU, memória, discos, rede" "$GREEN"
+  [[ "$ENABLE_LOGS" == 1 ]] && campo "Logs do sistema" "sim" "$GREEN"
+  [[ "$ENABLE_DOCKER" == 1 ]] && campo "Docker" "logs pelo Alloy; estado e eventos pela Coleta" "$GREEN"
+  [[ "$ENABLE_INTERNET" == 1 ]] && campo "Internet e DNS" "sim" "$GREEN"
+  [[ "$ENABLE_LINKS" == 1 ]] && campo "Links de internet" "${#LINKS[@]}" "$GREEN"
+  [[ "$ENABLE_VELOCIDADE" == 1 ]] && campo "Teste de velocidade" "a cada 30 min" "$GREEN"
+  [[ "$ENABLE_BLACKBOX" == 1 ]] && campo "Conectividade" "${#BLACKBOX_TARGETS[@]} alvo(s)" "$GREEN"
+  [[ "$ENABLE_SNMP" == 1 ]] && campo "SNMP" "${#SNMP_TARGETS[@]} equipamento(s)" "$GREEN"
+  (( ${#DATABASE_TARGETS[@]} > 0 )) && campo "Banco(s) de dados" "${#DATABASE_TARGETS[@]}" "$GREEN"
+
+  secao "Arquivos"
+  campo "Configuração do Alloy" "$CONFIG_FILE"
+  campo "Credenciais" "${ENV_FILE} (600)"
+  coleta_enabled && campo "Coleta Complementar" "$COLETA_CONFIG"
+  campo "UI local" "http://127.0.0.1:12345"
+
+  secao "Diagnóstico"
+  comando "systemctl status alloy"
+  comando "journalctl -u alloy -f"
+  comando "alloy validate ${CONFIG_FILE}"
+  coleta_enabled && comando "systemctl status coleta-complementar"
+  coleta_enabled && comando "python3 ${COLETA_BIN} verificar"
+
+  echo
+  echo -e "  ${YELLOW}${BOLD}Próximo passo:${NC} confira no NOC (Explore) os dados de cliente=\"${CLIENTE}\" e host=\"${HOST_LABEL}\"."
+  echo
+  return 0
 }
 
 main_somente_coleta() {
