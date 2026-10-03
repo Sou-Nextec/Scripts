@@ -10,9 +10,9 @@ Completa o que o Grafana Alloy não coleta sozinho. É um arquivo único por sis
 | Execução | serviço `coleta-complementar` (systemd) | tarefa agendada `NextecColetaComplementar` (SYSTEM) |
 | Métricas | `/var/lib/coleta-complementar/textfile/*.prom` | `...\coleta-complementar\textfile\*.prom` |
 | Eventos | `/var/log/coleta-complementar/eventos.jsonl` | `...\coleta-complementar\eventos.jsonl` |
-| Módulos | internet, links, docker, velocidade | internet, links (velocidade fica com a tarefa NextecSpeedtest do instalador) |
+| Módulos | internet, links, docker, velocidade, acessos | internet, links, acessos (velocidade fica com a tarefa NextecSpeedtest do instalador) |
 
-Quem instala e liga é o instalador do Alloy (`install-nextec-monitoring-linux-v2.sh` 2.1.0+ e `install-nextec-monitoring-windows-v2.ps1` 2.12.0+): ao marcar Docker, Internet, Links ou Velocidade, ele baixa o arquivo deste diretório, grava a configuração, cria o serviço ou a tarefa e acrescenta no `config.alloy` a leitura dos arquivos. Modelo comentado da configuração: `coleta-complementar.ini.example`.
+Quem instala e liga é o instalador do Alloy (`install-nextec-monitoring-linux-v2.sh` 2.1.0+ e `install-nextec-monitoring-windows-v2.ps1` 2.12.0+; módulo acessos a partir de 2.4.0 e 2.14.0, que também instalam o [atualizador automático](../atualizador/README.md)): ao marcar Docker, Internet, Links ou Velocidade, ele baixa o arquivo deste diretório, grava a configuração, cria o serviço ou a tarefa e acrescenta no `config.alloy` a leitura dos arquivos. Modelo comentado da configuração: `coleta-complementar.ini.example`.
 
 ## Divisão com o Alloy
 
@@ -26,6 +26,7 @@ Quem instala e liga é o instalador do Alloy (`install-nextec-monitoring-linux-v
 | Internet: status, DNS, IP público, diagnóstico | | Sim |
 | Links: status, qualidade, link em uso, gateway da operadora, causa das quedas | | Sim |
 | Velocidade no Linux | | Sim (Ookla Speedtest CLI) |
+| Acessos: logins com IP de origem, acesso privilegiado, origem nova, fora do horário | | Sim (journal no Linux; evento 4624 no Windows) |
 
 ## Comandos
 
@@ -98,6 +99,8 @@ Causas de queda: `rede local: firewall sem resposta`, `operadora: gateway sem re
 
 **Velocidade** (Linux; mesmos nomes do instalador Windows): `nextec_speedtest_up`, `_download_bits_per_second`, `_upload_bits_per_second`, `_ping_latency_milliseconds`, `_ping_jitter_milliseconds`, `_packet_loss_percent`, `_last_run_timestamp_seconds`, `_server_info`.
 
+**Acessos** (Linux): `nextec_acessos_total{privilegiado, alerta}` e `nextec_acessos_coletor_ultima_execucao_segundos`.
+
 **A própria coleta**: `nextec_coleta_complementar_info{versao, modulos}` e `nextec_coleta_complementar_modulo_ok{modulo}`.
 
 ## Eventos (Loki)
@@ -117,7 +120,22 @@ Um JSON por linha. `tipo`, `categoria` e `link` viram rótulos no Loki; o restan
 | `docker_evento` | `auditoria` | `criado`, `removido`, `iniciado`, `parado`, `reiniciado`, `renomeado`, `alterado`, `pausado`, `retomado`, `imagem_gerada` |
 | `docker_evento` | `imagem` | `imagem_baixada`, `imagem_removida`, `imagem_marcada`, `imagem_desmarcada`, `imagem_enviada`, `imagem_importada`, `imagem_carregada`, `imagem_salva` |
 
-Execuções do health check não viram evento de acesso. Parada pedida (`stop`, `restart`, atualização) vira `parado`, não `caiu`.
+| `acesso_evento` | `login` | `login`: usuario, canal (`ssh`, `console`, `rdp`, `console_cache`), metodo, origem_ip, origem_tipo, origem_nova, privilegiado, conta_emergencia, fora_horario, alerta |
+| `acesso_evento` | `elevacao` | `sudo`, `su` (Linux): usuario, usuario_destino, tty, comando, origem_ip da sessão |
+
+Execuções do health check não viram evento de acesso. No `acesso_inicio` do Docker, `origem_ip` e `usuario_login` mostram a sessão SSH que abriu o `docker exec`; aberto pela API (console do Portainer), fica sem origem.
+
+**Classificação dos acessos** (seção `[acessos]` do .ini):
+
+| Campo | Valores |
+| --- | --- |
+| `origem_tipo` | `local` (console), `rede_interna` (IP privado, VPN, CGNAT), `rede_local` (mesmo IP público do local), `conhecida` (`origens_conhecidas`), `publica` |
+| `origem_nova` | `sim` quando o usuário não entrou dessa rede (/24 no IPv4, /64 no IPv6) nos últimos 30 dias (`dias_origem_conhecida`) |
+| `privilegiado` | Linux: root ou grupos `sudo`, `wheel`, `admin`, `docker` (`grupos_privilegiados`). Windows: token de administrador (ElevatedToken ou evento 4672) |
+| `fora_horario` | Fora de `horario` (padrão `seg-sex 07:00-19:00; sab 07:00-14:00`, horário de Brasília) |
+| `alerta` | `critico`: root ou Administrator embutido, ou privilegiado de origem pública nova. `resumo`: privilegiado fora do horário. `nenhum`: só registro |
+
+Alertas no Grafana: "Acesso privilegiado suspeito" (alerta=critico, crítico) e "Acesso privilegiado fora do horário" (alerta=resumo, um aviso por dia por servidor). No primeiro mês de uso, toda origem pública é nova, então os primeiros acessos geram alerta até o histórico se formar. Parada pedida (`stop`, `restart`, atualização) vira `parado`, não `caiu`.
 
 ## Servidor cujo Alloy não veio do instalador
 
@@ -145,3 +163,4 @@ $env:NEXTEC_COLETA_URL = "https://raw.githubusercontent.com/Sou-Nextec/Scripts/<
 | Versão | Data | Mudanças |
 | --- | --- | --- |
 | 1.0.0 | 03/10/2026 | Primeira versão: internet, links, Docker e velocidade (Linux); internet e links (Windows). |
+| 1.1.0 | 03/10/2026 | Módulo acessos (Linux e Windows) com origem e classificação para os alertas de acesso privilegiado; origem (usuário e IP da sessão SSH) no evento de terminal aberto em container. |

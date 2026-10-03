@@ -36,6 +36,14 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.14.0 Atualizador automático Nextec: o instalador passa a instalar a
+           tarefa NextecAtualizador (SYSTEM, de madrugada), que aplica
+           versões publicadas e assinadas pela Nextec, em ondas e com volta
+           automática. Novo modo -Atualizar, sem perguntas, que reaplica a
+           configuração atual com arquivos já conferidos pela assinatura
+           (-ColetaArquivo, -AtualizadorArquivo, -AlloyInstaladorArquivo).
+           Pastas executadas como SYSTEM (Nextec, Coleta, Speedtest) passam a
+           ter ACL restrita: usuário comum só lê.
     2.13.0 Todas as respostas digitadas são validadas e a pergunta é repetida
            quando o valor é inválido, em vez de encerrar: cliente (hífen e
            acento convertidos para o padrão de labels), host, local, IPs,
@@ -178,8 +186,20 @@ param(
     [string]$NocTarget = "noc.nex.tec.br",
 
     # Executa o script sem interação, usando os parâmetros fornecidos e variáveis de ambiente para credenciais.
-    [switch]$Silent
+    [switch]$Silent,
+    # Modo do atualizador automático: reaplica a configuração atual sem
+    # perguntas e sem pedir credencial. Os arquivos chegam já conferidos pela
+    # assinatura do manifesto da Nextec.
+    [switch]$Atualizar,
+    [string]$ColetaArquivo = "",
+    [string]$AtualizadorArquivo = "",
+    [string]$AlloyInstaladorArquivo = "",
+    [string]$AlloyVersao = "",
+    [string]$PacoteVersao = ""
 )
+
+# A atualização nunca pergunta nada: roda pela tarefa agendada, sem console.
+if ($Atualizar) { $Silent = [switch]$true }
 
 # Guardado aqui, na raiz do script, porque $PSBoundParameters só reflete os
 # parâmetros recebidos por ESTE invocation quando lido neste escopo. É usado
@@ -222,7 +242,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.13.0"
+$InstallerVersion = "2.14.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -288,6 +308,15 @@ $ColetaTaskName = "NextecColetaComplementar"
 # nessa URL derruba a instalação do zero, não fica em modo degradado.
 $SpeedtestCliVersion = "1.2.0"
 $SpeedtestCliUrl = "https://install.speedtest.net/app/cli/ookla-speedtest-{0}-win64.zip" -f $SpeedtestCliVersion
+
+# Atualizador automático Nextec. Pasta própria, com ACL restrita, porque o
+# script roda como SYSTEM. NEXTEC_ATUALIZADOR_URL permite testar uma branch.
+$NextecDataDir = Join-Path $env:ProgramData "Nextec"
+$AtualizadorDir = Join-Path $NextecDataDir "atualizador"
+$AtualizadorScript = Join-Path $AtualizadorDir "nextec-atualizador.ps1"
+$AtualizadorConfig = Join-Path $NextecDataDir "atualizador.conf"
+$AtualizadorTaskName = "NextecAtualizador"
+$AtualizadorUrl = if ($env:NEXTEC_ATUALIZADOR_URL) { $env:NEXTEC_ATUALIZADOR_URL } else { "https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Alloy/atualizador/nextec-atualizador.ps1" }
 
 $RegistryPath = "HKLM:\SOFTWARE\GrafanaLabs\Alloy"
 $LatestInstallerUrl = "https://github.com/grafana/alloy/releases/latest/download/alloy-installer-windows-amd64.exe"
@@ -4637,6 +4666,14 @@ function Install-OrUpdateAlloy {
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+        if (-not [string]::IsNullOrWhiteSpace($AlloyInstaladorArquivo)) {
+            # Entregue pelo atualizador, com o SHA-256 conferido pelo manifesto
+            # assinado. Roda direto da pasta protegida do atualizador, sem
+            # passar por pasta temporária.
+            $installer = $AlloyInstaladorArquivo
+            Write-Info ("Instalador do Alloy {0} entregue pelo atualizador." -f $AlloyVersao)
+        }
+        else {
         Write-Info "Baixando instalador oficial do Grafana Alloy."
 
         # $ProgressPreference é forçado para "SilentlyContinue" no topo do
@@ -4672,6 +4709,7 @@ function Install-OrUpdateAlloy {
         }
         finally {
             $ProgressPreference = $previousProgressPreference
+        }
         }
 
         if (-not (Test-Path $installer)) {
@@ -5492,7 +5530,10 @@ function Write-ColetaConfig {
     $existente = Read-ColetaIniFile -Caminho $ColetaConfig
     $geral = [ordered]@{ intervalo_links_segundos = "15"; limite_latencia_ms = "150"; limite_perda_percentual = "5" }
     $internet = [ordered]@{ alvos = "1.1.1.1, 8.8.8.8"; firewall = ""; dns_servidores = "sistema, 1.1.1.1, 8.8.8.8"; dns_nome = "google.com" }
-    foreach ($par in @(@("geral", $geral), @("internet", $internet))) {
+    # Acessos (logins RDP e console com origem): ligado por padrão, inclusive
+    # em instalação antiga que receber esta versão pelo atualizador.
+    $acessos = [ordered]@{ ativo = "sim"; horario = "seg-sex 07:00-19:00; sab 07:00-14:00"; origens_conhecidas = "" }
+    foreach ($par in @(@("geral", $geral), @("internet", $internet), @("acessos", $acessos))) {
         if ($existente.Contains($par[0])) {
             foreach ($chave in $existente[$par[0]].Keys) { $par[1][$chave] = $existente[$par[0]][$chave] }
         }
@@ -5509,6 +5550,12 @@ function Write-ColetaConfig {
     $linhas.Add("")
     $linhas.Add("[internet]")
     foreach ($chave in $internet.Keys) { $linhas.Add(("{0} = {1}" -f $chave, $internet[$chave])) }
+    $linhas.Add("")
+    $linhas.Add("; Logins RDP e de console com IP de origem, para os alertas de acesso")
+    $linhas.Add("; privilegiado. horario: comercial, em Brasília. origens_conhecidas: redes")
+    $linhas.Add("; da Nextec ou VPN que não contam como origem nova (ex.: 203.0.113.0/24).")
+    $linhas.Add("[acessos]")
+    foreach ($chave in $acessos.Keys) { $linhas.Add(("{0} = {1}" -f $chave, $acessos[$chave])) }
 
     foreach ($link in $script:ColetaLinks) {
         $linhas.Add("")
@@ -5573,14 +5620,20 @@ function Install-ColetaComplementar {
 
     Write-Step "Coleta Complementar (internet e links)"
 
-    foreach ($pasta in @($ColetaDir, $ColetaTextfileDir)) {
-        if (-not (Test-Path -LiteralPath $pasta)) { New-Item -ItemType Directory -Path $pasta -Force | Out-Null }
-    }
+    # Roda como SYSTEM: pasta protegida antes de gravar o script.
+    Protect-NextecDirectory -Path $ColetaDir -LeituraUsuarios
+    if (-not (Test-Path -LiteralPath $ColetaTextfileDir)) { New-Item -ItemType Directory -Path $ColetaTextfileDir -Force | Out-Null }
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $temporario = Join-Path $env:TEMP ("coleta-complementar-{0}.ps1" -f [guid]::NewGuid().ToString("N"))
     try {
-        Invoke-WebRequest -Uri $ColetaUrl -OutFile $temporario -UseBasicParsing
+        if (-not [string]::IsNullOrWhiteSpace($ColetaArquivo)) {
+            # Entregue pelo atualizador, já conferido pela assinatura do manifesto.
+            Copy-Item -LiteralPath $ColetaArquivo -Destination $temporario -Force
+        }
+        else {
+            Invoke-WebRequest -Uri $ColetaUrl -OutFile $temporario -UseBasicParsing
+        }
         $erros = $null
         [void][System.Management.Automation.Language.Parser]::ParseFile($temporario, [ref]$null, [ref]$erros)
         if ($erros -and $erros.Count -gt 0) {
@@ -5959,13 +6012,18 @@ function New-AlloyConfiguration {
         [void]$builder.AppendLine("")
     }
 
-    if ($script:EnableColetaResolved) {
+    # Sempre presente: além da Coleta Complementar, o atualizador automático
+    # grava as métricas dele (versão, onda, resultado) na mesma pasta. Com a
+    # Coleta desligada o bloco leva outro nome, porque a leitura da
+    # configuração atual usa "coleta_complementar" para saber se ela está ligada.
+    $nomeTextfile = if ($script:EnableColetaResolved) { "coleta_complementar" } else { "atualizador" }
+    if ($true) {
         # Exporter próprio só com o textfile da Coleta Complementar. Separado
         # do "system" para valer em qualquer modo e para poder usar
         # honor_labels: as métricas trazem rótulos próprios (tipo do link,
         # tipo de espaço) que não podem ser sobrescritos pelos rótulos do host.
         [void]$builder.AppendLine("// Coleta Complementar Nextec: internet e links")
-        [void]$builder.AppendLine('prometheus.exporter.windows "coleta_complementar" {')
+        [void]$builder.AppendLine(('prometheus.exporter.windows "{0}" {{' -f $nomeTextfile))
         [void]$builder.AppendLine('  enabled_collectors = ["textfile"]')
         [void]$builder.AppendLine("")
         [void]$builder.AppendLine("  textfile {")
@@ -5973,8 +6031,8 @@ function New-AlloyConfiguration {
         [void]$builder.AppendLine("  }")
         [void]$builder.AppendLine("}")
         [void]$builder.AppendLine("")
-        [void]$builder.AppendLine('discovery.relabel "coleta_complementar_labels" {')
-        [void]$builder.AppendLine("  targets = prometheus.exporter.windows.coleta_complementar.targets")
+        [void]$builder.AppendLine(('discovery.relabel "{0}_labels" {{' -f $nomeTextfile))
+        [void]$builder.AppendLine(("  targets = prometheus.exporter.windows.{0}.targets" -f $nomeTextfile))
         [void]$builder.AppendLine("")
         Add-AlloyRelabelRule -Builder $builder -Target "instance" -Replacement $script:HostLabel
         Add-AlloyRelabelRule -Builder $builder -Target "host" -Replacement $script:HostLabel
@@ -5991,8 +6049,8 @@ function New-AlloyConfiguration {
         Add-AlloyRelabelRule -Builder $builder -Target "local" -Replacement $script:Local
         [void]$builder.AppendLine("}")
         [void]$builder.AppendLine("")
-        [void]$builder.AppendLine('prometheus.scrape "coleta_complementar" {')
-        [void]$builder.AppendLine("  targets         = discovery.relabel.coleta_complementar_labels.output")
+        [void]$builder.AppendLine(('prometheus.scrape "{0}" {{' -f $nomeTextfile))
+        [void]$builder.AppendLine(("  targets         = discovery.relabel.{0}_labels.output" -f $nomeTextfile))
         [void]$builder.AppendLine("  forward_to      = [prometheus.relabel.filtro_nextec.receiver]")
         [void]$builder.AppendLine('  job_name        = "integrations/coleta_complementar"')
         [void]$builder.AppendLine("  honor_labels    = true")
@@ -6745,6 +6803,14 @@ function Show-FinalSummary {
     }
     Write-Field -Label "Log do instalador" -Value $script:InstallerLog -Width 18
 
+    Write-Section "Atualização automática"
+    if (Get-ScheduledTask -TaskName $AtualizadorTaskName -ErrorAction SilentlyContinue) {
+        Write-Field -Label "Atualizador" -Value "ligado, todo dia de madrugada" -ValueColor Green -Width 18
+    }
+    else {
+        Write-Field -Label "Atualizador" -Value "não instalado" -ValueColor Yellow -Width 18
+    }
+
     if ($comPendencia) {
         Write-Host ""
         Write-Host "  PENDÊNCIAS" -ForegroundColor Yellow
@@ -6769,6 +6835,7 @@ function Show-FinalSummary {
     if ($script:EnableColetaResolved) {
         $comandos += ('powershell -ExecutionPolicy Bypass -File "{0}" -Acao verificar' -f (Join-Path $ColetaDir "coleta-complementar.ps1"))
     }
+    $comandos += ('powershell -ExecutionPolicy Bypass -File "{0}" -Acao verificar' -f $AtualizadorScript)
     foreach ($comando in $comandos) {
         Write-Host "    > " -ForegroundColor Cyan -NoNewline
         Write-Host $comando
@@ -6783,12 +6850,199 @@ function Show-FinalSummary {
 # MAIN
 # ==============================================================================
 
+# ==============================================================================
+# ATUALIZADOR AUTOMÁTICO NEXTEC
+# ==============================================================================
+#
+# A tarefa NextecAtualizador roda como SYSTEM de madrugada, lê o manifesto
+# publicado pela Nextec, confere a assinatura RSA e, quando há versão nova
+# liberada para a onda desta máquina, chama este instalador em -Atualizar.
+# Ver Alloy/atualizador/README.md no repositório Scripts.
+
+function Protect-NextecDirectory {
+    <#
+        Deixa a pasta gravável só por SYSTEM e Administradores. Obrigatório
+        para pasta com script executado como SYSTEM: com a ACL padrão do
+        ProgramData, um usuário comum pode criar a pasta antes, deixar ACE
+        própria nela ou trocá-la por um link e assim ganhar privilégio.
+
+        - Link (junction ou symlink) no lugar da pasta: o link é removido.
+        - Dono fora de SYSTEM/Administradores: o dono passa a ser
+          Administradores e as ACEs explícitas do conteúdo são descartadas.
+        - A DACL é montada do zero (sem herança), antes de qualquer gravação.
+        Usa SID porque o nome dos grupos muda com o idioma do Windows.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [switch]$LeituraUsuarios
+    )
+
+    $confiaveis = @("S-1-5-18", "S-1-5-32-544")
+    if (Test-Path -LiteralPath $Path) {
+        $item = Get-Item -LiteralPath $Path -Force
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            Write-Warn ("{0} era um link; removido e recriado como pasta." -f $Path)
+            [IO.Directory]::Delete($Path, $false)
+        }
+    }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
+
+    $dono = ""
+    try { $dono = (Get-Acl -LiteralPath $Path).GetOwner([Security.Principal.SecurityIdentifier]).Value } catch { $dono = "" }
+    $donoEstranho = ($confiaveis -notcontains $dono)
+
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetOwner((New-Object Security.Principal.SecurityIdentifier("S-1-5-32-544")))
+    $acl.SetAccessRuleProtection($true, $false)
+    $heranca = [Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit"
+    foreach ($sid in $confiaveis) {
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+            (New-Object Security.Principal.SecurityIdentifier($sid)), "FullControl", $heranca, "None", "Allow")))
+    }
+    if ($LeituraUsuarios) {
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+            (New-Object Security.Principal.SecurityIdentifier("S-1-5-32-545")), "ReadAndExecute", $heranca, "None", "Allow")))
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
+
+    # Links dentro da pasta saem (só o link, nunca o destino dele).
+    foreach ($link in @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })) {
+        Write-Warn ("Link removido de pasta protegida: {0}" -f $link.FullName)
+        if ($link.PSIsContainer) { [IO.Directory]::Delete($link.FullName, $false) } else { [IO.File]::Delete($link.FullName) }
+    }
+    # Conteúdo com dono e ACE próprios volta a só herdar da pasta.
+    if (@(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue).Count -gt 0) {
+        if ($donoEstranho) {
+            & icacls.exe (Join-Path $Path "*") /setowner "*S-1-5-32-544" /T /C /Q | Out-Null
+        }
+        & icacls.exe (Join-Path $Path "*") /reset /T /C /Q | Out-Null
+    }
+}
+
+function Test-DotNetParaAtualizador {
+    # O atualizador confere a assinatura com APIs do .NET Framework 4.6+ (release 393295).
+    try {
+        $release = (Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" -Name Release -ErrorAction Stop).Release
+        return ([int]$release -ge 393295)
+    }
+    catch { return $false }
+}
+
+function Install-Atualizador {
+    Write-Step "Atualizador automático Nextec"
+
+    if (-not (Test-DotNetParaAtualizador)) {
+        Write-Warn "Esta máquina tem .NET Framework anterior ao 4.6: o atualizador fica instalado, mas só aplica versões depois que o .NET for atualizado."
+    }
+
+    # Proteção antes de gravar qualquer arquivo. Nextec: só SYSTEM e
+    # Administradores (estado, cópias de credencial). Coleta e Speedtest
+    # também rodam como SYSTEM: usuário comum só lê.
+    Protect-NextecDirectory -Path $NextecDataDir
+    if (-not (Test-Path -LiteralPath $AtualizadorDir)) { New-Item -ItemType Directory -Path $AtualizadorDir -Force | Out-Null }
+    Protect-NextecDirectory -Path $ColetaDir -LeituraUsuarios
+    if (-not (Test-Path -LiteralPath $ColetaTextfileDir)) {
+        New-Item -ItemType Directory -Path $ColetaTextfileDir -Force | Out-Null
+    }
+    if (Test-Path -LiteralPath $SpeedtestDir) { Protect-NextecDirectory -Path $SpeedtestDir -LeituraUsuarios }
+
+    $temporario = Join-Path $env:TEMP ("nextec-atualizador-{0}.ps1" -f [guid]::NewGuid().ToString("N"))
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($AtualizadorArquivo)) {
+            Copy-Item -LiteralPath $AtualizadorArquivo -Destination $temporario -Force
+        }
+        else {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $AtualizadorUrl -OutFile $temporario -UseBasicParsing -TimeoutSec 120
+        }
+        $erros = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile($temporario, [ref]$null, [ref]$erros)
+        if ($erros -and $erros.Count -gt 0) {
+            throw ("Arquivo do atualizador tem erro de sintaxe: {0}" -f $erros[0].Message)
+        }
+        Copy-Item -LiteralPath $temporario -Destination $AtualizadorScript -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $temporario -Force -ErrorAction SilentlyContinue
+    }
+
+    # A configuração do operador (onda fixa, desligar) não é sobrescrita.
+    if (-not (Test-Path -LiteralPath $AtualizadorConfig)) {
+        $conteudo = @(
+            "; Atualizador automático Nextec.",
+            "; onda: auto (máquinas da Nextec na 0, ~10% dos clientes na 1, demais na 2) ou 0, 1, 2.",
+            "; habilitado: sim ou não. Desligar aqui só vale para esta máquina.",
+            "[atualizador]",
+            "habilitado = sim",
+            "onda = auto"
+        ) -join "`r`n"
+        [IO.File]::WriteAllText($AtualizadorConfig, $conteudo + "`r`n", (New-Object Text.UTF8Encoding($false)))
+    }
+
+    # Madrugada, com atraso aleatório de até 4h por máquina (01h às 05h).
+    # StartWhenAvailable recupera a execução perdida com a máquina desligada.
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Acao executar' -f $AtualizadorScript)
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 3) -MultipleInstances IgnoreNew
+    $gatilho = New-ScheduledTaskTrigger -Daily -At ([DateTime]::Today.AddHours(1)) -RandomDelay (New-TimeSpan -Hours 4)
+    Register-ScheduledTask -TaskName $AtualizadorTaskName -Action $action -Trigger $gatilho `
+        -Principal $principal -Settings $settings -Force | Out-Null
+
+    $versao = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $AtualizadorScript -Acao versao
+    Write-Ok ("Atualizador {0} instalado; roda todo dia de madrugada." -f ($versao | Select-Object -Last 1))
+}
+
+function Invoke-NextecAtualizacao {
+    <#
+        Modo -Atualizar: reaplica a configuração atual com o instalador novo.
+        Nada é perguntado. Credenciais, alvos e links vêm da instalação atual.
+    #>
+    Write-Step ("Atualização automática {0}" -f $PacoteVersao)
+
+    $configuracao = Read-CurrentAlloyConfiguration
+    if ($null -eq $configuracao) {
+        throw "Sem config.alloy da Nextec nesta máquina; rode o instalador interativo uma vez."
+    }
+    $inventory = Import-CurrentConfiguration -Configuration $configuracao
+    if ([string]::IsNullOrWhiteSpace($script:RwUsername) -or [string]::IsNullOrWhiteSpace($script:RwPassword)) {
+        throw "Credenciais do NOC não encontradas no registro do serviço; rode o instalador interativo."
+    }
+
+    $versaoAtual = ""
+    try {
+        $saida = (& $AlloyExe --version 2>$null | Select-Object -First 1) -join ""
+        if ($saida -match 'v?(\d+\.\d+\.\d+)') { $versaoAtual = $Matches[1] }
+    }
+    catch { $versaoAtual = "" }
+
+    if (-not [string]::IsNullOrWhiteSpace($AlloyInstaladorArquivo) -and $AlloyVersao -ne $versaoAtual) {
+        Write-Info ("Alloy {0} -> {1}" -f $versaoAtual, $AlloyVersao)
+        Backup-ExistingConfiguration
+        Update-AlloyBinaryOnly
+    }
+
+    $script:ConfigChanged = $true
+    Save-ReconfiguredAlloy -Inventory $inventory
+    Install-Atualizador
+    Write-Ok "Atualização concluída."
+}
+
 function Invoke-NextecInstaller {
     Show-Banner
     Initialize-Logging
     Assert-Administrator
 
     try {
+        if ($Atualizar) {
+            Invoke-NextecAtualizacao
+            return
+        }
+
         Set-NocDestination
 
         if (-not (Invoke-MaintenanceMenu)) {
@@ -6867,6 +7121,11 @@ function Invoke-NextecInstaller {
         # e o serviço já subiu. Falha aqui é informação para o técnico.
         Invoke-NextecVerification -Nome "Prontidão do Alloy" -Acao { Test-AlloyReadiness }
         Invoke-NextecVerification -Nome "Teste de ingestão no NOC" -Acao { Test-AlloyIngestion }
+
+        # Depois do Alloy validado: falha aqui não desfaz o monitoramento.
+        Invoke-NextecOptionalStep -Nome "Atualizador automático" -Acao {
+            Install-Atualizador
+        } | Out-Null
 
         Show-FinalSummary -Inventory $inventory
     }

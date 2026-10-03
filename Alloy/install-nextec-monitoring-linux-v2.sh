@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.3.0 (respostas validadas: valor inválido repete a pergunta)
+# Versão: 2.4.0 (atualizador automático: respostas gravadas e modo --atualizar)
 #
 # USO
 # ---
@@ -9,6 +9,11 @@
 #   sudo bash install-nextec-monitoring-linux-v2.sh --somente-coleta  só a Coleta
 #     Complementar, para servidor cujo Alloy roda fora deste instalador
 #     (ex.: o servidor da central, coletado pelo Alloy da stack)
+#   sudo bash install-nextec-monitoring-linux-v2.sh --atualizar       reaplica sem
+#     perguntas, com as respostas gravadas em /etc/nextec/instalacao.conf. É o
+#     modo usado pelo atualizador automático (nextec-atualizador), que entrega
+#     os arquivos já conferidos por assinatura em COLETA_ARQUIVO e
+#     ATUALIZADOR_ARQUIVO e a versão do Alloy em ALLOY_VERSAO.
 #
 # OBJETIVO
 # -------
@@ -30,6 +35,9 @@
 # 8. O que o Alloy não coleta sozinho (internet, links, estado e eventos do
 #    Docker, teste de velocidade) fica com a Coleta Complementar Nextec, baixada
 #    do repositório Scripts. Ela só grava arquivos locais; quem envia é o Alloy.
+# 9. As respostas ficam em /etc/nextec/instalacao.conf (sem senha) e o
+#    atualizador automático reaplica esta instalação a cada versão publicada e
+#    assinada pela Nextec. Ver Alloy/atualizador/README.md.
 #
 # DISTRIBUIÇÕES
 # ------------
@@ -46,7 +54,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.3.0"
+INSTALLER_VERSION="2.4.0"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -71,6 +79,17 @@ COLETA_SERVICE="/etc/systemd/system/coleta-complementar.service"
 SPEEDTEST_CLI_VERSION="1.2.0"
 SPEEDTEST_BIN="/usr/local/bin/speedtest"
 
+# Atualizador automático e respostas da instalação.
+NEXTEC_DIR="/etc/nextec"
+ESTADO_INSTALACAO="${NEXTEC_DIR}/instalacao.conf"
+ATUALIZADOR_URL="${ATUALIZADOR_URL:-https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Alloy/atualizador/nextec-atualizador.py}"
+ATUALIZADOR_BIN="/usr/local/lib/nextec/nextec-atualizador.py"
+ATUALIZADOR_CONFIG="${NEXTEC_DIR}/atualizador.conf"
+ATUALIZADOR_SERVICE="/etc/systemd/system/nextec-atualizador.service"
+ATUALIZADOR_TIMER="/etc/systemd/system/nextec-atualizador.timer"
+# 1 quando roda em --atualizar: nenhuma pergunta, nada de credencial nova.
+MODO_ATUALIZACAO=0
+
 # O pacote oficial usa /etc/default/alloy em Debian. No fallback binário também
 # adotamos o mesmo local para manter um único padrão de manutenção.
 ENV_FILE="/etc/default/alloy"
@@ -80,6 +99,10 @@ SYSTEMD_OVERRIDE="${SYSTEMD_OVERRIDE_DIR}/10-nextec.conf"
 # Cores ANSI. Se o terminal não suportar cores, o conteúdo continua legível.
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; WHITE='\033[0;37m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+# No modo --atualizar a saída vai para o log do atualizador: sem códigos de cor.
+if [[ "${1:-}" == "--atualizar" ]]; then
+  RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; WHITE=''; BOLD=''; DIM=''; NC=''
+fi
 
 ok()   { echo -e "${GREEN}✔${NC}  $*"; }
 info() { echo -e "${CYAN}ℹ${NC}  $*"; }
@@ -122,7 +145,7 @@ cleanup_on_error() {
 trap cleanup_on_error ERR
 
 banner() {
-  clear 2>/dev/null || true
+  [[ "$MODO_ATUALIZACAO" == "1" ]] || clear 2>/dev/null || true
   echo -e "${BLUE}${BOLD}"
   cat <<'TXT'
  _   _ _______  _______ _____ ____
@@ -467,7 +490,6 @@ detect_os() {
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
     source /etc/os-release
-    INSTALLER_VERSION="2.3.0"
     DISTRO_ID="${ID:-unknown}"
     DISTRO_LIKE="${ID_LIKE:-}"
     PRETTY_OS="${PRETTY_NAME:-$DISTRO_ID}"
@@ -666,7 +688,13 @@ install_alloy_apt() {
   # --force-confold mantém o /etc/default/alloy atual sem perguntar: o
   # instalador grava nele as credenciais logo depois.
   DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confold || true
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confold alloy
+  local pacote="alloy" candidato
+  if [[ -n "${ALLOY_VERSAO:-}" ]]; then
+    candidato="$(apt-cache madison alloy 2>/dev/null | awk -F'|' -v v="$ALLOY_VERSAO" '{gsub(/ /,"",$2); if ($2==v || index($2, v"-")==1) {print $2; exit}}')"
+    [[ -n "$candidato" ]] || { err "Versão ${ALLOY_VERSAO} do Alloy não encontrada no repositório da Grafana."; exit 1; }
+    pacote="alloy=${candidato}"
+  fi
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades -o Dpkg::Options::=--force-confold "$pacote"
 }
 
 install_alloy_rpm() {
@@ -682,7 +710,11 @@ gpgkey=https://rpm.grafana.com/gpg.key
 sslverify=1
 sslcacert=/etc/pki/tls/certs/ca-bundle.crt
 EOF
-  if [[ "$PKG_FAMILY" == "dnf" ]]; then dnf install -y alloy; else yum install -y alloy; fi
+  local pacote="alloy"
+  [[ -n "${ALLOY_VERSAO:-}" ]] && pacote="alloy-${ALLOY_VERSAO}"
+  if ! "$PKG_FAMILY" install -y "$pacote"; then
+    [[ -n "${ALLOY_VERSAO:-}" ]] && "$PKG_FAMILY" downgrade -y "$pacote"
+  fi
 }
 
 install_alloy_zypper() {
@@ -690,7 +722,11 @@ install_alloy_zypper() {
   zypper --non-interactive removerepo grafana >/dev/null 2>&1 || true
   zypper --non-interactive addrepo https://rpm.grafana.com grafana
   zypper --non-interactive --gpg-auto-import-keys refresh
-  zypper --non-interactive install alloy
+  if [[ -n "${ALLOY_VERSAO:-}" ]]; then
+    zypper --non-interactive install --oldpackage "alloy=${ALLOY_VERSAO}"
+  else
+    zypper --non-interactive install alloy
+  fi
 }
 
 install_alloy_binary() {
@@ -698,9 +734,17 @@ install_alloy_binary() {
   tmpdir="$(mktemp -d)"
   archive="${tmpdir}/alloy.zip"
   asset_url="https://github.com/grafana/alloy/releases/latest/download/alloy-linux-${ARCH}.zip"
+  [[ -n "${ALLOY_VERSAO:-}" ]] && asset_url="https://github.com/grafana/alloy/releases/download/v${ALLOY_VERSAO}/alloy-linux-${ARCH}.zip"
 
   info "Usando binário oficial do Alloy como fallback."
   curl -fL --retry 3 --connect-timeout 15 "$asset_url" -o "$archive"
+  if [[ -n "${ALLOY_BINARIO_SHA256:-}" ]]; then
+    # Hash vindo do manifesto assinado pela Nextec.
+    echo "${ALLOY_BINARIO_SHA256}  ${archive}" | sha256sum -c --quiet - || { err "SHA-256 do binário do Alloy não confere."; exit 1; }
+  elif [[ "$MODO_ATUALIZACAO" == "1" ]]; then
+    err "Atualização sem SHA-256 do binário do Alloy para ${ARCH}: recusada."
+    exit 1
+  fi
 
   if command -v unzip >/dev/null 2>&1; then
     unzip -q "$archive" -d "$tmpdir"
@@ -752,16 +796,20 @@ EOF
 # comando e derruba a atualização do pacote. Aqui o arquivo é conferido sem ser
 # executado e, se tiver linha inválida, é refeito; as credenciais são gravadas
 # de novo mais adiante pelo próprio instalador.
-sanitize_env_file() {
+env_file_valido() {
   [[ -f "$ENV_FILE" ]] || return 0
-  local linha invalido=0
+  local linha
   local re_linha='^[A-Za-z_][A-Za-z0-9_]*=("([^"\\]|\\.)*"|'"'"'[^'"'"']*'"'"'|[^[:space:]"'"'"'`$]*)$'
   while IFS= read -r linha || [[ -n "$linha" ]]; do
     linha="${linha%$'\r'}"
     [[ -z "${linha//[[:space:]]/}" || "$linha" =~ ^[[:space:]]*# ]] && continue
-    [[ "$linha" =~ $re_linha ]] || { invalido=1; break; }
+    [[ "$linha" =~ $re_linha ]] || return 1
   done < "$ENV_FILE"
-  (( invalido == 0 )) && return 0
+  return 0
+}
+
+sanitize_env_file() {
+  env_file_valido && return 0
 
   local copia="${ENV_FILE}.invalido-$(date +%Y%m%d-%H%M%S)"
   cp -a "$ENV_FILE" "$copia"
@@ -777,9 +825,29 @@ EOF
   warn "${ENV_FILE} tinha linha inválida e foi refeito (cópia protegida em ${copia}; apague depois de concluir)."
 }
 
+# Versão instalada do Alloy, só os números (ex.: 1.20.1); vazio se não houver.
+alloy_versao_instalada() {
+  command -v alloy >/dev/null 2>&1 || return 0
+  alloy --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true
+}
+
 install_alloy() {
   step "Instalando Grafana Alloy"
-  sanitize_env_file
+  if [[ "$MODO_ATUALIZACAO" == "1" ]]; then
+    # Sem credenciais em mãos, refazer o arquivo apagaria a senha de envio.
+    env_file_valido || { err "${ENV_FILE} tem linha inválida; rode o instalador interativo neste servidor."; exit 1; }
+  else
+    sanitize_env_file
+  fi
+
+  if [[ -n "${ALLOY_VERSAO:-}" ]]; then
+    [[ "$ALLOY_VERSAO" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { err "ALLOY_VERSAO inválida: ${ALLOY_VERSAO}"; exit 1; }
+    if [[ "$(alloy_versao_instalada)" == "$ALLOY_VERSAO" ]] && systemctl cat alloy.service >/dev/null 2>&1; then
+      ok "Grafana Alloy já está na versão ${ALLOY_VERSAO}."
+      return 0
+    fi
+    info "Versão do Alloy definida pela Nextec: ${ALLOY_VERSAO}."
+  fi
   install_prerequisites
 
   case "$PKG_FAMILY" in
@@ -828,7 +896,8 @@ append_env_var() {
 # ${COLETA_TEXTFILE} e eventos em ${COLETA_EVENTOS}; o Alloy lê e envia.
 coleta_enabled() {
   [[ "${ENABLE_INTERNET:-0}" == "1" || "${ENABLE_LINKS:-0}" == "1" || \
-     "${ENABLE_VELOCIDADE:-0}" == "1" || "${ENABLE_DOCKER:-0}" == "1" ]]
+     "${ENABLE_VELOCIDADE:-0}" == "1" || "${ENABLE_DOCKER:-0}" == "1" || \
+     "${ENABLE_ACESSOS:-0}" == "1" ]]
 }
 
 needs_loki() {
@@ -895,13 +964,17 @@ write_coleta_config() {
     # Reconfiguração sem links novos: preserva os links e limites já ajustados
     # e só atualiza quais módulos estão ligados.
     cp -a "$COLETA_CONFIG" "${COLETA_CONFIG}.$(date +%Y%m%d-%H%M%S).bak"
-    python3 - "$COLETA_CONFIG" "$ENABLE_INTERNET" "$ENABLE_DOCKER" "$ENABLE_VELOCIDADE" <<'PY'
+    python3 - "$COLETA_CONFIG" "$ENABLE_INTERNET" "$ENABLE_DOCKER" "$ENABLE_VELOCIDADE" "${ENABLE_ACESSOS:-0}" <<'PY'
 import configparser, sys
-caminho, internet, docker, velocidade = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+caminho, internet, docker, velocidade, acessos = sys.argv[1:6]
 config = configparser.ConfigParser(interpolation=None)
 config.optionxform = str
 config.read(caminho, encoding="utf-8")
-for secao, ligado in (("internet", internet), ("docker", docker), ("velocidade", velocidade)):
+if not config.has_section("acessos"):
+    config.add_section("acessos")
+    config["acessos"]["horario"] = "seg-sex 07:00-19:00; sab 07:00-14:00"
+    config["acessos"]["origens_conhecidas"] = ""
+for secao, ligado in (("internet", internet), ("docker", docker), ("velocidade", velocidade), ("acessos", acessos)):
     if not config.has_section(secao):
         config.add_section(secao)
     config[secao]["ativo"] = "sim" if ligado == "1" else "nao"
@@ -944,6 +1017,16 @@ ativo = $([[ "$ENABLE_DOCKER" == 1 ]] && echo sim || echo nao)
 [velocidade]
 ativo = $([[ "$ENABLE_VELOCIDADE" == 1 ]] && echo sim || echo nao)
 intervalo_minutos = 30
+
+[acessos]
+; Logins (SSH e console), sudo e su, com IP de origem. Alimenta os alertas
+; de acesso privilegiado: root direto, origem pública nova e fora do horário.
+ativo = $([[ "${ENABLE_ACESSOS:-0}" == 1 ]] && echo sim || echo nao)
+; Horário comercial (Brasília). Fora dele, acesso privilegiado entra no resumo.
+horario = seg-sex 07:00-19:00; sab 07:00-14:00
+; Redes de origem conhecidas, além da rede interna e do IP público do local
+; (ex.: VPN ou escritório da Nextec): 203.0.113.0/24, 198.51.100.7
+origens_conhecidas =
 EOF
     local item nome papel operadora tipo suporte ip_publico gateway alvos origem firewall interface
     for item in "${LINKS[@]}"; do
@@ -986,6 +1069,10 @@ install_speedtest_cli() {
      && tar -xzf "${tmp}/speedtest.tgz" -C "$tmp" speedtest; then
     install -m 0755 "${tmp}/speedtest" "$SPEEDTEST_BIN"
     ok "Speedtest CLI instalado em ${SPEEDTEST_BIN}."
+  elif [[ "$MODO_ATUALIZACAO" == "1" ]]; then
+    # Na atualização uma falha passageira não pode desligar o teste de vez
+    # (a resposta ficaria gravada): a próxima atualização tenta de novo.
+    warn "Não foi possível baixar o Speedtest CLI agora; nova tentativa na próxima atualização."
   else
     warn "Não foi possível baixar o Speedtest CLI; teste de velocidade desligado."
     ENABLE_VELOCIDADE=0
@@ -1018,7 +1105,12 @@ install_coleta_complementar() {
 
   local tmp
   tmp="$(mktemp)"
-  curl -fsSL "$COLETA_URL" -o "$tmp" || { err "Falha ao baixar a Coleta Complementar de ${COLETA_URL}"; exit 1; }
+  if [[ -n "${COLETA_ARQUIVO:-}" ]]; then
+    # Entregue pelo atualizador, já conferido pela assinatura do manifesto.
+    cp "$COLETA_ARQUIVO" "$tmp" || { err "Arquivo da Coleta Complementar não encontrado: ${COLETA_ARQUIVO}"; exit 1; }
+  else
+    curl -fsSL "$COLETA_URL" -o "$tmp" || { err "Falha ao baixar a Coleta Complementar de ${COLETA_URL}"; exit 1; }
+  fi
   python3 -m py_compile "$tmp" || { err "Arquivo baixado da Coleta Complementar é inválido."; exit 1; }
   install -D -m 0755 "$tmp" "$COLETA_BIN"
   rm -f "$tmp"
@@ -1060,6 +1152,13 @@ EOF
 configure_service_env() {
   step "Configurando credenciais e segurança local"
 
+  # Na atualização as credenciais já estão em ${ENV_FILE} e ficam como estão.
+  if [[ "$MODO_ATUALIZACAO" == "1" ]]; then
+    configure_service_groups
+    ok "Credenciais mantidas em ${ENV_FILE}."
+    return 0
+  fi
+
   append_env_var "NEXTEC_RW_USERNAME" "$RW_USERNAME"
   append_env_var "NEXTEC_RW_PASSWORD" "$RW_PASSWORD"
 
@@ -1078,6 +1177,11 @@ configure_service_env() {
   # A UI local do Alloy não deve ficar exposta na rede.
   append_env_var "CUSTOM_ARGS" "--server.http.listen-addr=127.0.0.1:12345"
 
+  configure_service_groups
+  ok "Segredos armazenados em ${ENV_FILE} com permissão 0600."
+}
+
+configure_service_groups() {
   if [[ "$ENABLE_LOGS" == "1" ]]; then
     getent group adm >/dev/null 2>&1 && usermod -aG adm alloy || true
     getent group systemd-journal >/dev/null 2>&1 && usermod -aG systemd-journal alloy || true
@@ -1091,8 +1195,6 @@ configure_service_env() {
       warn "Grupo docker não encontrado. O Alloy poderá não acessar /var/run/docker.sock."
     fi
   fi
-
-  ok "Segredos armazenados em ${ENV_FILE} com permissão 0600."
 }
 
 # ------------------------------------------------------------------------------
@@ -1361,11 +1463,12 @@ loki.source.docker "containers" {
 EOF
     fi
 
-    if coleta_enabled; then
-      cat <<EOF
+    # Sempre presente: além da Coleta Complementar, o atualizador automático
+    # grava aqui as métricas dele (versão, onda, resultado).
+    cat <<EOF
 
 // -----------------------------------------------------------------------------
-// COLETA COMPLEMENTAR NEXTEC
+// COLETA COMPLEMENTAR NEXTEC E ATUALIZADOR
 // Métricas: arquivos .prom em ${COLETA_TEXTFILE}.
 // Eventos: ${COLETA_EVENTOS}, um JSON por linha.
 // honor_labels mantém rótulos próprios das métricas (ex.: tipo do link).
@@ -1389,6 +1492,10 @@ prometheus.scrape "coleta_complementar" {
   scrape_interval = "15s"
   scrape_timeout  = "10s"
 }
+EOF
+
+    if needs_loki; then
+      cat <<EOF
 
 loki.source.file "coleta_complementar" {
   targets = [{
@@ -1652,6 +1759,11 @@ EOF
 
 prepare_snmp_config() {
   [[ "$ENABLE_SNMP" == "1" ]] || return 0
+  if [[ "$MODO_ATUALIZACAO" == "1" ]]; then
+    [[ -f "$SNMP_FILE" ]] || { err "SNMP ligado, mas ${SNMP_FILE} não existe."; exit 1; }
+    ok "snmp.yml mantido em ${SNMP_FILE}."
+    return 0
+  fi
 
   step "Preparando configuração SNMP"
   warn "SNMP exige um snmp.yml homologado com módulos e autenticações compatíveis."
@@ -1765,8 +1877,8 @@ resource_checklist() {
   (( ${#DETECTED_DATABASES[@]} > 0 )) && db_available=1
 
   # Estado inicial recomendado.
-  local -a selected=(0 0 0 0 0 0 1 0 1)
-  local -a disabled=(0 0 0 0 0 0 0 0 0)
+  local -a selected=(0 0 0 0 0 0 1 0 1 1)
+  local -a disabled=(0 0 0 0 0 0 0 0 0 0)
   local -a labels=(
     "Docker / containers"
     "Logs do sistema, warning/error/critical"
@@ -1777,8 +1889,9 @@ resource_checklist() {
     "Internet e DNS (saída padrão, IP público, diagnóstico)"
     "Links de internet (mais de um link neste local)"
     "Teste de velocidade (Speedtest)"
+    "Acessos ao servidor (logins com origem, alerta de acesso privilegiado)"
   )
-  local -a details=("" "" "" "" "" "" "recomendado" "" "recomendado")
+  local -a details=("" "" "" "" "" "" "recomendado" "" "recomendado" "recomendado")
 
   if [[ "$DOCKER_DETECTED" == "1" && "${DOCKER_DAEMON_AVAILABLE:-0}" == "1" ]]; then
     selected[0]=1
@@ -1840,7 +1953,7 @@ resource_checklist() {
 
       for token in "${tokens[@]}"; do
         [[ -z "$token" ]] && continue
-        if [[ "$token" =~ ^[1-9]$ ]]; then
+        if [[ "$token" =~ ^[0-9]+$ ]] && (( token >= 1 && token <= ${#labels[@]} )); then
           local idx=$((token-1))
           if [[ "${disabled[$idx]}" == "1" ]]; then
             warn "${labels[$idx]} não está disponível neste host."
@@ -1848,7 +1961,7 @@ resource_checklist() {
             [[ "${selected[$idx]}" == "1" ]] && selected[$idx]=0 || selected[$idx]=1
           fi
         else
-          warn "Opção inválida: ${token}. Use números de 1 a 9."
+          warn "Opção inválida: ${token}. Use números de 1 a ${#labels[@]}."
         fi
       done
     done
@@ -1977,6 +2090,7 @@ resource_checklist() {
   ENABLE_INTERNET="${selected[6]}"
   ENABLE_LINKS="${selected[7]}"
   ENABLE_VELOCIDADE="${selected[8]}"
+  ENABLE_ACESSOS="${selected[9]}"
   # Links dependem do módulo de internet (mesmo laço de medição).
   [[ "$ENABLE_LINKS" == "1" ]] && ENABLE_INTERNET=1
 
@@ -2086,6 +2200,7 @@ collect_inputs() {
   ENABLE_INTERNET=0
   ENABLE_LINKS=0
   ENABLE_VELOCIDADE=0
+  ENABLE_ACESSOS=0
   LINKS=()
   BLACKBOX_TARGETS=()
   SNMP_TARGETS=()
@@ -2231,6 +2346,7 @@ show_plan() {
   summary_row "Internet e DNS:" "$([[ "$ENABLE_INTERNET" == 1 ]] && echo sim || echo não)"
   summary_row "Links de internet:" "$([[ "$ENABLE_LINKS" == 1 ]] && echo "sim (${#LINKS[@]})" || echo não)"
   summary_row "Teste de velocidade:" "$([[ "$ENABLE_VELOCIDADE" == 1 ]] && echo sim || echo não)"
+  summary_row "Acessos (logins):" "$([[ "${ENABLE_ACESSOS:-0}" == 1 ]] && echo sim || echo não)"
 
   echo
   ask_yes_no "Confirmar instalação e configuração?" s || { warn "Cancelado."; exit 0; }
@@ -2270,6 +2386,7 @@ final_summary() {
   [[ "$ENABLE_INTERNET" == 1 ]] && campo "Internet e DNS" "sim" "$GREEN"
   [[ "$ENABLE_LINKS" == 1 ]] && campo "Links de internet" "${#LINKS[@]}" "$GREEN"
   [[ "$ENABLE_VELOCIDADE" == 1 ]] && campo "Teste de velocidade" "a cada 30 min" "$GREEN"
+  [[ "${ENABLE_ACESSOS:-0}" == 1 ]] && campo "Acessos" "logins com origem e alerta de privilegiado" "$GREEN"
   [[ "$ENABLE_BLACKBOX" == 1 ]] && campo "Conectividade" "${#BLACKBOX_TARGETS[@]} alvo(s)" "$GREEN"
   [[ "$ENABLE_SNMP" == 1 ]] && campo "SNMP" "${#SNMP_TARGETS[@]} equipamento(s)" "$GREEN"
   (( ${#DATABASE_TARGETS[@]} > 0 )) && campo "Banco(s) de dados" "${#DATABASE_TARGETS[@]}" "$GREEN"
@@ -2278,7 +2395,15 @@ final_summary() {
   campo "Configuração do Alloy" "$CONFIG_FILE"
   campo "Credenciais" "${ENV_FILE} (600)"
   coleta_enabled && campo "Coleta Complementar" "$COLETA_CONFIG"
+  campo "Respostas gravadas" "$ESTADO_INSTALACAO"
   campo "UI local" "http://127.0.0.1:12345"
+
+  secao "Atualização automática"
+  if systemctl is-enabled --quiet nextec-atualizador.timer 2>/dev/null; then
+    campo "Atualizador" "ligado, todo dia de madrugada" "$GREEN"
+  else
+    campo "Atualizador" "não instalado" "$YELLOW"
+  fi
 
   secao "Diagnóstico"
   comando "systemctl status alloy"
@@ -2286,11 +2411,210 @@ final_summary() {
   comando "alloy validate ${CONFIG_FILE}"
   coleta_enabled && comando "systemctl status coleta-complementar"
   coleta_enabled && comando "python3 ${COLETA_BIN} verificar"
+  comando "python3 ${ATUALIZADOR_BIN} verificar"
 
   echo
   echo -e "  ${YELLOW}${BOLD}Próximo passo:${NC} confira no NOC (Explore) os dados de cliente=\"${CLIENTE}\" e host=\"${HOST_LABEL}\"."
   echo
   return 0
+}
+
+# ------------------------------------------------------------------------------
+# RESPOSTAS DA INSTALAÇÃO E ATUALIZADOR AUTOMÁTICO
+# ------------------------------------------------------------------------------
+# As respostas ficam em ${ESTADO_INSTALACAO}, sem senha, para o modo
+# --atualizar reaplicar a mesma instalação com um instalador mais novo.
+# O arquivo é lido linha a linha com lista fechada de chaves; nunca é executado.
+salvar_estado_instalacao() {
+  local modo="${1:-completo}" tmp item
+  install -d -m 0755 "$NEXTEC_DIR"
+  tmp="$(mktemp)"
+  {
+    echo "# Respostas da instalação Nextec ($(date -u +%Y-%m-%dT%H:%M:%SZ))."
+    echo "# Lido pelo instalador em --atualizar. Sem senha: credenciais ficam em ${ENV_FILE}."
+    echo "FORMATO=1"
+    echo "INSTALADOR_VERSAO=${INSTALLER_VERSION}"
+    echo "MODO=${modo}"
+    echo "NOC_HOST=${NOC_HOST}"
+    echo "CLIENTE=${CLIENTE:-}"
+    echo "HOST_LABEL=${HOST_LABEL:-}"
+    echo "AMBIENTE=${AMBIENTE:-}"
+    echo "LOCAL=${LOCAL:-}"
+    echo "CRITICIDADE=${CRITICIDADE:-}"
+    echo "MONITOR_SERVER=${MONITOR_SERVER:-0}"
+    echo "COLLECTOR=${COLLECTOR:-0}"
+    echo "ENABLE_LOGS=${ENABLE_LOGS:-0}"
+    echo "ENABLE_DOCKER=${ENABLE_DOCKER:-0}"
+    echo "ENABLE_DATABASES=${ENABLE_DATABASES:-0}"
+    echo "ENABLE_BLACKBOX=${ENABLE_BLACKBOX:-0}"
+    echo "ENABLE_SNMP=${ENABLE_SNMP:-0}"
+    echo "ENABLE_EXPORTERS=${ENABLE_EXPORTERS:-0}"
+    echo "ENABLE_INTERNET=${ENABLE_INTERNET:-0}"
+    echo "ENABLE_LINKS=${ENABLE_LINKS:-0}"
+    echo "ENABLE_VELOCIDADE=${ENABLE_VELOCIDADE:-0}"
+    echo "ENABLE_ACESSOS=${ENABLE_ACESSOS:-0}"
+    for item in "${LINKS[@]}"; do echo "LINK=${item}"; done
+    for item in "${BLACKBOX_TARGETS[@]}"; do echo "BLACKBOX=${item}"; done
+    for item in "${SNMP_TARGETS[@]}"; do echo "SNMP=${item}"; done
+    for item in "${CUSTOM_EXPORTERS[@]}"; do echo "EXPORTER=${item}"; done
+    # Só o tipo do banco: a DSN fica em NEXTEC_DB_DSN_n, na mesma ordem.
+    for item in "${DATABASE_TARGETS[@]}"; do echo "BANCO=${item%%|*}"; done
+  } > "$tmp"
+  install -m 0600 "$tmp" "$ESTADO_INSTALACAO"
+  rm -f "$tmp"
+}
+
+carregar_estado_instalacao() {
+  [[ -f "$ESTADO_INSTALACAO" ]] || { err "Sem respostas gravadas em ${ESTADO_INSTALACAO}: rode o instalador interativo uma vez neste servidor."; return 1; }
+  local linha chave valor
+  LINKS=(); BLACKBOX_TARGETS=(); SNMP_TARGETS=(); CUSTOM_EXPORTERS=(); DATABASE_TARGETS=()
+  MODO_INSTALACAO="completo"
+  # Recurso novo vem ligado em instalação antiga, que não tem a resposta gravada.
+  ENABLE_ACESSOS=1
+  while IFS= read -r linha || [[ -n "$linha" ]]; do
+    [[ -z "$linha" || "$linha" == \#* ]] && continue
+    [[ "$linha" == *=* ]] || continue
+    chave="${linha%%=*}"
+    valor="${linha#*=}"
+    case "$chave" in
+      CLIENTE|LOCAL)
+        [[ "$valor" =~ ^[a-z0-9_]*$ ]] || { err "Valor inválido de ${chave} em ${ESTADO_INSTALACAO}."; return 1; }
+        printf -v "$chave" '%s' "$valor" ;;
+      HOST_LABEL)
+        [[ "$valor" =~ ^[a-z0-9_.-]*$ ]] || { err "Valor inválido de ${chave} em ${ESTADO_INSTALACAO}."; return 1; }
+        HOST_LABEL="$valor" ;;
+      AMBIENTE)
+        [[ "$valor" =~ ^(producao|homologacao|desenvolvimento|backup|teste)?$ ]] || { err "AMBIENTE inválido."; return 1; }
+        AMBIENTE="$valor" ;;
+      CRITICIDADE)
+        [[ "$valor" =~ ^(critico|alto|medio|baixo)?$ ]] || { err "CRITICIDADE inválida."; return 1; }
+        CRITICIDADE="$valor" ;;
+      NOC_HOST)
+        [[ "$valor" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || { err "NOC_HOST inválido."; return 1; }
+        NOC_HOST="$valor" ;;
+      MODO)
+        [[ "$valor" =~ ^(completo|somente_coleta)$ ]] || { err "MODO inválido."; return 1; }
+        MODO_INSTALACAO="$valor" ;;
+      MONITOR_SERVER|COLLECTOR|ENABLE_LOGS|ENABLE_DOCKER|ENABLE_DATABASES|ENABLE_BLACKBOX|ENABLE_SNMP|ENABLE_EXPORTERS|ENABLE_INTERNET|ENABLE_LINKS|ENABLE_VELOCIDADE|ENABLE_ACESSOS)
+        [[ "$valor" =~ ^[01]$ ]] || { err "Valor inválido de ${chave}."; return 1; }
+        printf -v "$chave" '%s' "$valor" ;;
+      LINK) LINKS+=("$valor") ;;
+      BLACKBOX) BLACKBOX_TARGETS+=("$valor") ;;
+      SNMP) SNMP_TARGETS+=("$valor") ;;
+      EXPORTER) CUSTOM_EXPORTERS+=("$valor") ;;
+      BANCO)
+        [[ "$valor" =~ ^(postgres|mysql|sqlserver)$ ]] || { err "BANCO inválido."; return 1; }
+        DATABASE_TARGETS+=("${valor}|") ;;
+      *) ;;
+    esac
+  done < "$ESTADO_INSTALACAO"
+  RW_URL="https://${NOC_HOST}/api/v1/write"
+  LOKI_URL="https://${NOC_HOST}/loki/api/v1/push"
+  return 0
+}
+
+install_atualizador() {
+  step "Instalando o atualizador automático Nextec"
+  command -v python3 >/dev/null 2>&1 || {
+    case "$PKG_FAMILY" in
+      apt) apt-get install -y -q python3 >/dev/null;;
+      dnf|yum) "$PKG_FAMILY" install -y -q python3 >/dev/null;;
+      zypper) zypper -q -n install python3 >/dev/null;;
+    esac
+  }
+  command -v python3 >/dev/null 2>&1 || { warn "python3 indisponível: atualizador automático não instalado."; return 0; }
+
+  local tmp
+  tmp="$(mktemp)"
+  if [[ -n "${ATUALIZADOR_ARQUIVO:-}" ]]; then
+    cp "$ATUALIZADOR_ARQUIVO" "$tmp" || { err "Arquivo do atualizador não encontrado: ${ATUALIZADOR_ARQUIVO}"; exit 1; }
+  elif ! curl -fsSL "$ATUALIZADOR_URL" -o "$tmp"; then
+    rm -f "$tmp"
+    warn "Não foi possível baixar o atualizador de ${ATUALIZADOR_URL}; esta máquina não receberá atualizações automáticas."
+    return 0
+  fi
+  python3 -m py_compile "$tmp" || { rm -f "$tmp"; err "Arquivo do atualizador é inválido."; exit 1; }
+  install -D -m 0755 -o root -g root "$tmp" "$ATUALIZADOR_BIN"
+  rm -f "$tmp"
+
+  install -d -m 0755 "$NEXTEC_DIR" "$COLETA_DADOS" "$COLETA_TEXTFILE" "$(dirname "$COLETA_EVENTOS")"
+  # A configuração do operador (onda fixa, desligar) não é sobrescrita.
+  if [[ ! -f "$ATUALIZADOR_CONFIG" ]]; then
+    cat > "$ATUALIZADOR_CONFIG" <<'EOF'
+; Atualizador automático Nextec.
+; onda: auto (servidores da Nextec na 0, ~10% dos clientes na 1, demais na 2) ou 0, 1, 2.
+; habilitado: sim ou não. Desligar aqui só vale para este servidor.
+[atualizador]
+habilitado = sim
+onda = auto
+EOF
+    chmod 0644 "$ATUALIZADOR_CONFIG"
+  fi
+
+  cat > "$ATUALIZADOR_SERVICE" <<EOF
+[Unit]
+Description=Atualizador automático do monitoramento Nextec
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env python3 ${ATUALIZADOR_BIN} executar
+# Roda como root: reaplica o instalador (pacotes, serviços e configuração).
+# Só aplica o que vier num manifesto assinado pela chave da Nextec.
+PrivateTmp=true
+# Maior que a soma dos limites internos (instalador, saúde, volta automática).
+TimeoutStartSec=2h
+EOF
+  # Madrugada, com atraso aleatório de até 4h por servidor (01h às 05h), para
+  # a frota não atualizar toda no mesmo minuto. Persistent recupera execução
+  # perdida com a máquina desligada.
+  cat > "$ATUALIZADOR_TIMER" <<'EOF'
+[Unit]
+Description=Atualizador automático do monitoramento Nextec (diário, de madrugada)
+
+[Timer]
+OnCalendar=*-*-* 01:00:00
+RandomizedDelaySec=4h
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now nextec-atualizador.timer >/dev/null 2>&1 || warn "Não foi possível ligar o timer do atualizador."
+  ok "Atualizador $(python3 "$ATUALIZADOR_BIN" versao 2>/dev/null || echo instalado) com timer diário de madrugada."
+}
+
+main_atualizar() {
+  MODO_ATUALIZACAO=1
+  need_root
+  need_systemd
+  banner
+  step "Atualização automática ${NEXTEC_PACOTE_VERSAO:-sem versão de pacote}"
+  carregar_estado_instalacao || exit 3
+  detect_os
+
+  if [[ "$MODO_INSTALACAO" == "somente_coleta" ]]; then
+    install_coleta_complementar
+    install_atualizador
+    salvar_estado_instalacao somente_coleta
+    ok "Coleta Complementar atualizada (modo somente coleta)."
+    return 0
+  fi
+
+  install_alloy
+  install_coleta_complementar
+  install_atualizador
+  prepare_snmp_config
+  write_blackbox_config
+  configure_service_env
+  generate_config
+  validate_and_start
+  rm -f "${CONFIG_FILE}.nextec-preinstall"
+  salvar_estado_instalacao completo
+  ok "Atualização concluída."
 }
 
 main_somente_coleta() {
@@ -2305,10 +2629,20 @@ main_somente_coleta() {
 
   step "Somente Coleta Complementar"
   info "Este modo não instala nem altera o Alloy deste servidor."
+  local raw detected
+  while true; do
+    raw="$(ask_required "Cliente, identificador da empresa (ex.: nextec)")"
+    CLIENTE="$(normalize_slug "$raw" | tr '-' '_' | sed -E 's/_+/_/g; s/^_+|_+$//g')"
+    [[ "$CLIENTE" =~ ^[a-z0-9_]+$ ]] && break
+    warn "Cliente inválido: ${raw}. Use letras, números e _. Tente de novo."
+  done
+  detected="$(normalize_slug "$(hostname -s 2>/dev/null || hostname)")"
+  HOST_LABEL="$(ask_slug "Hostname para monitoramento" "$detected" host)"
   ENABLE_INTERNET=0
   ENABLE_LINKS=0
   ENABLE_VELOCIDADE=0
   ENABLE_DOCKER=0
+  ENABLE_ACESSOS=0
   LINKS=()
 
   ask_yes_no "Medir a internet (status, DNS e IP público)?" s && ENABLE_INTERNET=1
@@ -2317,6 +2651,7 @@ main_somente_coleta() {
   if [[ "$DOCKER_DETECTED" == "1" ]]; then
     ask_yes_no "Coletar Docker (estado, consumo, health e eventos)?" s && ENABLE_DOCKER=1
   fi
+  ask_yes_no "Registrar acessos ao servidor (logins com origem)?" s && ENABLE_ACESSOS=1
 
   if ! coleta_enabled; then
     warn "Nenhum módulo escolhido. Nada a fazer."
@@ -2325,6 +2660,8 @@ main_somente_coleta() {
   [[ "$ENABLE_LINKS" == "1" ]] && collect_links_inputs
 
   install_coleta_complementar
+  install_atualizador
+  salvar_estado_instalacao somente_coleta
 
   step "Próximo passo: o Alloy deste servidor precisa ler a Coleta Complementar"
   echo "  Métricas: ${COLETA_TEXTFILE}/*.prom  (prometheus.exporter.unix com o coletor textfile)"
@@ -2361,11 +2698,14 @@ main() {
   validate_and_start
 
   rm -f "${CONFIG_FILE}.nextec-preinstall"
+  # Depois do Alloy validado: uma falha aqui não desfaz o monitoramento.
+  salvar_estado_instalacao completo
+  install_atualizador
   final_summary
 }
 
-if [[ "${1:-}" == "--somente-coleta" ]]; then
-  main_somente_coleta
-else
-  main "$@"
-fi
+case "${1:-}" in
+  --somente-coleta) main_somente_coleta ;;
+  --atualizar) main_atualizar ;;
+  *) main "$@" ;;
+esac

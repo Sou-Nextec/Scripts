@@ -12,6 +12,9 @@
       internet  sempre ligado: saída padrão, DNS, IP público e diagnóstico
       links     cada link de internet do local: status, qualidade, link em
                 uso (failover), gateway da operadora e causa das quedas
+      acessos   logins RDP e de console (evento 4624) com IP de origem;
+                marca acesso privilegiado, origem nova e fora do horário
+                para os alertas de acesso privilegiado
 
     O teste de velocidade no Windows continua com o instalador (tarefa
     NextecSpeedtest), que grava as mesmas métricas nextec_speedtest_*.
@@ -36,7 +39,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
-$Versao = "1.0.0"
+$Versao = "1.1.0"
 $PastaBase = Join-Path $env:ProgramData "GrafanaLabs\Alloy\coleta-complementar"
 if ([string]::IsNullOrWhiteSpace($Config)) {
     $Config = Join-Path $PastaBase "coleta-complementar.ini"
@@ -156,10 +159,10 @@ function Save-Metricas {
 }
 
 function Write-Evento {
-    param([string]$Categoria, [string]$Evento, [string]$Nivel = "info", [hashtable]$Campos = @{})
+    param([string]$Categoria, [string]$Evento, [string]$Nivel = "info", [hashtable]$Campos = @{}, [string]$Tipo = "links_evento")
     $registro = [ordered]@{
         ts        = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-        tipo      = "links_evento"
+        tipo      = $Tipo
         categoria = $Categoria
         evento    = $Evento
         nivel     = $Nivel
@@ -631,11 +634,230 @@ function Invoke-RodadaLinks {
     Save-Estado
 }
 
+# -----------------------------------------------------------------------------
+# Acessos (logins com origem)
+# -----------------------------------------------------------------------------
+# Lê o evento 4624 do log Security (logon RDP tipo 10, console 2 e console com
+# credencial em cache 11) e grava um evento por acesso, com a classificação
+# usada pelos alertas de acesso privilegiado:
+#   alerta=critico  Administrator embutido (RID 500), ou usuário privilegiado
+#                   entrando de IP público que ele não usou nesta máquina nos
+#                   últimos 30 dias
+#   alerta=resumo   usuário privilegiado fora do horário comercial
+#   alerta=nenhum   só registro
+# Logon de rede (tipo 3, compartilhamento de arquivo) fica de fora: num
+# controlador de domínio são milhares por hora.
+
+$TiposLogon = @{ "2" = "console"; "10" = "rdp"; "11" = "console_cache" }
+$DiasSemana = @{ "seg" = 0; "ter" = 1; "qua" = 2; "qui" = 3; "sex" = 4; "sab" = 5; "dom" = 6 }
+$RedesInternas = @("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "fc00::/7", "fe80::/10")
+
+function Read-Horario {
+    param([string]$Texto)
+    $grade = @{}
+    foreach ($parte in ([string]$Texto).Split(";")) {
+        if ($parte.Trim().ToLowerInvariant() -match '^([a-z]{3})(?:-([a-z]{3}))?\s+(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$') {
+            $fimNome = if ($Matches[2]) { $Matches[2] } else { $Matches[1] }
+            if (-not $script:DiasSemana.ContainsKey($Matches[1]) -or -not $script:DiasSemana.ContainsKey($fimNome)) { continue }
+            $primeiro = $script:DiasSemana[$Matches[1]]
+            $ultimo = $script:DiasSemana[$fimNome]
+            $faixa = @(([int]$Matches[3] * 60 + [int]$Matches[4]), ([int]$Matches[5] * 60 + [int]$Matches[6]))
+            $dia = $primeiro
+            while ($true) {
+                if (-not $grade.ContainsKey($dia)) { $grade[$dia] = @() }
+                $grade[$dia] += ,$faixa
+                if ($dia -eq $ultimo) { break }
+                $dia = ($dia + 1) % 7
+            }
+        }
+    }
+    return $grade
+}
+
+function Test-ForaHorario {
+    param([DateTime]$Utc)
+    # Brasília, UTC-3 o ano todo (sem horário de verão desde 2019).
+    $local = $Utc.AddHours(-3)
+    $dia = ([int]$local.DayOfWeek + 6) % 7
+    $minuto = $local.Hour * 60 + $local.Minute
+    if (-not $script:GradeHorario.ContainsKey($dia)) { return $true }
+    foreach ($faixa in $script:GradeHorario[$dia]) {
+        if ($minuto -ge $faixa[0] -and $minuto -lt $faixa[1]) { return $false }
+    }
+    return $true
+}
+
+function Test-CidrContem {
+    param([string]$Ip, [string]$Cidr)
+    $partes = $Cidr.Split("/")
+    $endereco = $null; $rede = $null
+    if (-not [Net.IPAddress]::TryParse($Ip, [ref]$endereco) -or -not [Net.IPAddress]::TryParse($partes[0], [ref]$rede)) { return $false }
+    if ($endereco.AddressFamily -ne $rede.AddressFamily) { return $false }
+    $a = $endereco.GetAddressBytes(); $b = $rede.GetAddressBytes()
+    $bits = if ($partes.Count -gt 1) { [int]$partes[1] } else { $a.Length * 8 }
+    for ($i = 0; $i -lt $a.Length -and $bits -gt 0; $i++) {
+        $mascara = if ($bits -ge 8) { 255 } else { (0xFF -shl (8 - $bits)) -band 0xFF }
+        if (($a[$i] -band $mascara) -ne ($b[$i] -band $mascara)) { return $false }
+        $bits -= 8
+    }
+    return $true
+}
+
+function Get-TipoOrigem {
+    param([string]$Ip)
+    if ([string]::IsNullOrWhiteSpace($Ip)) { return "local" }
+    $endereco = $null
+    if (-not [Net.IPAddress]::TryParse($Ip, [ref]$endereco)) { return "publica" }
+    if ([Net.IPAddress]::IsLoopback($endereco)) { return "local" }
+    foreach ($cidr in $script:OrigensConhecidas) { if (Test-CidrContem $Ip $cidr) { return "conhecida" } }
+    $ipLocal = if ($script:IpAtual) { $script:IpAtual } else { [string](Get-Secao "ip_publico")["ip"] }
+    if ($ipLocal -and $Ip -eq $ipLocal) { return "rede_local" }
+    foreach ($cidr in $script:RedesInternas) { if (Test-CidrContem $Ip $cidr) { return "rede_interna" } }
+    return "publica"
+}
+
+function Get-PrefixoOrigem {
+    param([string]$Ip)
+    $endereco = $null
+    if (-not [Net.IPAddress]::TryParse($Ip, [ref]$endereco)) { return $Ip }
+    $bytes = $endereco.GetAddressBytes()
+    if ($bytes.Length -eq 4) { return ("{0}.{1}.{2}.0/24" -f $bytes[0], $bytes[1], $bytes[2]) }
+    return ((0..3 | ForEach-Object { "{0:x2}{1:x2}" -f $bytes[$_ * 2], $bytes[$_ * 2 + 1] }) -join ":") + "::/64"
+}
+
+function Test-OrigemNova {
+    param([string]$Usuario, [string]$Ip, [double]$Instante)
+    $historico = Get-Secao "acessos_origens"
+    if (-not $historico.ContainsKey($Usuario)) { $historico[$Usuario] = @{} }
+    $prefixo = Get-PrefixoOrigem $Ip
+    $anterior = if ($historico[$Usuario].ContainsKey($prefixo)) { [double]$historico[$Usuario][$prefixo] } else { 0 }
+    $historico[$Usuario][$prefixo] = [long]$Instante
+    return (($Instante - $anterior) -gt ($script:DiasOrigemConhecida * 86400))
+}
+
+function Get-NivelAlerta {
+    param([bool]$Privilegiado, [bool]$Emergencia, [string]$TipoOrigem, [bool]$Nova, [bool]$Fora)
+    if ($Emergencia) { return "critico" }
+    if ($Privilegiado -and $TipoOrigem -eq "publica" -and $Nova) { return "critico" }
+    if ($Privilegiado -and $Fora) { return "resumo" }
+    return "nenhum"
+}
+
+function Test-LogonComPrivilegio {
+    <#
+        ElevatedToken (Windows 10 / Server 2016 em diante) diz se o logon
+        recebeu token de administrador. Sem o campo, procura o 4672
+        (privilégios especiais) do mesmo LogonId.
+    #>
+    param($Dados)
+    if ($Dados.ContainsKey("ElevatedToken") -and $Dados["ElevatedToken"]) {
+        return ($Dados["ElevatedToken"] -eq "%%1842")
+    }
+    $logonId = [string]$Dados["TargetLogonId"]
+    if (-not $logonId) { return $false }
+    $xpath = "*[System[(EventID=4672)] and EventData[Data[@Name='SubjectLogonId']='$logonId']]"
+    return [bool](Get-WinEvent -LogName Security -FilterXPath $xpath -MaxEvents 1 -ErrorAction SilentlyContinue)
+}
+
+function Invoke-RodadaAcessos {
+    $memoria = Get-Secao "acessos"
+    $ultimo = if ($memoria.ContainsKey("ultimo_record")) { [long]$memoria["ultimo_record"] } else { 0 }
+    if ($ultimo -eq 0) {
+        # Primeira execução: começa do evento mais recente, sem reprocessar o histórico.
+        $maisRecente = Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction SilentlyContinue
+        $memoria["ultimo_record"] = if ($maisRecente) { [long]$maisRecente.RecordId } else { 1 }
+        Save-Estado
+        return
+    }
+
+    $xpath = "*[System[(EventID=4624) and (EventRecordID > $ultimo)]]"
+    $eventos = @(Get-WinEvent -LogName Security -FilterXPath $xpath -MaxEvents 2000 -ErrorAction SilentlyContinue | Sort-Object RecordId)
+    if ($eventos.Count -eq 0) { return }
+
+    $logons = New-Object System.Collections.Generic.List[object]
+    foreach ($evento in $eventos) {
+        $memoria["ultimo_record"] = [long]$evento.RecordId
+        $dados = @{}
+        foreach ($campo in ([xml]$evento.ToXml()).Event.EventData.Data) { $dados[[string]$campo.Name] = [string]$campo.'#text' }
+        $tipoLogon = [string]$dados["LogonType"]
+        if (-not $script:TiposLogon.ContainsKey($tipoLogon)) { continue }
+        $usuario = [string]$dados["TargetUserName"]
+        $sid = [string]$dados["TargetUserSid"]
+        if ($usuario.EndsWith('$') -or $usuario -match '^(DWM|UMFD)-' -or $sid -in @("S-1-5-18", "S-1-5-19", "S-1-5-20")) { continue }
+        $ip = [string]$dados["IpAddress"]
+        if ($ip -eq "-" -or $ip -eq "::1" -or $ip -eq "127.0.0.1") { $ip = "" }
+        $logons.Add([pscustomobject]@{
+            Instante     = $evento.TimeCreated.ToUniversalTime()
+            Usuario      = $usuario
+            Dominio      = [string]$dados["TargetDomainName"]
+            Sid          = $sid
+            Canal        = $script:TiposLogon[$tipoLogon]
+            Metodo       = [string]$dados["AuthenticationPackageName"]
+            Ip           = $ip
+            Privilegiado = (Test-LogonComPrivilegio $dados)
+        })
+    }
+
+    # Com UAC, um logon de administrador gera dois 4624 (token completo e
+    # filtrado). Junta os repetidos em até 10 segundos num acesso só.
+    $unicos = New-Object System.Collections.Generic.List[object]
+    foreach ($logon in $logons) {
+        $anterior = if ($unicos.Count -gt 0) { $unicos[$unicos.Count - 1] } else { $null }
+        if ($null -ne $anterior -and $anterior.Usuario -eq $logon.Usuario -and $anterior.Ip -eq $logon.Ip -and
+            $anterior.Canal -eq $logon.Canal -and ($logon.Instante - $anterior.Instante).TotalSeconds -le 10) {
+            $anterior.Privilegiado = $anterior.Privilegiado -or $logon.Privilegiado
+            continue
+        }
+        $unicos.Add($logon)
+    }
+
+    foreach ($logon in $unicos) {
+        $emergencia = $logon.Sid -match '-500$'
+        $privilegiado = $emergencia -or $logon.Privilegiado
+        $tipo = Get-TipoOrigem $logon.Ip
+        $instante = ($logon.Instante - [DateTime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)).TotalSeconds
+        $nova = if ($tipo -eq "publica") { Test-OrigemNova $logon.Usuario $logon.Ip $instante } else { $false }
+        $fora = Test-ForaHorario $logon.Instante
+        $alerta = Get-NivelAlerta $privilegiado $emergencia $tipo $nova $fora
+        $nivel = switch ($alerta) { "critico" { "erro" } "resumo" { "aviso" } default { "info" } }
+        $onde = if ($logon.Ip) { "de $($logon.Ip)" } else { "no console" }
+        Write-Evento -Tipo "acesso_evento" -Categoria "login" -Evento "login" -Nivel $nivel -Campos @{
+            usuario          = $logon.Usuario
+            dominio          = $logon.Dominio
+            canal            = $logon.Canal
+            metodo           = $logon.Metodo
+            origem_ip        = $logon.Ip
+            origem_tipo      = $tipo
+            origem_nova      = $(if ($nova) { "sim" } else { "nao" })
+            privilegiado     = $(if ($privilegiado) { "sim" } else { "nao" })
+            conta_emergencia = $(if ($emergencia) { "sim" } else { "nao" })
+            fora_horario     = $(if ($fora) { "sim" } else { "nao" })
+            alerta           = $alerta
+            detalhe          = ("{0} entrou por {1} {2}" -f $logon.Usuario, $logon.Canal, $onde)
+        }
+    }
+
+    # Origens antigas saem do histórico depois do prazo.
+    $historico = Get-Secao "acessos_origens"
+    $limite = (Get-Agora) - ($script:DiasOrigemConhecida * 86400)
+    foreach ($usuario in @($historico.Keys)) {
+        foreach ($prefixo in @($historico[$usuario].Keys)) {
+            if ([double]$historico[$usuario][$prefixo] -lt $limite) { $historico[$usuario].Remove($prefixo) }
+        }
+        if ($historico[$usuario].Count -eq 0) { $historico.Remove($usuario) }
+    }
+    Save-Estado
+}
+
 function Save-Saude {
-    param([bool]$Ok)
+    param([bool]$Ok, [bool]$AcessosOk = $true)
     $metricas = New-Metricas
-    Add-Metrica $metricas "nextec_coleta_complementar_info" 1 ([ordered]@{ versao = $script:Versao; modulos = "internet" })
+    $modulos = if ($script:AcessosAtivo) { "internet,acessos" } else { "internet" }
+    Add-Metrica $metricas "nextec_coleta_complementar_info" 1 ([ordered]@{ versao = $script:Versao; modulos = $modulos })
     Add-Metrica $metricas "nextec_coleta_complementar_modulo_ok" ([int]$Ok) @{ modulo = "internet" }
+    if ($script:AcessosAtivo) {
+        Add-Metrica $metricas "nextec_coleta_complementar_modulo_ok" ([int]$AcessosOk) @{ modulo = "acessos" }
+    }
     Save-Metricas $metricas (Join-Path $script:PastaTextfile "coleta_complementar.prom")
 }
 
@@ -668,6 +890,13 @@ function Initialize-Configuracao {
     $script:UltimoIp = 0.0
     $script:IpAtual = $null
 
+    $acessos = if ($ini.Contains("acessos")) { $ini["acessos"] } else { @{} }
+    $script:AcessosAtivo = @("sim", "s", "1", "true", "ligado") -contains (Get-Valor $acessos "ativo" "nao").ToLowerInvariant()
+    $script:GradeHorario = Read-Horario (Get-Valor $acessos "horario" "seg-sex 07:00-19:00; sab 07:00-14:00")
+    if ($script:GradeHorario.Count -eq 0) { $script:GradeHorario = Read-Horario "seg-sex 07:00-19:00; sab 07:00-14:00" }
+    $script:OrigensConhecidas = @(Split-Lista (Get-Valor $acessos "origens_conhecidas" ""))
+    $script:DiasOrigemConhecida = [math]::Max(1, [int](Get-Valor $acessos "dias_origem_conhecida" "30"))
+
     $script:Links = @()
     foreach ($nomeSecao in $ini.Keys) {
         if ($nomeSecao -match '^link:(.+)$') {
@@ -697,13 +926,22 @@ function Invoke-Executar {
     Write-Evento "sistema" "coletor_iniciado" "info" @{ detalhe = "Coleta Complementar $script:Versao (Windows): internet" }
     while ($true) {
         $inicio = Get-Agora
+        # Um módulo com erro não derruba o outro.
+        $acessosOk = $true
+        if ($script:AcessosAtivo) {
+            try { Invoke-RodadaAcessos }
+            catch {
+                $acessosOk = $false
+                Write-Log "erro" ("rodada de acessos falhou: {0}" -f $_.Exception.Message)
+            }
+        }
         try {
             Invoke-RodadaLinks
-            Save-Saude $true
+            Save-Saude $true $acessosOk
         }
         catch {
             Write-Log "erro" ("rodada falhou: {0} | {1}" -f $_.Exception.Message, ($_.ScriptStackTrace -replace "`r?`n", " <- "))
-            try { Save-Saude $false } catch { }
+            try { Save-Saude $false $acessosOk } catch { }
         }
         $espera = $script:Intervalo - ((Get-Agora) - $inicio)
         if ($espera -gt 0) { Start-Sleep -Milliseconds ([int]($espera * 1000)) }
@@ -725,6 +963,11 @@ function Invoke-Verificar {
     Initialize-Configuracao
     Write-Host "Configuração: $script:Config"
     Write-Host "Links configurados: $($script:Links.Count)"
+    Write-Host ("Acessos (logins com origem): {0}" -f $(if ($script:AcessosAtivo) { "ligado" } else { "desligado" }))
+    if ($script:AcessosAtivo) {
+        try { [void](Get-WinEvent -LogName Security -MaxEvents 1) }
+        catch { $problemas += "log Security ilegível: o módulo acessos não registra logins ($($_.Exception.Message))" }
+    }
     Write-Host "Firewall local: $script:FirewallLocal"
     foreach ($link in $script:Links) {
         if ($link.alvos.Count -eq 0) { $problemas += "[link:$($link.nome)] sem alvos: o link nunca terá status" }
