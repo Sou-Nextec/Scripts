@@ -87,7 +87,23 @@ info() { echo -e "${CYAN}ℹ${NC}  $*"; }
 # chamadas dentro de $(...).
 warn() { echo -e "${YELLOW}⚠${NC}  $*" >&2; }
 err()  { echo -e "${RED}✖${NC} $*" >&2; }
-step() { echo -e "\n${BLUE}${BOLD}==>${NC} ${BOLD}$*${NC}"; }
+step() {
+  # Título de etapa: barra colorida e linha, para separar bem cada fase.
+  local titulo="$*"
+  echo
+  echo -e "${BLUE}${BOLD}▌ ${titulo}${NC}"
+  echo -e "${DIM}$(printf '─%.0s' {1..60})${NC}"
+}
+
+# pergunta "texto" "padrão" "dica": monta o texto colorido de uma pergunta.
+# ? em ciano, pergunta em negrito, padrão e dica apagados.
+pergunta() {
+  local texto="$1" padrao="${2:-}" dica="${3:-}" saida
+  saida="${CYAN}?${NC} ${BOLD}${texto}${NC}"
+  [[ -n "$dica" ]] && saida+=" ${DIM}(${dica})${NC}"
+  [[ -n "$padrao" ]] && saida+=" ${DIM}[${padrao}]${NC}"
+  echo -e "${saida}: "
+}
 
 # ------------------------------------------------------------------------------
 # TRATAMENTO DE ERRO E ROLLBACK
@@ -164,10 +180,10 @@ ask_required() {
   local prompt="$1" default="${2:-}" value
   while true; do
     if [[ -n "$default" ]]; then
-      read -r -p "$(echo -e "${CYAN}?${NC} ${prompt} [${default}]: ")" value || entrada_encerrada
+      read -r -p "$(pergunta "$prompt" "$default")" value || entrada_encerrada
       value="${value:-$default}"
     else
-      read -r -p "$(echo -e "${CYAN}?${NC} ${prompt}: ")" value || entrada_encerrada
+      read -r -p "$(pergunta "$prompt")" value || entrada_encerrada
     fi
     value="$(trim "$value")"
     [[ -n "$value" ]] && { printf '%s' "$value"; return; }
@@ -253,7 +269,7 @@ ask_address() {
   local value item ok_all itens=() invalidos=()
   while true; do
     if [[ "$optional" == "1" ]]; then
-      read -r -p "$(echo -e "${CYAN}?${NC} ${prompt} (ENTER para pular): ")" value
+      read -r -p "$(pergunta "$prompt" "" "ENTER para pular")" value || entrada_encerrada
       value="$(trim "$value")"
       [[ -z "$value" ]] && { printf ''; return 0; }
     else
@@ -328,7 +344,7 @@ ask_pattern() {
 ask_secret() {
   local prompt="$1" value
   while true; do
-    read -r -s -p "$(echo -e "${CYAN}?${NC} ${prompt}: ")" value || entrada_encerrada
+    read -r -s -p "$(pergunta "$prompt")" value || entrada_encerrada
     # A quebra de linha vai para stderr: no stdout ela entraria na senha
     # capturada por $(...) e o envio ao NOC daria 401.
     echo >&2
@@ -345,7 +361,7 @@ ask_yes_no() {
   local prompt="$1" default="${2:-s}" answer suffix
   [[ "$default" == "s" ]] && suffix="[S/n]" || suffix="[s/N]"
   while true; do
-    read -r -p "$(echo -e "${CYAN}?${NC} ${prompt} ${suffix}: ")" answer
+    read -r -p "$(pergunta "$prompt" "" "${suffix//[\[\]]/}")" answer
     answer="${answer:-$default}"
     case "${answer,,}" in
       s|sim|y|yes) return 0 ;;
@@ -361,14 +377,13 @@ choose() {
   local prompt="$1"; shift
   local options=("$@") choice i
 
-  echo -e "${CYAN}?${NC}  ${prompt}"
+  echo -e "${CYAN}?${NC} ${BOLD}${prompt}${NC}"
   for i in "${!options[@]}"; do
-    printf '  %b[%d]%b %s
-' "$WHITE" "$((i+1))" "$NC" "${options[$i]}"
+    printf '  %b%d%b  %s\n' "$CYAN" "$((i+1))" "$NC" "${options[$i]}"
   done
 
   while true; do
-    read -r -p "> " choice || entrada_encerrada
+    read -r -p "$(echo -e "${CYAN}›${NC} ")" choice || entrada_encerrada
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#options[@]} )); then
       CHOOSE_RESULT="$choice"
       return 0
@@ -392,13 +407,13 @@ configure_noc_destination() {
 
   echo
   echo -e "${BOLD}Destino:${NC} ${CYAN}${NOC_HOST}${NC}"
-  read -r -p "?  ENTER para continuar ou D para alterar: " action
+  read -r -p "$(pergunta "ENTER para continuar ou D para alterar")" action
 
   # Qualquer coisa diferente de D mantém o destino padrão.
   [[ "${action,,}" != "d" ]] && return 0
 
   while true; do
-    read -r -p "?  Novo destino: " input || entrada_encerrada
+    read -r -p "$(pergunta "Novo destino")" input || entrada_encerrada
 
     input="${input#http://}"
     input="${input#https://}"
@@ -429,9 +444,14 @@ summary_row() {
   pad=$(( width - len ))
   (( pad < 1 )) && pad=1
 
-  printf '%s' "$label"
+  local cor="$BOLD"
+  case "$value" in
+    sim|sim\ *) cor="$GREEN";;
+    não|0) cor="$DIM";;
+  esac
+  printf '  %b%s%b' "$DIM" "$label" "$NC"
   printf '%*s' "$pad" ''
-  printf '%s\n' "$value"
+  printf '%b%s%b\n' "$cor" "$value" "$NC"
 }
 
 alloy_escape() {
@@ -643,8 +663,10 @@ install_alloy_apt() {
   echo "deb [signed-by=/etc/apt/keyrings/grafana.asc] https://apt.grafana.com stable main" > /etc/apt/sources.list.d/grafana.list
   apt-get update -y
   # Conclui instalação interrompida por uma falha anterior, se houver.
-  dpkg --configure -a || true
-  apt-get install -y alloy
+  # --force-confold mantém o /etc/default/alloy atual sem perguntar: o
+  # instalador grava nele as credenciais logo depois.
+  DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confold || true
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confold alloy
 }
 
 install_alloy_rpm() {
@@ -840,7 +862,7 @@ collect_links_inputs() {
     case "$choice" in 1) papel=primario;; 2) papel=failover;; 3) papel=sdwan;; esac
     operadora="$(ini_value "$(ask_required "Operadora" "$nome")")"
     tipo="$(ini_value "$(ask_required "Tipo (fibra, radio, 4g, satelite, dedicado)" "fibra")")"
-    read -r -p "Telefone/protocolo de suporte da operadora (ENTER para pular): " suporte
+    read -r -p "$(pergunta "Telefone/protocolo de suporte da operadora" "" "ENTER para pular")" suporte || entrada_encerrada
     ip_publico="$(ask_address "IP público fixo do link (dinâmico: deixe vazio)" "" ip 1)"
     gateway="$(ask_address "Gateway da operadora para testar" "" host 1)"
     alvos="$(ask_address "Destinos que saem por este link, separados por vírgula" "8.8.8.8" host 0 1)"
@@ -851,12 +873,12 @@ collect_links_inputs() {
       warn "O IP ${origem} não existe neste servidor. Informe um IP local ou deixe vazio."
     done
     firewall=""
-    read -r -p "Nome do firewall no NOC, para tráfego por SNMP (ENTER para pular): " firewall
+    read -r -p "$(pergunta "Nome do firewall no NOC, para tráfego por SNMP" "" "ENTER para pular")" firewall || entrada_encerrada
     firewall="$(trim "$firewall")"
     [[ -n "$firewall" ]] && firewall="$(normalize_slug "$firewall")"
     interface=""
     while [[ -n "$firewall" ]]; do
-      read -r -p "Interface WAN do link no firewall (ex.: igb1): " interface
+      read -r -p "$(pergunta "Interface WAN do link no firewall" "" "ex.: igb1")" interface || entrada_encerrada
       interface="$(trim "$interface")"
       [[ "$interface" =~ $RE_INTERFACE ]] && break
       warn "Interface inválida. Use o nome como aparece no firewall, ex.: igb1, ether1, wan1."
@@ -1795,7 +1817,7 @@ resource_checklist() {
       done
 
       echo
-      read -r -p "> " input || entrada_encerrada
+      read -r -p "$(echo -e "${CYAN}›${NC} ")" input || entrada_encerrada
       [[ -z "${input//[[:space:]]/}" ]] && break
 
       # O script globalmente remove espaço do IFS. Aqui definimos IFS localmente

@@ -932,7 +932,7 @@ function Read-NextecAddress {
 
     while ($true) {
         if ($Optional) {
-            $value = Read-Host ("{0} (ENTER para pular)" -f $Prompt)
+            $value = Read-NextecInput -Prompt $Prompt -Hint "ENTER para pular"
             if ([string]::IsNullOrWhiteSpace($value)) { Write-Host ""; return "" }
             $value = $value.Trim()
         }
@@ -970,7 +970,7 @@ function Read-NextecSlug {
 
     while ($true) {
         if ($AllowKeep) {
-            $raw = Read-Host ("{0} (ENTER mantém)" -f $Prompt)
+            $raw = Read-NextecInput -Prompt $Prompt -Hint "ENTER mantém"
             if ([string]::IsNullOrWhiteSpace($raw)) { Write-Host ""; return "" }
             $raw = $raw.Trim()
         }
@@ -1002,7 +1002,7 @@ function Read-NextecPattern {
 
     while ($true) {
         if ($Optional) {
-            $value = Read-Host ("{0} (ENTER para pular)" -f $Prompt)
+            $value = Read-NextecInput -Prompt $Prompt -Hint "ENTER para pular"
             if ([string]::IsNullOrWhiteSpace($value)) { Write-Host ""; return "" }
             $value = $value.Trim()
         }
@@ -1026,6 +1026,29 @@ function ConvertTo-AlloyEscapedString {
     return $escaped
 }
 
+function Read-NextecInput {
+    <#
+        Pergunta com hierarquia visual: "?" em ciano, texto em branco, dica e
+        valor padrão em cinza. Read-Host sem -Prompt não imprime nada, então
+        o texto colorido montado aqui é o único que aparece.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Prompt,
+        [string]$Default = "",
+        [string]$Hint = "",
+        [switch]$AsSecureString
+    )
+
+    Write-Host "  ? " -ForegroundColor Cyan -NoNewline
+    Write-Host $Prompt -ForegroundColor White -NoNewline
+    if ($Hint) { Write-Host (" ({0})" -f $Hint) -ForegroundColor DarkGray -NoNewline }
+    if ($Default) { Write-Host (" [{0}]" -f $Default) -ForegroundColor DarkGray -NoNewline }
+    Write-Host ": " -NoNewline
+
+    if ($AsSecureString) { return (Read-Host -AsSecureString) }
+    return (Read-Host)
+}
+
 function Read-Required {
     param(
         [Parameter(Mandatory=$true)][string]$Prompt,
@@ -1034,10 +1057,10 @@ function Read-Required {
 
     while ($true) {
         if ([string]::IsNullOrWhiteSpace($Default)) {
-            $value = Read-Host $Prompt
+            $value = Read-NextecInput -Prompt $Prompt
         }
         else {
-            $value = Read-Host ("{0} [{1}]" -f $Prompt, $Default)
+            $value = Read-NextecInput -Prompt $Prompt -Default $Default
             if ([string]::IsNullOrWhiteSpace($value)) {
                 $value = $Default
             }
@@ -1061,7 +1084,7 @@ function Read-YesNo {
     $suffix = if ($Default) { "[S/n]" } else { "[s/N]" }
 
     while ($true) {
-        $answer = Read-Host ("{0} {1}" -f $Prompt, $suffix)
+        $answer = Read-NextecInput -Prompt $Prompt -Hint ($suffix.Trim("[]"))
 
         if ([string]::IsNullOrWhiteSpace($answer)) {
             Write-Host ""
@@ -1089,14 +1112,16 @@ function Read-Choice {
         [int]$Default = 1
     )
 
+    Write-Host "  ? " -ForegroundColor Cyan -NoNewline
     Write-Host $Prompt -ForegroundColor White
 
     for ($i = 0; $i -lt $Options.Count; $i++) {
-        Write-Host ("  [{0}] {1}" -f ($i + 1), $Options[$i])
+        Write-Host ("    {0}  " -f ($i + 1)) -ForegroundColor Cyan -NoNewline
+        Write-Host $Options[$i]
     }
 
     while ($true) {
-        $choiceText = Read-Host ("Escolha [{0}]" -f $Default)
+        $choiceText = Read-NextecInput -Prompt "Escolha" -Default $Default
 
         if ([string]::IsNullOrWhiteSpace($choiceText)) {
             Write-Host ""
@@ -1142,12 +1167,12 @@ function Read-RequiredSecret {
 
     while ($true) {
         if ($useMaskedInput) {
-            $secureValue = Read-Host $Prompt -AsSecureString
+            $secureValue = Read-NextecInput -Prompt $Prompt -AsSecureString
             $plainValue = Convert-SecureStringToPlainText -SecureValue $secureValue
         }
         else {
             Write-Warn "Console sem suporte a entrada mascarada (ex.: ISE); a senha ficará visível ao digitar."
-            $plainValue = Read-Host $Prompt
+            $plainValue = Read-NextecInput -Prompt $Prompt
         }
 
         if ([string]::IsNullOrWhiteSpace($plainValue)) {
@@ -1224,11 +1249,11 @@ function Set-NocDestination {
         Write-Host "Destino: " -NoNewline -ForegroundColor White
         Write-Host $script:NocHost -ForegroundColor Cyan
 
-        $action = Read-Host "?  ENTER para continuar ou D para alterar"
+        $action = Read-NextecInput -Prompt "ENTER para continuar ou D para alterar"
 
         if ($action.Trim().ToLowerInvariant() -eq "d") {
             while ($true) {
-                $inputHost = Read-Host "?  Novo destino"
+                $inputHost = Read-NextecInput -Prompt "Novo destino"
                 $inputHost = $inputHost -replace "^https?://", ""
                 $inputHost = $inputHost -replace "/.*$", ""
                 $inputHost = $inputHost.Trim()
@@ -1951,7 +1976,7 @@ function Read-BlackboxInterval {
     }
     else {
         while ($true) {
-            $texto = Read-Host ("    Intervalo em segundos [{0}]" -f $script:BlackboxIntervalSecondsResolved)
+            $texto = Read-NextecInput -Prompt "Intervalo em segundos" -Default $script:BlackboxIntervalSecondsResolved
 
             if ([string]::IsNullOrWhiteSpace($texto)) {
                 break
@@ -2186,7 +2211,7 @@ function Edit-InternetSettings {
     }
 
     while ($true) {
-        $intervaloTexto = Read-Host ("    Intervalo em minutos entre execuções [{0}]" -f $script:InternetIntervalMinutesResolved)
+        $intervaloTexto = Read-NextecInput -Prompt "Intervalo em minutos entre execuções" -Default $script:InternetIntervalMinutesResolved
 
         if ([string]::IsNullOrWhiteSpace($intervaloTexto)) {
             Write-Host ""
@@ -3024,11 +3049,12 @@ function Get-NextecMultiSelectionFallback {
             }
             else {
                 $mark = if ($item.Selected) { "x" } else { " " }
-                Write-Host ("  {0}[{1}] {2}. {3}" -f $indent, $mark, ($vi + 1), $item.Label)
+                $cor = if ($item.Selected) { [ConsoleColor]::Green } else { [ConsoleColor]::Gray }
+                Write-Host ("  {0}[{1}] {2}. {3}" -f $indent, $mark, ($vi + 1), $item.Label) -ForegroundColor $cor
             }
         }
 
-        $inputValue = Read-Host "Números para marcar/desmarcar/expandir, separados por espaço. ENTER confirma"
+        $inputValue = Read-NextecInput -Prompt "Números para marcar/desmarcar/expandir, separados por espaço" -Hint "ENTER confirma"
 
         if ([string]::IsNullOrWhiteSpace($inputValue)) {
             Write-Host ""
@@ -3366,7 +3392,7 @@ function Read-BlackboxTargets {
 
         $selectedOptions = $null
         while ($null -eq $selectedOptions) {
-            $raw = Read-Host "Escolha [1]"
+            $raw = Read-NextecInput -Prompt "Escolha" -Default "1"
             if ([string]::IsNullOrWhiteSpace($raw)) { $raw = "1" }
 
             $numbers = New-Object System.Collections.Generic.List[int]
@@ -5394,7 +5420,7 @@ function Read-ColetaLinkDefinition {
     $papel = @("primario", "failover", "sdwan")[$papelEscolha - 1]
     $operadora = ConvertTo-ColetaIniValue (Read-Required -Prompt "Operadora" -Default $nome)
     $tipo = ConvertTo-ColetaIniValue (Read-Required -Prompt "Tipo (fibra, radio, 4g, satelite, dedicado)" -Default "fibra")
-    $suporte = ConvertTo-ColetaIniValue (Read-Host "Telefone/protocolo de suporte da operadora (ENTER para pular)")
+    $suporte = ConvertTo-ColetaIniValue (Read-NextecInput -Prompt "Telefone/protocolo de suporte da operadora" -Hint "ENTER para pular")
     $ipPublico = Read-NextecAddress -Prompt "IP público fixo do link (dinâmico: deixe vazio)" -Kind ip -Optional
     $gateway = Read-NextecAddress -Prompt "Gateway da operadora para testar" -Kind host -Optional
     $alvos = Read-NextecAddress -Prompt "Destinos que saem por este link, separados por vírgula" -Default "8.8.8.8" -Kind host -List
@@ -5404,7 +5430,7 @@ function Read-ColetaLinkDefinition {
         Write-Warn ("O IP {0} não existe neste servidor. Informe um IP local ou deixe vazio." -f $origem)
     }
     $firewall = ""
-    $firewallRaw = Read-Host "Nome do firewall no NOC, para tráfego por SNMP (ENTER para pular)"
+    $firewallRaw = Read-NextecInput -Prompt "Nome do firewall no NOC, para tráfego por SNMP" -Hint "ENTER para pular"
     if (-not [string]::IsNullOrWhiteSpace($firewallRaw)) { $firewall = ConvertTo-Slug $firewallRaw }
     $interface = ""
     if ($firewall) {
