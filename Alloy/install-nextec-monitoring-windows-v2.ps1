@@ -36,6 +36,55 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.15.4 Teste de velocidade: o nome do servidor da Ookla chegava com
+           acento quebrado ("Claro M├│vel"). A saída do speedtest.exe
+           passa a ser lida como UTF-8, e o script da tarefa é gravado com
+           BOM para o PowerShell 5.1 não quebrar os textos das métricas.
+    2.15.3 Destino aparece uma vez só (no topo); a pergunta vira "Destino do
+           monitoramento [ENTER mantém, D altera]". Arquivo pequeno aparece
+           em KB, não "0.0 MB".
+    2.15.2 Links: "Quantos links de internet este local tem?" (padrão 1) no
+           lugar do item "Links de internet" do checklist e da pergunta "tem
+           mais de um link?". Por link: operadora, tipo e velocidade
+           contratada (padronizada em Mbps a partir de "500", "1 Giga",
+           "600/300"); função só com mais de um link. Destinos de teste
+           prontos (três por link, sem repetir entre links), trocados só se
+           o técnico quiser. Telefone de suporte saiu.
+    2.15.1 Console com fundo preto durante a instalação (o azul do
+           PowerShell apagava as cores). Cadastro de links refeito: pergunta
+           quantos links o local tem e, por link, só operadora, tipo, função
+           e telefone; o nome sai da operadora e do tipo, o IP público é
+           detectado e o resto fica em "opções avançadas".
+    2.15.0 Saída com a mesma hierarquia visual do instalador Linux (títulos
+           de etapa, símbolos, perguntas, resumo e quadro final). Download do
+           Alloy, do Speedtest, da Coleta e do atualizador com porcentagem.
+           Variáveis NEXTEC_*_URL passam para a sessão reaberta como
+           Administrador (antes a elevação perdia a URL da branch de teste).
+           "Ver e alterar" instala o atualizador e repara componentes que
+           ficaram pendentes, mesmo sem outra alteração.
+    2.14.1 O menu de instalação existente mostra a versão deste instalador,
+           a versão que gerou o config.alloy atual e as versões da Coleta
+           Complementar e do atualizador instalados.
+    2.14.0 Atualizador automático Nextec: o instalador passa a instalar a
+           tarefa NextecAtualizador (SYSTEM, de madrugada), que aplica
+           versões publicadas e assinadas pela Nextec, em ondas e com volta
+           automática. Novo modo -Atualizar, sem perguntas, que reaplica a
+           configuração atual com arquivos já conferidos pela assinatura
+           (-ColetaArquivo, -AtualizadorArquivo, -AlloyInstaladorArquivo).
+           Pastas executadas como SYSTEM (Nextec, Coleta, Speedtest) passam a
+           ter ACL restrita: usuário comum só lê.
+    2.13.0 Todas as respostas digitadas são validadas e a pergunta é repetida
+           quando o valor é inválido, em vez de encerrar: cliente (hífen e
+           acento convertidos para o padrão de labels), host, local, IPs,
+           host:porta, URLs, listas de destinos e interface WAN dos links.
+    2.12.0 Coleta Complementar Nextec: monitoramento de internet (status,
+           DNS, IP público, diagnóstico) e de cada link do local (failover,
+           gateway da operadora, causa das quedas). Arquivo único baixado do
+           repositório Scripts, roda por tarefa agendada e grava arquivos que
+           o próprio Alloy envia. Oferecida em qualquer modo, não só collector.
+           O .prom do Speedtest passa a terminar com quebra de linha, exigida
+           pelo coletor textfile.
+
     2.11.0 Corrige o registro da tarefa do Speedtest. O gatilho usava
            [TimeSpan]::MaxValue como duracao da repeticao, o que gera
            "P99999999DT23H59M59S" e faz o agendador recusar a tarefa com
@@ -143,6 +192,10 @@ param(
     # sozinho, sem passo manual. Exige -Modo collector, servidor_collector ou
     # estacao_collector.
     [switch]$EnableInternet,
+    # [Modo Silencioso] Liga a Coleta Complementar (internet, DNS, IP público
+    # e diagnóstico). Links ficam no arquivo coleta-complementar.ini; se ele já
+    # existir, é preservado.
+    [switch]$EnableColeta,
     # [Modo Silencioso] Intervalo em minutos entre execuções do teste de
     # velocidade. Padrão 30min: um link residencial não deve ser saturado por
     # um teste de banda a cada poucos minutos.
@@ -162,8 +215,20 @@ param(
     [string]$NocTarget = "noc.nex.tec.br",
 
     # Executa o script sem interação, usando os parâmetros fornecidos e variáveis de ambiente para credenciais.
-    [switch]$Silent
+    [switch]$Silent,
+    # Modo do atualizador automático: reaplica a configuração atual sem
+    # perguntas e sem pedir credencial. Os arquivos chegam já conferidos pela
+    # assinatura do manifesto da Nextec.
+    [switch]$Atualizar,
+    [string]$ColetaArquivo = "",
+    [string]$AtualizadorArquivo = "",
+    [string]$AlloyInstaladorArquivo = "",
+    [string]$AlloyVersao = "",
+    [string]$PacoteVersao = ""
 )
+
+# A atualização nunca pergunta nada: roda pela tarefa agendada, sem console.
+if ($Atualizar) { $Silent = [switch]$true }
 
 # Guardado aqui, na raiz do script, porque $PSBoundParameters só reflete os
 # parâmetros recebidos por ESTE invocation quando lido neste escopo. É usado
@@ -206,7 +271,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.11.0"
+$InstallerVersion = "2.15.4"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -255,11 +320,32 @@ $SpeedtestMetricsDir = Join-Path $SpeedtestDir "textfile"
 $SpeedtestMetricsFile = Join-Path $SpeedtestMetricsDir "nextec_speedtest.prom"
 $SpeedtestRunnerScript = Join-Path $SpeedtestDir "Invoke-NextecSpeedtest.ps1"
 $SpeedtestTaskName = "NextecSpeedtest"
+
+# Coleta Complementar Nextec (internet e links). Arquivo único baixado do
+# repositório Scripts; roda por tarefa agendada como SYSTEM e só grava
+# arquivos locais (métricas .prom e eventos em JSON). Quem envia é o Alloy.
+# NEXTEC_COLETA_URL permite testar uma branch sem alterar o instalador.
+$ColetaUrl = if ($env:NEXTEC_COLETA_URL) { $env:NEXTEC_COLETA_URL } else { "https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Alloy/coleta-complementar/coleta-complementar.ps1" }
+$ColetaDir = Join-Path $ProgramDataDir "coleta-complementar"
+$ColetaScript = Join-Path $ColetaDir "coleta-complementar.ps1"
+$ColetaConfig = Join-Path $ColetaDir "coleta-complementar.ini"
+$ColetaTextfileDir = Join-Path $ColetaDir "textfile"
+$ColetaEventos = Join-Path $ColetaDir "eventos.jsonl"
+$ColetaTaskName = "NextecColetaComplementar"
 # Versão pinada do Ookla Speedtest CLI. Checar a versão mais recente em
 # https://www.speedtest.net/apps/cli antes de trocar; um ZIP inexistente
 # nessa URL derruba a instalação do zero, não fica em modo degradado.
 $SpeedtestCliVersion = "1.2.0"
 $SpeedtestCliUrl = "https://install.speedtest.net/app/cli/ookla-speedtest-{0}-win64.zip" -f $SpeedtestCliVersion
+
+# Atualizador automático Nextec. Pasta própria, com ACL restrita, porque o
+# script roda como SYSTEM. NEXTEC_ATUALIZADOR_URL permite testar uma branch.
+$NextecDataDir = Join-Path $env:ProgramData "Nextec"
+$AtualizadorDir = Join-Path $NextecDataDir "atualizador"
+$AtualizadorScript = Join-Path $AtualizadorDir "nextec-atualizador.ps1"
+$AtualizadorConfig = Join-Path $NextecDataDir "atualizador.conf"
+$AtualizadorTaskName = "NextecAtualizador"
+$AtualizadorUrl = if ($env:NEXTEC_ATUALIZADOR_URL) { $env:NEXTEC_ATUALIZADOR_URL } else { "https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Alloy/atualizador/nextec-atualizador.ps1" }
 
 $RegistryPath = "HKLM:\SOFTWARE\GrafanaLabs\Alloy"
 $LatestInstallerUrl = "https://github.com/grafana/alloy/releases/latest/download/alloy-installer-windows-amd64.exe"
@@ -303,6 +389,9 @@ $script:EnableExportersResolved = $false
 $script:SelectedExporterKeys = [string[]]@()
 $script:EnableInternetResolved = $false
 $script:InternetIntervalMinutesResolved = 30
+$script:EnableColetaResolved = $false
+$script:EnableLinksResolved = $false
+$script:ColetaLinks = @()
 
 # Intervalo de sondagem dos alvos Blackbox. 60s é o padrão histórico e serve
 # para "o site está no ar". Para medir disponibilidade de link, latência e
@@ -322,58 +411,198 @@ $script:LokiPassword = ""
 # SAÍDA
 # ==============================================================================
 
-$script:LarguraConsole = 64
+$script:LarguraConsole = 60
+$script:TemaOriginal = $null
+
+# Símbolos do conjunto WGL4, presentes nas fontes do console clássico
+# (Consolas, Lucida Console) do Windows Server 2016+; caractere fora dele
+# vira um quadrado no conhost.
+$script:SimboloOk = [string][char]0x221A      # √
+$script:SimboloBarra = [string][char]0x258C   # ▌
+$script:SimboloLinha = [string][char]0x2500   # ─
+$script:SimboloCursor = [string][char]0x203A  # ›
 
 function Write-Step {
+    # Título de etapa: barra e linha, como no instalador Linux.
     param([Parameter(Mandatory=$true)][string]$Message)
     Write-Host ""
-    Write-Host ("  {0}" -f $Message.ToUpperInvariant()) -ForegroundColor Cyan
-    Write-Host ("  {0}" -f ("-" * [Math]::Min($script:LarguraConsole, $Message.Length + 4))) -ForegroundColor DarkCyan
+    Write-Host ("{0} {1}" -f $script:SimboloBarra, $Message) -ForegroundColor Cyan
+    Write-Host ($script:SimboloLinha * $script:LarguraConsole) -ForegroundColor DarkCyan
 }
 
 function Write-Section {
     # Subtítulo dentro de uma etapa, para separar blocos de informação.
     param([Parameter(Mandatory=$true)][string]$Message)
     Write-Host ""
-    Write-Host ("  {0}" -f $Message) -ForegroundColor White
+    Write-Host ("  {0}" -f $Message) -ForegroundColor Cyan
+}
+
+function Get-NextecCorDoValor {
+    # sim em verde, não/0 apagado, demais em branco (igual ao resumo Linux).
+    param([AllowEmptyString()][string]$Value)
+    if ($Value -match '^sim\b') { return [ConsoleColor]::Green }
+    if ($Value -eq "não" -or $Value -eq "0") { return [ConsoleColor]::DarkGray }
+    return [ConsoleColor]::White
 }
 
 function Write-Field {
     <#
         Par rótulo/valor com colunas alinhadas. Mantém o alinhamento mesmo
         quando o rótulo tem acento, porque o padding é aplicado depois da
-        formatação e conta caracteres, não bytes.
+        formatação e conta caracteres, não bytes. Sem -ValueColor, a cor
+        segue o valor (sim, não, demais).
     #>
     param(
         [Parameter(Mandatory=$true)][string]$Label,
         [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Value,
-        [ConsoleColor]$ValueColor = [ConsoleColor]::Gray,
-        [int]$Width = 16
+        [Nullable[ConsoleColor]]$ValueColor = $null,
+        [int]$Width = 24
     )
 
-    $rotulo = ("{0}:" -f $Label).PadRight($Width)
-    Write-Host ("    {0}" -f $rotulo) -ForegroundColor DarkGray -NoNewline
-    Write-Host $Value -ForegroundColor $ValueColor
+    $cor = if ($null -ne $ValueColor) { [ConsoleColor]$ValueColor } else { Get-NextecCorDoValor -Value $Value }
+    $rotulo = $Label.PadRight($Width)
+    Write-Host ("    {0}" -f $rotulo) -ForegroundColor Gray -NoNewline
+    Write-Host $Value -ForegroundColor $cor
 }
 
 function Write-Ok {
     param([Parameter(Mandatory=$true)][string]$Message)
-    Write-Host ("[OK] {0}" -f $Message) -ForegroundColor Green
+    Write-Host ("{0}  " -f $script:SimboloOk) -ForegroundColor Green -NoNewline
+    Write-Host $Message
 }
 
 function Write-Info {
     param([Parameter(Mandatory=$true)][string]$Message)
-    Write-Host ("[INFO] {0}" -f $Message) -ForegroundColor Gray
+    Write-Host "i  " -ForegroundColor Cyan -NoNewline
+    Write-Host $Message
 }
 
 function Write-Warn {
     param([Parameter(Mandatory=$true)][string]$Message)
-    Write-Host ("[AVISO] {0}" -f $Message) -ForegroundColor Yellow
+    Write-Host "!  " -ForegroundColor Yellow -NoNewline
+    Write-Host $Message -ForegroundColor Yellow
 }
 
 function Write-Fail {
     param([Parameter(Mandatory=$true)][string]$Message)
-    Write-Host ("[ERRO] {0}" -f $Message) -ForegroundColor Red
+    Write-Host "x  " -ForegroundColor Red -NoNewline
+    Write-Host $Message -ForegroundColor Red
+}
+
+function Write-Hint {
+    # Texto de ajuda, sem símbolo: explica a próxima pergunta.
+    param([Parameter(Mandatory=$true)][string]$Message)
+    Write-Host ("  {0}" -f $Message) -ForegroundColor DarkGray
+}
+
+function Set-NextecConsoleTheme {
+    <#
+        Fundo preto enquanto o instalador roda: no azul padrão do Windows
+        PowerShell, ciano, cinza e verde perdem contraste e a tela fica
+        "chapada". Volta às cores originais no fim (Restore-NextecConsoleTheme).
+    #>
+    if ($Silent -or $null -ne $script:TemaOriginal) { return }
+    try {
+        $ui = $Host.UI.RawUI
+        $script:TemaOriginal = @{ Fundo = $ui.BackgroundColor; Texto = $ui.ForegroundColor }
+        $ui.BackgroundColor = [ConsoleColor]::Black
+        $ui.ForegroundColor = [ConsoleColor]::Gray
+    }
+    catch {
+        $script:TemaOriginal = $null
+    }
+}
+
+function Restore-NextecConsoleTheme {
+    if ($null -eq $script:TemaOriginal) { return }
+    try {
+        $Host.UI.RawUI.BackgroundColor = $script:TemaOriginal.Fundo
+        $Host.UI.RawUI.ForegroundColor = $script:TemaOriginal.Texto
+    }
+    catch {
+    }
+    $script:TemaOriginal = $null
+}
+
+function Get-NextecTextoTamanho {
+    param([double]$Bytes)
+    if ($Bytes -lt 1MB) { return ("{0:N0} KB" -f [Math]::Max(1, $Bytes / 1KB)) }
+    return ("{0:N1} MB" -f ($Bytes / 1MB))
+}
+
+function Invoke-NextecDownload {
+    <#
+        Baixa um arquivo mostrando a porcentagem na mesma linha:
+          ↓ Grafana Alloy  [████████░░░░░░░░░░░░]  41%  9,3 de 22,7 MB
+        Só HTTPS: redirecionamento para fora do HTTPS é recusado. Sem console
+        interativo (RMM, atualizador) não desenha a barra, só o resultado.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Url,
+        [Parameter(Mandatory=$true)][string]$Destino,
+        [Parameter(Mandatory=$true)][string]$Descricao,
+        [int]$TimeoutSec = 600
+    )
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $mostrar = (-not $Silent) -and (Test-NextecInteractiveConsole)
+    $seta = [string][char]0x2193
+    $cheio = [string][char]0x2588
+    $vazio = [string][char]0x2591
+
+    $pedido = [Net.HttpWebRequest]::Create($Url)
+    $pedido.Timeout = $TimeoutSec * 1000
+    $pedido.ReadWriteTimeout = 120000
+    $pedido.UserAgent = "nextec-instalador/" + $InstallerVersion
+    $pedido.AllowAutoRedirect = $true
+
+    $resposta = $null
+    $entrada = $null
+    $saida = $null
+    try {
+        $resposta = $pedido.GetResponse()
+        if ($Url.StartsWith("https://") -and $resposta.ResponseUri.Scheme -ne "https") {
+            throw ("Download redirecionado para fora do HTTPS: {0}" -f $resposta.ResponseUri)
+        }
+
+        $total = [double]$resposta.ContentLength
+        $entrada = $resposta.GetResponseStream()
+        $saida = [IO.File]::Create($Destino)
+        $buffer = New-Object byte[] 65536
+        $lido = [double]0
+        $relogio = [Diagnostics.Stopwatch]::StartNew()
+
+        while ($true) {
+            $n = $entrada.Read($buffer, 0, $buffer.Length)
+            if ($n -le 0) { break }
+            $saida.Write($buffer, 0, $n)
+            $lido += $n
+
+            if ($mostrar -and $relogio.ElapsedMilliseconds -ge 250) {
+                $relogio.Reset(); $relogio.Start()
+                if ($total -gt 0) {
+                    $pct = [int][Math]::Floor(100 * $lido / $total)
+                    $blocos = [int][Math]::Floor($pct / 5)
+                    $texto = ("`r{0} {1}  [{2}{3}] {4,3}%  {5} de {6}   " -f $seta, $Descricao, ($cheio * $blocos), ($vazio * (20 - $blocos)), $pct, (Get-NextecTextoTamanho $lido), (Get-NextecTextoTamanho $total))
+                }
+                else {
+                    $texto = ("`r{0} {1}  {2}   " -f $seta, $Descricao, (Get-NextecTextoTamanho $lido))
+                }
+                Write-Host $texto -ForegroundColor Cyan -NoNewline
+            }
+        }
+    }
+    finally {
+        if ($null -ne $saida) { $saida.Dispose() }
+        if ($null -ne $entrada) { $entrada.Dispose() }
+        if ($null -ne $resposta) { $resposta.Close() }
+        if ($mostrar) {
+            # Limpa a linha da barra antes da próxima mensagem.
+            Write-Host ("`r{0}`r" -f (" " * 78)) -NoNewline
+        }
+    }
+
+    Write-Ok ("{0}: {1} baixados." -f $Descricao, (Get-NextecTextoTamanho (Get-Item -LiteralPath $Destino).Length))
 }
 
 function Wait-NextecOperator {
@@ -415,18 +644,30 @@ function Show-Banner {
     # Alguns hosts de RMM não implementam RawUI, e ali Clear-Host lança. Com
     # $ErrorActionPreference = "Stop" isso derrubaria o script na primeira
     # linha útil, com uma mensagem que não tem relação com o problema real.
+    Set-NextecConsoleTheme
+
     try {
         Clear-Host
     }
     catch {
     }
 
-    Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host "       NEXTEC NOC MONITORING INSTALLER, WINDOWS" -ForegroundColor White
-    Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host ("Versão:  {0}" -f $InstallerVersion)
+    $logo = @(
+        " _   _ _______  _______ _____ ____",
+        "| \ | | ____\ \/ /_   _| ____/ ___|",
+        "|  \| |  _|  \  /  | | |  _|| |",
+        "| |\  | |___ /  \  | | | |__| |___",
+        "|_| \_|_____/_/\_\ |_| |_____\____|"
+    )
+    foreach ($linhaLogo in $logo) {
+        Write-Host $linhaLogo -ForegroundColor Cyan
+    }
+    Write-Host ""
+    Write-Host "NOC Monitoring Installer, Windows" -ForegroundColor White -NoNewline
+    Write-Host ("  v{0}" -f $InstallerVersion) -ForegroundColor Gray
     if (-not [string]::IsNullOrEmpty($script:NocHost)) {
-        Write-Host ("Destino: {0}" -f $script:NocHost)
+        Write-Host "Destino: " -NoNewline
+        Write-Host $script:NocHost -ForegroundColor Cyan
     }
     Write-Host ""
 }
@@ -724,8 +965,22 @@ function Invoke-NextecRelaunch {
         $diretorio = $env:SystemRoot
     }
 
+    # A sessão elevada nasce do serviço AppInfo, sem as variáveis deste
+    # processo: as URLs de teste (branch) precisam ir no próprio comando.
+    $ambiente = ""
+    foreach ($nome in @("NEXTEC_COLETA_URL", "NEXTEC_ATUALIZADOR_URL")) {
+        $valor = [Environment]::GetEnvironmentVariable($nome, "Process")
+        if (-not [string]::IsNullOrWhiteSpace($valor)) {
+            if ($valor -notmatch '^https://[^\s''"`]+$') {
+                throw ("{0} precisa ser uma URL https sem espaços nem aspas." -f $nome)
+            }
+            $ambiente += ("`$env:{0} = '{1}'" -f $nome, $valor) + [Environment]::NewLine
+        }
+    }
+
     $comando = @"
 `$ErrorActionPreference = 'Continue'
+$ambiente
 Set-Location -LiteralPath '$($diretorio.Replace("'", "''"))'
 `$parametros = $hashtable
 `$global:LASTEXITCODE = 0
@@ -809,6 +1064,180 @@ function ConvertTo-Slug {
     return $result
 }
 
+function ConvertTo-ClienteSlug {
+    # O rótulo cliente só aceita minúsculas, números e _ (padrão de labels):
+    # hífen vira _ para "grupo-alves-de-faria" virar "grupo_alves_de_faria".
+    param([Parameter(Mandatory=$true)][string]$Value)
+
+    $slug = (ConvertTo-Slug $Value) -replace "-", "_"
+    $slug = $slug -replace "_+", "_"
+    return $slug.Trim("_")
+}
+
+# -----------------------------------------------------------------------------
+# VALIDAÇÃO DE ENTRADAS
+# Toda resposta digitada passa por aqui: valor inválido gera aviso e a pergunta
+# é repetida. O instalador nunca encerra por erro de digitação.
+# -----------------------------------------------------------------------------
+function Test-NextecIPv4 {
+    param([string]$Value)
+    if ($Value -notmatch '^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$') { return $false }
+    foreach ($i in 1..4) {
+        if ([int]$Matches[$i] -gt 255) { return $false }
+    }
+    return $true
+}
+
+function Test-NextecHost {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    if (Test-NextecIPv4 $Value) { return $true }
+    # Só números e pontos precisa ser um IP válido ("1.2.3" não é host).
+    if ($Value -notmatch '[A-Za-z]') { return $false }
+    return ($Value.Length -le 253 -and $Value -match '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$')
+}
+
+function Test-NextecPort {
+    param([string]$Value)
+    $port = 0
+    return ($Value -match '^\d{1,5}$' -and [int]::TryParse($Value, [ref]$port) -and $port -ge 1 -and $port -le 65535)
+}
+
+function Test-NextecHostPort {
+    param([string]$Value)
+    $i = $Value.LastIndexOf(":")
+    if ($i -lt 1) { return $false }
+    return ((Test-NextecHost $Value.Substring(0, $i)) -and (Test-NextecPort $Value.Substring($i + 1)))
+}
+
+function Test-NextecDestino {
+    # Destino de sonda: URL http(s), host/IP ou host:porta.
+    param([string]$Value)
+    if ($Value -match '^https?://([^/:?#]+)(:(\d+))?([/?#].*)?$') {
+        $urlHost = $Matches[1]
+        $urlPorta = $Matches[3]
+        if (-not (Test-NextecHost $urlHost)) { return $false }
+        return ([string]::IsNullOrEmpty($urlPorta) -or (Test-NextecPort $urlPorta))
+    }
+    return ((Test-NextecHost $Value) -or (Test-NextecHostPort $Value))
+}
+
+function Test-NextecAddress {
+    param([string]$Value, [string]$Kind)
+    switch ($Kind) {
+        "ip"       { return (Test-NextecIPv4 $Value) }
+        "host"     { return (Test-NextecHost $Value) }
+        "hostport" { return (Test-NextecHostPort $Value) }
+        "destino"  { return (Test-NextecDestino $Value) }
+    }
+    return $false
+}
+
+function Get-NextecAddressExample {
+    param([string]$Kind)
+    switch ($Kind) {
+        "ip"       { return "ex.: 192.168.0.1" }
+        "host"     { return "ex.: 192.168.0.1 ou fw.cliente.com.br" }
+        "hostport" { return "ex.: 127.0.0.1:9182" }
+        "destino"  { return "ex.: 192.168.0.1, cliente.com.br, https://cliente.com.br ou 10.0.0.5:3389" }
+    }
+    return ""
+}
+
+function Read-NextecAddress {
+    # Kind: ip, host, hostport ou destino. -List aceita vários separados por vírgula.
+    param(
+        [Parameter(Mandatory=$true)][string]$Prompt,
+        [string]$Default = "",
+        [Parameter(Mandatory=$true)][ValidateSet("ip","host","hostport","destino")][string]$Kind,
+        [switch]$Optional,
+        [switch]$List
+    )
+
+    while ($true) {
+        if ($Optional) {
+            $value = Read-NextecInput -Prompt $Prompt -Hint "ENTER para pular"
+            if ([string]::IsNullOrWhiteSpace($value)) { return "" }
+            $value = $value.Trim()
+        }
+        else {
+            $value = Read-Required -Prompt $Prompt -Default $Default
+        }
+
+        if ($List) {
+            $itens = @($value -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+            $invalidos = @($itens | Where-Object { -not (Test-NextecAddress -Value $_ -Kind $Kind) })
+            if ($itens.Count -gt 0 -and $invalidos.Count -eq 0) {
+                return ($itens -join ", ")
+            }
+            Write-Warn ("Endereço inválido: {0}. Use {1}, separados por vírgula." -f ($(if ($invalidos.Count) { $invalidos -join ", " } else { "vazio" })), (Get-NextecAddressExample $Kind))
+        }
+        else {
+            if (Test-NextecAddress -Value $value -Kind $Kind) {
+                return $value
+            }
+            Write-Warn ("Endereço inválido: {0}. Use {1}." -f $value, (Get-NextecAddressExample $Kind))
+        }
+    }
+}
+
+function Read-NextecSlug {
+    # Kind cliente/label: minúsculas, números e _ (hífen e espaço viram _).
+    # Kind host: igual, mas mantém hífen (hostnames reais usam hífen).
+    # -AllowKeep: ENTER devolve "" para o chamador manter o valor atual.
+    param(
+        [Parameter(Mandatory=$true)][string]$Prompt,
+        [string]$Default = "",
+        [ValidateSet("cliente","label","host")][string]$Kind = "label",
+        [switch]$AllowKeep
+    )
+
+    while ($true) {
+        if ($AllowKeep) {
+            $raw = Read-NextecInput -Prompt $Prompt -Hint "ENTER mantém"
+            if ([string]::IsNullOrWhiteSpace($raw)) { return "" }
+            $raw = $raw.Trim()
+        }
+        else {
+            $raw = Read-Required -Prompt $Prompt -Default $Default
+        }
+
+        $slug = if ($Kind -eq "host") { ConvertTo-Slug $raw } else { ConvertTo-ClienteSlug $raw }
+
+        if (-not [string]::IsNullOrWhiteSpace($slug) -and $slug -match '^[a-z0-9][a-z0-9_-]*$') {
+            if ($slug -cne $raw) {
+                Write-Info ("Será registrado como: {0}" -f $slug)
+            }
+            return $slug
+        }
+
+        Write-Warn ("Valor inválido: {0}. Use letras e números (acentos, espaços e símbolos são convertidos)." -f $raw)
+    }
+}
+
+function Read-NextecPattern {
+    param(
+        [Parameter(Mandatory=$true)][string]$Prompt,
+        [string]$Default = "",
+        [Parameter(Mandatory=$true)][string]$Pattern,
+        [Parameter(Mandatory=$true)][string]$Hint,
+        [switch]$Optional
+    )
+
+    while ($true) {
+        if ($Optional) {
+            $value = Read-NextecInput -Prompt $Prompt -Hint "ENTER para pular"
+            if ([string]::IsNullOrWhiteSpace($value)) { return "" }
+            $value = $value.Trim()
+        }
+        else {
+            $value = Read-Required -Prompt $Prompt -Default $Default
+        }
+        if ($value -match $Pattern) { return $value }
+        Write-Warn ("Valor inválido: {0}. Use {1}." -f $value, $Hint)
+    }
+}
+
 function ConvertTo-AlloyEscapedString {
     param([AllowEmptyString()][string]$Value)
 
@@ -821,6 +1250,29 @@ function ConvertTo-AlloyEscapedString {
     return $escaped
 }
 
+function Read-NextecInput {
+    <#
+        Pergunta com hierarquia visual: "?" em ciano, texto em branco, dica e
+        valor padrão em cinza. Read-Host sem -Prompt não imprime nada, então
+        o texto colorido montado aqui é o único que aparece.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Prompt,
+        [string]$Default = "",
+        [string]$Hint = "",
+        [switch]$AsSecureString
+    )
+
+    Write-Host "? " -ForegroundColor Cyan -NoNewline
+    Write-Host $Prompt -ForegroundColor White -NoNewline
+    if ($Hint) { Write-Host (" ({0})" -f $Hint) -ForegroundColor DarkGray -NoNewline }
+    if ($Default) { Write-Host (" [{0}]" -f $Default) -ForegroundColor DarkGray -NoNewline }
+    Write-Host ": " -NoNewline
+
+    if ($AsSecureString) { return (Read-Host -AsSecureString) }
+    return (Read-Host)
+}
+
 function Read-Required {
     param(
         [Parameter(Mandatory=$true)][string]$Prompt,
@@ -829,17 +1281,16 @@ function Read-Required {
 
     while ($true) {
         if ([string]::IsNullOrWhiteSpace($Default)) {
-            $value = Read-Host $Prompt
+            $value = Read-NextecInput -Prompt $Prompt
         }
         else {
-            $value = Read-Host ("{0} [{1}]" -f $Prompt, $Default)
+            $value = Read-NextecInput -Prompt $Prompt -Default $Default
             if ([string]::IsNullOrWhiteSpace($value)) {
                 $value = $Default
             }
         }
 
         if (-not [string]::IsNullOrWhiteSpace($value)) {
-            Write-Host ""
             return $value.Trim()
         }
 
@@ -856,22 +1307,21 @@ function Read-YesNo {
     $suffix = if ($Default) { "[S/n]" } else { "[s/N]" }
 
     while ($true) {
-        $answer = Read-Host ("{0} {1}" -f $Prompt, $suffix)
+        $answer = Read-NextecInput -Prompt $Prompt -Hint ($suffix.Trim("[]"))
 
         if ([string]::IsNullOrWhiteSpace($answer)) {
-            Write-Host ""
             return $Default
         }
 
         switch ($answer.Trim().ToLowerInvariant()) {
-            "s"   { Write-Host ""; return $true }
-            "sim" { Write-Host ""; return $true }
-            "y"   { Write-Host ""; return $true }
-            "yes" { Write-Host ""; return $true }
-            "n"   { Write-Host ""; return $false }
-            "nao" { Write-Host ""; return $false }
-            "não" { Write-Host ""; return $false }
-            "no"  { Write-Host ""; return $false }
+            "s"   { return $true }
+            "sim" { return $true }
+            "y"   { return $true }
+            "yes" { return $true }
+            "n"   { return $false }
+            "nao" { return $false }
+            "não" { return $false }
+            "no"  { return $false }
             default { Write-Warn "Responda S ou N." }
         }
     }
@@ -884,24 +1334,29 @@ function Read-Choice {
         [int]$Default = 1
     )
 
-    Write-Host $Prompt -ForegroundColor White
+    # Igual ao instalador Linux: número em ciano, "›" marca o padrão e
+    # ENTER escolhe o padrão.
+    Write-Host "? " -ForegroundColor Cyan -NoNewline
+    Write-Host $Prompt -ForegroundColor White -NoNewline
+    Write-Host (" [ENTER = {0}]" -f $Default) -ForegroundColor DarkGray
 
     for ($i = 0; $i -lt $Options.Count; $i++) {
-        Write-Host ("  [{0}] {1}" -f ($i + 1), $Options[$i])
+        $marca = if (($i + 1) -eq $Default) { $script:SimboloCursor } else { " " }
+        Write-Host ("  {0}{1,2}  " -f $marca, ($i + 1)) -ForegroundColor Cyan -NoNewline
+        Write-Host $Options[$i]
     }
 
     while ($true) {
-        $choiceText = Read-Host ("Escolha [{0}]" -f $Default)
+        Write-Host ("{0} " -f $script:SimboloCursor) -ForegroundColor Cyan -NoNewline
+        $choiceText = Read-Host
 
         if ([string]::IsNullOrWhiteSpace($choiceText)) {
-            Write-Host ""
             return $Default
         }
 
         $number = 0
-        if ([int]::TryParse($choiceText, [ref]$number)) {
+        if ([int]::TryParse($choiceText.Trim(), [ref]$number)) {
             if ($number -ge 1 -and $number -le $Options.Count) {
-                Write-Host ""
                 return $number
             }
         }
@@ -937,12 +1392,12 @@ function Read-RequiredSecret {
 
     while ($true) {
         if ($useMaskedInput) {
-            $secureValue = Read-Host $Prompt -AsSecureString
+            $secureValue = Read-NextecInput -Prompt $Prompt -AsSecureString
             $plainValue = Convert-SecureStringToPlainText -SecureValue $secureValue
         }
         else {
             Write-Warn "Console sem suporte a entrada mascarada (ex.: ISE); a senha ficará visível ao digitar."
-            $plainValue = Read-Host $Prompt
+            $plainValue = Read-NextecInput -Prompt $Prompt
         }
 
         if ([string]::IsNullOrWhiteSpace($plainValue)) {
@@ -955,7 +1410,6 @@ function Read-RequiredSecret {
             continue
         }
 
-        Write-Host ""
         return $plainValue
     }
 }
@@ -1015,15 +1469,12 @@ function Set-NocDestination {
     $script:NocHost = $NocTarget
 
     if (-not $Silent) {
-        Write-Host ""
-        Write-Host "Destino: " -NoNewline -ForegroundColor White
-        Write-Host $script:NocHost -ForegroundColor Cyan
-
-        $action = Read-Host "?  ENTER para continuar ou D para alterar"
+        # O banner já mostra o destino: aqui só a confirmação.
+        $action = Read-NextecInput -Prompt "Destino do monitoramento" -Hint "ENTER mantém, D altera" -Default $script:NocHost
 
         if ($action.Trim().ToLowerInvariant() -eq "d") {
             while ($true) {
-                $inputHost = Read-Host "?  Novo destino"
+                $inputHost = Read-NextecInput -Prompt "Novo destino"
                 $inputHost = $inputHost -replace "^https?://", ""
                 $inputHost = $inputHost -replace "/.*$", ""
                 $inputHost = $inputHost.Trim()
@@ -1054,26 +1505,93 @@ function Get-AlloyInstalledVersion {
             return $null
         }
 
-        return [string](($result.Output -split "`r?`n") | Select-Object -First 1)
+        $linha = [string](($result.Output -split "`r?`n") | Select-Object -First 1)
+        $m = [Regex]::Match($linha, '\d+\.\d+\.\d+')
+        if ($m.Success) { return $m.Value }
+        return $linha
     }
     catch {
         return $null
     }
 }
 
+function Get-NextecEstadoServico {
+    param([AllowNull()][object]$Servico)
+    if ($null -eq $Servico) { return "não encontrado" }
+    switch ([string]$Servico.Status) {
+        "Running" { return "ativo" }
+        "StartPending" { return "iniciando" }
+        "Stopped" { return "parado" }
+        default { return [string]$Servico.Status }
+    }
+}
+
 function Show-MaintenanceStatus {
+    # Mesmo quadro do instalador Linux: versões e estado de cada parte.
     $service = Get-AlloyService
     $version = Get-AlloyInstalledVersion
     $configExists = Test-Path -LiteralPath $ConfigFile
 
-    $versionLabel = if ([string]::IsNullOrWhiteSpace($version)) { "instalado, versão não identificada" } else { $version }
-    $serviceLabel = if ($null -ne $service) { $service.Status } else { "não encontrado" }
-    $configLabel = if ($configExists) { $ConfigFile } else { "não encontrada" }
+    # Versões lidas do texto dos arquivos (nada é executado).
+    $conteudoConfig = ""
+    if ($configExists) {
+        try { $conteudoConfig = [IO.File]::ReadAllText($ConfigFile) } catch { $conteudoConfig = "" }
+    }
+    $cabecalho = { param($chave)
+        $m = [Regex]::Match($conteudoConfig, ('(?m)^\s*//\s*nextec:{0}\s*=\s*(\S+)' -f $chave))
+        if ($m.Success) { $m.Groups[1].Value } else { "" }
+    }
+    $versaoConfig = & $cabecalho "versao"
+    $cliente = & $cabecalho "cliente"
+    $hostLabel = & $cabecalho "host"
+    $versaoColeta = Get-VersaoNoArquivo -Caminho $ColetaScript -Padrao '(?m)^\$Versao\s*=\s*"([^"]+)"'
+    $versaoAtualizador = Get-VersaoNoArquivo -Caminho $AtualizadorScript -Padrao '(?m)^\$script:Versao\s*=\s*"([^"]+)"'
 
-    Write-Info ("Binário Alloy: {0}" -f $versionLabel)
-    Write-Info ("Caminho:       {0}" -f $AlloyExe)
-    Write-Info ("Serviço:       {0} ({1})" -f $script:AlloyServiceName, $serviceLabel)
-    Write-Info ("Configuração:  {0}" -f $configLabel)
+    $instaladoCom = if ($versaoConfig) { "v$versaoConfig" } elseif ($configExists) { "versão anterior à 2.12 (não identificada)" } else { "sem configuração" }
+    $alloy = if ([string]::IsNullOrWhiteSpace($version)) { "versão não identificada" } else { $version }
+
+    $coleta = "não instalada"
+    if ($versaoColeta) {
+        $tarefaColeta = Get-ScheduledTask -TaskName $ColetaTaskName -ErrorAction SilentlyContinue
+        $coleta = if ($null -ne $tarefaColeta) { "$versaoColeta (ligada)" } else { "$versaoColeta (tarefa ausente)" }
+    }
+    $atualizador = "não instalado"
+    if ($versaoAtualizador) {
+        $tarefa = Get-ScheduledTask -TaskName $AtualizadorTaskName -ErrorAction SilentlyContinue
+        $atualizador = if ($null -ne $tarefa) { "$versaoAtualizador (ligado)" } else { "$versaoAtualizador (tarefa ausente)" }
+    }
+
+    Write-Field -Label "Este instalador" -Value ("v{0}" -f $InstallerVersion) -ValueColor White
+    Write-Field -Label "Instalado com" -Value $instaladoCom -ValueColor White
+    if ($cliente) { Write-Field -Label "Cliente" -Value $cliente -ValueColor White }
+    if ($hostLabel) { Write-Field -Label "Host" -Value $hostLabel -ValueColor White }
+    Write-Field -Label "Grafana Alloy" -Value ("{0} ({1})" -f $alloy, (Get-NextecEstadoServico -Servico $service)) -ValueColor White
+    Write-Field -Label "Coleta Complementar" -Value $coleta -ValueColor $(if ($versaoColeta) { [ConsoleColor]::White } else { [ConsoleColor]::DarkGray })
+    Write-Field -Label "Atualizador" -Value $atualizador -ValueColor $(if ($versaoAtualizador) { [ConsoleColor]::White } else { [ConsoleColor]::Yellow })
+    Write-Field -Label "Configuração" -Value $(if ($configExists) { $ConfigFile } else { "não encontrada" }) -ValueColor Gray
+    Write-Host ""
+}
+
+function Get-VersaoNoArquivo {
+    param(
+        [string]$Caminho,
+        [string]$Padrao
+    )
+
+    if ([string]::IsNullOrEmpty($Caminho) -or -not (Test-Path -LiteralPath $Caminho -PathType Leaf)) {
+        return ""
+    }
+
+    try {
+        $m = [Regex]::Match([IO.File]::ReadAllText($Caminho), $Padrao)
+        if ($m.Success) {
+            return $m.Groups[1].Value
+        }
+    }
+    catch {
+    }
+
+    return ""
 }
 
 function Update-AlloyBinaryOnly {
@@ -1405,6 +1923,7 @@ function Read-CurrentAlloyConfiguration {
         CustomExporters          = $customExporters
         EnableInternet           = $enableInternet
         InternetIntervalMinutes  = $internetIntervalMinutes
+        EnableColeta             = ($content -match 'prometheus\.exporter\.windows\s+"coleta_complementar"')
         BlackboxIntervalSeconds  = $blackboxIntervalSeconds
         Modificado               = (Get-Item -LiteralPath $ConfigFile).LastWriteTime
         Arquivo                  = $ConfigFile
@@ -1513,6 +2032,15 @@ function Show-CurrentConfiguration {
         Write-Field -Label "Internet" -Value "não monitorada" -ValueColor DarkGray
     }
 
+    if ($c.EnableColeta) {
+        $linksAtuais = @(Get-ColetaLinksFromIni)
+        $textoLinks = if ($linksAtuais.Count -gt 0) { ($linksAtuais | ForEach-Object { $_.nome }) -join ", " } else { "nenhum link cadastrado" }
+        Write-Field -Label "Coleta Complementar" -Value ("internet; links: {0}" -f $textoLinks)
+    }
+    else {
+        Write-Field -Label "Coleta Complementar" -Value "desligada" -ValueColor DarkGray
+    }
+
     if ($c.BlackboxTargets.Count -gt 0) {
         Write-Section ("Conectividade, Blackbox ({0} alvo(s))" -f $c.BlackboxTargets.Count)
         Write-Host ("    {0,-18} {1,-28} {2,-16} {3}" -f "NOME", "ENDEREÇO", "MÓDULO", "TIPO") -ForegroundColor DarkGray
@@ -1577,6 +2105,9 @@ function Import-CurrentConfiguration {
     $script:EnableBlackboxResolved     = ($c.BlackboxTargets.Count -gt 0)
     $script:EnableSnmpResolved         = ($c.SnmpTargets.Count -gt 0)
     $script:EnableInternetResolved     = $c.EnableInternet
+    $script:EnableColetaResolved       = [bool]$c.EnableColeta
+    if ($script:EnableColetaResolved) { Import-ColetaLinks }
+    $script:EnableLinksResolved        = ($script:ColetaLinks.Count -gt 0)
 
     if ($script:EnableInternetResolved) {
         $script:InternetIntervalMinutesResolved = $c.InternetIntervalMinutes
@@ -1628,6 +2159,18 @@ function Import-CurrentConfiguration {
     return $inventory
 }
 
+function Get-NextecComponentesPendentes {
+    # Componentes que a configuração atual pede e que não estão instalados.
+    $faltando = New-Object System.Collections.Generic.List[string]
+    if (-not (Test-Path -LiteralPath $AtualizadorScript) -or -not (Get-ScheduledTask -TaskName $AtualizadorTaskName -ErrorAction SilentlyContinue)) {
+        $faltando.Add("atualizador automático")
+    }
+    if ($script:EnableColetaResolved -and (-not (Test-Path -LiteralPath $ColetaScript) -or -not (Get-ScheduledTask -TaskName $ColetaTaskName -ErrorAction SilentlyContinue))) {
+        $faltando.Add("Coleta Complementar")
+    }
+    return $faltando.ToArray()
+}
+
 function Save-ReconfiguredAlloy {
     <#
         Regrava a configuração a partir do estado atual das variáveis, valida e
@@ -1641,6 +2184,7 @@ function Save-ReconfiguredAlloy {
     New-BlackboxConfiguration
     Install-SnmpConfiguration
     Install-InternetMonitoring
+    Install-ColetaComplementar
     New-AlloyConfiguration -Inventory $Inventory
     Format-AndValidateAlloyConfiguration
     Restart-AlloyService
@@ -1652,27 +2196,14 @@ function Edit-IdentificationSettings {
     Write-Step "Identificação"
 
     Write-Info ("Cliente atual: {0}" -f $script:Cliente)
-    $cliente = Read-Host "Novo cliente (ENTER mantém)"
-    if (-not [string]::IsNullOrWhiteSpace($cliente)) {
-        $slug = ConvertTo-Slug $cliente
-        if ($slug -notmatch "^[a-z0-9][a-z0-9_-]*$") {
-            throw ("Cliente inválido após normalização: {0}" -f $slug)
-        }
-        $script:Cliente = $slug
-    }
+    $slug = Read-NextecSlug -Prompt "Novo cliente" -Kind cliente -AllowKeep
+    if ($slug) { $script:Cliente = $slug }
 
     Write-Info ("Local atual: {0}" -f $script:Local)
-    $local = Read-Host "Novo local (ENTER mantém)"
-    if (-not [string]::IsNullOrWhiteSpace($local)) {
-        # Mesma validação da primeira instalação. Sem ela, uma entrada como
-        # "###" vira string vazia na normalização e o host chega ao NOC sem a
-        # label obrigatória, sem nada acusar.
-        $slugLocal = ConvertTo-Slug $local
-        if ([string]::IsNullOrWhiteSpace($slugLocal)) {
-            throw ("Local inválido após normalização: {0}" -f $local)
-        }
-        $script:Local = $slugLocal
-    }
+    # Read-NextecSlug repete a pergunta quando a entrada vira vazio na
+    # normalização (ex.: "###"), para o host nunca chegar ao NOC sem local.
+    $slugLocal = Read-NextecSlug -Prompt "Novo local" -Kind label -AllowKeep
+    if ($slugLocal) { $script:Local = $slugLocal }
 
     $ambientes = @("producao","homologacao","desenvolvimento","backup","teste")
     $indiceAmbiente = [Array]::IndexOf($ambientes, $script:Ambiente)
@@ -1685,14 +2216,8 @@ function Edit-IdentificationSettings {
     $script:Criticidade = $criticidades[(Read-Choice -Prompt "Criticidade" -Options $criticidades -Default ($indiceCriticidade + 1)) - 1]
 
     Write-Info ("Host atual: {0}" -f $script:HostLabel)
-    $hostLabel = Read-Host "Novo nome do host (ENTER mantém)"
-    if (-not [string]::IsNullOrWhiteSpace($hostLabel)) {
-        $slugHost = ConvertTo-Slug $hostLabel
-        if ([string]::IsNullOrWhiteSpace($slugHost)) {
-            throw ("Nome de host inválido após normalização: {0}" -f $hostLabel)
-        }
-        $script:HostLabel = $slugHost
-    }
+    $slugHost = Read-NextecSlug -Prompt "Novo nome do host" -Kind host -AllowKeep
+    if ($slugHost) { $script:HostLabel = $slugHost }
 }
 
 function Edit-LogSettings {
@@ -1711,7 +2236,7 @@ function Edit-LogSettings {
 
     # A credencial do Loki só é necessária quando algum log é coletado, e pode
     # não existir se o host nunca enviou log até agora.
-    if (($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved) -and
+    if ((Test-NextecNeedsLoki) -and
         [string]::IsNullOrWhiteSpace($script:LokiUsername)) {
         Write-Info "Este host ainda não tem credencial de Loki gravada."
         Read-NocCredentials
@@ -1751,7 +2276,7 @@ function Read-BlackboxInterval {
     }
     else {
         while ($true) {
-            $texto = Read-Host ("    Intervalo em segundos [{0}]" -f $script:BlackboxIntervalSecondsResolved)
+            $texto = Read-NextecInput -Prompt "Intervalo em segundos" -Default $script:BlackboxIntervalSecondsResolved
 
             if ([string]::IsNullOrWhiteSpace($texto)) {
                 break
@@ -1986,7 +2511,7 @@ function Edit-InternetSettings {
     }
 
     while ($true) {
-        $intervaloTexto = Read-Host ("    Intervalo em minutos entre execuções [{0}]" -f $script:InternetIntervalMinutesResolved)
+        $intervaloTexto = Read-NextecInput -Prompt "Intervalo em minutos entre execuções" -Default $script:InternetIntervalMinutesResolved
 
         if ([string]::IsNullOrWhiteSpace($intervaloTexto)) {
             Write-Host ""
@@ -2184,6 +2709,7 @@ function Invoke-ConfigurationMenu {
         # criava um beco: o item só existia se o host já tivesse algum alvo, e
         # era justamente por esse item que se ativava o primeiro.
         [void]$opcoes.Add("Internet (Speedtest)")
+        [void]$opcoes.Add("Internet e links (Coleta Complementar)")
         [void]$opcoes.Add("Exporters adicionais")
 
         [void]$opcoes.Add("Credenciais do NOC")
@@ -2202,6 +2728,7 @@ function Invoke-ConfigurationMenu {
             "Alvos de conectividade (Blackbox)" { Edit-BlackboxTargets; $alterou = $true }
             "Alvos SNMP" { Edit-SnmpTargets; $alterou = $true }
             "Internet (Speedtest)" { Edit-InternetSettings; $alterou = $true }
+            "Internet e links (Coleta Complementar)" { Edit-ColetaSettings; $alterou = $true }
             "Exporters adicionais" { Edit-CustomExporters; $alterou = $true }
             "Credenciais do NOC" {
                 # Limpa o que veio do registro para que Read-NocCredentials
@@ -2219,12 +2746,21 @@ function Invoke-ConfigurationMenu {
                 Write-Info "O Bloco de Notas foi aberto. Alterações feitas por lá não passam pela validação deste instalador."
             }
             "Gravar e aplicar as alterações" {
-                if (-not $alterou) {
+                # Mesmo sem alteração, grava quando falta componente (ex.: o
+                # atualizador ou a Coleta não baixaram na instalação).
+                $pendentes = @(Get-NextecComponentesPendentes)
+                if (-not $alterou -and $pendentes.Count -eq 0) {
                     Write-Info "Nada foi alterado."
                     return
                 }
+                if (-not $alterou) {
+                    Write-Info ("Nada foi alterado, mas falta instalar: {0}. Aplicando a configuração atual." -f ($pendentes -join ", "))
+                }
 
                 Save-ReconfiguredAlloy -Inventory $inventory
+                Invoke-NextecOptionalStep -Nome "Atualizador automático" -Acao {
+                    Install-Atualizador
+                } | Out-Null
                 return
             }
             "Sair sem gravar" {
@@ -2252,8 +2788,8 @@ function Invoke-MaintenanceMenu {
     $options = @(
         "Ver e alterar a configuração atual",
         "Reconfigurar tudo, fluxo completo (identificação, recursos, credenciais)",
-        "Atualizar/reinstalar o binário do Grafana Alloy, mantém configuração atual",
-        "Validar configuração atual e reiniciar o serviço",
+        "Atualizar o Grafana Alloy, mantendo a configuração",
+        "Validar a configuração e reiniciar os serviços",
         "Cancelar"
     )
 
@@ -2745,21 +3281,21 @@ function Get-NextecMultiSelectionConsole {
 
             Clear-Host
             Show-Banner
-            Write-Host ("==> {0}" -f $Title) -ForegroundColor Cyan
-            Write-Host "Use as setas para navegar. ESPAÇO expande/retrai categorias e marca/desmarca itens. ENTER confirma." -ForegroundColor DarkGray
+            Write-Host $Title -ForegroundColor White
+            Write-Host "Setas navegam, ESPAÇO abre/fecha categorias e marca/desmarca, ENTER confirma." -ForegroundColor Gray
             Write-Host ""
 
             for ($vi = 0; $vi -lt $visibleIndexes.Count; $vi++) {
                 $item = $Items[$visibleIndexes[$vi]]
                 $indent = "  " * [int]$item.Depth
-                $prefix = if ($vi -eq $cursor) { ">" } else { " " }
+                $prefix = if ($vi -eq $cursor) { [string][char]0x00BB } else { " " }
 
                 if ([bool]$item.HasChildren) {
-                    $arrow = if ([bool]$item.Expanded) { "v" } else { ">" }
+                    $arrow = if ([bool]$item.Expanded) { [string][char]0x25BC } else { [string][char]0x25BA }
                     $line = ("{0} {1}{2} {3}" -f $prefix, $indent, $arrow, $item.Label)
                 }
                 else {
-                    $mark = if ($item.Selected) { "x" } else { " " }
+                    $mark = if ($item.Selected) { $script:SimboloOk } else { " " }
                     $line = ("{0} {1}[{2}] {3}" -f $prefix, $indent, $mark, $item.Label)
                 }
 
@@ -2822,11 +3358,12 @@ function Get-NextecMultiSelectionFallback {
             }
             else {
                 $mark = if ($item.Selected) { "x" } else { " " }
-                Write-Host ("  {0}[{1}] {2}. {3}" -f $indent, $mark, ($vi + 1), $item.Label)
+                $cor = if ($item.Selected) { [ConsoleColor]::Green } else { [ConsoleColor]::Gray }
+                Write-Host ("  {0}[{1}] {2}. {3}" -f $indent, $mark, ($vi + 1), $item.Label) -ForegroundColor $cor
             }
         }
 
-        $inputValue = Read-Host "Números para marcar/desmarcar/expandir, separados por espaço. ENTER confirma"
+        $inputValue = Read-NextecInput -Prompt "Números para marcar/desmarcar/expandir, separados por espaço" -Hint "ENTER confirma"
 
         if ([string]::IsNullOrWhiteSpace($inputValue)) {
             Write-Host ""
@@ -2958,6 +3495,7 @@ function Read-ResourceChecklist {
     $script:EnableExportersResolved = $EnableExporters.IsPresent
     $script:EnableInternetResolved = $EnableInternet.IsPresent
     $script:InternetIntervalMinutesResolved = $InternetIntervalMinutes
+    $script:EnableColetaResolved = $EnableColeta.IsPresent
     $script:SelectedHostFeatureKeys = [string[]]@()
     $script:SelectedExporterKeys = [string[]]@()
 
@@ -2986,6 +3524,11 @@ function Read-ResourceChecklist {
         # e registra a tarefa agendada. Não pede nada além de marcar aqui.
         $items.Add((New-NextecChecklistItem -Key "internet" -Label "Internet (Speedtest), disponibilidade, latência, download e upload" -Selected $script:EnableInternetResolved))
     }
+
+    # Coleta Complementar: vale para qualquer modo. Internet vem marcada por
+    # padrão na instalação interativa; links só quando o local tem mais de um.
+    $padraoColeta = $script:EnableColetaResolved -or (-not $Silent)
+    $items.Add((New-NextecChecklistItem -Key "coleta" -Label "Internet e links: status, DNS, IP público e causa das quedas" -Selected $padraoColeta))
 
     # "Exporters adicionais" agora é uma categoria em árvore: ESPAÇO/ENTER
     # expande e mostra o catálogo de exporters como filhos selecionáveis,
@@ -3050,6 +3593,7 @@ function Read-ResourceChecklist {
     if ($script:EnableInternetResolved) {
         $script:InternetIntervalMinutesResolved = $InternetIntervalMinutes
     }
+    $script:EnableColetaResolved = ($selectedKeys -contains "coleta")
 
     $featureKeys = New-Object System.Collections.Generic.List[string]
     $exporterKeys = New-Object System.Collections.Generic.List[string]
@@ -3141,8 +3685,8 @@ function Read-BlackboxTargets {
     $suffixByOption = @{ 1 = "ping"; 2 = "http"; 3 = "https"; 4 = "tcp"; 5 = "dns"; 6 = "content" }
 
     do {
-        $name = ConvertTo-Slug (Read-Required "Nome do alvo (ex.: fw_matriz)")
-        $address = Read-Required "IP, FQDN ou URL"
+        $name = Read-NextecSlug -Prompt "Nome do alvo (ex.: fw_matriz)" -Kind host
+        $address = Read-NextecAddress -Prompt "IP, FQDN ou URL" -Kind destino
 
         Write-Host "Tipo de teste (pode escolher mais de um, separados por vírgula, ex.: 1,2)" -ForegroundColor White
         for ($i = 0; $i -lt $probeOptions.Count; $i++) {
@@ -3151,7 +3695,7 @@ function Read-BlackboxTargets {
 
         $selectedOptions = $null
         while ($null -eq $selectedOptions) {
-            $raw = Read-Host "Escolha [1]"
+            $raw = Read-NextecInput -Prompt "Escolha" -Default "1"
             if ([string]::IsNullOrWhiteSpace($raw)) { $raw = "1" }
 
             $numbers = New-Object System.Collections.Generic.List[int]
@@ -3229,7 +3773,7 @@ function Get-NextecSnmpConfigFromRepo {
     $destino = Join-Path $env:TEMP ("nextec-snmp-{0}" -f $vendor.File)
 
     try {
-        Invoke-WebRequest -Uri $url -OutFile $destino -UseBasicParsing
+        Invoke-NextecDownload -Url $url -Destino $destino -Descricao ("snmp.yml {0}" -f $vendor.File) -TimeoutSec 120
     }
     catch {
         Write-Warn ("Falha ao baixar {0}: {1}" -f $url, $_.Exception.Message)
@@ -3744,7 +4288,7 @@ function Read-SnmpTargets {
         $name = ""
 
         while ([string]::IsNullOrWhiteSpace($name)) {
-            $name = ConvertTo-Slug (Read-Required "Nome do equipamento")
+            $name = Read-NextecSlug -Prompt "Nome do equipamento" -Kind host
 
             if ([string]::IsNullOrWhiteSpace($name)) {
                 Write-Warn "Nome inválido após normalização. Use letras, números, hífen ou sublinhado."
@@ -3757,7 +4301,7 @@ function Read-SnmpTargets {
             }
         }
 
-        $address = Read-Required "IP/FQDN SNMP"
+        $address = Read-NextecAddress -Prompt "IP/FQDN SNMP" -Kind host
 
         $authDefinition = Read-SnmpAuthDefinition -EquipmentName $name
         $auth = $authDefinition.Name
@@ -3775,7 +4319,7 @@ function Read-SnmpTargets {
         $typeChoice = Read-Choice -Prompt "Tipo do equipamento" -Options $typeOptions -Default 1
         $assetType = $typeOptions[$typeChoice - 1]
 
-        $system = ConvertTo-Slug (Read-Required -Prompt "Sistema/fabricante" -Default "network")
+        $system = Read-NextecSlug -Prompt "Sistema/fabricante" -Default "network" -Kind label
 
         $script:SnmpTargets += [pscustomobject]@{
             Name = $name
@@ -3836,8 +4380,8 @@ function Read-CustomExporters {
         }
 
         Write-Info $definition.Label
-        $target = Read-Required -Prompt "Target host:porta" -Default $definition.DefaultTarget
-        $service = ConvertTo-Slug (Read-Required -Prompt "Label servico" -Default $definition.DefaultService)
+        $target = Read-NextecAddress -Prompt "Target host:porta" -Default $definition.DefaultTarget -Kind hostport
+        $service = Read-NextecSlug -Prompt "Label servico" -Default $definition.DefaultService -Kind label
 
         $script:CustomExporters += [pscustomobject]@{
             Name = $definition.Key
@@ -3848,9 +4392,9 @@ function Read-CustomExporters {
 
     if ($selectedKeys -contains "custom") {
         do {
-            $name = ConvertTo-Slug (Read-Required "Nome do exporter")
-            $target = Read-Required -Prompt "Target host:porta" -Default ""
-            $service = ConvertTo-Slug (Read-Required -Prompt "Label servico" -Default $name)
+            $name = Read-NextecSlug -Prompt "Nome do exporter" -Kind label
+            $target = Read-NextecAddress -Prompt "Target host:porta" -Kind hostport
+            $service = Read-NextecSlug -Prompt "Label servico" -Default $name -Kind label
 
             $script:CustomExporters += [pscustomobject]@{
                 Name = $name
@@ -3885,17 +4429,15 @@ function Get-NextecConfiguration {
             throw "No modo silencioso, informe -Cliente."
         }
 
-        $rawCliente = Read-Required "Cliente (ex.: cliente_exemplo)"
-        $script:Cliente = ConvertTo-Slug $rawCliente
+        $script:Cliente = Read-NextecSlug -Prompt "Cliente, identificador da empresa e não do servidor (ex.: advocacia_martins)" -Kind cliente
     }
     else {
-        $script:Cliente = ConvertTo-Slug $Cliente
+        $script:Cliente = ConvertTo-ClienteSlug $Cliente
     }
 
-    # Aceita hífen porque ConvertTo-Slug preserva hífen. As duas regras
-    # precisam concordar, senão nomes como "Cartorio-Bruno" são normalizados e
-    # rejeitados em seguida.
-    if ($script:Cliente -notmatch "^[a-z0-9][a-z0-9_-]*$") {
+    # ConvertTo-ClienteSlug troca hífen por _, então "Cartorio-Bruno" vira
+    # "cartorio_bruno" e passa nesta regra (a mesma do padrão de labels).
+    if ($script:Cliente -notmatch "^[a-z0-9][a-z0-9_]*$") {
         throw ("Cliente inválido após normalização: {0}" -f $script:Cliente)
     }
 
@@ -3906,7 +4448,7 @@ function Get-NextecConfiguration {
         $script:HostLabel = ConvertTo-Slug $Inventory.Hostname
     } else {
         $detectedHost = ConvertTo-Slug $Inventory.Hostname
-        $script:HostLabel = ConvertTo-Slug (Read-Required -Prompt "Hostname para monitoramento" -Default $detectedHost)
+        $script:HostLabel = Read-NextecSlug -Prompt "Hostname para monitoramento" -Default $detectedHost -Kind host
     }
 
     $script:Ambiente = $Ambiente
@@ -3927,7 +4469,7 @@ function Get-NextecConfiguration {
         $ambienteChoice = Read-Choice -Prompt "Ambiente" -Options $ambienteOptions -Default 1
         $script:Ambiente = $ambienteOptions[$ambienteChoice - 1]
 
-        $script:Local = ConvertTo-Slug (Read-Required -Prompt "Local" -Default $Local)
+        $script:Local = Read-NextecSlug -Prompt "Local" -Default $Local -Kind label
 
         $criticidadeOptions = @("critico","alto","medio","baixo")
         $defaultCrit = [Array]::IndexOf($criticidadeOptions, $Criticidade) + 1
@@ -4003,6 +4545,8 @@ function Get-NextecConfiguration {
     }
 
     Read-ResourceChecklist -MonitorHost $script:MonitorHost -Collector $script:Collector -DetectedFeatures @($script:DetectedHostFeatures)
+    if ($script:EnableColetaResolved) { Import-ColetaLinks }
+    if ($script:EnableColetaResolved -and -not $Silent) { Invoke-ColetaLinksPrompt }
     Read-BlackboxTargets
     Read-SnmpTargets
     Read-CustomExporters
@@ -4033,7 +4577,7 @@ function Read-NocCredentials {
     $script:RwUsername = $rwUser
     $script:RwPassword = $rwPassword
 
-    if (-not ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved)) {
+    if (-not (Test-NextecNeedsLoki)) {
         return
     }
 
@@ -4068,40 +4612,38 @@ function Show-Plan {
 
     Write-Step "Resumo antes da instalação"
 
-    $rows = [ordered]@{
-        "Cliente"       = $script:Cliente
-        "Host"          = $script:HostLabel
-        "Sistema"       = $Inventory.Caption
-        "Build"         = $Inventory.Build
-        "Tipo detectado"= $Inventory.Generation
-        "Modo Alloy"    = $script:ResolvedMode
-        "Ambiente"      = $script:Ambiente
-        "Local"         = $script:Local
-        "Criticidade"   = $script:Criticidade
-        "Destino"       = $script:NocHost
-    }
+    $simNao = { param($v) if ($v) { "sim" } else { "não" } }
 
-    foreach ($entry in $rows.GetEnumerator()) {
-        Write-Host ("  {0,-27} {1}" -f ($entry.Key + ":"), $entry.Value)
-    }
+    Write-Field -Label "Cliente" -Value $script:Cliente -ValueColor White -Width 26
+    Write-Field -Label "Host" -Value $script:HostLabel -ValueColor White -Width 26
+    Write-Field -Label "Sistema" -Value ("{0} (build {1})" -f $Inventory.Caption, $Inventory.Build) -Width 26
+    Write-Field -Label "Tipo detectado" -Value $Inventory.Generation -Width 26
+    Write-Field -Label "Modo Alloy" -Value $script:ResolvedMode -Width 26
+    Write-Field -Label "Ambiente" -Value $script:Ambiente -Width 26
+    Write-Field -Label "Local" -Value $script:Local -Width 26
+    Write-Field -Label "Criticidade" -Value $script:Criticidade -Width 26
+    Write-Field -Label "Destino" -Value $script:NocHost -Width 26
 
     if ($script:MonitorHost) {
-        Write-Host ("  {0,-27} {1}" -f "Perfil base:", "CPU, memória, discos, rede, uptime, serviços")
+        Write-Field -Label "Perfil base" -Value "sim (CPU, memória, discos, rede, uptime, serviços)" -Width 26
 
         $selectedFeatures = @($script:DetectedHostFeatures | Where-Object { $script:SelectedHostFeatureKeys -contains $_.Key })
-        $featureText = if ($selectedFeatures.Count -gt 0) { ($selectedFeatures | ForEach-Object { $_.Label }) -join ", " } else { "nenhum adicional" }
-        Write-Host ("  {0,-27} {1}" -f "Recursos detectados:", $featureText)
-        Write-Host ("  {0,-27} {1}" -f "Logs do sistema:", $(if ($script:EnableLogsResolved) { "sim" } else { "não" }))
-        Write-Host ("  {0,-27} {1}" -f "Logs de autenticação:", $(if ($script:EnableSecurityLogsResolved) { "sim" } else { "não" }))
+        $featureText = if ($selectedFeatures.Count -gt 0) { "sim (" + (($selectedFeatures | ForEach-Object { $_.Label }) -join ", ") + ")" } else { "não" }
+        Write-Field -Label "Recursos detectados" -Value $featureText -Width 26
+        Write-Field -Label "Logs do sistema" -Value (& $simNao $script:EnableLogsResolved) -Width 26
+        Write-Field -Label "Logs de autenticação" -Value (& $simNao $script:EnableSecurityLogsResolved) -Width 26
     }
 
     if ($script:Collector) {
-        Write-Host ("  {0,-27} {1}" -f "SNMP:", $(if ($script:EnableSnmpResolved) { "sim ($($script:SnmpTargets.Count))" } else { "não" }))
-        Write-Host ("  {0,-27} {1}" -f "Conectividade:", $(if ($script:EnableBlackboxResolved) { "sim ($($script:BlackboxTargets.Count))" } else { "não" }))
-        Write-Host ("  {0,-27} {1}" -f "Internet (Speedtest):", $(if ($script:EnableInternetResolved) { "sim (a cada $($script:InternetIntervalMinutesResolved) min)" } else { "não" }))
+        Write-Field -Label "SNMP" -Value $(if ($script:EnableSnmpResolved) { "sim ($($script:SnmpTargets.Count))" } else { "não" }) -Width 26
+        Write-Field -Label "Conectividade" -Value $(if ($script:EnableBlackboxResolved) { "sim ($($script:BlackboxTargets.Count))" } else { "não" }) -Width 26
+        Write-Field -Label "Internet (Speedtest)" -Value $(if ($script:EnableInternetResolved) { "sim (a cada $($script:InternetIntervalMinutesResolved) min)" } else { "não" }) -Width 26
     }
 
-    Write-Host ("  {0,-27} {1}" -f "Exporters adicionais:", $script:CustomExporters.Count)
+    Write-Field -Label "Internet (Coleta)" -Value (& $simNao $script:EnableColetaResolved) -Width 26
+    Write-Field -Label "Links de internet" -Value $(if ($script:ColetaLinks.Count -gt 0) { "sim ($($script:ColetaLinks.Count))" } else { "não" }) -Width 26
+    Write-Field -Label "Exporters adicionais" -Value ([string]$script:CustomExporters.Count) -Width 26
+    Write-Host ""
 
     if (-not $Silent) {
         if (-not (Read-YesNo -Prompt "Confirmar instalação/configuração?" -Default $true)) {
@@ -4394,27 +4936,25 @@ function Install-OrUpdateAlloy {
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-        Write-Info "Baixando instalador oficial do Grafana Alloy."
-
-        # $ProgressPreference é forçado para "SilentlyContinue" no topo do
-        # script (evita que outros comandos poluam a tela). Isso também
-        # suprime a barra de progresso nativa do Invoke-WebRequest, fazendo
-        # o download parecer travado sem nenhum feedback visual. Habilitamos
-        # a barra só durante este download e restauramos o valor original
-        # logo em seguida, mesmo se der erro.
-        # São ~130 MB pelo link do cliente. -TimeoutSec é obrigatório porque o
-        # default do PowerShell 5.1 é espera infinita: um proxy que aceita a
-        # conexão e não responde trava o instalador sem mensagem. As tentativas
-        # cobrem queda momentânea de link, que de outra forma descartaria todo
-        # o fluxo interativo já preenchido.
-        $previousProgressPreference = $ProgressPreference
-        $ProgressPreference = "Continue"
+        if (-not [string]::IsNullOrWhiteSpace($AlloyInstaladorArquivo)) {
+            # Entregue pelo atualizador, com o SHA-256 conferido pelo manifesto
+            # assinado. Roda direto da pasta protegida do atualizador, sem
+            # passar por pasta temporária.
+            $installer = $AlloyInstaladorArquivo
+            Write-Info ("Instalador do Alloy {0} entregue pelo atualizador." -f $AlloyVersao)
+        }
+        else {
+        # Download com porcentagem na mesma linha (Invoke-NextecDownload). O
+        # tempo limite é obrigatório: o padrão do .NET é esperar para sempre,
+        # e um proxy que aceita a conexão e não responde travaria o
+        # instalador sem mensagem. As tentativas cobrem queda momentânea de
+        # link, que de outra forma descartaria o fluxo já preenchido.
         try {
             $maxTries = 3
 
             for ($try = 1; $try -le $maxTries; $try++) {
                 try {
-                    Invoke-WebRequest -Uri $LatestInstallerUrl -OutFile $installer -UseBasicParsing -TimeoutSec 600
+                    Invoke-NextecDownload -Url $LatestInstallerUrl -Destino $installer -Descricao "Grafana Alloy" -TimeoutSec 600
                     break
                 }
                 catch {
@@ -4428,7 +4968,7 @@ function Install-OrUpdateAlloy {
             }
         }
         finally {
-            $ProgressPreference = $previousProgressPreference
+        }
         }
 
         if (-not (Test-Path $installer)) {
@@ -4574,7 +5114,7 @@ function Set-AlloyServiceEnvironment {
     $environment.Add(("NEXTEC_RW_USERNAME={0}" -f $script:RwUsername))
     $environment.Add(("NEXTEC_RW_PASSWORD={0}" -f $script:RwPassword))
 
-    if ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved) {
+    if (Test-NextecNeedsLoki) {
         $environment.Add(("NEXTEC_LOKI_USERNAME={0}" -f $script:LokiUsername))
         $environment.Add(("NEXTEC_LOKI_PASSWORD={0}" -f $script:LokiPassword))
     }
@@ -4825,7 +5365,7 @@ function Install-SpeedtestCli {
     $zipPath = Join-Path $SpeedtestDir "speedtest-cli.zip"
 
     try {
-        Invoke-WebRequest -Uri $SpeedtestCliUrl -OutFile $zipPath -UseBasicParsing
+        Invoke-NextecDownload -Url $SpeedtestCliUrl -Destino $zipPath -Descricao "Speedtest CLI" -TimeoutSec 300
     }
     catch {
         throw ("Falha ao baixar o Speedtest CLI em {0}: {1}. Confira se a versão pinada no instalador ({2}) ainda existe em https://www.speedtest.net/apps/cli." -f $SpeedtestCliUrl, $_.Exception.Message, $SpeedtestCliVersion)
@@ -4869,6 +5409,10 @@ $metricsFile  = "__NEXTEC_SPEEDTEST_METRICS_FILE__"
 $tempFile     = "__NEXTEC_SPEEDTEST_METRICS_FILE__.tmp"
 
 $timestamp = [int][double]::Parse((Get-Date -UFormat %s))
+
+# O speedtest.exe escreve UTF-8; sem isto o PowerShell 5.1 lê a saída na
+# página de código do console e quebra os acentos do nome do servidor.
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
 
 try {
     $raw = & $speedtestExe --accept-license --accept-gdpr --format=json --progress=no 2>$null
@@ -4936,8 +5480,35 @@ catch {
 # COM BOM, e o parser do formato texto do Prometheus lê o BOM como parte do
 # primeiro nome de métrica, descartando o arquivo inteiro com
 # "invalid metric name".
-[IO.File]::WriteAllText($tempFile, ($lines -join "`n"), (New-Object Text.UTF8Encoding($false)))
+[IO.File]::WriteAllText($tempFile, (($lines -join "`n") + "`n"), (New-Object Text.UTF8Encoding($false)))
 Move-Item -LiteralPath $tempFile -Destination $metricsFile -Force
+
+# Histórico dos testes no NOC: com a Coleta Complementar instalada, cada teste
+# vira um evento no mesmo arquivo que o Alloy já envia ao Loki.
+$eventsFile = "__NEXTEC_COLETA_EVENTOS__"
+if (Test-Path -LiteralPath (Split-Path -Parent $eventsFile)) {
+    $sucesso = ($lines -contains "nextec_speedtest_up 1")
+    $evento = [ordered]@{
+        ts        = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+        tipo      = "links_evento"
+        categoria = "velocidade"
+        evento    = "teste_velocidade"
+        nivel     = if ($sucesso) { "info" } else { "aviso" }
+    }
+    if ($sucesso) {
+        $evento.download_mbps = [math]::Round($downloadBps / 1e6, 1)
+        $evento.upload_mbps   = [math]::Round($uploadBps / 1e6, 1)
+        $evento.latencia_ms   = [math]::Round($latencyMs, 1)
+        $evento.detalhe       = $serverName
+    }
+    else {
+        $evento.detalhe = "teste falhou"
+    }
+    try {
+        [IO.File]::AppendAllText($eventsFile, (($evento | ConvertTo-Json -Compress) + "`n"), (New-Object Text.UTF8Encoding($false)))
+    }
+    catch { }
+}
 '@
 
     # Valor puro, sem ConvertTo-AlloyEscapedString: aquela função escapa para
@@ -4946,11 +5517,14 @@ Move-Item -LiteralPath $tempFile -Destination $metricsFile -Force
     # há nada para escapar aqui.
     $runnerContent = $runnerContent.Replace("__NEXTEC_SPEEDTEST_EXE__", $SpeedtestExe)
     $runnerContent = $runnerContent.Replace("__NEXTEC_SPEEDTEST_METRICS_FILE__", $SpeedtestMetricsFile)
+    $runnerContent = $runnerContent.Replace("__NEXTEC_COLETA_EVENTOS__", $ColetaEventos)
 
     [IO.File]::WriteAllText(
         $SpeedtestRunnerScript,
         $runnerContent,
-        (New-Object Text.UTF8Encoding($false))
+        # Com BOM: sem ele o PowerShell 5.1 lê o script como ANSI e quebra
+        # os acentos dos textos de ajuda das métricas.
+        (New-Object Text.UTF8Encoding($true))
     )
 }
 
@@ -5061,6 +5635,507 @@ function Install-InternetMonitoring {
     }
     catch {
         Write-Warn ("Primeiro teste de velocidade falhou, mas a tarefa agendada ({0} em {1} min) segue tentando: {2}" -f $SpeedtestTaskName, $script:InternetIntervalMinutesResolved, $_.Exception.Message)
+    }
+}
+
+# ==============================================================================
+# COLETA COMPLEMENTAR NEXTEC (INTERNET E LINKS)
+# ==============================================================================
+#
+# O Alloy coleta o servidor, os logs e as sondas. O que ele não faz sozinho
+# (status consolidado da internet, IP público, link em uso, causa das quedas)
+# fica com a Coleta Complementar: um arquivo único baixado do repositório
+# Scripts, executado por tarefa agendada como SYSTEM. Ela só grava arquivos:
+# métricas em $ColetaTextfileDir e eventos em $ColetaEventos. Quem envia ao
+# NOC é o próprio Alloy, com a mesma credencial e os mesmos rótulos.
+#
+# O coleta-complementar.ini é a fonte da verdade dos links: a reconfiguração
+# lê dali, e ajustes feitos à mão em [geral] e [internet] são preservados.
+
+function Test-NextecNeedsLoki {
+    return ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved -or $script:EnableColetaResolved)
+}
+
+function Read-ColetaIniFile {
+    param([Parameter(Mandatory=$true)][string]$Caminho)
+
+    $secoes = [ordered]@{}
+    if (-not (Test-Path -LiteralPath $Caminho -PathType Leaf)) { return $secoes }
+
+    $atual = $null
+    foreach ($linhaBruta in [IO.File]::ReadAllLines($Caminho, (New-Object Text.UTF8Encoding($false)))) {
+        $linha = ($linhaBruta -replace '\s[;#].*$', '').Trim()
+        if ($linha -eq "" -or $linha.StartsWith(";") -or $linha.StartsWith("#")) { continue }
+        if ($linha -match '^\[(.+)\]$') {
+            $atual = $Matches[1].Trim()
+            $secoes[$atual] = [ordered]@{}
+            continue
+        }
+        if ($null -ne $atual -and $linha -match '^([^=]+)=(.*)$') {
+            $secoes[$atual][$Matches[1].Trim()] = $Matches[2].Trim()
+        }
+    }
+    return $secoes
+}
+
+function Get-ColetaLinksFromIni {
+    $ini = Read-ColetaIniFile -Caminho $ColetaConfig
+    $links = New-Object System.Collections.Generic.List[object]
+    foreach ($nomeSecao in $ini.Keys) {
+        if ($nomeSecao -notmatch '^link:(.+)$') { continue }
+        $secao = $ini[$nomeSecao]
+        $valor = { param($chave, $padrao) if ($secao.Contains($chave)) { [string]$secao[$chave] } else { $padrao } }
+        $links.Add([pscustomobject]@{
+            nome               = $Matches[1].Trim()
+            papel              = & $valor "papel" "primario"
+            operadora          = & $valor "operadora" ""
+            tipo               = & $valor "tipo" ""
+            suporte            = & $valor "suporte" ""
+            ip_publico         = & $valor "ip_publico" ""
+            gateway            = & $valor "gateway" ""
+            alvos              = & $valor "alvos" ""
+            origem             = & $valor "origem" ""
+            firewall           = & $valor "firewall" ""
+            interface_firewall = & $valor "interface_firewall" ""
+            velocidade_mbps    = & $valor "velocidade_mbps" ""
+            velocidade_upload_mbps = & $valor "velocidade_upload_mbps" ""
+        })
+    }
+    return $links.ToArray()
+}
+
+function Import-ColetaLinks {
+    $script:ColetaLinks = @(Get-ColetaLinksFromIni)
+}
+
+function ConvertTo-ColetaIniValue {
+    param([string]$Valor)
+    # Colchetes e quebras de linha quebrariam o arquivo INI.
+    if ($null -eq $Valor) { return "" }
+    return ($Valor -replace "[\r\n]+", " " -replace "\[", "(" -replace "\]", ")").Trim()
+}
+
+$script:PapeisLink = [ordered]@{ primario = "principal"; failover = "reserva"; sdwan = "SD-WAN" }
+$script:TiposLink = [ordered]@{ fibra = "Fibra"; radio = "Rádio"; "4g" = "4G/5G"; satelite = "Satélite"; dedicado = "Dedicado" }
+$script:TiposLinkNome = @{ fibra = "Fibra"; radio = "Rádio"; "4g" = "4G"; satelite = "Satélite"; dedicado = "Dedicado" }
+# Três destinos por link, de provedores diferentes (uma queda de provedor não
+# derruba a medição). Com mais de um link, cada conjunto precisa de uma rota
+# própria no firewall, por isso os conjuntos não se repetem.
+$script:DestinosLink = @(
+    "8.8.8.8, 1.1.1.1, 9.9.9.9",
+    "8.8.4.4, 1.0.0.1, 149.112.112.112",
+    "208.67.222.222, 208.67.220.220, 94.140.14.14",
+    "94.140.15.15, 76.76.2.0, 76.76.10.0"
+)
+
+function ConvertTo-NextecMbps {
+    # "500", "500m", "1g", "1.5giga" em Mbps (inteiro); $null se inválido.
+    param([string]$Texto)
+    $m = [Regex]::Match($Texto, '^(\d+(?:\.\d+)?)(g|gb|gbps|giga|gigas|m|mb|mbps|mega|megas)?$')
+    if (-not $m.Success) { return $null }
+    $valor = [double]::Parse($m.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture)
+    if ($m.Groups[2].Value.StartsWith("g")) { $valor = $valor * 1000 }
+    $inteiro = [int][Math]::Round($valor)
+    if ($inteiro -lt 1 -or $inteiro -gt 100000) { return $null }
+    return $inteiro
+}
+
+function ConvertTo-NextecVelocidade {
+    <#
+        Padroniza a velocidade contratada digitada pelo técnico: "500",
+        "500 Mega", "1 Giga", "1,5G", "600/300" viram download e upload em
+        Mbps. Devolve $null quando não entende.
+    #>
+    param([string]$Texto)
+    $v = ($Texto.ToLowerInvariant() -replace '\s', '') -replace ',', '.'
+    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+    $partes = $v.Split('/')
+    if ($partes.Count -gt 2) { return $null }
+    $down = ConvertTo-NextecMbps $partes[0]
+    if ($null -eq $down) { return $null }
+    $up = ""
+    if ($partes.Count -eq 2 -and $partes[1] -ne "") {
+        $upNum = ConvertTo-NextecMbps $partes[1]
+        if ($null -eq $upNum) { return $null }
+        $up = [string]$upNum
+    }
+    return [pscustomobject]@{ Download = [string]$down; Upload = $up }
+}
+
+function Get-NextecVelocidadeTexto {
+    param([string]$Download, [string]$Upload)
+    if ([string]::IsNullOrWhiteSpace($Download)) { return "não informada" }
+    if ($Upload) { return ("{0}/{1} Mbps" -f $Download, $Upload) }
+    return ("{0} Mbps" -f $Download)
+}
+
+function Get-NextecIpPublico {
+    # IP público de saída agora (o do link em uso). Vazio se não conseguir.
+    foreach ($url in @("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com")) {
+        try {
+            $pedido = [Net.HttpWebRequest]::Create($url)
+            $pedido.Timeout = 5000
+            $pedido.UserAgent = "nextec-instalador/" + $InstallerVersion
+            $resposta = $pedido.GetResponse()
+            try {
+                $leitor = New-Object IO.StreamReader($resposta.GetResponseStream())
+                $ip = $leitor.ReadToEnd().Trim()
+            }
+            finally {
+                $resposta.Close()
+            }
+            $endereco = $null
+            if ([Net.IPAddress]::TryParse($ip, [ref]$endereco)) { return $ip }
+        }
+        catch {
+        }
+    }
+    return ""
+}
+
+function Get-NomeLinkUnico {
+    param([string]$Base)
+    $nome = $Base
+    $n = 2
+    while (@($script:ColetaLinks | Where-Object { $_.nome -eq $nome }).Count -gt 0) {
+        $nome = "{0} {1}" -f $Base, $n
+        $n++
+    }
+    return $nome
+}
+
+function Read-ColetaLinkDefinition {
+    <#
+        Um link por vez: operadora, tipo e velocidade contratada; função só
+        com mais de um link. O nome sai da operadora e do tipo. Destinos de
+        teste vêm prontos (três por link) e só são digitados se o técnico
+        quiser trocar. Com mais de um link, confirma o IP público detectado
+        para o principal (os demais a Coleta aprende quando ficam sozinhos no
+        ar). Gateway, IP de origem e firewall ficam em opções avançadas.
+    #>
+    param(
+        [int]$Numero = 1,
+        [int]$Total = 1
+    )
+
+    $variosLinks = ($Total -gt 1) -or ($script:ColetaLinks.Count -gt 0)
+    if ($Total -gt 1) {
+        Write-Section ("Link {0} de {1}" -f $Numero, $Total)
+    }
+    else {
+        Write-Section "Link de internet"
+    }
+
+    $operadora = ConvertTo-ColetaIniValue (Read-Required -Prompt "Operadora")
+    $tipos = @($script:TiposLink.Keys)
+    $tipo = $tipos[(Read-Choice -Prompt "Tipo de conexão" -Options @($script:TiposLink.Values) -Default 1) - 1]
+
+    $velocidade = [pscustomobject]@{ Download = ""; Upload = "" }
+    while ($true) {
+        $texto = Read-NextecInput -Prompt "Velocidade contratada" -Hint "ex.: 500, 1 Giga, 600/300; ENTER se não souber"
+        if ([string]::IsNullOrWhiteSpace($texto)) { break }
+        $lida = ConvertTo-NextecVelocidade $texto
+        if ($null -ne $lida) {
+            $velocidade = $lida
+            Write-Info ("Registrada como {0}." -f (Get-NextecVelocidadeTexto $velocidade.Download $velocidade.Upload))
+            break
+        }
+        Write-Warn ("Velocidade inválida: {0}. Use Mega ou Giga, ex.: 500, 500 Mega, 1 Giga ou 600/300." -f $texto)
+    }
+
+    $temPrincipal = @($script:ColetaLinks | Where-Object { $_.papel -eq "primario" }).Count -gt 0
+    if (-not $variosLinks) {
+        $papel = "primario"
+    }
+    else {
+        $papeis = @($script:PapeisLink.Keys)
+        $padraoPapel = if ($temPrincipal) { 2 } else { 1 }
+        $papel = $papeis[(Read-Choice -Prompt "Função deste link" -Options @("principal", "reserva (entra quando o principal cai)", "SD-WAN (os dois em uso ao mesmo tempo)") -Default $padraoPapel) - 1]
+    }
+
+    $padraoDestino = ""
+    if ($script:ColetaLinks.Count -lt $script:DestinosLink.Count) {
+        $padraoDestino = $script:DestinosLink[$script:ColetaLinks.Count]
+    }
+    if ($variosLinks) {
+        Write-Hint "Com mais de um link, o firewall precisa mandar os destinos de teste deste"
+        Write-Hint "link só por ele (uma rota por link)."
+    }
+    if ($padraoDestino -and (Read-YesNo -Prompt ("Destinos de teste: {0}. Usar estes?" -f $padraoDestino) -Default $true)) {
+        $alvos = $padraoDestino
+    }
+    else {
+        $alvos = Read-NextecAddress -Prompt "Destinos de teste deste link, separados por vírgula" -Kind host -List
+    }
+
+    $ipPublico = ""
+    if ($variosLinks -and $papel -eq "primario") {
+        $detectado = Get-NextecIpPublico
+        if ($detectado -and (Read-YesNo -Prompt ("O IP público atual ({0}) é deste link?" -f $detectado) -Default $true)) {
+            $ipPublico = $detectado
+        }
+    }
+
+    $gateway = ""; $origem = ""; $firewall = ""; $interface = ""
+    if (Read-YesNo -Prompt "Opções avançadas (gateway da operadora, IP de origem, firewall)?" -Default $false) {
+        Write-Hint "Gateway: separa queda da operadora de problema no firewall."
+        $gateway = Read-NextecAddress -Prompt "IP do gateway da operadora" -Kind host -Optional
+        while ($true) {
+            $origem = Read-NextecAddress -Prompt "IP deste servidor que sai só por este link" -Kind ip -Optional
+            if (-not $origem -or (Get-NetIPAddress -IPAddress $origem -ErrorAction SilentlyContinue)) { break }
+            Write-Warn ("O IP {0} não existe neste servidor. Informe um IP local ou deixe vazio." -f $origem)
+        }
+        $firewallRaw = Read-NextecInput -Prompt "Nome do firewall no NOC, para cruzar com o tráfego SNMP" -Hint "opcional"
+        if (-not [string]::IsNullOrWhiteSpace($firewallRaw)) { $firewall = ConvertTo-Slug $firewallRaw }
+        if ($firewall) {
+            $interface = Read-NextecPattern -Prompt "Interface WAN do link no firewall" -Pattern '^[A-Za-z0-9._:/-]+$' -Hint "o nome como aparece no firewall, ex.: igb1, ether1, wan1"
+        }
+    }
+
+    $nome = Get-NomeLinkUnico -Base (ConvertTo-ColetaIniValue ("{0} {1}" -f $operadora, $script:TiposLinkNome[$tipo]))
+    return [pscustomobject]@{
+        nome = $nome; papel = $papel; operadora = $operadora; tipo = $tipo; suporte = ""
+        ip_publico = $ipPublico; gateway = $gateway; alvos = $alvos; origem = $origem
+        firewall = $firewall; interface_firewall = $interface
+        velocidade_mbps = $velocidade.Download; velocidade_upload_mbps = $velocidade.Upload
+    }
+}
+
+function Show-ColetaLinks {
+    if ($script:ColetaLinks.Count -eq 0) {
+        Write-Hint "Nenhum link cadastrado."
+        return
+    }
+    Write-Host ("    {0,-20} {1,-10} {2,-14} {3,-16} {4}" -f "LINK", "FUNÇÃO", "VELOCIDADE", "IP PÚBLICO", "DESTINOS DE TESTE") -ForegroundColor Gray
+    foreach ($link in $script:ColetaLinks) {
+        $funcao = if ($script:PapeisLink.Contains([string]$link.papel)) { $script:PapeisLink[[string]$link.papel] } else { $link.papel }
+        $ip = if ($link.ip_publico) { $link.ip_publico } else { "automático" }
+        $vel = if ($link.velocidade_mbps) { Get-NextecVelocidadeTexto $link.velocidade_mbps $link.velocidade_upload_mbps } else { "-" }
+        Write-Host ("    {0,-20} " -f $link.nome) -ForegroundColor White -NoNewline
+        Write-Host ("{0,-10} {1,-14} {2,-16} {3}" -f $funcao, $vel, $ip, $link.alvos)
+    }
+}
+
+function Invoke-ColetaLinksPrompt {
+    # Sem links cadastrados: "Quantos links?" (padrão 1). Com links: mostra e
+    # pergunta se quer alterar.
+    if ($script:ColetaLinks.Count -eq 0) {
+        Edit-ColetaLinks
+    }
+    else {
+        Write-Host ""
+        Show-ColetaLinks
+        if (Read-YesNo -Prompt ("Alterar os {0} link(s) de internet cadastrado(s)?" -f $script:ColetaLinks.Count) -Default $false) {
+            Edit-ColetaLinks
+        }
+    }
+    $script:EnableLinksResolved = ($script:ColetaLinks.Count -gt 0)
+}
+
+function Edit-ColetaLinks {
+    Write-Step "Links de internet"
+
+    if ($script:ColetaLinks.Count -eq 0) {
+        $total = 0
+        while ($total -lt 1 -or $total -gt 6) {
+            $texto = Read-Required -Prompt "Quantos links de internet este local tem?" -Default "1"
+            if (-not [int]::TryParse($texto, [ref]$total) -or $total -lt 1 -or $total -gt 6) {
+                Write-Warn "Informe um número de 1 a 6."
+                $total = 0
+            }
+        }
+        for ($n = 1; $n -le $total; $n++) {
+            $novo = Read-ColetaLinkDefinition -Numero $n -Total $total
+            $script:ColetaLinks = @($script:ColetaLinks) + $novo
+            Write-Ok ("Link {0} cadastrado ({1}, {2})." -f $novo.nome, $script:PapeisLink[$novo.papel], (Get-NextecVelocidadeTexto $novo.velocidade_mbps $novo.velocidade_upload_mbps))
+        }
+    }
+
+    while ($true) {
+        Write-Host ""
+        Show-ColetaLinks
+        Write-Host ""
+        $escolha = Read-Choice -Prompt "Links" -Options @("Adicionar link", "Remover link", "Concluir") -Default 3
+
+        switch ($escolha) {
+            1 {
+                $novo = Read-ColetaLinkDefinition
+                $script:ColetaLinks = @($script:ColetaLinks) + $novo
+                Write-Ok ("Link {0} cadastrado ({1}, {2})." -f $novo.nome, $script:PapeisLink[$novo.papel], (Get-NextecVelocidadeTexto $novo.velocidade_mbps $novo.velocidade_upload_mbps))
+            }
+            2 {
+                if ($script:ColetaLinks.Count -eq 0) { continue }
+                $indice = Read-Choice -Prompt "Qual link remover?" -Options @($script:ColetaLinks | ForEach-Object { $_.nome }) -Default 1
+                $removido = $script:ColetaLinks[$indice - 1].nome
+                $script:ColetaLinks = @($script:ColetaLinks | Where-Object { $_.nome -ne $removido })
+                Write-Ok ("Link {0} removido." -f $removido)
+            }
+            3 {
+                $script:EnableLinksResolved = ($script:ColetaLinks.Count -gt 0)
+                return
+            }
+        }
+    }
+}
+
+function Write-ColetaConfig {
+    <#
+        Regrava o coleta-complementar.ini. [geral] e [internet] mantêm o que já
+        estava no arquivo (inclusive ajustes feitos à mão); os links vêm de
+        $script:ColetaLinks.
+    #>
+    $existente = Read-ColetaIniFile -Caminho $ColetaConfig
+    $geral = [ordered]@{ intervalo_links_segundos = "15"; limite_latencia_ms = "150"; limite_perda_percentual = "5" }
+    $internet = [ordered]@{ alvos = "1.1.1.1, 8.8.8.8"; firewall = ""; dns_servidores = "sistema, 1.1.1.1, 8.8.8.8"; dns_nome = "google.com" }
+    # Acessos (logins RDP e console com origem): ligado por padrão, inclusive
+    # em instalação antiga que receber esta versão pelo atualizador.
+    $acessos = [ordered]@{ ativo = "sim"; horario = "seg-sex 07:00-19:00; sab 07:00-14:00"; origens_conhecidas = "" }
+    foreach ($par in @(@("geral", $geral), @("internet", $internet), @("acessos", $acessos))) {
+        if ($existente.Contains($par[0])) {
+            foreach ($chave in $existente[$par[0]].Keys) { $par[1][$chave] = $existente[$par[0]][$chave] }
+        }
+    }
+
+    $linhas = New-Object System.Collections.Generic.List[string]
+    $linhas.Add("; Coleta Complementar Nextec")
+    $linhas.Add(("; Gerado pelo instalador {0} em {1}." -f $InstallerVersion, (Get-Date -Format "dd/MM/yyyy HH:mm")))
+    $linhas.Add("; Depois de alterar: Restart-ScheduledTask -TaskName $ColetaTaskName (ou reiniciar o servidor).")
+    $linhas.Add("; Manual completo: Confluence NXTDOC, ""Coleta Complementar Nextec"".")
+    $linhas.Add("")
+    $linhas.Add("[geral]")
+    foreach ($chave in $geral.Keys) { $linhas.Add(("{0} = {1}" -f $chave, $geral[$chave])) }
+    $linhas.Add("")
+    $linhas.Add("[internet]")
+    foreach ($chave in $internet.Keys) { $linhas.Add(("{0} = {1}" -f $chave, $internet[$chave])) }
+    $linhas.Add("")
+    $linhas.Add("; Logins RDP e de console com IP de origem, para os alertas de acesso")
+    $linhas.Add("; privilegiado. horario: comercial, em Brasília. origens_conhecidas: redes")
+    $linhas.Add("; da Nextec ou VPN que não contam como origem nova (ex.: 203.0.113.0/24).")
+    $linhas.Add("[acessos]")
+    foreach ($chave in $acessos.Keys) { $linhas.Add(("{0} = {1}" -f $chave, $acessos[$chave])) }
+
+    foreach ($link in $script:ColetaLinks) {
+        $linhas.Add("")
+        $linhas.Add(("[link:{0}]" -f $link.nome))
+        foreach ($chave in @("papel", "operadora", "tipo", "suporte", "ip_publico", "gateway", "alvos", "origem", "firewall", "interface_firewall", "velocidade_mbps", "velocidade_upload_mbps")) {
+            $valorLink = if ($link.PSObject.Properties[$chave]) { $link.$chave } else { "" }
+            $linhas.Add(("{0} = {1}" -f $chave, $valorLink))
+        }
+        $linhas.Add("teste_velocidade = nao")
+    }
+
+    if (Test-Path -LiteralPath $ColetaConfig) {
+        Copy-Item -LiteralPath $ColetaConfig -Destination ("{0}.{1}.bak" -f $ColetaConfig, (Get-Date -Format "yyyyMMdd-HHmmss")) -Force
+    }
+    [IO.File]::WriteAllText($ColetaConfig, (($linhas -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($false)))
+}
+
+function Register-ColetaScheduledTask {
+    <#
+        A Coleta roda em laço contínuo. A tarefa sobe na inicialização e tem um
+        segundo gatilho a cada 5 minutos com "ignorar nova instância": se o
+        processo cair por qualquer motivo, volta em no máximo 5 minutos, sem
+        nunca rodar duas cópias ao mesmo tempo.
+    #>
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Acao executar' -f $ColetaScript)
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
+        -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+
+    $gatilhos = @(
+        (New-ScheduledTaskTrigger -AtStartup),
+        (New-SpeedtestTrigger -Inicio ((Get-Date).AddMinutes(1)) -Intervalo (New-TimeSpan -Minutes 5))
+    )
+
+    Register-ScheduledTask -TaskName $ColetaTaskName -Action $action -Trigger $gatilhos `
+        -Principal $principal -Settings $settings -Force | Out-Null
+}
+
+function Stop-ColetaComplementar {
+    if (Get-ScheduledTask -TaskName $ColetaTaskName -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask -TaskName $ColetaTaskName -ErrorAction SilentlyContinue
+    }
+    # Stop-ScheduledTask nem sempre encerra o powershell.exe filho.
+    Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like ('*{0}*' -f $ColetaScript) } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+}
+
+function Install-ColetaComplementar {
+    if (-not $script:EnableColetaResolved) {
+        # Desligando numa reconfiguração: para e remove a tarefa, mas mantém o
+        # .ini (links cadastrados) para uma eventual religação.
+        if (Get-ScheduledTask -TaskName $ColetaTaskName -ErrorAction SilentlyContinue) {
+            Stop-ColetaComplementar
+            Unregister-ScheduledTask -TaskName $ColetaTaskName -Confirm:$false
+            Get-ChildItem -LiteralPath $ColetaTextfileDir -Filter "*.prom" -ErrorAction SilentlyContinue | Remove-Item -Force
+            Write-Info "Coleta Complementar desligada."
+        }
+        return
+    }
+
+    Write-Step "Coleta Complementar (internet e links)"
+
+    # Roda como SYSTEM: pasta protegida antes de gravar o script.
+    Protect-NextecDirectory -Path $ColetaDir -LeituraUsuarios
+    if (-not (Test-Path -LiteralPath $ColetaTextfileDir)) { New-Item -ItemType Directory -Path $ColetaTextfileDir -Force | Out-Null }
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $temporario = Join-Path $env:TEMP ("coleta-complementar-{0}.ps1" -f [guid]::NewGuid().ToString("N"))
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($ColetaArquivo)) {
+            # Entregue pelo atualizador, já conferido pela assinatura do manifesto.
+            Copy-Item -LiteralPath $ColetaArquivo -Destination $temporario -Force
+        }
+        else {
+            Invoke-NextecDownload -Url $ColetaUrl -Destino $temporario -Descricao "Coleta Complementar" -TimeoutSec 120
+        }
+        $erros = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile($temporario, [ref]$null, [ref]$erros)
+        if ($erros -and $erros.Count -gt 0) {
+            throw ("Arquivo baixado da Coleta Complementar tem erro de sintaxe: {0}" -f $erros[0].Message)
+        }
+        Stop-ColetaComplementar
+        Copy-Item -LiteralPath $temporario -Destination $ColetaScript -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $temporario -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-ColetaConfig
+    Register-ColetaScheduledTask
+    Start-ScheduledTask -TaskName $ColetaTaskName
+
+    $versao = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ColetaScript -Acao versao
+    Write-Ok ("Coleta Complementar {0} instalada; {1} link(s) cadastrado(s)." -f ($versao | Select-Object -Last 1), $script:ColetaLinks.Count)
+
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ColetaScript -Acao verificar | ForEach-Object { Write-Info $_ }
+}
+
+function Edit-ColetaSettings {
+    Write-Step "Internet e links (Coleta Complementar)"
+
+    if ($script:EnableColetaResolved) {
+        Write-Info ("Ligada. Configuração em {0}." -f $ColetaConfig)
+    }
+    else {
+        Write-Info "Desligada."
+    }
+
+    $script:EnableColetaResolved = Read-YesNo -Prompt "Monitorar a internet deste local (status, DNS, IP público, diagnóstico)?" -Default $true
+    if (-not $script:EnableColetaResolved) {
+        $script:EnableLinksResolved = $false
+        return
+    }
+
+    if ($script:ColetaLinks.Count -eq 0) { Import-ColetaLinks }
+    Invoke-ColetaLinksPrompt
+
+    if ((Test-NextecNeedsLoki) -and [string]::IsNullOrWhiteSpace($script:LokiUsername)) {
+        Write-Info "Os eventos da Coleta Complementar vão para o Loki; este host ainda não tem credencial."
+        Read-NocCredentials
     }
 }
 
@@ -5393,8 +6468,56 @@ function New-AlloyConfiguration {
         [void]$builder.AppendLine("")
     }
 
-    if ($script:MonitorHost -and ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved)) {
-        [void]$builder.AppendLine("// Logs Windows")
+    # Sempre presente: além da Coleta Complementar, o atualizador automático
+    # grava as métricas dele (versão, onda, resultado) na mesma pasta. Com a
+    # Coleta desligada o bloco leva outro nome, porque a leitura da
+    # configuração atual usa "coleta_complementar" para saber se ela está ligada.
+    $nomeTextfile = if ($script:EnableColetaResolved) { "coleta_complementar" } else { "atualizador" }
+    if ($true) {
+        # Exporter próprio só com o textfile da Coleta Complementar. Separado
+        # do "system" para valer em qualquer modo e para poder usar
+        # honor_labels: as métricas trazem rótulos próprios (tipo do link,
+        # tipo de espaço) que não podem ser sobrescritos pelos rótulos do host.
+        [void]$builder.AppendLine("// Coleta Complementar Nextec: internet e links")
+        [void]$builder.AppendLine(('prometheus.exporter.windows "{0}" {{' -f $nomeTextfile))
+        [void]$builder.AppendLine('  enabled_collectors = ["textfile"]')
+        [void]$builder.AppendLine("")
+        [void]$builder.AppendLine("  textfile {")
+        [void]$builder.AppendLine(('    text_file_directory = "{0}"' -f (ConvertTo-AlloyEscapedString $ColetaTextfileDir)))
+        [void]$builder.AppendLine("  }")
+        [void]$builder.AppendLine("}")
+        [void]$builder.AppendLine("")
+        [void]$builder.AppendLine(('discovery.relabel "{0}_labels" {{' -f $nomeTextfile))
+        [void]$builder.AppendLine(("  targets = prometheus.exporter.windows.{0}.targets" -f $nomeTextfile))
+        [void]$builder.AppendLine("")
+        Add-AlloyRelabelRule -Builder $builder -Target "instance" -Replacement $script:HostLabel
+        Add-AlloyRelabelRule -Builder $builder -Target "host" -Replacement $script:HostLabel
+        Add-AlloyRelabelRule -Builder $builder -Target "cliente" -Replacement $script:Cliente
+        # O alvo do exporter já traz job=integrations/windows, que prevalece
+        # sobre job_name do scrape: o job da Coleta é fixado aqui.
+        Add-AlloyRelabelRule -Builder $builder -Target "job" -Replacement "integrations/coleta_complementar"
+        Add-AlloyRelabelRule -Builder $builder -Target "servico" -Replacement "coleta_complementar"
+        Add-AlloyRelabelRule -Builder $builder -Target "tipo" -Replacement $script:TipoLabel
+        Add-AlloyRelabelRule -Builder $builder -Target "ambiente" -Replacement $script:Ambiente
+        Add-AlloyRelabelRule -Builder $builder -Target "os" -Replacement "windows"
+        Add-AlloyRelabelRule -Builder $builder -Target "origem" -Replacement "alloy"
+        Add-AlloyRelabelRule -Builder $builder -Target "criticidade" -Replacement $script:Criticidade
+        Add-AlloyRelabelRule -Builder $builder -Target "local" -Replacement $script:Local
+        [void]$builder.AppendLine("}")
+        [void]$builder.AppendLine("")
+        [void]$builder.AppendLine(('prometheus.scrape "{0}" {{' -f $nomeTextfile))
+        [void]$builder.AppendLine(("  targets         = discovery.relabel.{0}_labels.output" -f $nomeTextfile))
+        [void]$builder.AppendLine("  forward_to      = [prometheus.relabel.filtro_nextec.receiver]")
+        [void]$builder.AppendLine('  job_name        = "integrations/coleta_complementar"')
+        [void]$builder.AppendLine("  honor_labels    = true")
+        [void]$builder.AppendLine('  scrape_interval = "15s"')
+        [void]$builder.AppendLine('  scrape_timeout  = "10s"')
+        [void]$builder.AppendLine("}")
+        [void]$builder.AppendLine("")
+    }
+
+    if (($script:MonitorHost -and ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved)) -or $script:EnableColetaResolved) {
+        [void]$builder.AppendLine("// Logs Windows e eventos da Coleta Complementar")
         [void]$builder.AppendLine('loki.write "nextec" {')
         [void]$builder.AppendLine("  endpoint {")
         [void]$builder.AppendLine(('    url = "{0}"' -f (ConvertTo-AlloyEscapedString $script:LokiUrl)))
@@ -5513,6 +6636,44 @@ function New-AlloyConfiguration {
             [void]$builder.AppendLine("}")
             [void]$builder.AppendLine("")
         }
+    }
+
+    if ($script:EnableColetaResolved) {
+        # Um JSON por linha. tipo, categoria e link viram rótulos porque os
+        # painéis filtram por eles; o restante fica no corpo (| json).
+        [void]$builder.AppendLine('loki.source.file "coleta_complementar" {')
+        [void]$builder.AppendLine("  targets = [{")
+        [void]$builder.AppendLine(('    "__path__"  = "{0}",' -f (ConvertTo-AlloyEscapedString $ColetaEventos)))
+        [void]$builder.AppendLine(('    cliente     = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Cliente)))
+        [void]$builder.AppendLine(('    host        = "{0}",' -f (ConvertTo-AlloyEscapedString $script:HostLabel)))
+        [void]$builder.AppendLine('    servico     = "coleta_complementar",')
+        [void]$builder.AppendLine(('    ambiente    = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Ambiente)))
+        [void]$builder.AppendLine('    os          = "windows",')
+        [void]$builder.AppendLine('    origem      = "alloy",')
+        [void]$builder.AppendLine(('    criticidade = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Criticidade)))
+        [void]$builder.AppendLine(('    local       = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Local)))
+        [void]$builder.AppendLine("  }]")
+        [void]$builder.AppendLine("  forward_to    = [loki.process.coleta_complementar.receiver]")
+        [void]$builder.AppendLine("  tail_from_end = true")
+        [void]$builder.AppendLine("}")
+        [void]$builder.AppendLine("")
+        [void]$builder.AppendLine('loki.process "coleta_complementar" {')
+        [void]$builder.AppendLine("  forward_to = [loki.write.nextec.receiver]")
+        [void]$builder.AppendLine("")
+        [void]$builder.AppendLine("  stage.json {")
+        [void]$builder.AppendLine('    expressions = { tipo = "", categoria = "", link = "", ts = "" }')
+        [void]$builder.AppendLine("  }")
+        [void]$builder.AppendLine("")
+        [void]$builder.AppendLine("  stage.labels {")
+        [void]$builder.AppendLine('    values = { tipo = "", categoria = "", link = "" }')
+        [void]$builder.AppendLine("  }")
+        [void]$builder.AppendLine("")
+        [void]$builder.AppendLine("  stage.timestamp {")
+        [void]$builder.AppendLine('    source = "ts"')
+        [void]$builder.AppendLine('    format = "RFC3339"')
+        [void]$builder.AppendLine("  }")
+        [void]$builder.AppendLine("}")
+        [void]$builder.AppendLine("")
     }
 
     if ($script:EnableBlackboxResolved) {
@@ -5763,7 +6924,7 @@ function Format-AndValidateAlloyConfiguration {
             [Environment]::SetEnvironmentVariable("NEXTEC_RW_PASSWORD", $script:RwPassword, "Process")
         }
 
-        if ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved) {
+        if (Test-NextecNeedsLoki) {
             if (-not [string]::IsNullOrEmpty($script:LokiUsername)) {
                 [Environment]::SetEnvironmentVariable("NEXTEC_LOKI_USERNAME", $script:LokiUsername, "Process")
                 [Environment]::SetEnvironmentVariable("NEXTEC_LOKI_PASSWORD", $script:LokiPassword, "Process")
@@ -5969,6 +7130,10 @@ function Restore-Configuration {
         # A tarefa agendada é criada antes da validação do config.alloy. Se a
         # instalação foi revertida, deixá-la ativa produz um teste de
         # velocidade a cada 30 minutos num host que não coleta o resultado.
+        if ($script:EnableColetaResolved -and -not $restored) {
+            Unregister-ScheduledTask -TaskName $ColetaTaskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+
         if ($script:EnableInternetResolved -and -not $restored) {
             try {
                 Unregister-ScheduledTask -TaskName $SpeedtestTaskName -Confirm:$false -ErrorAction SilentlyContinue
@@ -6032,79 +7197,299 @@ function Show-FinalSummary {
     # coisa que só aparece semanas depois, quando alguém sente falta do dado.
     $comPendencia = ($script:EtapasComFalha.Count -gt 0)
     $cor = if ($comPendencia) { [ConsoleColor]::Yellow } else { [ConsoleColor]::Green }
-    $titulo = if ($comPendencia) { "        INSTALAÇÃO CONCLUÍDA COM PENDÊNCIAS" } else { "                 INSTALAÇÃO CONCLUÍDA" }
+
+    $simbolo = if ($comPendencia) { "!" } else { $script:SimboloOk }
+    $titulo = if ($comPendencia) { "INSTALAÇÃO CONCLUÍDA COM PENDÊNCIAS" } else { "INSTALAÇÃO CONCLUÍDA" }
+    $titulo = "{0}  {1}" -f $simbolo, $titulo
+    $largura = 54
+    $esquerda = [int][Math]::Floor(($largura - $titulo.Length) / 2)
+    $direita = $largura - $titulo.Length - $esquerda
+    $h = [string][char]0x2550
 
     Write-Host ""
-    Write-Host "============================================================" -ForegroundColor $cor
-    Write-Host $titulo -ForegroundColor $cor
-    Write-Host "============================================================" -ForegroundColor $cor
-    Write-Host ("Cliente:        {0}" -f $script:Cliente)
-    Write-Host ("Host:           {0}" -f $script:HostLabel)
-    Write-Host ("Sistema:        {0}" -f $Inventory.Caption)
-    Write-Host ("Tipo:           {0}" -f $Inventory.Generation)
-    Write-Host ("Modo:           {0}" -f $script:ResolvedMode)
+    Write-Host ("  {0}{1}{2}" -f [char]0x2554, ($h * $largura), [char]0x2557) -ForegroundColor $cor
+    Write-Host ("  {0}{1}{2}{3}{4}" -f [char]0x2551, (" " * $esquerda), $titulo, (" " * $direita), [char]0x2551) -ForegroundColor $cor
+    Write-Host ("  {0}{1}{2}" -f [char]0x255A, ($h * $largura), [char]0x255D) -ForegroundColor $cor
+
     # Estado real do serviço. O resumo é o que o técnico usa para encerrar o
     # atendimento, então não pode afirmar nada que não tenha sido verificado.
     $alloyService = Get-AlloyService
-    $alloyStatus = if ($null -ne $alloyService) { [string]$alloyService.Status } else { "não encontrado" }
-    Write-Host ("Alloy:          {0}" -f $alloyStatus)
-    Write-Host ("Configuração:   {0}" -f $ConfigFile)
-    Write-Host ("Métricas:       {0}" -f $script:RemoteWriteUrl)
+    $alloyStatus = Get-NextecEstadoServico -Servico $alloyService
+    $corAlloy = if ($alloyStatus -eq "ativo") { [ConsoleColor]::Green } else { [ConsoleColor]::Red }
 
-    if ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved) {
-        Write-Host ("Logs:           {0}" -f $script:LokiUrl)
+    Write-Section "Identificação"
+    Write-Field -Label "Cliente" -Value $script:Cliente -ValueColor White -Width 20
+    Write-Field -Label "Host" -Value $script:HostLabel -ValueColor White -Width 20
+    Write-Field -Label "Sistema" -Value $Inventory.Caption -Width 20
+    Write-Field -Label "Modo" -Value $script:ResolvedMode -Width 20
+    Write-Field -Label "Alloy" -Value $alloyStatus -ValueColor $corAlloy -Width 20
+
+    Write-Section "Envio para o NOC"
+    Write-Field -Label "Métricas" -Value $script:RemoteWriteUrl -Width 20
+    if (Test-NextecNeedsLoki) {
+        Write-Field -Label "Logs e eventos" -Value $script:LokiUrl -Width 20
     }
 
+    Write-Section "Coletas ligadas"
     if ($script:MonitorHost) {
+        Write-Field -Label "Servidor" -Value "CPU, memória, discos, rede, serviços" -ValueColor Green -Width 20
         $selectedFeatures = @($script:DetectedHostFeatures | Where-Object { $script:SelectedHostFeatureKeys -contains $_.Key })
         if ($selectedFeatures.Count -gt 0) {
-            Write-Host ("Recursos:       {0}" -f (($selectedFeatures | ForEach-Object { $_.Label }) -join ", "))
+            Write-Field -Label "Recursos" -Value (($selectedFeatures | ForEach-Object { $_.Label }) -join ", ") -ValueColor Green -Width 20
         }
     }
-
     if ($script:EnableBlackboxResolved) {
-        Write-Host ("Conectividade:   {0} alvo(s)" -f $script:BlackboxTargets.Count)
+        Write-Field -Label "Conectividade" -Value ("{0} alvo(s)" -f $script:BlackboxTargets.Count) -ValueColor Green -Width 20
     }
-
     if ($script:EnableSnmpResolved) {
-        Write-Host ("SNMP:           {0} alvo(s)" -f $script:SnmpTargets.Count)
+        Write-Field -Label "SNMP" -Value ("{0} equipamento(s)" -f $script:SnmpTargets.Count) -ValueColor Green -Width 20
     }
-
     if ($script:EnableInternetResolved) {
-        Write-Host ("Internet:       Speedtest a cada {0} min ({1})" -f $script:InternetIntervalMinutesResolved, $SpeedtestMetricsFile)
+        Write-Field -Label "Velocidade" -Value ("Speedtest a cada {0} min" -f $script:InternetIntervalMinutesResolved) -ValueColor Green -Width 20
     }
-
+    if ($script:EnableColetaResolved) {
+        Write-Field -Label "Internet e links" -Value ("Coleta Complementar, {0} link(s)" -f $script:ColetaLinks.Count) -ValueColor Green -Width 20
+    }
     if ($script:CustomExporters.Count -gt 0) {
-        Write-Host ("Exporters:      {0}" -f $script:CustomExporters.Count)
+        Write-Field -Label "Exporters" -Value ([string]$script:CustomExporters.Count) -ValueColor Green -Width 20
     }
 
-    Write-Host ("Log instalador: {0}" -f $script:InstallerLog)
+    Write-Section "Arquivos"
+    Write-Field -Label "Configuração" -Value $ConfigFile -Width 20
+    if ($script:EnableInternetResolved) {
+        Write-Field -Label "Speedtest" -Value $SpeedtestMetricsFile -Width 20
+    }
+    if ($script:EnableColetaResolved) {
+        Write-Field -Label "Coleta" -Value $ColetaConfig -Width 20
+    }
+    Write-Field -Label "Log do instalador" -Value $script:InstallerLog -Width 20
+
+    Write-Section "Atualização automática"
+    if (Get-ScheduledTask -TaskName $AtualizadorTaskName -ErrorAction SilentlyContinue) {
+        Write-Field -Label "Atualizador" -Value "ligado, todo dia entre 01h e 05h" -ValueColor Green -Width 20
+    }
+    else {
+        Write-Field -Label "Atualizador" -Value "não instalado" -ValueColor Yellow -Width 20
+    }
 
     if ($comPendencia) {
-        Write-Host ""
-        Write-Host "PENDÊNCIAS" -ForegroundColor Yellow
-        Write-Host "O host está sendo monitorado, mas estes itens não puderam ser" -ForegroundColor Yellow
-        Write-Host "configurados. Rode o instalador de novo e use a opção" -ForegroundColor Yellow
-        Write-Host "'Ver e alterar a configuração atual' para tentar só o que faltou." -ForegroundColor Yellow
-        Write-Host ""
-
+        Write-Section "Pendências"
+        Write-Host "    O host está sendo monitorado, mas estes itens ficaram de fora." -ForegroundColor Yellow
+        Write-Host "    Rode o instalador de novo e escolha 'Ver e alterar': ligue de" -ForegroundColor Yellow
+        Write-Host "    novo o que faltou e escolha 'Gravar'. O atualizador é refeito sozinho." -ForegroundColor Yellow
         foreach ($etapa in $script:EtapasComFalha) {
-            Write-Host ("  - {0}" -f $etapa.Nome) -ForegroundColor Yellow
-            Write-Host ("      {0}" -f $etapa.Erro) -ForegroundColor DarkGray
+            Write-Host "    ! " -ForegroundColor Yellow -NoNewline
+            Write-Host $etapa.Nome -ForegroundColor White
+            Write-Host ("      {0}" -f $etapa.Erro) -ForegroundColor Gray
         }
+    }
+
+    Write-Section "Diagnóstico"
+    $comandos = @(
+        'Get-Service Alloy',
+        ('& "{0}" validate "{1}"' -f $AlloyExe, $ConfigFile),
+        'Invoke-WebRequest http://127.0.0.1:12345/-/ready -UseBasicParsing',
+        'Get-WinEvent -LogName Application | Where-Object ProviderName -Match "Alloy|Grafana" | Select-Object -First 20'
+    )
+    if ($script:EnableColetaResolved) {
+        $comandos += ('powershell -ExecutionPolicy Bypass -File "{0}" -Acao verificar' -f (Join-Path $ColetaDir "coleta-complementar.ps1"))
+    }
+    $comandos += ('powershell -ExecutionPolicy Bypass -File "{0}" -Acao verificar' -f $AtualizadorScript)
+    foreach ($comando in $comandos) {
+        Write-Host "    > " -ForegroundColor Cyan -NoNewline
+        Write-Host $comando
     }
 
     Write-Host ""
-    Write-Host "Diagnóstico:"
-    Write-Host '  Get-Service Alloy'
-    Write-Host ('  & "{0}" validate "{1}"' -f $AlloyExe, $ConfigFile)
-    Write-Host '  Invoke-WebRequest http://127.0.0.1:12345/-/ready -UseBasicParsing'
-    Write-Host '  Get-WinEvent -LogName Application | Where-Object ProviderName -Match "Alloy|Grafana" | Select-Object -First 20'
+    Write-Host "  Próximo passo: " -ForegroundColor Yellow -NoNewline
+    Write-Host ("confira no NOC (Explore) os dados de cliente=""{0}"" e host=""{1}""." -f $script:Cliente, $script:HostLabel)
 }
 
 # ==============================================================================
 # MAIN
 # ==============================================================================
+
+# ==============================================================================
+# ATUALIZADOR AUTOMÁTICO NEXTEC
+# ==============================================================================
+#
+# A tarefa NextecAtualizador roda como SYSTEM de madrugada, lê o manifesto
+# publicado pela Nextec, confere a assinatura RSA e, quando há versão nova
+# liberada para a onda desta máquina, chama este instalador em -Atualizar.
+# Ver Alloy/atualizador/README.md no repositório Scripts.
+
+function Protect-NextecDirectory {
+    <#
+        Deixa a pasta gravável só por SYSTEM e Administradores. Obrigatório
+        para pasta com script executado como SYSTEM: com a ACL padrão do
+        ProgramData, um usuário comum pode criar a pasta antes, deixar ACE
+        própria nela ou trocá-la por um link e assim ganhar privilégio.
+
+        - Link (junction ou symlink) no lugar da pasta: o link é removido.
+        - Dono fora de SYSTEM/Administradores: o dono passa a ser
+          Administradores e as ACEs explícitas do conteúdo são descartadas.
+        - A DACL é montada do zero (sem herança), antes de qualquer gravação.
+        Usa SID porque o nome dos grupos muda com o idioma do Windows.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [switch]$LeituraUsuarios
+    )
+
+    $confiaveis = @("S-1-5-18", "S-1-5-32-544")
+    if (Test-Path -LiteralPath $Path) {
+        $item = Get-Item -LiteralPath $Path -Force
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            Write-Warn ("{0} era um link; removido e recriado como pasta." -f $Path)
+            [IO.Directory]::Delete($Path, $false)
+        }
+    }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
+
+    $dono = ""
+    try { $dono = (Get-Acl -LiteralPath $Path).GetOwner([Security.Principal.SecurityIdentifier]).Value } catch { $dono = "" }
+    $donoEstranho = ($confiaveis -notcontains $dono)
+
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetOwner((New-Object Security.Principal.SecurityIdentifier("S-1-5-32-544")))
+    $acl.SetAccessRuleProtection($true, $false)
+    $heranca = [Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit"
+    foreach ($sid in $confiaveis) {
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+            (New-Object Security.Principal.SecurityIdentifier($sid)), "FullControl", $heranca, "None", "Allow")))
+    }
+    if ($LeituraUsuarios) {
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+            (New-Object Security.Principal.SecurityIdentifier("S-1-5-32-545")), "ReadAndExecute", $heranca, "None", "Allow")))
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
+
+    # Links dentro da pasta saem (só o link, nunca o destino dele).
+    foreach ($link in @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })) {
+        Write-Warn ("Link removido de pasta protegida: {0}" -f $link.FullName)
+        if ($link.PSIsContainer) { [IO.Directory]::Delete($link.FullName, $false) } else { [IO.File]::Delete($link.FullName) }
+    }
+    # Conteúdo com dono e ACE próprios volta a só herdar da pasta.
+    if (@(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue).Count -gt 0) {
+        if ($donoEstranho) {
+            & icacls.exe (Join-Path $Path "*") /setowner "*S-1-5-32-544" /T /C /Q | Out-Null
+        }
+        & icacls.exe (Join-Path $Path "*") /reset /T /C /Q | Out-Null
+    }
+}
+
+function Test-DotNetParaAtualizador {
+    # O atualizador confere a assinatura com APIs do .NET Framework 4.6+ (release 393295).
+    try {
+        $release = (Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" -Name Release -ErrorAction Stop).Release
+        return ([int]$release -ge 393295)
+    }
+    catch { return $false }
+}
+
+function Install-Atualizador {
+    Write-Step "Atualizador automático Nextec"
+
+    if (-not (Test-DotNetParaAtualizador)) {
+        Write-Warn "Esta máquina tem .NET Framework anterior ao 4.6: o atualizador fica instalado, mas só aplica versões depois que o .NET for atualizado."
+    }
+
+    # Proteção antes de gravar qualquer arquivo. Nextec: só SYSTEM e
+    # Administradores (estado, cópias de credencial). Coleta e Speedtest
+    # também rodam como SYSTEM: usuário comum só lê.
+    Protect-NextecDirectory -Path $NextecDataDir
+    if (-not (Test-Path -LiteralPath $AtualizadorDir)) { New-Item -ItemType Directory -Path $AtualizadorDir -Force | Out-Null }
+    Protect-NextecDirectory -Path $ColetaDir -LeituraUsuarios
+    if (-not (Test-Path -LiteralPath $ColetaTextfileDir)) {
+        New-Item -ItemType Directory -Path $ColetaTextfileDir -Force | Out-Null
+    }
+    if (Test-Path -LiteralPath $SpeedtestDir) { Protect-NextecDirectory -Path $SpeedtestDir -LeituraUsuarios }
+
+    $temporario = Join-Path $env:TEMP ("nextec-atualizador-{0}.ps1" -f [guid]::NewGuid().ToString("N"))
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($AtualizadorArquivo)) {
+            Copy-Item -LiteralPath $AtualizadorArquivo -Destination $temporario -Force
+        }
+        else {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-NextecDownload -Url $AtualizadorUrl -Destino $temporario -Descricao "Atualizador" -TimeoutSec 120
+        }
+        $erros = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile($temporario, [ref]$null, [ref]$erros)
+        if ($erros -and $erros.Count -gt 0) {
+            throw ("Arquivo do atualizador tem erro de sintaxe: {0}" -f $erros[0].Message)
+        }
+        Copy-Item -LiteralPath $temporario -Destination $AtualizadorScript -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $temporario -Force -ErrorAction SilentlyContinue
+    }
+
+    # A configuração do operador (onda fixa, desligar) não é sobrescrita.
+    if (-not (Test-Path -LiteralPath $AtualizadorConfig)) {
+        $conteudo = @(
+            "; Atualizador automático Nextec.",
+            "; onda: auto (máquinas da Nextec na 0, ~10% dos clientes na 1, demais na 2) ou 0, 1, 2.",
+            "; habilitado: sim ou não. Desligar aqui só vale para esta máquina.",
+            "[atualizador]",
+            "habilitado = sim",
+            "onda = auto"
+        ) -join "`r`n"
+        [IO.File]::WriteAllText($AtualizadorConfig, $conteudo + "`r`n", (New-Object Text.UTF8Encoding($false)))
+    }
+
+    # Madrugada, com atraso aleatório de até 4h por máquina (01h às 05h).
+    # StartWhenAvailable recupera a execução perdida com a máquina desligada.
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Acao executar' -f $AtualizadorScript)
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 3) -MultipleInstances IgnoreNew
+    $gatilho = New-ScheduledTaskTrigger -Daily -At ([DateTime]::Today.AddHours(1)) -RandomDelay (New-TimeSpan -Hours 4)
+    Register-ScheduledTask -TaskName $AtualizadorTaskName -Action $action -Trigger $gatilho `
+        -Principal $principal -Settings $settings -Force | Out-Null
+
+    $versao = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $AtualizadorScript -Acao versao
+    Write-Ok ("Atualizador {0} instalado; roda todo dia de madrugada." -f ($versao | Select-Object -Last 1))
+}
+
+function Invoke-NextecAtualizacao {
+    <#
+        Modo -Atualizar: reaplica a configuração atual com o instalador novo.
+        Nada é perguntado. Credenciais, alvos e links vêm da instalação atual.
+    #>
+    Write-Step ("Atualização automática {0}" -f $PacoteVersao)
+
+    $configuracao = Read-CurrentAlloyConfiguration
+    if ($null -eq $configuracao) {
+        throw "Sem config.alloy da Nextec nesta máquina; rode o instalador interativo uma vez."
+    }
+    $inventory = Import-CurrentConfiguration -Configuration $configuracao
+    if ([string]::IsNullOrWhiteSpace($script:RwUsername) -or [string]::IsNullOrWhiteSpace($script:RwPassword)) {
+        throw "Credenciais do NOC não encontradas no registro do serviço; rode o instalador interativo."
+    }
+
+    $versaoAtual = ""
+    try {
+        $saida = (& $AlloyExe --version 2>$null | Select-Object -First 1) -join ""
+        if ($saida -match 'v?(\d+\.\d+\.\d+)') { $versaoAtual = $Matches[1] }
+    }
+    catch { $versaoAtual = "" }
+
+    if (-not [string]::IsNullOrWhiteSpace($AlloyInstaladorArquivo) -and $AlloyVersao -ne $versaoAtual) {
+        Write-Info ("Alloy {0} -> {1}" -f $versaoAtual, $AlloyVersao)
+        Backup-ExistingConfiguration
+        Update-AlloyBinaryOnly
+    }
+
+    $script:ConfigChanged = $true
+    Save-ReconfiguredAlloy -Inventory $inventory
+    Install-Atualizador
+    Write-Ok "Atualização concluída."
+}
 
 function Invoke-NextecInstaller {
     Show-Banner
@@ -6112,6 +7497,11 @@ function Invoke-NextecInstaller {
     Assert-Administrator
 
     try {
+        if ($Atualizar) {
+            Invoke-NextecAtualizacao
+            return
+        }
+
         Set-NocDestination
 
         if (-not (Invoke-MaintenanceMenu)) {
@@ -6171,6 +7561,14 @@ function Invoke-NextecInstaller {
             } | Out-Null
         }
 
+        if ($script:EnableColetaResolved) {
+            Invoke-NextecOptionalStep -Nome "Coleta Complementar (internet e links)" -Acao {
+                Install-ColetaComplementar
+            } -AoFalhar {
+                $script:EnableColetaResolved = $false
+            } | Out-Null
+        }
+
         $script:Collector = ($script:EnableBlackboxResolved -or $script:EnableSnmpResolved -or
                              $script:EnableInternetResolved -or ($script:CustomExporters.Count -gt 0))
 
@@ -6182,6 +7580,11 @@ function Invoke-NextecInstaller {
         # e o serviço já subiu. Falha aqui é informação para o técnico.
         Invoke-NextecVerification -Nome "Prontidão do Alloy" -Acao { Test-AlloyReadiness }
         Invoke-NextecVerification -Nome "Teste de ingestão no NOC" -Acao { Test-AlloyIngestion }
+
+        # Depois do Alloy validado: falha aqui não desfaz o monitoramento.
+        Invoke-NextecOptionalStep -Nome "Atualizador automático" -Acao {
+            Install-Atualizador
+        } | Out-Null
 
         Show-FinalSummary -Inventory $inventory
     }
@@ -6243,6 +7646,7 @@ finally {
     if (-not $Silent -and -not $script:Relaunched) {
         Wait-NextecOperator
     }
+    Restore-NextecConsoleTheme
 }
 
 # Dot-source (". .\script.ps1") roda no processo do operador, e ali "exit"

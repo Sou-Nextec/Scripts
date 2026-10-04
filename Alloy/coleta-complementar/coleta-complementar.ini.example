@@ -1,0 +1,76 @@
+; Coleta Complementar Nextec: modelo de configuração
+;
+; Linux:   /etc/coleta-complementar/coleta-complementar.ini
+;          depois de alterar: systemctl restart coleta-complementar
+; Windows: C:\ProgramData\GrafanaLabs\Alloy\coleta-complementar\coleta-complementar.ini
+;          depois de alterar: Restart-ScheduledTask -TaskName NextecColetaComplementar
+;
+; Normalmente o instalador do Alloy gera este arquivo. Edite à mão só para
+; ajustar limites, destinos ou links.
+
+[geral]
+; Intervalo entre medições de internet e links, em segundos (mínimo 10).
+intervalo_links_segundos = 15
+; Acima destes limites o link (ou a internet) fica "degradado".
+limite_latencia_ms = 150
+limite_perda_percentual = 5
+
+[internet]
+; Linux: "nao" desliga o módulo, a menos que haja links cadastrados abaixo.
+ativo = sim
+; Destinos testados pela saída padrão do servidor.
+alvos = 1.1.1.1, 8.8.8.8
+; Firewall/gateway da rede local. Vazio: usa o gateway padrão do servidor.
+; Se ele não responder, a queda é atribuída à rede local.
+firewall =
+; Servidores DNS testados ("sistema" usa o DNS configurado no servidor).
+dns_servidores = sistema, 1.1.1.1, 8.8.8.8
+dns_nome = google.com
+; Consulta do IP público (a cada 5 minutos e sempre que um link cai ou volta).
+ip_publico_intervalo_segundos = 300
+
+; Só Linux: estado, consumo, health, configuração e eventos dos containers.
+[docker]
+ativo = nao
+socket = /var/run/docker.sock
+intervalo_segundos = 60
+
+; Só Linux: no Windows o teste de velocidade fica com o instalador (tarefa NextecSpeedtest).
+[velocidade]
+ativo = nao
+intervalo_minutos = 30
+
+; Um bloco por link. O nome depois de "link:" é o que aparece no painel.
+; Cada link precisa de pelo menos um destino que saia SOMENTE por ele:
+;   a) rota por link no firewall (ex.: 8.8.8.8 pelo link 1, 1.1.1.1 pelo link 2), ou
+;   b) "origem" com um IP deste servidor que saia pela WAN do link.
+; Sem isso os dois links medem o mesmo caminho e o painel mostra dois links iguais.
+[link:Cyberline Fibra]
+; primario, failover ou sdwan
+papel = primario
+operadora = Cyberline
+tipo = fibra
+suporte = 0800 000 0000
+; IP público fixo do link: é como o monitor descobre qual link está em uso.
+ip_publico = 200.200.200.10
+; Gateway da operadora: separa "operadora sem sinal" de "sem saída para a internet".
+gateway = 200.200.200.1
+alvos = 8.8.8.8
+origem =
+; Firewall e interface WAN no NOC, para o tráfego por link via SNMP.
+firewall = fw_matriz
+interface_firewall = igb1
+teste_velocidade = nao
+
+[link:Vivo 4G]
+papel = failover
+operadora = Vivo
+tipo = 4g
+suporte =
+ip_publico =
+gateway =
+alvos = 1.1.1.1
+origem =
+firewall = fw_matriz
+interface_firewall = igb2
+teste_velocidade = nao
