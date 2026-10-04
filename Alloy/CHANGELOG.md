@@ -10,12 +10,21 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.7.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.17.2 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.8.0 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.18.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.2.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
 ## 2026-10-04
+
+### Instaladores Windows 2.18.0 e Linux 2.8.0, módulos SNMP
+
+- **Novos fabricantes no SNMP.** Ubiquiti, Cisco, HP / Aruba, TP-Link e Intelbras entram na lista, com módulo próprio em `Alloy/snmp/` gerado pelo `gerar_modulos.py`. Todos coletam equipamento, tempo ligado e interfaces; o que cada um traz a mais está no `Alloy/snmp/README.md`.
+- **Ubiquiti.** CPU e memória (HOST-RESOURCES e UCD-SNMP) e, no access point UniFi, clientes conectados por SSID.
+- **Cisco.** CPU, memória (pools antigos e IOS-XE), temperatura, ventoinhas e fontes.
+- **HP / Aruba.** CPU e memória das linhas ProCurve/ArubaOS-Switch e Comware (1920, 1950, 5130), mais temperatura no Comware.
+- **TP-Link.** CPU e memória dos switches JetStream e Omada.
+- **Intelbras.** Só o padrão (equipamento, interfaces e HOST-RESOURCES quando publicada), porque a linha usa firmwares de origens diferentes.
 
 ### Instalador Windows 2.17.2
 

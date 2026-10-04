@@ -1,0 +1,731 @@
+# ============================================================================
+# Nextec, módulo SNMP para Cisco (IOS, IOS-XE e Catalyst)
+# Gerado por gerar_modulos.py. Não edite à mão: altere o gerador e rode de novo.
+#
+# Fontes: SNMPv2-MIB, IF-MIB, IF-X-MIB e CISCO-PROCESS-MIB, CISCO-MEMORY-POOL-MIB, CISCO-ENHANCED-MEMPOOL-MIB e CISCO-ENVMON-MIB.
+# Os nomes das métricas são os usados pelo painel Nextec | Firewall.
+#
+# Segurança: este arquivo NÃO contém community, usuário ou senha. As
+# credenciais ficam no snmp-auth.yml de cada cliente, gravado pelo instalador.
+# ============================================================================
+modules:
+  cisco_v2c:
+    walk:
+    - 1.3.6.1.2.1.1
+    - 1.3.6.1.2.1.2.2
+    - 1.3.6.1.2.1.31.1.1
+    - 1.3.6.1.4.1.9.9.109.1.1.1.1.7
+    - 1.3.6.1.4.1.9.9.109.1.1.1.1.8
+    - 1.3.6.1.4.1.9.9.48.1.1.1.2
+    - 1.3.6.1.4.1.9.9.48.1.1.1.5
+    - 1.3.6.1.4.1.9.9.48.1.1.1.6
+    - 1.3.6.1.4.1.9.9.221.1.1.1.1.3
+    - 1.3.6.1.4.1.9.9.221.1.1.1.1.18
+    - 1.3.6.1.4.1.9.9.221.1.1.1.1.20
+    - 1.3.6.1.4.1.9.9.13.1.3.1.2
+    - 1.3.6.1.4.1.9.9.13.1.3.1.3
+    - 1.3.6.1.4.1.9.9.13.1.3.1.6
+    - 1.3.6.1.4.1.9.9.13.1.4.1.2
+    - 1.3.6.1.4.1.9.9.13.1.4.1.3
+    - 1.3.6.1.4.1.9.9.13.1.5.1.2
+    - 1.3.6.1.4.1.9.9.13.1.5.1.3
+    metrics:
+    - name: sysDescr
+      oid: 1.3.6.1.2.1.1.1
+      type: DisplayString
+      help: Descrição do equipamento e firmware
+    - name: sysUpTime
+      oid: 1.3.6.1.2.1.1.3
+      type: gauge
+      help: Tempo ligado, em centésimos de segundo
+    - name: ifAdminStatus
+      oid: 1.3.6.1.2.1.2.2.1.7
+      type: gauge
+      help: Estado configurado da interface (1=up 2=down 3=testing)
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifOperStatus
+      oid: 1.3.6.1.2.1.2.2.1.8
+      type: gauge
+      help: Estado operacional da interface (1=up 2=down)
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifInDiscards
+      oid: 1.3.6.1.2.1.2.2.1.13
+      type: counter
+      help: Pacotes recebidos descartados
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifInErrors
+      oid: 1.3.6.1.2.1.2.2.1.14
+      type: counter
+      help: Pacotes recebidos com erro
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifOutDiscards
+      oid: 1.3.6.1.2.1.2.2.1.19
+      type: counter
+      help: Pacotes enviados descartados
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifOutErrors
+      oid: 1.3.6.1.2.1.2.2.1.20
+      type: counter
+      help: Pacotes enviados com erro
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifHCInOctets
+      oid: 1.3.6.1.2.1.31.1.1.1.6
+      type: counter
+      help: Bytes recebidos (64 bits)
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifHCOutOctets
+      oid: 1.3.6.1.2.1.31.1.1.1.10
+      type: counter
+      help: Bytes enviados (64 bits)
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifHighSpeed
+      oid: 1.3.6.1.2.1.31.1.1.1.15
+      type: gauge
+      help: Velocidade da interface em Mbps
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: cpmCPUTotal1minRev
+      oid: 1.3.6.1.4.1.9.9.109.1.1.1.1.7
+      type: gauge
+      help: Uso de CPU em porcentagem, média de 1 minuto
+      indexes:
+      - labelname: cpmCPUTotalIndex
+        type: gauge
+    - name: cpmCPUTotal5minRev
+      oid: 1.3.6.1.4.1.9.9.109.1.1.1.1.8
+      type: gauge
+      help: Uso de CPU em porcentagem, média de 5 minutos
+      indexes:
+      - labelname: cpmCPUTotalIndex
+        type: gauge
+    - name: ciscoMemoryPoolUsed
+      oid: 1.3.6.1.4.1.9.9.48.1.1.1.5
+      type: gauge
+      help: Memória usada no pool, em bytes
+      indexes:
+      - labelname: ciscoMemoryPoolType
+        type: gauge
+      lookups:
+      - labels:
+        - ciscoMemoryPoolType
+        labelname: ciscoMemoryPoolName
+        oid: 1.3.6.1.4.1.9.9.48.1.1.1.2
+        type: DisplayString
+    - name: ciscoMemoryPoolFree
+      oid: 1.3.6.1.4.1.9.9.48.1.1.1.6
+      type: gauge
+      help: Memória livre no pool, em bytes
+      indexes:
+      - labelname: ciscoMemoryPoolType
+        type: gauge
+      lookups:
+      - labels:
+        - ciscoMemoryPoolType
+        labelname: ciscoMemoryPoolName
+        oid: 1.3.6.1.4.1.9.9.48.1.1.1.2
+        type: DisplayString
+    - name: cempMemPoolHCUsed
+      oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.18
+      type: gauge
+      help: Memória usada no pool, em bytes (64 bits)
+      indexes:
+      - labelname: entPhysicalIndex
+        type: gauge
+      - labelname: cempMemPoolIndex
+        type: gauge
+      lookups:
+      - labels:
+        - entPhysicalIndex
+        - cempMemPoolIndex
+        labelname: cempMemPoolName
+        oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.3
+        type: DisplayString
+    - name: cempMemPoolHCFree
+      oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.20
+      type: gauge
+      help: Memória livre no pool, em bytes (64 bits)
+      indexes:
+      - labelname: entPhysicalIndex
+        type: gauge
+      - labelname: cempMemPoolIndex
+        type: gauge
+      lookups:
+      - labels:
+        - entPhysicalIndex
+        - cempMemPoolIndex
+        labelname: cempMemPoolName
+        oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.3
+        type: DisplayString
+    - name: ciscoEnvMonTemperatureStatusValue
+      oid: 1.3.6.1.4.1.9.9.13.1.3.1.3
+      type: gauge
+      help: Temperatura em graus Celsius
+      indexes:
+      - labelname: ciscoEnvMonTemperatureStatusIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ciscoEnvMonTemperatureStatusIndex
+        labelname: ciscoEnvMonTemperatureStatusDescr
+        oid: 1.3.6.1.4.1.9.9.13.1.3.1.2
+        type: DisplayString
+    - name: ciscoEnvMonTemperatureState
+      oid: 1.3.6.1.4.1.9.9.13.1.3.1.6
+      type: gauge
+      help: Estado do sensor de temperatura (1=normal 2=warning 3=critical)
+      indexes:
+      - labelname: ciscoEnvMonTemperatureStatusIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ciscoEnvMonTemperatureStatusIndex
+        labelname: ciscoEnvMonTemperatureStatusDescr
+        oid: 1.3.6.1.4.1.9.9.13.1.3.1.2
+        type: DisplayString
+    - name: ciscoEnvMonFanState
+      oid: 1.3.6.1.4.1.9.9.13.1.4.1.3
+      type: gauge
+      help: Estado da ventoinha (1=normal 2=warning 3=critical)
+      indexes:
+      - labelname: ciscoEnvMonFanStatusIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ciscoEnvMonFanStatusIndex
+        labelname: ciscoEnvMonFanStatusDescr
+        oid: 1.3.6.1.4.1.9.9.13.1.4.1.2
+        type: DisplayString
+    - name: ciscoEnvMonSupplyState
+      oid: 1.3.6.1.4.1.9.9.13.1.5.1.3
+      type: gauge
+      help: Estado da fonte (1=normal 2=warning 3=critical)
+      indexes:
+      - labelname: ciscoEnvMonSupplyStatusIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ciscoEnvMonSupplyStatusIndex
+        labelname: ciscoEnvMonSupplyStatusDescr
+        oid: 1.3.6.1.4.1.9.9.13.1.5.1.2
+        type: DisplayString
+  cisco_v3:
+    walk:
+    - 1.3.6.1.2.1.1
+    - 1.3.6.1.2.1.2.2
+    - 1.3.6.1.2.1.31.1.1
+    - 1.3.6.1.4.1.9.9.109.1.1.1.1.7
+    - 1.3.6.1.4.1.9.9.109.1.1.1.1.8
+    - 1.3.6.1.4.1.9.9.48.1.1.1.2
+    - 1.3.6.1.4.1.9.9.48.1.1.1.5
+    - 1.3.6.1.4.1.9.9.48.1.1.1.6
+    - 1.3.6.1.4.1.9.9.221.1.1.1.1.3
+    - 1.3.6.1.4.1.9.9.221.1.1.1.1.18
+    - 1.3.6.1.4.1.9.9.221.1.1.1.1.20
+    - 1.3.6.1.4.1.9.9.13.1.3.1.2
+    - 1.3.6.1.4.1.9.9.13.1.3.1.3
+    - 1.3.6.1.4.1.9.9.13.1.3.1.6
+    - 1.3.6.1.4.1.9.9.13.1.4.1.2
+    - 1.3.6.1.4.1.9.9.13.1.4.1.3
+    - 1.3.6.1.4.1.9.9.13.1.5.1.2
+    - 1.3.6.1.4.1.9.9.13.1.5.1.3
+    metrics:
+    - name: sysDescr
+      oid: 1.3.6.1.2.1.1.1
+      type: DisplayString
+      help: Descrição do equipamento e firmware
+    - name: sysUpTime
+      oid: 1.3.6.1.2.1.1.3
+      type: gauge
+      help: Tempo ligado, em centésimos de segundo
+    - name: ifAdminStatus
+      oid: 1.3.6.1.2.1.2.2.1.7
+      type: gauge
+      help: Estado configurado da interface (1=up 2=down 3=testing)
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifOperStatus
+      oid: 1.3.6.1.2.1.2.2.1.8
+      type: gauge
+      help: Estado operacional da interface (1=up 2=down)
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifInDiscards
+      oid: 1.3.6.1.2.1.2.2.1.13
+      type: counter
+      help: Pacotes recebidos descartados
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifInErrors
+      oid: 1.3.6.1.2.1.2.2.1.14
+      type: counter
+      help: Pacotes recebidos com erro
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifOutDiscards
+      oid: 1.3.6.1.2.1.2.2.1.19
+      type: counter
+      help: Pacotes enviados descartados
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifOutErrors
+      oid: 1.3.6.1.2.1.2.2.1.20
+      type: counter
+      help: Pacotes enviados com erro
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifHCInOctets
+      oid: 1.3.6.1.2.1.31.1.1.1.6
+      type: counter
+      help: Bytes recebidos (64 bits)
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifHCOutOctets
+      oid: 1.3.6.1.2.1.31.1.1.1.10
+      type: counter
+      help: Bytes enviados (64 bits)
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifHighSpeed
+      oid: 1.3.6.1.2.1.31.1.1.1.15
+      type: gauge
+      help: Velocidade da interface em Mbps
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: cpmCPUTotal1minRev
+      oid: 1.3.6.1.4.1.9.9.109.1.1.1.1.7
+      type: gauge
+      help: Uso de CPU em porcentagem, média de 1 minuto
+      indexes:
+      - labelname: cpmCPUTotalIndex
+        type: gauge
+    - name: cpmCPUTotal5minRev
+      oid: 1.3.6.1.4.1.9.9.109.1.1.1.1.8
+      type: gauge
+      help: Uso de CPU em porcentagem, média de 5 minutos
+      indexes:
+      - labelname: cpmCPUTotalIndex
+        type: gauge
+    - name: ciscoMemoryPoolUsed
+      oid: 1.3.6.1.4.1.9.9.48.1.1.1.5
+      type: gauge
+      help: Memória usada no pool, em bytes
+      indexes:
+      - labelname: ciscoMemoryPoolType
+        type: gauge
+      lookups:
+      - labels:
+        - ciscoMemoryPoolType
+        labelname: ciscoMemoryPoolName
+        oid: 1.3.6.1.4.1.9.9.48.1.1.1.2
+        type: DisplayString
+    - name: ciscoMemoryPoolFree
+      oid: 1.3.6.1.4.1.9.9.48.1.1.1.6
+      type: gauge
+      help: Memória livre no pool, em bytes
+      indexes:
+      - labelname: ciscoMemoryPoolType
+        type: gauge
+      lookups:
+      - labels:
+        - ciscoMemoryPoolType
+        labelname: ciscoMemoryPoolName
+        oid: 1.3.6.1.4.1.9.9.48.1.1.1.2
+        type: DisplayString
+    - name: cempMemPoolHCUsed
+      oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.18
+      type: gauge
+      help: Memória usada no pool, em bytes (64 bits)
+      indexes:
+      - labelname: entPhysicalIndex
+        type: gauge
+      - labelname: cempMemPoolIndex
+        type: gauge
+      lookups:
+      - labels:
+        - entPhysicalIndex
+        - cempMemPoolIndex
+        labelname: cempMemPoolName
+        oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.3
+        type: DisplayString
+    - name: cempMemPoolHCFree
+      oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.20
+      type: gauge
+      help: Memória livre no pool, em bytes (64 bits)
+      indexes:
+      - labelname: entPhysicalIndex
+        type: gauge
+      - labelname: cempMemPoolIndex
+        type: gauge
+      lookups:
+      - labels:
+        - entPhysicalIndex
+        - cempMemPoolIndex
+        labelname: cempMemPoolName
+        oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.3
+        type: DisplayString
+    - name: ciscoEnvMonTemperatureStatusValue
+      oid: 1.3.6.1.4.1.9.9.13.1.3.1.3
+      type: gauge
+      help: Temperatura em graus Celsius
+      indexes:
+      - labelname: ciscoEnvMonTemperatureStatusIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ciscoEnvMonTemperatureStatusIndex
+        labelname: ciscoEnvMonTemperatureStatusDescr
+        oid: 1.3.6.1.4.1.9.9.13.1.3.1.2
+        type: DisplayString
+    - name: ciscoEnvMonTemperatureState
+      oid: 1.3.6.1.4.1.9.9.13.1.3.1.6
+      type: gauge
+      help: Estado do sensor de temperatura (1=normal 2=warning 3=critical)
+      indexes:
+      - labelname: ciscoEnvMonTemperatureStatusIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ciscoEnvMonTemperatureStatusIndex
+        labelname: ciscoEnvMonTemperatureStatusDescr
+        oid: 1.3.6.1.4.1.9.9.13.1.3.1.2
+        type: DisplayString
+    - name: ciscoEnvMonFanState
+      oid: 1.3.6.1.4.1.9.9.13.1.4.1.3
+      type: gauge
+      help: Estado da ventoinha (1=normal 2=warning 3=critical)
+      indexes:
+      - labelname: ciscoEnvMonFanStatusIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ciscoEnvMonFanStatusIndex
+        labelname: ciscoEnvMonFanStatusDescr
+        oid: 1.3.6.1.4.1.9.9.13.1.4.1.2
+        type: DisplayString
+    - name: ciscoEnvMonSupplyState
+      oid: 1.3.6.1.4.1.9.9.13.1.5.1.3
+      type: gauge
+      help: Estado da fonte (1=normal 2=warning 3=critical)
+      indexes:
+      - labelname: ciscoEnvMonSupplyStatusIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ciscoEnvMonSupplyStatusIndex
+        labelname: ciscoEnvMonSupplyStatusDescr
+        oid: 1.3.6.1.4.1.9.9.13.1.5.1.2
+        type: DisplayString
