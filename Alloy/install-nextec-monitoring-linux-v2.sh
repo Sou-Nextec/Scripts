@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.5.3 (destino mostrado uma vez só)
+# Versão: 2.5.4 (Exporters com opção Voltar; criticidade alto e modo servidor como padrão)
 #
 # USO
 # ---
@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.5.3"
+INSTALLER_VERSION="2.5.4"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -2361,7 +2361,8 @@ select_specialized_exporter() {
   echo -e "${DIM}PostgreSQL e MySQL/MariaDB são tratados automaticamente na etapa de bancos.${NC}"
   echo
 
-  choose "Selecione o exporter/integração" \
+  # ENTER escolhe "Voltar": quem marcou o item por engano sai sem cadastrar nada.
+  choose_padrao "Selecione o exporter/integração" 9 \
     "Redis Exporter              (padrão :9121)" \
     "Nginx Prometheus Exporter   (padrão :9113)" \
     "Apache Exporter             (padrão :9117)" \
@@ -2369,7 +2370,8 @@ select_specialized_exporter() {
     "Elasticsearch Exporter      (padrão :9114)" \
     "MongoDB Exporter            (padrão :9216)" \
     "NVIDIA DCGM Exporter        (padrão :9400)" \
-    "Outro endpoint Prometheus"
+    "Outro endpoint Prometheus" \
+    "Voltar, sem adicionar exporter"
 
   choice="$CHOOSE_RESULT"
   case "$choice" in
@@ -2381,6 +2383,7 @@ select_specialized_exporter() {
     6) EXPORTER_NAME="mongodb_exporter"; EXPORTER_DEFAULT_TARGET="127.0.0.1:9216"; EXPORTER_SERVICE_LABEL="mongodb" ;;
     7) EXPORTER_NAME="nvidia_dcgm_exporter"; EXPORTER_DEFAULT_TARGET="127.0.0.1:9400"; EXPORTER_SERVICE_LABEL="gpu" ;;
     8) EXPORTER_NAME=""; EXPORTER_DEFAULT_TARGET=""; EXPORTER_SERVICE_LABEL="" ;;
+    9) EXPORTER_NAME="__voltar__"; EXPORTER_DEFAULT_TARGET=""; EXPORTER_SERVICE_LABEL="" ;;
   esac
 }
 
@@ -2444,6 +2447,7 @@ collect_custom_exporters() {
   while true; do
     local cn ct cs
     select_specialized_exporter
+    [[ "$EXPORTER_NAME" == "__voltar__" ]] && break
 
     if [[ -n "$EXPORTER_NAME" ]]; then
       cn="$EXPORTER_NAME"
@@ -2460,6 +2464,12 @@ collect_custom_exporters() {
 
     ask_yes_no "Adicionar outro exporter?" n || break
   done
+
+  # Sem nenhum exporter cadastrado, o item fica desligado no resumo e no estado.
+  if (( ${#CUSTOM_EXPORTERS[@]} == 0 )); then
+    ENABLE_EXPORTERS=0
+    info "Nenhum exporter adicionado."
+  fi
 }
 
 # Identificação. Com uma instalação existente carregada, as respostas atuais
@@ -2487,7 +2497,7 @@ collect_identification() {
   LOCAL="$(ask_slug "Local" "${LOCAL:-matriz}" label)"
 
   local criticidades=(critico alto medio baixo)
-  choose_padrao "Criticidade" "$(indice_de "${CRITICIDADE:-critico}" "${criticidades[@]}")" "${criticidades[@]}"
+  choose_padrao "Criticidade" "$(indice_de "${CRITICIDADE:-alto}" "${criticidades[@]}")" "${criticidades[@]}"
   CRITICIDADE="${criticidades[$((CHOOSE_RESULT-1))]}"
   return 0
 }
@@ -2498,7 +2508,7 @@ collect_inputs() {
   local choice
 
   step "Função deste Alloy"
-  choose "Selecione o modo" "Servidor monitorado" "Collector de rede" "Servidor + Collector de rede"
+  choose_padrao "Selecione o modo" 1 "Servidor monitorado" "Collector de rede" "Servidor + Collector de rede"
   choice="$CHOOSE_RESULT"
   MONITOR_SERVER=0
   COLLECTOR=0

@@ -10,7 +10,7 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.5.3 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.5.4 |
 | Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.15.4 |
 | Coleta Complementar | `coleta-complementar/` | 1.2.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
@@ -44,6 +44,11 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 - **Horário do atualizador.** Passa a rodar entre 01h e 05h no horário de Brasília, mesmo em servidor com outro fuso (o timer usa `America/Sao_Paulo`, no systemd 235 ou mais novo).
 - **Banner.** Mostra a versão do instalador.
 - **Correção SNMP.** O tipo "ups" era gravado como "storage".
+
+### Instalador Linux 2.5.4
+
+- **Exporters adicionais com saída.** A lista ganhou a opção "Voltar, sem adicionar exporter", que é o padrão do ENTER. Quem marcou o item por engano sai sem cadastrar nada, e o item fica desligado.
+- **Mais respostas prontas.** A criticidade vem com "alto" e o modo com "Servidor monitorado", iguais ao Windows: basta ENTER.
 
 ### Instalador Windows 2.15.4
 
