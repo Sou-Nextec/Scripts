@@ -17,6 +17,14 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 ## 2026-10-03
 
+### Repositório
+
+- **Validação automática (GitHub Actions).** Todo push e pull request confere:
+  - sintaxe e ShellCheck do Bash;
+  - compilação e nomes indefinidos do Python;
+  - sintaxe do PowerShell no 7 e no Windows PowerShell 5.1, com PSScriptAnalyzer;
+  - UTF-8, BOM dos `.ps1` com acento e versões desta tabela contra os scripts.
+
 ### Instalador Linux 2.5.0
 
 - **Instalação existente.** Rodar o instalador num servidor que já tem o Alloy abre um menu de manutenção. O menu mostra:

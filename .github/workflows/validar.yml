@@ -1,0 +1,68 @@
+# Validação dos scripts a cada push e pull request.
+# Só lê o repositório: não publica, não assina e não acessa servidor.
+name: Validar scripts
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validar-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repositorio:
+    name: Codificação e versões
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: UTF-8, BOM dos .ps1 e versões do CHANGELOG
+        run: python3 .github/scripts/validar_repositorio.py
+
+  shell:
+    name: Bash
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sintaxe (bash -n)
+        run: git ls-files -z '*.sh' | xargs -0 -r -n1 bash -n
+      - name: ShellCheck (erros)
+        run: git ls-files -z '*.sh' | xargs -0 -r shellcheck -S error
+
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compilação
+        run: git ls-files -z '*.py' | xargs -0 -r python -m py_compile
+      - name: Ruff (sintaxe e nomes indefinidos, compatível com Python 3.7)
+        run: |
+          pip install --quiet ruff
+          git ls-files -z '*.py' | xargs -0 -r ruff check --select E9,F63,F7,F82 --target-version py37
+
+  powershell-7:
+    name: PowerShell 7 e PSScriptAnalyzer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sintaxe e achados de severidade Error
+        shell: pwsh
+        run: ./.github/scripts/validar_powershell.ps1
+
+  powershell-51:
+    name: Windows PowerShell 5.1
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sintaxe no parser do 5.1 (o que roda nos servidores dos clientes)
+        shell: powershell
+        run: .\.github\scripts\validar_powershell.ps1
