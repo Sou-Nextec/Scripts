@@ -47,6 +47,8 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.18.0 SNMP: Ubiquiti, Cisco, HP / Aruba, TP-Link e Intelbras no
+           catálogo de fabricantes.
     2.17.2 Corrige a tela que não abria na 2.17.1 (ícone da janela lido
            antes de existir, erro no modo estrito).
     2.17.1 Emblema da Nextec como ícone das janelas (barra de título e
@@ -327,7 +329,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.17.2"
+$InstallerVersion = "2.18.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -356,6 +358,11 @@ $NextecSnmpVendors = [ordered]@{
     "2" = @{ Label = "Fortigate"; File = "fortigate.yml" }
     "3" = @{ Label = "Mikrotik"; File = "mikrotik.yml" }
     "4" = @{ Label = "SonicWall"; File = "sonicwall.yml" }
+    "5" = @{ Label = "Ubiquiti"; File = "ubiquiti.yml" }
+    "6" = @{ Label = "Cisco"; File = "cisco.yml" }
+    "7" = @{ Label = "HP / Aruba"; File = "hp.yml" }
+    "8" = @{ Label = "TP-Link"; File = "tplink.yml" }
+    "9" = @{ Label = "Intelbras"; File = "intelbras.yml" }
 }
 
 # Nome do serviço Windows. Resolve-AlloyInstallation substitui pelo nome real
@@ -8813,7 +8820,7 @@ function Show-NextecInstallerGui {
     Add-GuiColunaTexto $g.Snmp "tipo" "Tipo" 60
     Add-GuiColunaTexto $g.Snmp "credencial" "Credencial" 90
     $p.Controls.Add($g.Snmp)
-    $p.Controls.Add((New-GuiLabel "Fabricante fora da lista (pfSense, Fortigate, Mikrotik, SonicWall)? Solicite ao NOC a inclusão do fabricante antes de cadastrar o equipamento." 24 368 820 -Dica))
+    $p.Controls.Add((New-GuiLabel "Fabricante fora da lista? Solicite ao NOC a inclusão do fabricante antes de cadastrar o equipamento." 24 368 820 -Dica))
 
     # Linha da grade a partir do objeto devolvido pela janela do equipamento.
     $g.GravarEquipamento = {
