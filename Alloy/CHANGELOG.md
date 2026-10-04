@@ -11,11 +11,15 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
 | Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.6.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.16.1 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.16.2 |
 | Coleta Complementar | `coleta-complementar/` | 1.2.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
 ## 2026-10-04
+
+### Instalador Windows 2.16.2
+
+- **Logo na tela de instalação.** O cabeçalho da janela mostra a logo da Nextec (versão clara), embutida no script para continuar funcionando pelo comando direto do GitHub. Se a imagem não carregar, a tela abre sem ela.
 
 ### Instalador Windows 2.16.1
 

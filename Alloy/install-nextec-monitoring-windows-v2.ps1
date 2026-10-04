@@ -47,6 +47,9 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.16.2 Logo da Nextec no cabeçalho da tela de instalação, embutida no
+           próprio script.
+
     2.16.1 Tela Recursos: o perfil básico (CPU, memória, discos, rede,
            uptime e serviços do Windows) aparece na árvore marcado e
            travado, em cinza, em vez de só citado no texto.
@@ -308,7 +311,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.16.1"
+$InstallerVersion = "2.16.2"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -7878,6 +7881,92 @@ function ConvertTo-SnmpAuthYaml {
     return ($linhas -join [Environment]::NewLine)
 }
 
+function Get-NextecLogoImage {
+    <#
+        Logo da Nextec (versão clara, para fundo escuro) embutida em Base64
+        para o script continuar sendo um arquivo só, inclusive no one-liner.
+        Se a imagem não puder ser montada, a tela abre sem logo.
+    #>
+    $base64 = (
+        "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"
+    )
+    try {
+        # O stream não pode ser descartado enquanto a imagem estiver em uso:
+        # o GDI+ lê os bytes dele sob demanda.
+        $stream = New-Object IO.MemoryStream(,[Convert]::FromBase64String($base64))
+        return [Drawing.Image]::FromStream($stream)
+    }
+    catch {
+        return $null
+    }
+}
+
 function Show-NextecInstallerGui {
     <#
         Abre a tela de instalação e preenche as mesmas variáveis que o fluxo
@@ -7923,6 +8012,17 @@ function Show-NextecInstallerGui {
     $sub.ForeColor = [Drawing.Color]::FromArgb(217, 214, 255)
     $sub.Location = New-Object Drawing.Point(22, 38); $sub.AutoSize = $true
     $topo.Controls.Add($titulo); $topo.Controls.Add($sub)
+    $imagemLogo = Get-NextecLogoImage
+    if ($null -ne $imagemLogo) {
+        $logo = New-Object Windows.Forms.PictureBox
+        $logo.Image = $imagemLogo
+        $logo.SizeMode = [Windows.Forms.PictureBoxSizeMode]::Zoom
+        $logo.Size = New-Object Drawing.Size(118, 32)
+        $logo.Location = New-Object Drawing.Point(($topo.ClientSize.Width - 118 - 20), 16)
+        $logo.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
+        $logo.BackColor = [Drawing.Color]::Transparent
+        $topo.Controls.Add($logo)
+    }
 
     $rodape = New-Object Windows.Forms.Panel
     $rodape.Dock = "Bottom"; $rodape.Height = 56; $rodape.BackColor = [Drawing.Color]::White
