@@ -47,6 +47,18 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.17.0 Tela mais clara: campos obrigatórios com asterisco vermelho;
+           perfil básico recolhido; Speedtest com a recomendação ao lado;
+           links em Mbps e Função com inicial maiúscula; testes de
+           conectividade numerados do mais simples (1) ao mais completo
+           (6); equipamento SNMP cadastrado numa janela só, com a
+           credencial junto e aviso para fabricante fora da lista;
+           exporters pelo nome do serviço, com passo a passo para outro
+           serviço. Janela de andamento: o console fica escondido, o log
+           aparece na própria tela e ela só fecha quando o técnico quiser
+           (vale para a simulação e para a instalação). Escala correta
+           em telas de 125% e 150% no PowerShell 7.
+
     2.16.2 Logo da Nextec no cabeçalho da tela de instalação, embutida no
            próprio script.
 
@@ -311,7 +323,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.16.2"
+$InstallerVersion = "2.17.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -467,6 +479,7 @@ $script:SimboloCursor = [string][char]0x203A  # ›
 function Write-Step {
     # Título de etapa: barra e linha, como no instalador Linux.
     param([Parameter(Mandatory=$true)][string]$Message)
+    if ($null -ne $script:GuiProgresso) { Add-NextecGuiLog "" ; Add-NextecGuiLog ("{0} {1}" -f $script:SimboloBarra, $Message) "etapa" }
     Write-Host ""
     Write-Host ("{0} {1}" -f $script:SimboloBarra, $Message) -ForegroundColor Cyan
     Write-Host ($script:SimboloLinha * $script:LarguraConsole) -ForegroundColor DarkCyan
@@ -475,6 +488,7 @@ function Write-Step {
 function Write-Section {
     # Subtítulo dentro de uma etapa, para separar blocos de informação.
     param([Parameter(Mandatory=$true)][string]$Message)
+    if ($null -ne $script:GuiProgresso) { Add-NextecGuiLog ""; Add-NextecGuiLog ("  {0}" -f $Message) "secao" }
     Write-Host ""
     Write-Host ("  {0}" -f $Message) -ForegroundColor Cyan
 }
@@ -503,30 +517,35 @@ function Write-Field {
 
     $cor = if ($null -ne $ValueColor) { [ConsoleColor]$ValueColor } else { Get-NextecCorDoValor -Value $Value }
     $rotulo = $Label.PadRight($Width)
+    if ($null -ne $script:GuiProgresso) { Add-NextecGuiLog ("    {0}{1}" -f $rotulo, $Value) }
     Write-Host ("    {0}" -f $rotulo) -ForegroundColor Gray -NoNewline
     Write-Host $Value -ForegroundColor $cor
 }
 
 function Write-Ok {
     param([Parameter(Mandatory=$true)][string]$Message)
+    if ($null -ne $script:GuiProgresso) { Add-NextecGuiLog ("{0}  {1}" -f $script:SimboloOk, $Message) "ok" }
     Write-Host ("{0}  " -f $script:SimboloOk) -ForegroundColor Green -NoNewline
     Write-Host $Message
 }
 
 function Write-Info {
     param([Parameter(Mandatory=$true)][string]$Message)
+    if ($null -ne $script:GuiProgresso) { Add-NextecGuiLog ("i  {0}" -f $Message) "info" }
     Write-Host "i  " -ForegroundColor Cyan -NoNewline
     Write-Host $Message
 }
 
 function Write-Warn {
     param([Parameter(Mandatory=$true)][string]$Message)
+    if ($null -ne $script:GuiProgresso) { Add-NextecGuiLog ("!  {0}" -f $Message) "aviso" }
     Write-Host "!  " -ForegroundColor Yellow -NoNewline
     Write-Host $Message -ForegroundColor Yellow
 }
 
 function Write-Fail {
     param([Parameter(Mandatory=$true)][string]$Message)
+    if ($null -ne $script:GuiProgresso) { Add-NextecGuiLog ("x  {0}" -f $Message) "falha" }
     Write-Host "x  " -ForegroundColor Red -NoNewline
     Write-Host $Message -ForegroundColor Red
 }
@@ -534,7 +553,176 @@ function Write-Fail {
 function Write-Hint {
     # Texto de ajuda, sem símbolo: explica a próxima pergunta.
     param([Parameter(Mandatory=$true)][string]$Message)
+    if ($null -ne $script:GuiProgresso) { Add-NextecGuiLog ("  {0}" -f $Message) "dica" }
     Write-Host ("  {0}" -f $Message) -ForegroundColor DarkGray
+}
+
+# ==============================================================================
+# JANELA DE ANDAMENTO (TELA)
+# ==============================================================================
+# Com a tela, o console fica escondido e o andamento aparece numa janela com o
+# mesmo cabeçalho. Write-Step, Write-Ok e demais escrevem nos dois lugares.
+$script:GuiProgresso = $null
+$script:UsouTela = $false
+$script:UsouProgresso = $false
+$script:ConsoleEscondido = $false
+
+function Set-NextecConsoleVisivel {
+    param([bool]$Visivel)
+    try {
+        if (-not ("Nextec.ConsoleJanela" -as [type])) {
+            Add-Type -Namespace "Nextec" -Name "ConsoleJanela" -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+'@
+        }
+        $janela = [Nextec.ConsoleJanela]::GetConsoleWindow()
+        if ($janela -eq [IntPtr]::Zero) { return }
+        if ($Visivel) {
+            if ($script:ConsoleEscondido) { [void][Nextec.ConsoleJanela]::ShowWindow($janela, 5) }
+            $script:ConsoleEscondido = $false
+        }
+        else {
+            [void][Nextec.ConsoleJanela]::ShowWindow($janela, 0)
+            $script:ConsoleEscondido = $true
+        }
+    }
+    catch {
+        Write-Verbose ("Não foi possível alterar a janela do console: {0}" -f $_.Exception.Message)
+    }
+}
+
+function Invoke-NextecGuiEventos {
+    if ($null -ne $script:GuiProgresso) { [Windows.Forms.Application]::DoEvents() }
+}
+
+function Wait-NextecSegundos {
+    # Pausa que mantém a janela de andamento respondendo.
+    param([double]$Segundos)
+    if ($null -eq $script:GuiProgresso) { Start-Sleep -Milliseconds ([int]($Segundos * 1000)); return }
+    $fim = (Get-Date).AddSeconds($Segundos)
+    while ((Get-Date) -lt $fim) { [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50 }
+}
+
+function Wait-NextecProcesso {
+    # Espera um processo terminar sem congelar a janela de andamento.
+    param([Parameter(Mandatory=$true)][Diagnostics.Process]$Processo)
+    while (-not $Processo.HasExited) {
+        Invoke-NextecGuiEventos
+        Start-Sleep -Milliseconds 100
+    }
+    $Processo.WaitForExit()
+}
+
+function Add-NextecGuiLog {
+    param([AllowEmptyString()][string]$Texto, [string]$Tipo = "texto")
+    $gp = $script:GuiProgresso
+    if ($null -eq $gp -or $gp.Form.IsDisposed) { return }
+    $cor = switch ($Tipo) {
+        "etapa" { $script:GuiCores.Marinho }
+        "secao" { $script:GuiCores.Roxo }
+        "ok" { [Drawing.Color]::FromArgb(22, 128, 60) }
+        "aviso" { [Drawing.Color]::FromArgb(176, 96, 0) }
+        "falha" { $script:GuiCores.Erro }
+        "dica" { $script:GuiCores.Cinza }
+        default { $script:GuiCores.Texto }
+    }
+    $log = $gp.Log
+    $log.SelectionStart = $log.TextLength
+    $log.SelectionLength = 0
+    $log.SelectionColor = $cor
+    $log.SelectionFont = $(if ($Tipo -eq "etapa") { $gp.FonteEtapa } else { $gp.FonteLog })
+    $log.AppendText($Texto + [Environment]::NewLine)
+    $log.ScrollToCaret()
+    [Windows.Forms.Application]::DoEvents()
+}
+
+function Set-NextecGuiStatus {
+    param([string]$Texto)
+    if ($null -eq $script:GuiProgresso) { return }
+    $script:GuiProgresso.Status.Text = $Texto
+    [Windows.Forms.Application]::DoEvents()
+}
+
+function Open-NextecGuiProgresso {
+    <#
+        Janela de andamento: abre depois da tela de respostas, com o mesmo
+        cabeçalho, e mostra tudo o que a instalação (ou a simulação) escreve.
+        Só deixa fechar quando o trabalho termina.
+    #>
+    param([Parameter(Mandatory=$true)][object]$Inventory, [Parameter(Mandatory=$true)][string]$Titulo)
+
+    $gp = @{ Concluido = $false }
+    $form = New-Object Windows.Forms.Form
+    $form.Text = "Nextec · Instalação do monitoramento"
+    $form.Size = New-Object Drawing.Size(900, 680)
+    $form.MinimumSize = New-Object Drawing.Size(700, 480)
+    $form.StartPosition = "CenterScreen"
+    $form.Font = New-Object Drawing.Font("Segoe UI", 9.5)
+    $form.BackColor = [Drawing.Color]::White
+    $form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::None
+    $gp.Form = $form
+
+    $rodape = New-Object Windows.Forms.Panel
+    $rodape.Dock = "Bottom"; $rodape.Height = 56; $rodape.BackColor = [Drawing.Color]::White
+    # Largura final já na criação: as âncoras dos filhos são medidas a partir dela.
+    $rodape.Width = 884
+    $gp.Status = New-GuiLabel "" 16 18 640
+    $gp.Status.Anchor = [Windows.Forms.AnchorStyles]::Left -bor [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
+    $gp.Fechar = New-GuiBotao "Fechar" 670 12 200 -Principal
+    $gp.Fechar.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
+    $gp.Fechar.Enabled = $false
+    $gp.Fechar.Add_Click({ $script:GuiProgresso.Form.Close() })
+    $rodape.Controls.Add($gp.Status); $rodape.Controls.Add($gp.Fechar)
+
+    $corpo = New-Object Windows.Forms.Panel
+    $corpo.Dock = "Fill"; $corpo.BackColor = [Drawing.Color]::White
+    $corpo.Padding = New-Object Windows.Forms.Padding(24, 52, 24, 8)
+    $gp.Titulo = New-GuiLabel $Titulo 24 14 800 -Titulo
+    $corpo.Controls.Add($gp.Titulo)
+    $gp.Log = New-Object Windows.Forms.RichTextBox
+    $gp.Log.Dock = "Fill"; $gp.Log.ReadOnly = $true
+    $gp.Log.BorderStyle = [Windows.Forms.BorderStyle]::FixedSingle
+    $gp.Log.BackColor = [Drawing.Color]::FromArgb(250, 250, 252)
+    $gp.FonteLog = New-Object Drawing.Font("Consolas", 9.5)
+    $gp.FonteEtapa = New-Object Drawing.Font("Consolas", 10, [Drawing.FontStyle]::Bold)
+    $gp.Log.Font = $gp.FonteLog
+    $corpo.Controls.Add($gp.Log)
+
+    $form.Controls.Add($corpo)
+    $form.Controls.Add($rodape)
+    $form.Controls.Add((New-GuiCabecalho -Inventory $Inventory))
+    # Fechar no X durante o trabalho deixaria a instalação pela metade.
+    $form.Add_FormClosing({ param($s, $e) if (-not $script:GuiProgresso.Concluido) { $e.Cancel = $true } })
+
+    Set-GuiEscala -Controle $form
+    $script:GuiProgresso = $gp
+    $script:UsouProgresso = $true
+    $form.Show()
+    $form.Activate()
+    Set-NextecGuiStatus "Em andamento..."
+}
+
+function Complete-NextecGuiProgresso {
+    # Mostra o resultado, libera o botão Fechar e espera o técnico fechar.
+    param([bool]$Sucesso, [string]$Titulo, [string]$Mensagem)
+    $gp = $script:GuiProgresso
+    if ($null -eq $gp) { return }
+    if (-not $gp.Form.IsDisposed) {
+        $gp.Concluido = $true
+        $gp.Titulo.Text = $Titulo
+        $gp.Titulo.ForeColor = $(if ($Sucesso) { [Drawing.Color]::FromArgb(22, 128, 60) } else { $script:GuiCores.Erro })
+        $gp.Status.Text = $Mensagem
+        $gp.Status.ForeColor = $gp.Titulo.ForeColor
+        $gp.Fechar.Enabled = $true
+        [void]$gp.Fechar.Focus()
+        while ($gp.Form.Visible) {
+            [Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 50
+        }
+        $gp.Form.Dispose()
+    }
+    $script:GuiProgresso = $null
 }
 
 function Set-NextecConsoleTheme {
@@ -587,7 +775,7 @@ function Invoke-NextecDownload {
     )
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $mostrar = (-not $Silent) -and (Test-NextecInteractiveConsole)
+    $mostrar = (-not $Silent) -and (Test-NextecInteractiveConsole) -and ($null -eq $script:GuiProgresso)
     $seta = [string][char]0x2193
     $cheio = [string][char]0x2588
     $vazio = [string][char]0x2591
@@ -619,6 +807,12 @@ function Invoke-NextecDownload {
             if ($n -le 0) { break }
             $saida.Write($buffer, 0, $n)
             $lido += $n
+
+            if ($null -ne $script:GuiProgresso -and $relogio.ElapsedMilliseconds -ge 250) {
+                $relogio.Reset(); $relogio.Start()
+                if ($total -gt 0) { Set-NextecGuiStatus ("Baixando {0}: {1}% ({2} de {3})" -f $Descricao, [int][Math]::Floor(100 * $lido / $total), (Get-NextecTextoTamanho $lido), (Get-NextecTextoTamanho $total)) }
+                else { Set-NextecGuiStatus ("Baixando {0}: {1}" -f $Descricao, (Get-NextecTextoTamanho $lido)) }
+            }
 
             if ($mostrar -and $relogio.ElapsedMilliseconds -ge 250) {
                 $relogio.Reset(); $relogio.Start()
@@ -1292,6 +1486,15 @@ function ConvertTo-AlloyEscapedString {
     return $escaped
 }
 
+function Show-NextecConsoleParaPergunta {
+    # Pergunta no console com a janela de andamento aberta: o console volta a
+    # aparecer, senão a instalação ficaria parada esperando uma resposta que
+    # ninguém vê.
+    if ($null -eq $script:GuiProgresso -or -not $script:ConsoleEscondido) { return }
+    Add-NextecGuiLog "!  Há uma pergunta na janela do console. Responda lá para continuar." "aviso"
+    Set-NextecConsoleVisivel $true
+}
+
 function Read-NextecInput {
     <#
         Pergunta com hierarquia visual: "?" em ciano, texto em branco, dica e
@@ -1311,6 +1514,7 @@ function Read-NextecInput {
     if ($Default) { Write-Host (" [{0}]" -f $Default) -ForegroundColor DarkGray -NoNewline }
     Write-Host ": " -NoNewline
 
+    Show-NextecConsoleParaPergunta
     if ($AsSecureString) { return (Read-Host -AsSecureString) }
     return (Read-Host)
 }
@@ -1390,6 +1594,7 @@ function Read-Choice {
 
     while ($true) {
         Write-Host ("{0} " -f $script:SimboloCursor) -ForegroundColor Cyan -NoNewline
+        Show-NextecConsoleParaPergunta
         $choiceText = Read-Host
 
         if ([string]::IsNullOrWhiteSpace($choiceText)) {
@@ -3529,14 +3734,14 @@ function Get-NextecExporterCatalog {
     # Read-CustomExporters. "custom" representa "Outro endpoint Prometheus",
     # que aceita múltiplas entradas livres.
     return @(
-        [pscustomobject]@{ Key = "redis_exporter";         Label = "Redis Exporter, padrão :9121";              DefaultTarget = "127.0.0.1:9121";  DefaultService = "redis" }
-        [pscustomobject]@{ Key = "nginx_exporter";         Label = "Nginx Prometheus Exporter, padrão :9113";   DefaultTarget = "127.0.0.1:9113";  DefaultService = "nginx" }
-        [pscustomobject]@{ Key = "apache_exporter";        Label = "Apache Exporter, padrão :9117";             DefaultTarget = "127.0.0.1:9117";  DefaultService = "apache" }
-        [pscustomobject]@{ Key = "rabbitmq_prometheus";    Label = "RabbitMQ Prometheus, padrão :15692";        DefaultTarget = "127.0.0.1:15692"; DefaultService = "rabbitmq" }
-        [pscustomobject]@{ Key = "elasticsearch_exporter"; Label = "Elasticsearch Exporter, padrão :9114";      DefaultTarget = "127.0.0.1:9114";  DefaultService = "elasticsearch" }
-        [pscustomobject]@{ Key = "mongodb_exporter";       Label = "MongoDB Exporter, padrão :9216";            DefaultTarget = "127.0.0.1:9216";  DefaultService = "mongodb" }
-        [pscustomobject]@{ Key = "nvidia_dcgm_exporter";   Label = "NVIDIA DCGM Exporter, padrão :9400";        DefaultTarget = "127.0.0.1:9400";  DefaultService = "gpu" }
-        [pscustomobject]@{ Key = "custom";                 Label = "Outro endpoint Prometheus";                 DefaultTarget = "";                 DefaultService = "" }
+        [pscustomobject]@{ Key = "redis_exporter";         Label = "Redis";                                    DefaultTarget = "127.0.0.1:9121";  DefaultService = "redis" }
+        [pscustomobject]@{ Key = "nginx_exporter";         Label = "Nginx";                                    DefaultTarget = "127.0.0.1:9113";  DefaultService = "nginx" }
+        [pscustomobject]@{ Key = "apache_exporter";        Label = "Apache";                                   DefaultTarget = "127.0.0.1:9117";  DefaultService = "apache" }
+        [pscustomobject]@{ Key = "rabbitmq_prometheus";    Label = "RabbitMQ";                                 DefaultTarget = "127.0.0.1:15692"; DefaultService = "rabbitmq" }
+        [pscustomobject]@{ Key = "elasticsearch_exporter"; Label = "Elasticsearch";                            DefaultTarget = "127.0.0.1:9114";  DefaultService = "elasticsearch" }
+        [pscustomobject]@{ Key = "mongodb_exporter";       Label = "MongoDB";                                  DefaultTarget = "127.0.0.1:9216";  DefaultService = "mongodb" }
+        [pscustomobject]@{ Key = "nvidia_dcgm_exporter";   Label = "GPU NVIDIA (DCGM)";                        DefaultTarget = "127.0.0.1:9400";  DefaultService = "gpu" }
+        [pscustomobject]@{ Key = "custom";                 Label = "Outro serviço com métricas Prometheus";    DefaultTarget = "";                 DefaultService = "" }
     )
 }
 
@@ -3762,22 +3967,23 @@ function Read-BlackboxTargets {
     # status: uma página que carrega com erro (ex.: WordPress quebrado) mas
     # ainda responde 200 passa despercebida. ICMP só confere se o host
     # responde a ping, nada além disso.
+    # Ordem do mais simples ao mais completo, igual à tela e ao Linux.
     $probeOptions = @(
-        "ICMP/Ping - só confere se o host responde a ping. Não diz nada sobre um site ou serviço estar funcionando.",
-        "HTTP 2xx - abre a URL e confere se a resposta veio com status 200-299. Não confere o conteúdo da página: um site com erro visível mas que responde 200 passa como OK.",
-        "HTTPS 2xx com validação de certificado - igual ao HTTP 2xx, mas exige HTTPS válido e também avisa quando o certificado está perto de vencer.",
-        "TCP connect - só confere se a porta aceita conexão. Não valida o que roda por cima dela.",
-        "DNS (UDP) - confere se o servidor DNS responde a uma consulta.",
-        "HTTP 2xx com verificação de conteúdo - além do status 200-299, falha se a página trouxer um erro conhecido no corpo (ex.: 'Há um erro crítico' do WordPress, erro de conexão com banco, 500/502/503). Pega o caso de página que carrega mas está quebrada."
+        "Ping - só confere se o host responde a ping. Não diz nada sobre um site ou serviço estar funcionando.",
+        "TCP - só confere se a porta aceita conexão. Não valida o que roda por cima dela.",
+        "DNS - confere se o servidor DNS responde a uma consulta.",
+        "HTTP - abre a URL e confere se a resposta veio com status 200-299. Não confere o conteúdo: um site com erro visível que responde 200 passa como OK.",
+        "HTTPS com certificado - igual ao HTTP, mas exige HTTPS válido e avisa quando o certificado está perto de vencer.",
+        "Conteúdo - além do status 200-299, falha se a página trouxer um erro conhecido (ex.: 'Há um erro crítico' do WordPress, erro de conexão com banco, 500/502/503). Pega a página que carrega mas está quebrada."
     )
-    $moduleByOption = @{ 1 = "icmp_ipv4"; 2 = "http_2xx"; 3 = "http_2xx_ssl"; 4 = "tcp_connect"; 5 = "dns_udp"; 6 = "http_2xx_content" }
-    $suffixByOption = @{ 1 = "ping"; 2 = "http"; 3 = "https"; 4 = "tcp"; 5 = "dns"; 6 = "content" }
+    $moduleByOption = @{ 1 = "icmp_ipv4"; 2 = "tcp_connect"; 3 = "dns_udp"; 4 = "http_2xx"; 5 = "http_2xx_ssl"; 6 = "http_2xx_content" }
+    $suffixByOption = @{ 1 = "ping"; 2 = "tcp"; 3 = "dns"; 4 = "http"; 5 = "https"; 6 = "content" }
 
     do {
         $name = Read-NextecSlug -Prompt "Nome do alvo (ex.: fw_matriz)" -Kind host
         $address = Read-NextecAddress -Prompt "IP, FQDN ou URL" -Kind destino
 
-        Write-Host "Tipo de teste (pode escolher mais de um, separados por vírgula, ex.: 1,2)" -ForegroundColor White
+        Write-Host "Tipo de teste, do 1 (mais simples) ao 6 (mais completo). Pode escolher mais de um, separados por vírgula, ex.: 1,4" -ForegroundColor White
         for ($i = 0; $i -lt $probeOptions.Count; $i++) {
             Write-Host ("  [{0}] {1}" -f ($i + 1), $probeOptions[$i])
         }
@@ -4833,7 +5039,7 @@ function Test-NocConnectivity {
 
             Write-Warn ("Falha temporária na conectividade com {0} (tentativa {1}/{2}): {3}" -f $script:NocHost, $attempt, $maxAttempts, $_.Exception.Message)
             Write-Info ("Tentando de novo em {0}s..." -f $delaySeconds)
-            Start-Sleep -Seconds $delaySeconds
+            Wait-NextecSegundos $delaySeconds
         }
     }
 }
@@ -5068,7 +5274,7 @@ function Install-OrUpdateAlloy {
                     }
 
                     Write-Warn ("Falha no download (tentativa {0} de {1}): {2}" -f $try, $maxTries, $_.Exception.Message)
-                    Start-Sleep -Seconds (5 * $try)
+                    Wait-NextecSegundos (5 * $try)
                 }
             }
         }
@@ -5095,7 +5301,8 @@ function Install-OrUpdateAlloy {
 
         Write-Info "Executando instalador silencioso do Alloy (/S). Isso pode levar até um minuto sem nenhuma saída na tela; é esperado."
 
-        $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
+        $process = Start-Process -FilePath $installer -ArgumentList $arguments -PassThru
+        Wait-NextecProcesso -Processo $process
 
         if ($process.ExitCode -ne 0) {
             throw ("Instalador do Alloy retornou código {0}." -f $process.ExitCode)
@@ -5820,7 +6027,7 @@ function ConvertTo-ColetaIniValue {
     return ($Valor -replace "[\r\n]+", " " -replace "\[", "(" -replace "\]", ")").Trim()
 }
 
-$script:PapeisLink = [ordered]@{ primario = "principal"; failover = "reserva"; sdwan = "SD-WAN" }
+$script:PapeisLink = [ordered]@{ primario = "Principal"; failover = "Reserva"; sdwan = "SD-WAN" }
 $script:TiposLink = [ordered]@{ fibra = "Fibra"; radio = "Rádio"; "4g" = "4G/5G"; satelite = "Satélite"; dedicado = "Dedicado" }
 $script:TiposLinkNome = @{ fibra = "Fibra"; radio = "Rádio"; "4g" = "4G"; satelite = "Satélite"; dedicado = "Dedicado" }
 # Três destinos por link, de provedores diferentes (uma queda de provedor não
@@ -7076,7 +7283,7 @@ function Restart-AlloyService {
     $deadline = (Get-Date).AddSeconds(30)
 
     do {
-        Start-Sleep -Seconds 1
+        Wait-NextecSegundos 1
         $service = Get-Service -Name $script:AlloyServiceName
 
         if ($service.Status -eq "Running") {
@@ -7122,7 +7329,7 @@ function Test-AlloyReadiness {
             Write-Verbose ("Tentativa {0} de readiness falhou: {1}" -f $attempt, $_.Exception.Message)
         }
 
-        Start-Sleep -Seconds 2
+        Wait-NextecSegundos 2
     }
 
     $message = "Alloy não respondeu em http://127.0.0.1:12345/-/ready após 10 tentativas. Verifique 'Get-Service Alloy' e o log de eventos (Application, provedor Alloy)."
@@ -7180,7 +7387,7 @@ function Test-AlloyIngestion {
         return
     }
 
-    Start-Sleep -Seconds 45
+    Wait-NextecSegundos 45
     $second = Get-AlloySampleCounters
 
     if ($null -eq $second) {
@@ -7623,10 +7830,75 @@ function Test-NextecUseGui {
 # Cores da marca. Preenchidas por Initialize-GuiCores, depois de carregar o
 # System.Drawing (no Windows PowerShell 5.1 ele não vem carregado no console).
 $script:GuiCores = @{}
+$script:GuiEscala = 1.0
 $script:GuiFabricantesSnmp = @()
 $script:ConfirmadoNaTela = $false
 
+function Get-GuiControlesRecursivo {
+    param([Windows.Forms.Control]$Controle)
+    foreach ($c in @($Controle.Controls)) {
+        $c
+        if ($c.Controls.Count -gt 0) { Get-GuiControlesRecursivo -Controle $c }
+    }
+}
+
+function Set-GuiEscala {
+    <#
+        Os layouts da tela são escritos em pixels de 100% (96 DPI). O
+        PowerShell 7 roda com DPI do sistema: numa tela de 150% a fonte já sai
+        maior, mas posição e tamanho não acompanham e os rótulos ficam
+        cortados. Aqui tudo é multiplicado pelo fator da tela antes de a
+        janela abrir. No Windows PowerShell 5.1 o fator é 1 (o Windows amplia a
+        janela inteira) e nada muda.
+
+        As âncoras saem durante a escala e voltam no fim: com elas, o controle
+        ancorado à direita andaria duas vezes (pela âncora e pela escala).
+    #>
+    param([Parameter(Mandatory=$true)][Windows.Forms.Control]$Controle)
+    $f = $script:GuiEscala
+    if ($f -le 1.01) { return }
+    $todos = @(Get-GuiControlesRecursivo -Controle $Controle)
+    $ancoras = @{}
+    foreach ($c in $todos) {
+        $ancoras[$c] = $c.Anchor
+        if ($c.Dock -eq [Windows.Forms.DockStyle]::None) { $c.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Left }
+    }
+    $Controle.Size = New-Object Drawing.Size([int]($Controle.Width * $f), [int]($Controle.Height * $f))
+    if ($Controle -is [Windows.Forms.Form] -and -not $Controle.MinimumSize.IsEmpty) {
+        $Controle.MinimumSize = New-Object Drawing.Size([int]($Controle.MinimumSize.Width * $f), [int]($Controle.MinimumSize.Height * $f))
+    }
+    foreach ($c in $todos) {
+        if ($c -is [Windows.Forms.TabPage]) { continue }
+        switch ($c.Dock) {
+            ([Windows.Forms.DockStyle]::Fill) { }
+            ([Windows.Forms.DockStyle]::Top) { $c.Height = [int]($c.Height * $f) }
+            ([Windows.Forms.DockStyle]::Bottom) { $c.Height = [int]($c.Height * $f) }
+            default { $c.Bounds = New-Object Drawing.Rectangle([int]($c.Left * $f), [int]($c.Top * $f), [int]($c.Width * $f), [int]($c.Height * $f)) }
+        }
+        if ($c -is [Windows.Forms.TabControl]) {
+            $c.Padding = New-Object Drawing.Point([int]($c.Padding.X * $f), [int]($c.Padding.Y * $f))
+        }
+        elseif ($c -is [Windows.Forms.Panel]) {
+            $pad = $c.Padding
+            $c.Padding = New-Object Windows.Forms.Padding([int]($pad.Left * $f), [int]($pad.Top * $f), [int]($pad.Right * $f), [int]($pad.Bottom * $f))
+        }
+    }
+    foreach ($c in $todos) { $c.Anchor = $ancoras[$c] }
+}
+
 function Initialize-GuiCores {
+    # Escala da tela (1 = 100%, 1.5 = 150%). Os layouts são escritos para 96
+    # DPI e PerformAutoScale ajusta tamanhos e posições; o que é medido em
+    # pixel na hora (largura de texto, altura de item) usa este fator.
+    $script:GuiEscala = 1.0
+    try {
+        $tela = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+        $script:GuiEscala = [double]$tela.DpiX / 96.0
+        $tela.Dispose()
+    }
+    catch {
+        $script:GuiEscala = 1.0
+    }
     $script:GuiCores = @{
         Marinho = [Drawing.Color]::FromArgb(13, 0, 53)
         Roxo    = [Drawing.Color]::FromArgb(92, 80, 255)
@@ -7637,13 +7909,15 @@ function Initialize-GuiCores {
     }
 }
 
+# Do teste mais simples ao mais completo: cada nível confere mais coisas que o
+# anterior. O número na frente deixa a ordem visível na lista.
 $script:GuiModulosBlackbox = [ordered]@{
-    icmp_ipv4        = "Ping (o host responde)"
-    http_2xx         = "HTTP 2xx (status da página)"
-    http_2xx_ssl     = "HTTPS 2xx com certificado"
-    http_2xx_content = "HTTP 2xx com conteúdo (pega página quebrada)"
-    tcp_connect      = "TCP (a porta aceita conexão)"
-    dns_udp          = "DNS (o servidor responde)"
+    icmp_ipv4        = "1. Ping: o host responde"
+    tcp_connect      = "2. TCP: a porta aceita conexão"
+    dns_udp          = "3. DNS: o servidor resolve nomes"
+    http_2xx         = "4. HTTP: a página responde (2xx)"
+    http_2xx_ssl     = "5. HTTPS: responde e o certificado é válido"
+    http_2xx_content = "6. Conteúdo: a página abre sem erro"
 }
 $script:GuiSufixoBlackbox = @{ icmp_ipv4 = "ping"; http_2xx = "http"; http_2xx_ssl = "https"; tcp_connect = "tcp"; dns_udp = "dns"; http_2xx_content = "content" }
 
@@ -7671,6 +7945,46 @@ function New-GuiLabel {
     if ($Dica) { $l.ForeColor = $script:GuiCores.Cinza; $l.Font = New-Object Drawing.Font("Segoe UI", 8.5) }
     if ($Titulo) { $l.Font = New-Object Drawing.Font("Segoe UI Semibold", 11); $l.ForeColor = $script:GuiCores.Marinho; $l.Height = 28 }
     return $l
+}
+
+function Add-GuiRotulo {
+    <#
+        Rótulo de campo. Com -Obrigatorio, ganha um asterisco vermelho logo
+        depois do texto.
+    #>
+    param($Pagina, [string]$Texto, [int]$X, [int]$Y, [int]$Largura = 200, [switch]$Obrigatorio)
+    $l = New-GuiLabel $Texto $X $Y $Largura
+    $Pagina.Controls.Add($l)
+    if ($Obrigatorio) {
+        $fonte = New-Object Drawing.Font("Segoe UI", 9.5)
+        $largura = [int]([Windows.Forms.TextRenderer]::MeasureText($Texto, $fonte).Width / $script:GuiEscala)
+        $a = New-GuiLabel "*" ($X + $largura - 2) $Y 14
+        $a.ForeColor = $script:GuiCores.Erro
+        $a.Font = New-Object Drawing.Font("Segoe UI Semibold", 10)
+        $Pagina.Controls.Add($a)
+        $a.BringToFront()
+        # O asterisco acompanha o rótulo quando o campo some (Set-GuiVisivel).
+        $l.Tag = $a
+    }
+    return $l
+}
+
+function Set-GuiVisivel {
+    param([Parameter(Mandatory=$true)][object[]]$Controles, [bool]$Visivel)
+    foreach ($c in $Controles) {
+        $c.Visible = $Visivel
+        if ($c.Tag -is [Windows.Forms.Control]) { $c.Tag.Visible = $Visivel }
+    }
+}
+
+function Add-GuiLegendaObrigatorio {
+    # "* obrigatório" no canto direito do título de cada aba.
+    param($Pagina, [int]$X = 690, [int]$Y = 20)
+    $l = New-GuiLabel "* campo obrigatório" $X $Y 160
+    $l.ForeColor = $script:GuiCores.Erro
+    $l.Font = New-Object Drawing.Font("Segoe UI", 8.5)
+    $l.TextAlign = [Drawing.ContentAlignment]::MiddleRight
+    $Pagina.Controls.Add($l)
 }
 
 function New-GuiTextBox {
@@ -7707,8 +8021,26 @@ function New-GuiGrid {
     $g.AutoSizeColumnsMode = [Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
     $g.EditMode = [Windows.Forms.DataGridViewEditMode]::EditOnEnter
     $g.ColumnHeadersDefaultCellStyle.Font = New-Object Drawing.Font("Segoe UI Semibold", 9)
+    $g.ColumnHeadersDefaultCellStyle.WrapMode = [Windows.Forms.DataGridViewTriState]::False
     # Valor fora da lista de uma coluna de escolha não abre caixa de erro.
     $g.Add_DataError({ param($s, $e) $e.ThrowException = $false })
+    # Coluna obrigatória: o título termina em " *" e o asterisco sai vermelho.
+    $g.Add_CellPainting({
+        param($s, $e)
+        if ($e.RowIndex -ne -1 -or $e.ColumnIndex -lt 0) { return }
+        $texto = [string]$e.Value
+        if (-not $texto.EndsWith(" *")) { return }
+        $e.PaintBackground($e.CellBounds, $true)
+        $base = $texto.Substring(0, $texto.Length - 2)
+        $fonte = $e.CellStyle.Font
+        $flags = [Windows.Forms.TextFormatFlags]::VerticalCenter -bor [Windows.Forms.TextFormatFlags]::Left -bor [Windows.Forms.TextFormatFlags]::NoPadding
+        $area = New-Object Drawing.Rectangle(($e.CellBounds.X + 6), $e.CellBounds.Y, ($e.CellBounds.Width - 6), $e.CellBounds.Height)
+        [Windows.Forms.TextRenderer]::DrawText($e.Graphics, $base, $fonte, $area, $e.CellStyle.ForeColor, $flags)
+        $largura = [Windows.Forms.TextRenderer]::MeasureText($e.Graphics, $base, $fonte, $area.Size, $flags).Width
+        $areaAst = New-Object Drawing.Rectangle(($area.X + $largura + 2), $e.CellBounds.Y, 16, $e.CellBounds.Height)
+        [Windows.Forms.TextRenderer]::DrawText($e.Graphics, "*", $fonte, $areaAst, $script:GuiCores.Erro, $flags)
+        $e.Handled = $true
+    })
     return $g
 }
 
@@ -7750,110 +8082,158 @@ function Get-GuiCelula {
     return ([string]$v).Trim()
 }
 
-function Show-GuiCredencialSnmp {
+function Show-GuiEquipamentoSnmp {
     <#
-        Janela da credencial de um equipamento SNMP. Devolve um objeto com a
-        versão e os campos, ou $null se o técnico cancelar. Senha nunca
-        aparece na grade: a linha guarda o objeto na propriedade Tag.
+        Janela de um equipamento SNMP: identificação, fabricante e credencial
+        juntos. Devolve um objeto com os campos, ou $null se o técnico
+        cancelar. Senha nunca aparece na grade: a linha guarda a credencial
+        na propriedade Tag.
     #>
-    param([string]$Equipamento, [object]$Atual)
+    param([object]$Atual)
 
     $f = New-Object Windows.Forms.Form
-    $f.Text = "Credencial SNMP · $Equipamento"
-    $f.Size = New-Object Drawing.Size(460, 400)
+    $f.Text = $(if ($null -ne $Atual) { "Editar equipamento SNMP" } else { "Novo equipamento SNMP" })
+    $f.Size = New-Object Drawing.Size(520, 660)
     $f.StartPosition = "CenterParent"
     $f.FormBorderStyle = "FixedDialog"
     $f.MaximizeBox = $false; $f.MinimizeBox = $false
     $f.Font = New-Object Drawing.Font("Segoe UI", 9.5)
     $f.BackColor = [Drawing.Color]::White
+    $f.AutoScaleMode = [Windows.Forms.AutoScaleMode]::None
 
-    $f.Controls.Add((New-GuiLabel "Versão SNMP" 20 18 140))
-    $versao = New-GuiCombo 170 15 250 @("v2c (community)", "v3 (usuário e senha)")
+    $f.Controls.Add((New-GuiLabel "Equipamento" 20 12 300 -Titulo))
+    Add-GuiLegendaObrigatorio $f 320 16
+
+    [void](Add-GuiRotulo $f "Nome" 20 52 160 -Obrigatorio)
+    $nome = New-GuiTextBox 200 49 280 ""
+    $f.Controls.Add($nome)
+    $f.Controls.Add((New-GuiLabel "Curto e sem espaço. Ex.: fw_matriz, sw_core" 200 74 290 -Dica))
+
+    [void](Add-GuiRotulo $f "IP ou FQDN" 20 104 160 -Obrigatorio)
+    $endereco = New-GuiTextBox 200 101 280 ""
+    $f.Controls.Add($endereco)
+
+    [void](Add-GuiRotulo $f "Fabricante" 20 142 160 -Obrigatorio)
+    $fabricante = New-GuiCombo 200 139 180 @($NextecSnmpVendors.Values | ForEach-Object { $_.Label })
+    $f.Controls.Add($fabricante)
+    $f.Controls.Add((New-GuiLabel "Fabricante fora da lista? Solicite ao NOC a inclusão antes de cadastrar." 200 164 300 -Dica))
+    $f.Controls[$f.Controls.Count - 1].Height = 34
+
+    [void](Add-GuiRotulo $f "Tipo" 20 204 160)
+    $tipos = @("firewall", "switch", "storage", "ap", "ups")
+    $tipo = New-GuiCombo 200 201 180 $tipos
+    $f.Controls.Add($tipo)
+
+    $f.Controls.Add((New-GuiLabel "Credencial SNMP" 20 244 300 -Titulo))
+    [void](Add-GuiRotulo $f "Versão" 20 284 160)
+    $versao = New-GuiCombo 200 281 280 @("v2c (community)", "v3 (usuário e senha, mais seguro)")
     $f.Controls.Add($versao)
 
-    $f.Controls.Add((New-GuiLabel "Community" 20 58 140))
-    $community = New-GuiTextBox 170 55 250 "public" -Senha
+    $rCommunity = Add-GuiRotulo $f "Community" 20 322 160 -Obrigatorio
+    $community = New-GuiTextBox 200 319 280 "public" -Senha
     $f.Controls.Add($community)
 
-    $f.Controls.Add((New-GuiLabel "Usuário SNMPv3" 20 98 140))
-    $usuario = New-GuiTextBox 170 95 250 "nextec_monitoramento"
+    $rUsuario = Add-GuiRotulo $f "Usuário" 20 322 160 -Obrigatorio
+    $usuario = New-GuiTextBox 200 319 280 "nextec_monitoramento"
     $f.Controls.Add($usuario)
-    $f.Controls.Add((New-GuiLabel "Segurança" 20 133 140))
-    $nivel = New-GuiCombo 170 130 250 @("authPriv (autenticação e criptografia)", "authNoPriv (só autenticação)")
+    $rNivel = Add-GuiRotulo $f "Segurança" 20 357 160
+    $nivel = New-GuiCombo 200 354 280 @("Autenticação e criptografia (authPriv)", "Só autenticação (authNoPriv)")
     $f.Controls.Add($nivel)
-    $f.Controls.Add((New-GuiLabel "Autenticação" 20 168 140))
-    $protAuth = New-GuiCombo 170 165 120 @("SHA", "SHA256", "SHA512", "MD5")
+    $rProtAuth = Add-GuiRotulo $f "Autenticação" 20 392 160
+    $protAuth = New-GuiCombo 200 389 120 @("SHA", "SHA256", "SHA512", "MD5")
     $f.Controls.Add($protAuth)
-    $senhaAuth = New-GuiTextBox 300 165 120 "" -Senha
+    $rSenhaAuth = Add-GuiRotulo $f "Senha de autenticação" 20 427 170 -Obrigatorio
+    $senhaAuth = New-GuiTextBox 200 424 280 "" -Senha
     $f.Controls.Add($senhaAuth)
-    $f.Controls.Add((New-GuiLabel "Criptografia" 20 203 140))
-    $protPriv = New-GuiCombo 170 200 120 @("AES", "AES256", "DES")
+    $rProtPriv = Add-GuiRotulo $f "Criptografia" 20 462 160
+    $protPriv = New-GuiCombo 200 459 120 @("AES", "AES256", "DES")
     $f.Controls.Add($protPriv)
-    $senhaPriv = New-GuiTextBox 300 200 120 "" -Senha
+    $rSenhaPriv = Add-GuiRotulo $f "Senha de criptografia" 20 497 170 -Obrigatorio
+    $senhaPriv = New-GuiTextBox 200 494 280 "" -Senha
     $f.Controls.Add($senhaPriv)
-    $f.Controls.Add((New-GuiLabel "Protocolo à esquerda, senha à direita. Senhas não aparecem na tela." 20 235 410 -Dica))
+    $f.Controls.Add((New-GuiLabel "A credencial fica só neste servidor (snmp-auth.yml) e não aparece de novo na tela." 20 530 470 -Dica))
 
-    $erro = New-GuiLabel "" 20 262 410
+    $erro = New-GuiLabel "" 20 554 470
     $erro.ForeColor = $script:GuiCores.Erro
     $f.Controls.Add($erro)
 
     if ($null -ne $Atual) {
-        if ($Atual.Versao -eq "v3") {
-            $versao.SelectedIndex = 1
-            $usuario.Text = $Atual.Usuario
-            $nivel.SelectedIndex = $(if ($Atual.Nivel -eq "authNoPriv") { 1 } else { 0 })
-            $protAuth.SelectedItem = $Atual.ProtocoloAuth
-            $senhaAuth.Text = $Atual.SenhaAuth
-            if ($Atual.ProtocoloPriv) { $protPriv.SelectedItem = $Atual.ProtocoloPriv }
-            $senhaPriv.Text = $Atual.SenhaPriv
-        }
-        else {
-            $community.Text = $Atual.Community
+        $nome.Text = $Atual.Nome
+        $endereco.Text = $Atual.Endereco
+        if ($Atual.Fabricante) { $fabricante.SelectedItem = $Atual.Fabricante }
+        if ($Atual.Tipo) { $tipo.SelectedItem = $Atual.Tipo }
+        $cred = $Atual.Credencial
+        if ($null -ne $cred) {
+            if ($cred.Versao -eq "v3") {
+                $versao.SelectedIndex = 1
+                $usuario.Text = $cred.Usuario
+                $nivel.SelectedIndex = $(if ($cred.Nivel -eq "authNoPriv") { 1 } else { 0 })
+                $protAuth.SelectedItem = $cred.ProtocoloAuth
+                $senhaAuth.Text = $cred.SenhaAuth
+                if ($cred.ProtocoloPriv) { $protPriv.SelectedItem = $cred.ProtocoloPriv }
+                $senhaPriv.Text = $cred.SenhaPriv
+            }
+            else {
+                $community.Text = $cred.Community
+            }
         }
     }
 
+    # Mostra só os campos da versão escolhida.
+    $v2 = @($rCommunity, $community)
+    $v3 = @($rUsuario, $usuario, $rNivel, $nivel, $rProtAuth, $protAuth, $rSenhaAuth, $senhaAuth)
+    $priv = @($rProtPriv, $protPriv, $rSenhaPriv, $senhaPriv)
     $atualizar = {
-        $v3 = ($versao.SelectedIndex -eq 1)
-        $community.Enabled = -not $v3
-        $usuario.Enabled = $v3; $nivel.Enabled = $v3; $protAuth.Enabled = $v3; $senhaAuth.Enabled = $v3
-        $comPriv = $v3 -and ($nivel.SelectedIndex -eq 0)
-        $protPriv.Enabled = $comPriv; $senhaPriv.Enabled = $comPriv
+        $ehV3 = ($versao.SelectedIndex -eq 1)
+        Set-GuiVisivel $v2 (-not $ehV3)
+        Set-GuiVisivel $v3 $ehV3
+        Set-GuiVisivel $priv ($ehV3 -and ($nivel.SelectedIndex -eq 0))
     }
     $versao.Add_SelectedIndexChanged($atualizar)
     $nivel.Add_SelectedIndexChanged($atualizar)
-    & $atualizar
 
-    $ok = New-GuiBotao "Salvar" 200 300 110 -Principal
-    $cancelar = New-GuiBotao "Cancelar" 320 300 100
+    $ok = New-GuiBotao "Salvar" 260 578 110 -Principal
+    $cancelar = New-GuiBotao "Cancelar" 380 578 100
     $cancelar.DialogResult = [Windows.Forms.DialogResult]::Cancel
     $f.CancelButton = $cancelar
+    $f.AcceptButton = $ok
     $f.Controls.Add($ok); $f.Controls.Add($cancelar)
+    $f.Add_Shown({ & $atualizar; [void]$nome.Focus() })
+    Set-GuiEscala -Controle $f
 
-    $script:GuiCredencialResultado = $null
+
+    $script:GuiEquipamentoResultado = $null
     $ok.Add_Click({
+        $n = (Get-GuiSlug $nome.Text) -replace "[-.]", "_"
+        if (-not $n) { $erro.Text = "Informe o nome do equipamento."; [void]$nome.Focus(); return }
+        if (-not (Test-NextecHost $endereco.Text.Trim())) { $erro.Text = "IP ou FQDN inválido. Ex.: 10.0.0.1 ou fw.cliente.local"; [void]$endereco.Focus(); return }
         if ($versao.SelectedIndex -eq 0) {
-            if ([string]::IsNullOrWhiteSpace($community.Text)) { $erro.Text = "Informe a community."; return }
-            $script:GuiCredencialResultado = [pscustomobject]@{ Versao = "v2c"; Community = $community.Text }
+            if ([string]::IsNullOrWhiteSpace($community.Text)) { $erro.Text = "Informe a community."; [void]$community.Focus(); return }
+            $cred = [pscustomobject]@{ Versao = "v2c"; Community = $community.Text }
         }
         else {
-            if ([string]::IsNullOrWhiteSpace($usuario.Text)) { $erro.Text = "Informe o usuário."; return }
-            if ([string]::IsNullOrEmpty($senhaAuth.Text)) { $erro.Text = "Informe a senha de autenticação."; return }
+            if ([string]::IsNullOrWhiteSpace($usuario.Text)) { $erro.Text = "Informe o usuário SNMPv3."; [void]$usuario.Focus(); return }
+            if ([string]::IsNullOrEmpty($senhaAuth.Text)) { $erro.Text = "Informe a senha de autenticação."; [void]$senhaAuth.Focus(); return }
             $nivelTexto = $(if ($nivel.SelectedIndex -eq 0) { "authPriv" } else { "authNoPriv" })
-            if ($nivelTexto -eq "authPriv" -and [string]::IsNullOrEmpty($senhaPriv.Text)) { $erro.Text = "Informe a senha de criptografia."; return }
-            $script:GuiCredencialResultado = [pscustomobject]@{
+            if ($nivelTexto -eq "authPriv" -and [string]::IsNullOrEmpty($senhaPriv.Text)) { $erro.Text = "Informe a senha de criptografia."; [void]$senhaPriv.Focus(); return }
+            $cred = [pscustomobject]@{
                 Versao = "v3"; Usuario = $usuario.Text.Trim(); Nivel = $nivelTexto
                 ProtocoloAuth = [string]$protAuth.SelectedItem; SenhaAuth = $senhaAuth.Text
                 ProtocoloPriv = $(if ($nivelTexto -eq "authPriv") { [string]$protPriv.SelectedItem } else { "" })
                 SenhaPriv = $(if ($nivelTexto -eq "authPriv") { $senhaPriv.Text } else { "" })
             }
         }
+        $script:GuiEquipamentoResultado = [pscustomobject]@{
+            Nome = $n; Endereco = $endereco.Text.Trim(); Fabricante = [string]$fabricante.SelectedItem
+            Tipo = [string]$tipo.SelectedItem; Credencial = $cred
+        }
         $f.DialogResult = [Windows.Forms.DialogResult]::OK
         $f.Close()
     })
 
-    [void]$f.ShowDialog()
+    [void]$f.ShowDialog($script:Gui.Form)
     $f.Dispose()
-    return $script:GuiCredencialResultado
+    return $script:GuiEquipamentoResultado
 }
 
 function ConvertTo-SnmpAuthYaml {
@@ -7967,39 +8347,10 @@ function Get-NextecLogoImage {
     }
 }
 
-function Show-NextecInstallerGui {
-    <#
-        Abre a tela de instalação e preenche as mesmas variáveis que o fluxo
-        do console preenche. Devolve $true se o técnico confirmou e $false
-        se fechou a janela.
-    #>
-    param(
-        [Parameter(Mandatory=$true)][object]$Inventory,
-        [Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$DetectedFeatures
-    )
-
-    [Windows.Forms.Application]::EnableVisualStyles()
-    Initialize-GuiCores
-    $g = @{}
-    $script:Gui = $g
-    $g.Inventory = $Inventory
-    $g.Features = @($DetectedFeatures)
-    $g.Confirmado = $false
-    # Com Set-StrictMode, ler chave que não existe no hashtable dá erro: toda
-    # chave lida por um evento precisa nascer aqui.
-    $g.Ocupado = $false
-    $estacao = ($Inventory.ProductType -eq 1)
-
-    $form = New-Object Windows.Forms.Form
-    $form.Text = "Nextec · Instalação do monitoramento"
-    $form.Size = New-Object Drawing.Size(900, 680)
-    $form.MinimumSize = New-Object Drawing.Size(900, 680)
-    $form.StartPosition = "CenterScreen"
-    $form.Font = New-Object Drawing.Font("Segoe UI", 9.5)
-    $form.BackColor = $script:GuiCores.Fundo
-    $form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::Dpi
-    $g.Form = $form
-
+function New-GuiCabecalho {
+    # Faixa do topo com título, versão, host e logo. Usada na tela de
+    # respostas e na janela de andamento.
+    param([Parameter(Mandatory=$true)][object]$Inventory)
     $topo = New-Object Windows.Forms.Panel
     $topo.Dock = "Top"; $topo.Height = 64; $topo.BackColor = $script:GuiCores.Marinho
     $titulo = New-Object Windows.Forms.Label
@@ -8024,6 +8375,46 @@ function Show-NextecInstallerGui {
         $topo.Controls.Add($logo)
     }
 
+    return $topo
+}
+
+function Show-NextecInstallerGui {
+    <#
+        Abre a tela de instalação e preenche as mesmas variáveis que o fluxo
+        do console preenche. Devolve $true se o técnico confirmou e $false
+        se fechou a janela.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][object]$Inventory,
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$DetectedFeatures
+    )
+
+    Initialize-GuiCores
+    [Windows.Forms.Application]::EnableVisualStyles()
+    $script:UsouTela = $true
+    Set-NextecConsoleVisivel $false
+    $g = @{}
+    $script:Gui = $g
+    $g.Inventory = $Inventory
+    $g.Features = @($DetectedFeatures)
+    $g.Confirmado = $false
+    # Com Set-StrictMode, ler chave que não existe no hashtable dá erro: toda
+    # chave lida por um evento precisa nascer aqui.
+    $g.Ocupado = $false
+    $estacao = ($Inventory.ProductType -eq 1)
+
+    $form = New-Object Windows.Forms.Form
+    $form.Text = "Nextec · Instalação do monitoramento"
+    $form.Size = New-Object Drawing.Size(900, 680)
+    $form.MinimumSize = New-Object Drawing.Size(900, 680)
+    $form.StartPosition = "CenterScreen"
+    $form.Font = New-Object Drawing.Font("Segoe UI", 9.5)
+    $form.BackColor = $script:GuiCores.Fundo
+    $form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::None
+    $g.Form = $form
+
+    $topo = New-GuiCabecalho -Inventory $Inventory
+
     $rodape = New-Object Windows.Forms.Panel
     $rodape.Dock = "Bottom"; $rodape.Height = 56; $rodape.BackColor = [Drawing.Color]::White
     $g.Erro = New-GuiLabel "" 16 18 520
@@ -8045,7 +8436,8 @@ function Show-NextecInstallerGui {
     $p = New-Object Windows.Forms.TabPage; $p.Text = "Identificação"; $p.BackColor = [Drawing.Color]::White
     $g.PaginaIdentificacao = $p
     $p.Controls.Add((New-GuiLabel "Quem é este servidor no NOC" 24 16 600 -Titulo))
-    $p.Controls.Add((New-GuiLabel "Cliente" 24 62 200))
+    Add-GuiLegendaObrigatorio $p
+    [void](Add-GuiRotulo $p "Cliente" 24 62 200 -Obrigatorio)
     $g.Cliente = New-GuiTextBox 230 59 360 $(if ($script:Cliente) { [string]$script:Cliente } else { "" })
     $p.Controls.Add($g.Cliente)
     $g.ClienteSlug = New-GuiLabel "Identificador da empresa, não do servidor. Ex.: advocacia_martins" 230 84 600 -Dica
@@ -8055,7 +8447,7 @@ function Show-NextecInstallerGui {
         if ($s) { $script:Gui.ClienteSlug.Text = "No NOC vai ficar: $s" } else { $script:Gui.ClienteSlug.Text = "Identificador da empresa, não do servidor. Ex.: advocacia_martins" }
     })
 
-    $p.Controls.Add((New-GuiLabel "Nome do host" 24 117 200))
+    [void](Add-GuiRotulo $p "Nome do host" 24 117 200 -Obrigatorio)
     $hostPadrao = $(if ($script:HostLabel) { [string]$script:HostLabel } else { Get-GuiSlug $Inventory.Hostname })
     $g.Host = New-GuiTextBox 230 114 360 $hostPadrao
     $p.Controls.Add($g.Host)
@@ -8065,7 +8457,7 @@ function Show-NextecInstallerGui {
     $g.Ambiente = New-GuiCombo 230 154 200 $ambientes ([Math]::Max(0, [Array]::IndexOf($ambientes, [string]$script:Ambiente)))
     $p.Controls.Add($g.Ambiente)
 
-    $p.Controls.Add((New-GuiLabel "Local" 24 197 200))
+    [void](Add-GuiRotulo $p "Local" 24 197 200 -Obrigatorio)
     $g.Local = New-GuiTextBox 230 194 200 $(if ($script:Local) { [string]$script:Local } else { "matriz" })
     $p.Controls.Add($g.Local)
     $p.Controls.Add((New-GuiLabel "Ex.: matriz, filial_sp" 440 197 300 -Dica))
@@ -8090,7 +8482,7 @@ function Show-NextecInstallerGui {
     $p.Controls.Add($g.Modo)
     $p.Controls.Add((New-GuiLabel "Collector é o servidor que alcança firewall, switch, nobreak e os destinos de teste." 230 300 600 -Dica))
 
-    $p.Controls.Add((New-GuiLabel "Destino do NOC" 24 340 200))
+    [void](Add-GuiRotulo $p "Destino do NOC" 24 340 200 -Obrigatorio)
     $g.Destino = New-GuiTextBox 230 337 360 $script:NocHost
     $p.Controls.Add($g.Destino)
 
@@ -8103,9 +8495,9 @@ function Show-NextecInstallerGui {
     $arvore = New-Object Windows.Forms.TreeView
     $arvore.CheckBoxes = $true
     $arvore.Location = New-Object Drawing.Point(24, 74)
-    $arvore.Size = New-Object Drawing.Size(560, 420)
+    $arvore.Size = New-Object Drawing.Size(560, 384)
     $arvore.Font = New-Object Drawing.Font("Segoe UI", 10)
-    $arvore.ItemHeight = 24
+    $arvore.ItemHeight = [int](24 * $script:GuiEscala)
     $arvore.ShowLines = $false
     $arvore.FullRowSelect = $true
     $g.Arvore = $arvore
@@ -8116,7 +8508,16 @@ function Show-NextecInstallerGui {
     $g.Intervalo.Minimum = 5; $g.Intervalo.Maximum = 1440
     $g.Intervalo.Value = [Math]::Max(5, [int]$InternetIntervalMinutes)
     $p.Controls.Add($g.Intervalo)
-    $p.Controls.Add((New-GuiLabel "Clique no texto para marcar. Exporters: marque o grupo e escolha os filhos." 24 502 760 -Dica))
+    $g.IntervaloDica = New-GuiLabel "Recomendado: 30 min." 604 134 250 -Dica
+    $p.Controls.Add($g.IntervaloDica)
+    $g.IntervaloAviso = New-GuiLabel "Cada teste satura o link por alguns segundos. Abaixo de 15 min o cliente sente lentidão e o consumo de franquia cresce muito." 604 156 250 -Dica
+    $g.IntervaloAviso.Height = 70
+    $p.Controls.Add($g.IntervaloAviso)
+    $g.Intervalo.Add_ValueChanged({
+        $gg = $script:Gui
+        $gg.IntervaloAviso.ForeColor = $(if ($gg.Intervalo.Value -lt 15) { $script:GuiCores.Erro } else { $script:GuiCores.Cinza })
+    })
+    $p.Controls.Add((New-GuiLabel "Clique no texto para marcar. Exporters: marque o grupo e escolha os filhos." 24 464 760 -Dica))
 
     # Itens do perfil básico são fixos: qualquer tentativa de desmarcar
     # (clique, barra de espaço) é cancelada antes de acontecer.
@@ -8163,13 +8564,14 @@ function Show-NextecInstallerGui {
     $p = New-Object Windows.Forms.TabPage; $p.Text = "Links de internet"; $p.BackColor = [Drawing.Color]::White
     $g.PaginaLinks = $p
     $p.Controls.Add((New-GuiLabel "Links de internet deste local" 24 16 600 -Titulo))
-    $p.Controls.Add((New-GuiLabel "Velocidade: 500, 1 Giga, 600/300 (vazio se não souber). Destinos já vêm prontos, um conjunto por link." 24 46 820 -Dica))
+    Add-GuiLegendaObrigatorio $p
+    $p.Controls.Add((New-GuiLabel "Velocidade contratada em Mbps: 500, 1000 ou 600/300 (download/upload); vazio se não souber. Destinos de teste já vêm prontos." 24 46 820 -Dica))
     $g.Links = New-GuiGrid 24 72 820 300
-    Add-GuiColunaTexto $g.Links "operadora" "Operadora" 110
+    Add-GuiColunaTexto $g.Links "operadora" "Operadora *" 110
     Add-GuiColunaLista $g.Links "tipo" "Tipo" @($script:TiposLink.Values) 70
-    Add-GuiColunaLista $g.Links "papel" "Função" @("principal", "reserva", "SD-WAN") 70
-    Add-GuiColunaTexto $g.Links "velocidade" "Velocidade" 70
-    Add-GuiColunaTexto $g.Links "alvos" "Destinos de teste" 170
+    Add-GuiColunaLista $g.Links "papel" "Função" @($script:PapeisLink.Values) 70
+    Add-GuiColunaTexto $g.Links "velocidade" "Velocidade (Mbps)" 105
+    Add-GuiColunaTexto $g.Links "alvos" "Destinos de teste *" 170
     Add-GuiColunaTexto $g.Links "ip_publico" "IP público" 80
     Add-GuiColunaTexto $g.Links "gateway" "Gateway" 70
     Add-GuiColunaTexto $g.Links "origem" "IP de origem" 70
@@ -8197,13 +8599,13 @@ function Show-NextecInstallerGui {
             $r.Cells["operadora"].Value = $Link.operadora
             $tipoTexto = $(if ($script:TiposLink.Contains([string]$Link.tipo)) { $script:TiposLink[[string]$Link.tipo] } else { @($script:TiposLink.Values)[0] })
             $r.Cells["tipo"].Value = $tipoTexto
-            $r.Cells["papel"].Value = $(if ($script:PapeisLink.Contains([string]$Link.papel)) { $script:PapeisLink[[string]$Link.papel] } else { "principal" })
+            $r.Cells["papel"].Value = $(if ($script:PapeisLink.Contains([string]$Link.papel)) { $script:PapeisLink[[string]$Link.papel] } else { $script:PapeisLink["primario"] })
             $r.Cells["velocidade"].Value = $(if ($Link.velocidade_upload_mbps) { "{0}/{1}" -f $Link.velocidade_mbps, $Link.velocidade_upload_mbps } else { [string]$Link.velocidade_mbps })
             foreach ($c in @("alvos", "ip_publico", "gateway", "origem", "firewall", "interface_firewall")) { $r.Cells[$c].Value = [string]$Link.$c }
         }
         else {
             $r.Cells["tipo"].Value = @($script:TiposLink.Values)[0]
-            $r.Cells["papel"].Value = $(if ($i -eq 0) { "principal" } else { "reserva" })
+            $r.Cells["papel"].Value = $(if ($i -eq 0) { $script:PapeisLink["primario"] } else { $script:PapeisLink["failover"] })
             $r.Cells["alvos"].Value = $(if ($i -lt $script:DestinosLink.Count) { $script:DestinosLink[$i] } else { "" })
         }
     }
@@ -8214,12 +8616,14 @@ function Show-NextecInstallerGui {
     # ---------------- Conectividade ----------------
     $p = New-Object Windows.Forms.TabPage; $p.Text = "Conectividade"; $p.BackColor = [Drawing.Color]::White
     $g.PaginaBlackbox = $p
-    $p.Controls.Add((New-GuiLabel "Sistemas, sites e portas que este servidor vai testar" 24 16 700 -Titulo))
-    $p.Controls.Add((New-GuiLabel "Para dois testes no mesmo alvo (ex.: ping e HTTPS), cadastre duas linhas com o mesmo nome." 24 46 820 -Dica))
+    $p.Controls.Add((New-GuiLabel "Sistemas, sites e portas que este servidor vai testar" 24 16 640 -Titulo))
+    Add-GuiLegendaObrigatorio $p
+    $p.Controls.Add((New-GuiLabel "Testes do 1 (mais simples) ao 6 (mais completo). Para dois testes no mesmo alvo, cadastre duas linhas com o mesmo nome." 24 46 820 -Dica))
     $g.Blackbox = New-GuiGrid 24 72 820 300
-    Add-GuiColunaTexto $g.Blackbox "nome" "Nome (ex.: fw_matriz)" 80
-    Add-GuiColunaTexto $g.Blackbox "endereco" "IP, FQDN ou URL" 120
-    Add-GuiColunaLista $g.Blackbox "modulo" "Teste" @($script:GuiModulosBlackbox.Values) 130
+    Add-GuiColunaTexto $g.Blackbox "nome" "Nome (ex.: fw_matriz) *" 80
+    Add-GuiColunaTexto $g.Blackbox "endereco" "IP, FQDN ou URL *" 110
+    Add-GuiColunaLista $g.Blackbox "modulo" "Teste" @($script:GuiModulosBlackbox.Values) 150
+    $g.Blackbox.Columns["modulo"].DropDownWidth = 330
     Add-GuiColunaLista $g.Blackbox "tipo" "Tipo do ativo" @("firewall", "switch", "link", "aplicacao", "site", "storage") 60
     $p.Controls.Add($g.Blackbox)
     $p.Controls.Add((New-GuiLabel "Testar a cada" 24 386 120))
@@ -8234,75 +8638,123 @@ function Show-NextecInstallerGui {
     # ---------------- SNMP ----------------
     $p = New-Object Windows.Forms.TabPage; $p.Text = "SNMP"; $p.BackColor = [Drawing.Color]::White
     $g.PaginaSnmp = $p
-    $p.Controls.Add((New-GuiLabel "Equipamentos de rede (firewall, switch, nobreak, AP)" 24 16 700 -Titulo))
-    $p.Controls.Add((New-GuiLabel "O módulo do fabricante vem do repositório Nextec. A credencial fica só neste servidor (snmp-auth.yml)." 24 46 820 -Dica))
-    $g.Snmp = New-GuiGrid 24 72 820 300
-    Add-GuiColunaTexto $g.Snmp "nome" "Nome (ex.: fw_matriz)" 90
+    $p.Controls.Add((New-GuiLabel "Equipamentos de rede (firewall, switch, nobreak, AP)" 24 16 640 -Titulo))
+    Add-GuiLegendaObrigatorio $p
+    $p.Controls.Add((New-GuiLabel "Use Adicionar equipamento: nome, endereço, fabricante e credencial ficam na mesma janela. Duplo clique numa linha edita." 24 46 820 -Dica))
+    $g.Snmp = New-GuiGrid 24 72 820 290
+    $g.Snmp.ReadOnly = $true
+    $g.Snmp.SelectionMode = [Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    $g.Snmp.MultiSelect = $false
+    Add-GuiColunaTexto $g.Snmp "nome" "Nome" 90
     Add-GuiColunaTexto $g.Snmp "endereco" "IP ou FQDN" 90
-    Add-GuiColunaLista $g.Snmp "fabricante" "Fabricante" @($NextecSnmpVendors.Values | ForEach-Object { $_.Label }) 80
-    Add-GuiColunaLista $g.Snmp "tipo" "Tipo" @("firewall", "switch", "storage", "ap", "ups") 60
-    Add-GuiColunaTexto $g.Snmp "credencial" "Credencial" 80 -SomenteLeitura
-    $botaoCred = New-Object Windows.Forms.DataGridViewButtonColumn
-    $botaoCred.Name = "definir"; $botaoCred.HeaderText = ""; $botaoCred.Text = "Definir..."; $botaoCred.UseColumnTextForButtonValue = $true; $botaoCred.FillWeight = 50
-    [void]$g.Snmp.Columns.Add($botaoCred)
-    $g.Snmp.Add_CellContentClick({
-        param($s, $e)
-        if ($e.RowIndex -lt 0 -or $script:Gui.Snmp.Columns[$e.ColumnIndex].Name -ne "definir") { return }
-        $linha = $script:Gui.Snmp.Rows[$e.RowIndex]
-        $nome = Get-GuiCelula $linha "nome"
-        if (-not $nome) { $nome = "equipamento" }
-        $cred = Show-GuiCredencialSnmp -Equipamento $nome -Atual $linha.Tag
-        if ($null -ne $cred) {
-            $linha.Tag = $cred
-            $linha.Cells["credencial"].Value = $(if ($cred.Versao -eq "v2c") { "v2c, definida" } else { "v3 {0}, definida" -f $cred.Nivel })
+    Add-GuiColunaTexto $g.Snmp "fabricante" "Fabricante" 70
+    Add-GuiColunaTexto $g.Snmp "tipo" "Tipo" 60
+    Add-GuiColunaTexto $g.Snmp "credencial" "Credencial" 90
+    $p.Controls.Add($g.Snmp)
+    $p.Controls.Add((New-GuiLabel "Fabricante fora da lista (pfSense, Fortigate, Mikrotik, SonicWall)? Solicite ao NOC a inclusão do fabricante antes de cadastrar o equipamento." 24 368 820 -Dica))
+
+    # Linha da grade a partir do objeto devolvido pela janela do equipamento.
+    $g.GravarEquipamento = {
+        param($Linha, $Equipamento)
+        $Linha.Cells["nome"].Value = $Equipamento.Nome
+        $Linha.Cells["endereco"].Value = $Equipamento.Endereco
+        $Linha.Cells["fabricante"].Value = $Equipamento.Fabricante
+        $Linha.Cells["tipo"].Value = $Equipamento.Tipo
+        $cred = $Equipamento.Credencial
+        $Linha.Cells["credencial"].Value = $(if ($cred.Versao -eq "v2c") { "v2c (community)" } else { "v3, {0}" -f $cred.Nivel })
+        $Linha.Tag = $cred
+    }
+    $g.EditarEquipamento = {
+        $gg = $script:Gui
+        $linha = $gg.Snmp.CurrentRow
+        if ($null -eq $linha) { $gg.Erro.Text = "Selecione um equipamento na lista."; return }
+        $atual = [pscustomobject]@{
+            Nome = Get-GuiCelula $linha "nome"; Endereco = Get-GuiCelula $linha "endereco"
+            Fabricante = Get-GuiCelula $linha "fabricante"; Tipo = Get-GuiCelula $linha "tipo"; Credencial = $linha.Tag
+        }
+        $eq = Show-GuiEquipamentoSnmp -Atual $atual
+        if ($null -ne $eq) { & $gg.GravarEquipamento $linha $eq; $gg.Erro.Text = "" }
+    }
+    $g.Snmp.Add_CellDoubleClick({ param($s, $e) if ($e.RowIndex -ge 0) { & $script:Gui.EditarEquipamento } })
+    $b1 = New-GuiBotao "Adicionar equipamento" 24 400 190 -Principal
+    $b3 = New-GuiBotao "Editar selecionado" 224 400 160
+    $b2 = New-GuiBotao "Remover selecionado" 394 400 170
+    $b1.Add_Click({
+        $eq = Show-GuiEquipamentoSnmp -Atual $null
+        if ($null -ne $eq) {
+            $gg = $script:Gui
+            $i = $gg.Snmp.Rows.Add()
+            & $gg.GravarEquipamento $gg.Snmp.Rows[$i] $eq
+            $gg.Erro.Text = ""
         }
     })
-    $p.Controls.Add($g.Snmp)
-    $b1 = New-GuiBotao "Adicionar equipamento" 24 386 180
-    $b2 = New-GuiBotao "Remover selecionado" 214 386 170
-    $b1.Add_Click({ $i = $script:Gui.Snmp.Rows.Add(); $r = $script:Gui.Snmp.Rows[$i]; $r.Cells["fabricante"].Value = @($NextecSnmpVendors.Values)[0].Label; $r.Cells["tipo"].Value = "firewall"; $r.Cells["credencial"].Value = "não definida" })
+    $b3.Add_Click({ & $script:Gui.EditarEquipamento })
     $b2.Add_Click({ if ($null -ne $script:Gui.Snmp.CurrentRow) { $script:Gui.Snmp.Rows.Remove($script:Gui.Snmp.CurrentRow) } })
-    $p.Controls.Add($b1); $p.Controls.Add($b2)
+    $p.Controls.Add($b1); $p.Controls.Add($b3); $p.Controls.Add($b2)
 
     # ---------------- Exporters ----------------
     $p = New-Object Windows.Forms.TabPage; $p.Text = "Exporters"; $p.BackColor = [Drawing.Color]::White
     $g.PaginaExporters = $p
-    $p.Controls.Add((New-GuiLabel "Endereço dos exporters marcados" 24 16 700 -Titulo))
-    $p.Controls.Add((New-GuiLabel "Só para exporter que já está rodando. O endereço padrão já vem preenchido." 24 46 820 -Dica))
-    $g.Exporters = New-GuiGrid 24 72 820 300
-    Add-GuiColunaTexto $g.Exporters "nome" "Exporter" 100
-    Add-GuiColunaTexto $g.Exporters "alvo" "host:porta" 100
-    Add-GuiColunaTexto $g.Exporters "servico" "Rótulo servico" 80
+    $p.Controls.Add((New-GuiLabel "Serviços que já publicam métricas Prometheus" 24 16 640 -Titulo))
+    Add-GuiLegendaObrigatorio $p
+    $p.Controls.Add((New-GuiLabel "Os marcados em Recursos já vêm com o endereço de costume. Troque só se o serviço usa outra porta ou outro servidor." 24 46 820 -Dica))
+    $g.Exporters = New-GuiGrid 24 72 820 190
+    Add-GuiColunaTexto $g.Exporters "nome" "Serviço *" 90
+    Add-GuiColunaTexto $g.Exporters "alvo" "Endereço (host:porta) *" 110
+    Add-GuiColunaTexto $g.Exporters "servico" "Nome no NOC (opcional)" 90
     $p.Controls.Add($g.Exporters)
-    $b1 = New-GuiBotao "Outro endpoint" 24 386 150
-    $b2 = New-GuiBotao "Remover selecionado" 184 386 170
-    $b1.Add_Click({ $i = $script:Gui.Exporters.Rows.Add(); $script:Gui.Exporters.Rows[$i].Tag = "custom" })
+    $b1 = New-GuiBotao "Adicionar outro serviço" 24 270 190
+    $b2 = New-GuiBotao "Remover selecionado" 224 270 170
+    $b1.Add_Click({ $i = $script:Gui.Exporters.Rows.Add(); $script:Gui.Exporters.Rows[$i].Tag = "custom"; $script:Gui.Exporters.CurrentCell = $script:Gui.Exporters.Rows[$i].Cells["nome"]; $script:Gui.Exporters.BeginEdit($true) | Out-Null })
     $b2.Add_Click({ if ($null -ne $script:Gui.Exporters.CurrentRow) { $script:Gui.Exporters.Rows.Remove($script:Gui.Exporters.CurrentRow) } })
     $p.Controls.Add($b1); $p.Controls.Add($b2)
+    $guia = New-Object Windows.Forms.GroupBox
+    $guia.Text = "Como adicionar um serviço que não está na lista"
+    $guia.Location = New-Object Drawing.Point(24, 314); $guia.Size = New-Object Drawing.Size(820, 160)
+    $passos = @(
+        "1. Abra http://host:porta/metrics no navegador. Se aparecer texto como ""nome_da_metrica 123"", o serviço publica métricas.",
+        "2. Clique em Adicionar outro serviço e preencha: Serviço (nome curto, ex.: minio), Endereço (ex.: 127.0.0.1:9000).",
+        "3. Nome no NOC é opcional: agrupa o serviço nos painéis. Em branco, usa o nome do serviço.",
+        "4. Se /metrics não abrir, o serviço precisa de um exporter próprio. Solicite ao NOC antes de cadastrar."
+    )
+    $y = 24
+    foreach ($passo in $passos) {
+        $l = New-GuiLabel $passo 12 $y 796
+        $l.Height = 30
+        $guia.Controls.Add($l)
+        $y += 32
+    }
+    $p.Controls.Add($guia)
 
     # ---------------- Credenciais ----------------
     $p = New-Object Windows.Forms.TabPage; $p.Text = "Credenciais"; $p.BackColor = [Drawing.Color]::White
     $g.PaginaCredenciais = $p
     $p.Controls.Add((New-GuiLabel "Credencial do NOC (Bitwarden)" 24 16 600 -Titulo))
-    $p.Controls.Add((New-GuiLabel "Usuário (métricas)" 24 62 200))
+    Add-GuiLegendaObrigatorio $p
+    [void](Add-GuiRotulo $p "Usuário (métricas)" 24 62 200 -Obrigatorio)
     $g.RwUser = New-GuiTextBox 230 59 300 ([string]$script:RwUsername)
     $p.Controls.Add($g.RwUser)
-    $p.Controls.Add((New-GuiLabel "Senha (métricas)" 24 102 200))
+    [void](Add-GuiRotulo $p "Senha (métricas)" 24 102 200 -Obrigatorio)
     $g.RwSenha = New-GuiTextBox 230 99 300 ([string]$script:RwPassword) -Senha
     $p.Controls.Add($g.RwSenha)
     $g.MesmaLoki = New-Object Windows.Forms.CheckBox
     $g.MesmaLoki.Text = "Usar a mesma credencial para logs e eventos (Loki)"
     $g.MesmaLoki.Location = New-Object Drawing.Point(230, 140); $g.MesmaLoki.AutoSize = $true; $g.MesmaLoki.Checked = $true
     $p.Controls.Add($g.MesmaLoki)
-    $p.Controls.Add((New-GuiLabel "Usuário (Loki)" 24 182 200))
+    $g.RotuloLokiUser = Add-GuiRotulo $p "Usuário (Loki)" 24 182 200 -Obrigatorio
     $g.LokiUser = New-GuiTextBox 230 179 300
     $p.Controls.Add($g.LokiUser)
-    $p.Controls.Add((New-GuiLabel "Senha (Loki)" 24 222 200))
+    $g.RotuloLokiSenha = Add-GuiRotulo $p "Senha (Loki)" 24 222 200 -Obrigatorio
     $g.LokiSenha = New-GuiTextBox 230 219 300 "" -Senha
     $p.Controls.Add($g.LokiSenha)
     $p.Controls.Add((New-GuiLabel "As credenciais ficam no registro do serviço do Alloy, com acesso só de SYSTEM e Administradores." 24 262 820 -Dica))
-    $g.MesmaLoki.Add_CheckedChanged({ $script:Gui.LokiUser.Enabled = -not $script:Gui.MesmaLoki.Checked; $script:Gui.LokiSenha.Enabled = -not $script:Gui.MesmaLoki.Checked })
-    $g.LokiUser.Enabled = $false; $g.LokiSenha.Enabled = $false
+    # Com a mesma credencial, os campos do Loki somem em vez de ficar cinza.
+    $g.AtualizarLoki = {
+        $gg = $script:Gui
+        Set-GuiVisivel @($gg.RotuloLokiUser, $gg.LokiUser, $gg.RotuloLokiSenha, $gg.LokiSenha) (-not $gg.MesmaLoki.Checked)
+    }
+    $g.MesmaLoki.Add_CheckedChanged({ & $script:Gui.AtualizarLoki })
+    & $g.AtualizarLoki
 
     # ---------------- Resumo ----------------
     $p = New-Object Windows.Forms.TabPage; $p.Text = "Resumo"; $p.BackColor = [Drawing.Color]::White
@@ -8357,7 +8809,6 @@ function Show-NextecInstallerGui {
             )) {
                 [void](& $fixo $basico $item[0] $item[1])
             }
-            $basico.Expand()
             $logs = & $novo $null "logs" "Logs do sistema (Critical e Error)" ([bool]$EnableLogs.IsPresent -or $script:EnableLogsResolved)
             [void](& $novo $logs "logs_warning" "Incluir os avisos (Warning), aumenta muito o volume" ([bool]$EnableLogWarnings.IsPresent))
             $logs.Expand()
@@ -8462,7 +8913,7 @@ function Show-NextecInstallerGui {
                 $n = $r.Index + 1
                 if (-not (Get-GuiCelula $r "operadora")) { return "Link ${n}: informe a operadora." }
                 $vel = Get-GuiCelula $r "velocidade"
-                if ($vel -and $null -eq (ConvertTo-NextecVelocidade $vel)) { return "Link ${n}: velocidade inválida ($vel). Use 500, 1 Giga ou 600/300." }
+                if ($vel -and $null -eq (ConvertTo-NextecVelocidade $vel)) { return "Link ${n}: velocidade inválida ($vel). Use Mbps: 500, 1000 ou 600/300." }
                 foreach ($a in ((Get-GuiCelula $r "alvos") -split ",")) {
                     if ($a.Trim() -and -not (Test-NextecHost $a.Trim())) { return "Link ${n}: destino inválido ($($a.Trim()))." }
                 }
@@ -8471,9 +8922,9 @@ function Show-NextecInstallerGui {
                     $v = Get-GuiCelula $r $c
                     if ($v -and -not (Test-NextecHost $v)) { return "Link ${n}: $c inválido ($v)." }
                 }
-                if ((Get-GuiCelula $r "papel") -eq "principal") { $principais++ }
+                if ((Get-GuiCelula $r "papel") -eq $script:PapeisLink["primario"]) { $principais++ }
             }
-            if ($principais -ne 1) { return "Marque exatamente um link como principal." }
+            if ($principais -ne 1) { return "Marque exatamente um link como Principal." }
         }
         if ($Pagina -eq $gg.PaginaBlackbox) {
             if ($gg.Blackbox.Rows.Count -eq 0) { return "Cadastre pelo menos um alvo ou desmarque Conectividade." }
@@ -8497,15 +8948,15 @@ function Show-NextecInstallerGui {
                 if ($nomes -contains $nome) { return "Equipamento ${n}: nome repetido ($nome)." }
                 $nomes += $nome
                 if (-not (Test-NextecHost (Get-GuiCelula $r "endereco"))) { return "Equipamento ${n}: IP ou FQDN inválido." }
-                if ($null -eq $r.Tag) { return "Equipamento ${n}: defina a credencial (botão Definir...)." }
+                if ($null -eq $r.Tag) { return "Equipamento ${n}: falta a credencial. Selecione a linha e clique em Editar selecionado." }
             }
         }
         if ($Pagina -eq $gg.PaginaExporters) {
-            if ($gg.Exporters.Rows.Count -eq 0) { return "Marque um exporter em Recursos ou use Outro endpoint." }
+            if ($gg.Exporters.Rows.Count -eq 0) { return "Marque um serviço em Recursos ou use Adicionar outro serviço." }
             foreach ($r in $gg.Exporters.Rows) {
                 $n = $r.Index + 1
-                if (-not (Get-GuiSlug (Get-GuiCelula $r "nome"))) { return "Exporter ${n}: informe o nome." }
-                if (-not (Test-NextecHostPort (Get-GuiCelula $r "alvo"))) { return "Exporter ${n}: use host:porta, ex.: 127.0.0.1:9121." }
+                if (-not (Get-GuiSlug (Get-GuiCelula $r "nome"))) { return "Serviço ${n}: informe o nome." }
+                if (-not (Test-NextecHostPort (Get-GuiCelula $r "alvo"))) { return "Serviço ${n}: o endereço precisa ser host:porta, ex.: 127.0.0.1:9121." }
             }
         }
         if ($Pagina -eq $gg.PaginaCredenciais) {
@@ -8555,6 +9006,12 @@ function Show-NextecInstallerGui {
         }
     })
 
+    # Todas as abas entram antes da escala: aba que ficasse de fora apareceria
+    # depois com o layout de 96 DPI numa tela de 150%.
+    foreach ($pg in @($g.PaginaIdentificacao, $g.PaginaRecursos, $g.PaginaLinks, $g.PaginaBlackbox, $g.PaginaSnmp, $g.PaginaExporters, $g.PaginaCredenciais, $g.PaginaResumo)) {
+        if (-not $abas.TabPages.Contains($pg)) { $abas.TabPages.Add($pg) }
+    }
+    Set-GuiEscala -Controle $form
     & $g.MontarArvore
     & $g.MontarAbas
     & $g.AtualizarRodape
@@ -8587,7 +9044,10 @@ function Get-GuiResumo {
     }
     if (& $gg.Marcado "coleta") {
         [void]$linhas.Add(("Links de internet .. {0}" -f $gg.Links.Rows.Count))
-        foreach ($r in $gg.Links.Rows) { [void]$linhas.Add(("    {0} {1} ({2}) {3}" -f (Get-GuiCelula $r "operadora"), (Get-GuiCelula $r "tipo"), (Get-GuiCelula $r "papel"), (Get-GuiCelula $r "velocidade"))) }
+        foreach ($r in $gg.Links.Rows) {
+            $vel = Get-GuiCelula $r "velocidade"
+            [void]$linhas.Add(("    {0} {1} ({2}) {3}" -f (Get-GuiCelula $r "operadora"), (Get-GuiCelula $r "tipo"), (Get-GuiCelula $r "papel"), $(if ($vel) { "$vel Mbps" } else { "velocidade não informada" })))
+        }
     }
     else { [void]$linhas.Add("Internet e links ... não") }
     if (& $gg.Marcado "internet") { [void]$linhas.Add(("Speedtest .......... a cada {0} min" -f $gg.Intervalo.Value)) }
@@ -8793,6 +9253,7 @@ function Invoke-NextecSimulacao {
             Write-Info "Tela fechada sem concluir."
             return
         }
+        Open-NextecGuiProgresso -Inventory $inventory -Titulo "Simulação em andamento"
     }
     else {
         Get-NextecConfiguration -Inventory $inventory -DetectedFeatures $detectedFeatures
@@ -8834,10 +9295,11 @@ function Invoke-NextecInstaller {
 
         Show-DetectionSummary -Inventory $inventory -DetectedFeatures @($detectedFeatures)
         if ($script:UsarTela) {
-            Write-Info "Preencha a tela de instalação. O andamento aparece nesta janela."
+            Write-Info "Preencha a tela de instalação. O andamento aparece na própria tela."
             if (-not (Show-NextecInstallerGui -Inventory $inventory -DetectedFeatures $detectedFeatures)) {
                 throw "Instalação cancelada pelo operador."
             }
+            Open-NextecGuiProgresso -Inventory $inventory -Titulo "Instalação em andamento"
         }
         else {
             Get-NextecConfiguration -Inventory $inventory -DetectedFeatures $detectedFeatures
@@ -8969,10 +9431,25 @@ finally {
     # mensagem existir e o suporte recebia um log que parava no rollback.
     Stop-Logging
 
+    # Com a tela, o resultado fica na janela de andamento até o técnico
+    # fechar; o console volta a aparecer só depois.
+    if ($null -ne $script:GuiProgresso) {
+        $logTexto = $(if ([string]::IsNullOrWhiteSpace([string]$script:InstallerLog)) { "" } else { " Log: {0}" -f $script:InstallerLog })
+        if ($Simular) {
+            if ($script:ExitCode -eq 0) { Complete-NextecGuiProgresso -Sucesso $true -Titulo "Simulação concluída" -Mensagem "Nada foi instalado neste computador. Pode fechar." }
+            else { Complete-NextecGuiProgresso -Sucesso $false -Titulo "A simulação parou com erro" -Mensagem "Veja a mensagem em vermelho acima." }
+        }
+        elseif ($script:ExitCode -eq 0) { Complete-NextecGuiProgresso -Sucesso $true -Titulo "Instalação concluída" -Mensagem ("Confira o resumo acima.{0}" -f $logTexto) }
+        elseif ($script:ExitCode -eq 2) { Complete-NextecGuiProgresso -Sucesso $true -Titulo "Instalação concluída com pendências" -Mensagem ("O monitoramento básico está ativo; veja os avisos acima.{0}" -f $logTexto) }
+        else { Complete-NextecGuiProgresso -Sucesso $false -Titulo "A instalação falhou" -Mensagem ("Veja a mensagem em vermelho acima.{0}" -f $logTexto) }
+    }
+    Set-NextecConsoleVisivel $true
+
     # Segura a janela antes de devolver o controle, porque o console aberto por
     # duplo clique ou atalho fecha assim que o script retorna. Quando o
-    # trabalho foi delegado a outra sessão, quem espera o operador é ela.
-    if (-not $Silent -and -not $script:Relaunched) {
+    # trabalho foi delegado a outra sessão, quem espera o operador é ela; com a
+    # tela, quem esperou foi a janela de andamento.
+    if (-not $Silent -and -not $script:Relaunched -and -not $script:UsouProgresso) {
         Wait-NextecOperator
     }
     Restore-NextecConsoleTheme

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.6.0 (Catálogo SNMP por fabricante com credencial separada; exporters em árvore no checklist)
+# Versão: 2.7.0 (Testes de conectividade do mais simples ao mais completo; obrigatórios marcados; velocidade em Mbps)
 #
 # USO
 # ---
@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.6.0"
+INSTALLER_VERSION="2.7.0"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -142,8 +142,9 @@ step() {
 # pergunta "texto" "padrão" "dica": monta o texto colorido de uma pergunta.
 # ? em ciano, pergunta em negrito, padrão e dica apagados.
 pergunta() {
-  local texto="$1" padrao="${2:-}" dica="${3:-}" saida
+  local texto="$1" padrao="${2:-}" dica="${3:-}" obrigatorio="${4:-0}" saida
   saida="${CYAN}?${NC} ${BOLD}${texto}${NC}"
+  [[ "$obrigatorio" == "1" ]] && saida+="${RED}${BOLD} *${NC}"
   [[ -n "$dica" ]] && saida+=" ${DIM}(${dica})${NC}"
   [[ -n "$padrao" ]] && saida+=" ${DIM}[${padrao}]${NC}"
   echo -e "${saida}: "
@@ -224,10 +225,10 @@ ask_required() {
   local prompt="$1" default="${2:-}" value
   while true; do
     if [[ -n "$default" ]]; then
-      read -r -p "$(pergunta "$prompt" "$default")" value || entrada_encerrada
+      read -r -p "$(pergunta "$prompt" "$default" "" 1)" value || entrada_encerrada
       value="${value:-$default}"
     else
-      read -r -p "$(pergunta "$prompt")" value || entrada_encerrada
+      read -r -p "$(pergunta "$prompt" "" "" 1)" value || entrada_encerrada
     fi
     value="$(trim "$value")"
     [[ -n "$value" ]] && { printf '%s' "$value"; return; }
@@ -1016,7 +1017,7 @@ LINK_DESTINOS_PADRAO=(
 )
 
 papel_rotulo() {
-  case "$1" in primario) echo "principal";; failover) echo "reserva";; sdwan) echo "SD-WAN";; *) echo "$1";; esac
+  case "$1" in primario) echo "Principal";; failover) echo "Reserva";; sdwan) echo "SD-WAN";; *) echo "$1";; esac
 }
 
 # velocidade_mbps "500m" / "1g" / "1.5giga": valor em Mbps, inteiro.
@@ -1071,7 +1072,7 @@ collect_one_link() {
   tipo_rotulo="${LINK_TIPOS_NOME[$((CHOOSE_RESULT-1))]}"
 
   while true; do
-    read -r -p "$(pergunta "Velocidade contratada" "" "ex.: 500, 1 Giga, 600/300; ENTER se não souber")" resposta || entrada_encerrada
+    read -r -p "$(pergunta "Velocidade contratada em Mbps" "" "ex.: 500, 1000 ou 600/300; ENTER se não souber")" resposta || entrada_encerrada
     resposta="$(trim "$resposta")"
     [[ -z "$resposta" ]] && break
     if velocidade="$(normalizar_velocidade "$resposta")"; then
@@ -1079,7 +1080,7 @@ collect_one_link() {
       info "Registrada como $(velocidade_texto "$vel_down" "$vel_up")."
       break
     fi
-    warn "Velocidade inválida: ${resposta}. Use Mega ou Giga, ex.: 500, 500 Mega, 1 Giga ou 600/300."
+    warn "Velocidade inválida: ${resposta}. Use Mbps, ex.: 500, 1000 ou 600/300 (download/upload)."
   done
 
   if [[ "$varios" == "0" ]]; then
@@ -1090,7 +1091,7 @@ collect_one_link() {
       [[ "$n" == "primario" ]] && tem_principal=1
     done
     choose_padrao "Função deste link" "$([[ "$tem_principal" == 1 ]] && echo 2 || echo 1)" \
-      "principal" "reserva (entra quando o principal cai)" "SD-WAN (os dois em uso ao mesmo tempo)"
+      "Principal" "Reserva (entra quando o principal cai)" "SD-WAN (os dois em uso ao mesmo tempo)"
     case "$CHOOSE_RESULT" in 1) papel=primario;; 2) papel=failover;; 3) papel=sdwan;; esac
   fi
 
@@ -2003,9 +2004,46 @@ modules:
       preferred_ip_protocol: ip4
       follow_redirects: true
 
+  # HTTPS com validação de certificado. Produz probe_ssl_earliest_cert_expiry.
+  http_2xx_ssl:
+    prober: http
+    timeout: 10s
+    http:
+      preferred_ip_protocol: ip4
+      follow_redirects: true
+      fail_if_not_ssl: true
+      tls_config:
+        insecure_skip_verify: false
+
+  # HTTP com verificação de conteúdo: além do 2xx, falha se o corpo trouxer
+  # uma assinatura de erro conhecida (WordPress quebrado, banco fora, 5xx).
+  http_2xx_content:
+    prober: http
+    timeout: 10s
+    http:
+      preferred_ip_protocol: ip4
+      follow_redirects: true
+      fail_if_body_matches_regexp:
+        - "(?i)há um erro crítico"
+        - "(?i)there has been a critical error"
+        - "(?i)error establishing a database connection"
+        - "(?i)erro de conex(a|ã)o com o banco de dados"
+        - "(?i)\\b(500 internal server error|502 bad gateway|503 service unavailable|504 gateway timeout)\\b"
+      tls_config:
+        insecure_skip_verify: false
+
   tcp_connect:
     prober: tcp
     timeout: 5s
+
+  dns_udp:
+    prober: dns
+    timeout: 5s
+    dns:
+      transport_protocol: udp
+      preferred_ip_protocol: ip4
+      query_name: nex.tec.br
+      query_type: A
 EOF
   chmod 0640 "$BLACKBOX_FILE"
   chown root:alloy "$BLACKBOX_FILE" 2>/dev/null || true
@@ -2209,6 +2247,7 @@ collect_snmp_targets() {
     done
     sa="$(ask_address "IP/FQDN SNMP" "" host)"
 
+    dica "Fabricante fora da lista? Solicite ao NOC a inclusão do fabricante; \"Outro\" só com snmp.yml já homologado."
     choose_padrao "Fabricante" 1 "${SNMP_FABRICANTES_ROTULOS[@]}" "Outro (snmp.yml próprio)"
     choice="$CHOOSE_RESULT"
     if (( choice <= ${#SNMP_FABRICANTES[@]} )); then
@@ -2456,10 +2495,10 @@ resource_checklist() {
     "Logs do sistema, warning/error/critical"
     "Banco de dados"
     "SNMP, firewalls/switches/UPS/APs"
-    "Conectividade e disponibilidade (Blackbox), ping/HTTP/TCP"
+    "Conectividade e disponibilidade (Blackbox), ping/TCP/DNS/HTTP"
     "Exporters adicionais"
     "Internet e links (status, DNS, IP público, cadastro dos links)"
-    "Teste de velocidade (Speedtest)"
+    "Teste de velocidade (Speedtest, a cada 30 min)"
     "Acessos ao servidor (logins com origem, alerta de acesso privilegiado)"
   )
   local -a details=("" "" "" "" "" "" "recomendado" "recomendado" "recomendado")
@@ -2798,14 +2837,14 @@ resource_checklist() {
 # tanto a árvore do checklist quanto a lista do menu de alteração.
 EXPORTER_CATALOGO_CHAVES=(redis_exporter nginx_exporter apache_exporter rabbitmq_prometheus elasticsearch_exporter mongodb_exporter nvidia_dcgm_exporter outro)
 EXPORTER_CATALOGO_ROTULOS=(
-  "Redis Exporter, padrão :9121"
-  "Nginx Prometheus Exporter, padrão :9113"
-  "Apache Exporter, padrão :9117"
-  "RabbitMQ Prometheus, padrão :15692"
-  "Elasticsearch Exporter, padrão :9114"
-  "MongoDB Exporter, padrão :9216"
-  "NVIDIA DCGM Exporter, padrão :9400"
-  "Outro endpoint Prometheus"
+  "Redis"
+  "Nginx"
+  "Apache"
+  "RabbitMQ"
+  "Elasticsearch"
+  "MongoDB"
+  "GPU NVIDIA (DCGM)"
+  "Outro serviço com métricas Prometheus"
 )
 EXPORTER_CATALOGO_ALVOS=(127.0.0.1:9121 127.0.0.1:9113 127.0.0.1:9117 127.0.0.1:15692 127.0.0.1:9114 127.0.0.1:9216 127.0.0.1:9400 "")
 EXPORTER_CATALOGO_SERVICOS=(redis nginx apache rabbitmq elasticsearch mongodb gpu "")
@@ -2853,6 +2892,18 @@ select_specialized_exporter() {
   return 0
 }
 
+# Passo a passo para cadastrar um serviço que não está no catálogo.
+guia_outro_exporter() {
+  echo
+  echo -e "  ${BOLD}Como adicionar um serviço que não está na lista${NC}"
+  dica "1. Rode: curl -s http://host:porta/metrics | head"
+  dica "   Se aparecer texto como \"nome_da_metrica 123\", o serviço publica métricas."
+  dica "2. Informe um nome curto (ex.: minio) e o endereço host:porta (ex.: 127.0.0.1:9000)."
+  dica "3. Nome no NOC agrupa o serviço nos painéis; ENTER usa o mesmo nome."
+  dica "4. Se /metrics não responder, o serviço precisa de um exporter próprio: solicite ao NOC."
+  echo
+}
+
 # Pergunta endereço e serviço de um exporter do catálogo (chave) ou de um
 # endpoint livre (chave "outro") e acrescenta em CUSTOM_EXPORTERS.
 cadastrar_exporter() {
@@ -2861,17 +2912,19 @@ cadastrar_exporter() {
   if [[ "$chave" != "outro" ]]; then
     echo
     info "${EXPORTER_CATALOGO_ROTULOS[$idx]}"
+    dica "ENTER aceita o endereço de costume; troque só se o serviço usa outra porta ou outro servidor."
     cn="$chave"
-    ct="$(ask_address "Target host:porta" "${EXPORTER_CATALOGO_ALVOS[$idx]}" hostport)"
-    cs="$(ask_slug "Label servico" "${EXPORTER_CATALOGO_SERVICOS[$idx]}" label)"
+    ct="$(ask_address "Endereço (host:porta)" "${EXPORTER_CATALOGO_ALVOS[$idx]}" hostport)"
+    cs="$(ask_slug "Nome no NOC" "${EXPORTER_CATALOGO_SERVICOS[$idx]}" label)"
   else
+    guia_outro_exporter
     while true; do
-      cn="$(ask_slug "Nome do exporter" "" label)"
+      cn="$(ask_slug "Serviço (nome curto, ex.: minio)" "" label)"
       nome_existe "$cn" "${CUSTOM_EXPORTERS[@]}" || break
-      warn "Já existe um exporter chamado '${cn}'. Use outro nome."
+      warn "Já existe um serviço chamado '${cn}'. Use outro nome."
     done
-    ct="$(ask_address "Target host:porta" "" hostport)"
-    cs="$(ask_slug "Label servico" "$cn" label)"
+    ct="$(ask_address "Endereço (host:porta)" "" hostport)"
+    cs="$(ask_slug "Nome no NOC" "$cn" label)"
   fi
   CUSTOM_EXPORTERS+=("${cn}|${ct}|${cs}")
   ok "Integração adicionada: ${cn} -> ${ct} (servico=${cs})"
@@ -2932,9 +2985,9 @@ collect_exporters_marcados() {
       (( tem_outro == 1 )) && continue
       while true; do
         echo
-        info "Outro endpoint Prometheus"
+        info "Outro serviço com métricas Prometheus"
         cadastrar_exporter outro
-        ask_yes_no "Adicionar mais um endpoint Prometheus?" n || break
+        ask_yes_no "Adicionar mais um serviço?" n || break
       done
       continue
     fi
@@ -2960,11 +3013,24 @@ collect_blackbox_targets() {
       nome_existe "$bn" "${BLACKBOX_TARGETS[@]}" || break
       warn "Já existe um alvo chamado '${bn}'. Use outro nome."
     done
-    ba="$(ask_address "IP, FQDN ou URL" "" destino)"
-
-    choose "Tipo de teste" "ICMP/Ping" "HTTP/HTTPS 2xx" "TCP connect"
+    # Do teste mais simples ao mais completo: cada nível confere mais coisas
+    # que o anterior. Mesmos módulos e mesma ordem do Windows.
+    choose "Tipo de teste (1 = mais simples, 6 = mais completo)" \
+      "Ping: o host responde" \
+      "TCP: a porta aceita conexão" \
+      "DNS: o servidor resolve nomes" \
+      "HTTP: a página responde (2xx)" \
+      "HTTPS: responde e o certificado é válido" \
+      "Conteúdo: a página abre sem erro (pega página quebrada que responde 200)"
     choice="$CHOOSE_RESULT"
-    case "$choice" in 1) bm=icmp_ipv4;; 2) bm=http_2xx;; 3) bm=tcp_connect;; esac
+    case "$choice" in
+      1) bm=icmp_ipv4; ba="$(ask_address "IP ou FQDN" "" host)";;
+      2) bm=tcp_connect; ba="$(ask_address "host:porta" "" hostport)";;
+      3) bm=dns_udp; ba="$(ask_address "IP do servidor DNS" "" host)";;
+      4) bm=http_2xx; ba="$(ask_address "URL ou endereço" "" destino)";;
+      5) bm=http_2xx_ssl; ba="$(ask_address "URL ou endereço" "" destino)";;
+      6) bm=http_2xx_content; ba="$(ask_address "URL ou endereço" "" destino)";;
+    esac
 
     choose "Tipo do ativo" "firewall" "switch" "link" "aplicacao" "storage"
     choice="$CHOOSE_RESULT"
@@ -2980,6 +3046,7 @@ collect_blackbox_targets() {
 collect_identification() {
   step "Identificação"
   local raw detected
+  echo -e "  ${DIM}Perguntas com ${NC}${RED}${BOLD}*${NC}${DIM} são obrigatórias; ENTER aceita o valor entre colchetes.${NC}"
 
   while true; do
     raw="$(ask_required "Cliente, identificador da empresa e não do servidor (ex.: advocacia_martins)" "${CLIENTE:-}")"
@@ -3887,6 +3954,7 @@ main_somente_coleta() {
   ENABLE_ACESSOS=0
 
   ask_yes_no "Medir a internet e os links (status, DNS e IP público)?" "$p_internet" && ENABLE_INTERNET=1
+  dica "Recomendado: a cada 30 min. Cada teste satura o link por alguns segundos."
   ask_yes_no "Teste de velocidade a cada 30 minutos?" "$p_velocidade" && ENABLE_VELOCIDADE=1
   if [[ "$DOCKER_DETECTED" == "1" ]]; then
     ask_yes_no "Coletar Docker (estado, consumo, health e eventos)?" "$p_docker" && ENABLE_DOCKER=1

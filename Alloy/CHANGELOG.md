@@ -10,12 +10,32 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.6.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.16.2 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.7.0 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.17.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.2.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
 ## 2026-10-04
+
+### Instalador Windows 2.17.0
+
+- **Campos obrigatórios marcados.** Asterisco vermelho no rótulo (Cliente, Nome do host, Local, Destino, credencial do NOC) e no título das colunas obrigatórias das grades, com a legenda "* campo obrigatório" em cada aba.
+- **Recursos.** O perfil básico abre recolhido. Ao lado do intervalo do Speedtest aparece a recomendação (30 min) e o aviso fica vermelho abaixo de 15 min.
+- **Links de internet.** Velocidade em Mbps (500, 1000 ou 600/300). Função com inicial maiúscula: Principal, Reserva e SD-WAN.
+- **Conectividade.** Os seis testes ficam numerados do mais simples ao mais completo: 1 Ping, 2 TCP, 3 DNS, 4 HTTP, 5 HTTPS com certificado, 6 Conteúdo. A mesma ordem vale no console.
+- **SNMP.** O equipamento é cadastrado numa janela só: nome, endereço, fabricante, tipo e credencial, mostrando apenas os campos da versão escolhida (v2c ou v3). Editar e remover pela lista. Fabricante fora da lista traz o aviso para solicitar a inclusão ao NOC.
+- **Exporters.** A árvore mostra só o nome do serviço (Redis, Nginx, Elasticsearch...), sem porta. A aba traz o passo a passo para cadastrar outro serviço com métricas Prometheus.
+- **Andamento na própria tela.** Depois de confirmar, o console fica escondido e uma janela com o mesmo cabeçalho mostra o log em tempo real, com o download em porcentagem. No fim aparece "Simulação concluída" ou o resultado da instalação, e a janela só fecha quando o técnico clica em Fechar.
+- **Telas com zoom.** No PowerShell 7, com a tela em 125% ou 150%, os rótulos saíam cortados (texto ampliado e layout não). Agora a tela inteira acompanha a escala.
+
+### Instalador Linux 2.7.0
+
+- **Conectividade.** Seis testes, na mesma ordem do Windows (Ping, TCP, DNS, HTTP, HTTPS com certificado e Conteúdo). O blackbox.yml passa a ter os módulos `http_2xx_ssl`, `http_2xx_content` e `dns_udp`, e o endereço é conferido conforme o teste (TCP pede host:porta).
+- **Obrigatórios.** Pergunta obrigatória sai com asterisco vermelho, com a legenda na identificação.
+- **Links.** Velocidade em Mbps e Função com inicial maiúscula (Principal, Reserva, SD-WAN).
+- **Speedtest.** A recomendação de 30 minutos aparece no checklist e na pergunta.
+- **Exporters.** Catálogo pelo nome do serviço e passo a passo para outro serviço com métricas Prometheus.
+- **SNMP.** Aviso para solicitar ao NOC fabricante que não está na lista.
 
 ### Instalador Windows 2.16.2
 
