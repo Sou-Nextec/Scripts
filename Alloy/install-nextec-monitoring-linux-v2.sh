@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.5.0 (menu de manutenção em instalação existente; atualizador no horário de Brasília)
+# Versão: 2.5.1 (cadastro de links mais curto: nome automático, IP público detectado)
 #
 # USO
 # ---
@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.5.0"
+INSTALLER_VERSION="2.5.1"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -967,49 +967,143 @@ ini_value() {
   printf '%s' "$(trim "$value")"
 }
 
-collect_links_inputs() {
-  step "Links de internet"
-  info "Cada link precisa de pelo menos um destino que saia SOMENTE por ele."
-  info "Use uma rota por link no firewall (ex.: 8.8.8.8 pelo link 1, 1.1.1.1 pelo link 2),"
-  info "ou um IP de origem deste servidor que saia pela WAN do link."
-  local nome papel choice operadora tipo suporte ip_publico gateway alvos origem firewall interface
-  while true; do
-    while true; do
-      nome="$(ini_value "$(ask_required "Nome do link (ex.: Cyberline Fibra)")")"
-      # Nome repetido vira seção [link:...] duplicada e a Coleta não inicia.
-      nome_existe "$nome" "${LINKS[@]}" || break
-      warn "Já existe um link chamado '${nome}'. Use outro nome."
+# Destino de teste padrão que ainda não está em uso por outro link.
+proximo_destino_link() {
+  local destino item alvos usado
+  for destino in 8.8.8.8 1.1.1.1 9.9.9.9 208.67.222.222; do
+    usado=0
+    for item in "${LINKS[@]}"; do
+      IFS='|' read -r _ _ _ _ _ _ _ alvos _ <<<"$item"
+      [[ ", ${alvos}, " == *", ${destino}, "* ]] && usado=1
     done
-    choose "Papel do link" "primario" "failover" "sdwan"
-    choice="$CHOOSE_RESULT"
-    case "$choice" in 1) papel=primario;; 2) papel=failover;; 3) papel=sdwan;; esac
-    operadora="$(ini_value "$(ask_required "Operadora" "$nome")")"
-    tipo="$(ini_value "$(ask_required "Tipo (fibra, radio, 4g, satelite, dedicado)" "fibra")")"
-    read -r -p "$(pergunta "Telefone/protocolo de suporte da operadora" "" "ENTER para pular")" suporte || entrada_encerrada
-    ip_publico="$(ask_address "IP público fixo do link (dinâmico: deixe vazio)" "" ip 1)"
-    gateway="$(ask_address "Gateway da operadora para testar" "" host 1)"
-    alvos="$(ask_address "Destinos que saem por este link, separados por vírgula" "8.8.8.8" host 0 1)"
+    [[ "$usado" == "0" ]] && { echo "$destino"; return 0; }
+  done
+  echo ""
+}
+
+# Só o essencial por link: operadora, tipo, papel e destino de teste. O nome é
+# montado (operadora + tipo) e o IP público é aprendido pela Coleta (com um só
+# link no ar, o IP de saída é dele). O resto fica em "opções avançadas".
+dica() { echo -e "  ${DIM}$*${NC}"; }
+
+# IP público de saída agora (o do link em uso). Vazio se não conseguir.
+ip_publico_atual() {
+  local url ip
+  for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+    ip="$(curl -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    if is_ipv4 "$ip" || [[ "$ip" =~ ^[0-9A-Fa-f:]+:[0-9A-Fa-f:]*$ ]]; then
+      printf '%s' "$ip"
+      return 0
+    fi
+  done
+  return 0
+}
+
+LINK_TIPOS=(fibra radio 4g satelite dedicado)
+LINK_TIPOS_ROTULO=("Fibra" "Rádio" "4G/5G" "Satélite" "Dedicado")
+LINK_TIPOS_NOME=("Fibra" "Rádio" "4G" "Satélite" "Dedicado")
+# Um destino diferente por link: cada um precisa de uma rota própria no firewall.
+LINK_DESTINOS=(8.8.8.8 1.1.1.1 9.9.9.9 208.67.222.222 8.8.4.4 1.0.0.1)
+
+papel_rotulo() {
+  case "$1" in primario) echo "principal";; failover) echo "reserva";; sdwan) echo "SD-WAN";; *) echo "$1";; esac
+}
+
+# Um link por vez. Só o essencial é perguntado: operadora, tipo, função e
+# telefone. O nome sai da operadora e do tipo; com mais de um link, pede o
+# destino de teste exclusivo e confirma o IP público detectado para o link
+# principal (os demais a Coleta aprende quando ficam sozinhos no ar).
+# Gateway, IP de origem e firewall ficam em opções avançadas.
+collect_one_link() {
+  local numero="$1" total="$2" varios=0 item tem_principal=0
+  local operadora tipo tipo_rotulo papel suporte alvos ip_publico detectado padrao_destino
+  local gateway="" origem="" firewall="" interface="" nome base n
+  (( total > 1 || ${#LINKS[@]} > 0 )) && varios=1
+  echo
+  if (( total > 1 )); then
+    echo -e "  ${CYAN}${BOLD}Link ${numero} de ${total}${NC}"
+  else
+    echo -e "  ${CYAN}${BOLD}Novo link${NC}"
+  fi
+
+  operadora="$(ini_value "$(ask_required "Operadora")")"
+  choose_padrao "Tipo de conexão" 1 "${LINK_TIPOS_ROTULO[@]}"
+  tipo="${LINK_TIPOS[$((CHOOSE_RESULT-1))]}"
+  tipo_rotulo="${LINK_TIPOS_NOME[$((CHOOSE_RESULT-1))]}"
+
+  if [[ "$varios" == "0" ]]; then
+    papel=primario
+  else
+    for item in "${LINKS[@]}"; do
+      IFS='|' read -r _ n _ <<<"$item"
+      [[ "$n" == "primario" ]] && tem_principal=1
+    done
+    choose_padrao "Função deste link" "$([[ "$tem_principal" == 1 ]] && echo 2 || echo 1)" \
+      "principal" "reserva (entra quando o principal cai)" "SD-WAN (os dois em uso ao mesmo tempo)"
+    case "$CHOOSE_RESULT" in 1) papel=primario;; 2) papel=failover;; 3) papel=sdwan;; esac
+  fi
+
+  read -r -p "$(pergunta "Telefone de suporte da operadora" "" "opcional")" suporte || entrada_encerrada
+
+  alvos="1.1.1.1, 8.8.8.8"
+  ip_publico=""
+  if [[ "$varios" == "1" ]]; then
+    n=${#LINKS[@]}
+    (( n > ${#LINK_DESTINOS[@]} - 1 )) && n=$(( ${#LINK_DESTINOS[@]} - 1 ))
+    padrao_destino="${LINK_DESTINOS[$n]}"
+    dica "Para medir cada link separado, o firewall manda um destino só por este link"
+    dica "(rota por link). Use um destino diferente em cada link, ex.: ${padrao_destino}."
+    alvos="$(ask_address "Destino de teste deste link" "$padrao_destino" host 0 1)"
+    if [[ "$papel" == "primario" ]]; then
+      detectado="$(ip_publico_atual)"
+      if [[ -n "$detectado" ]] && ask_yes_no "O IP público atual (${detectado}) é deste link?" s; then
+        ip_publico="$detectado"
+      fi
+    fi
+  fi
+
+  if ask_yes_no "Opções avançadas (gateway da operadora, IP de origem, firewall)?" n; then
+    dica "Gateway: separa queda da operadora de problema no firewall."
+    gateway="$(ask_address "IP do gateway da operadora" "" host 1)"
     while true; do
-      origem="$(ask_address "IP de origem neste servidor para este link" "" ip 1)"
+      origem="$(ask_address "IP deste servidor que sai só por este link" "" ip 1)"
       [[ -z "$origem" ]] && break
       ip -o addr show 2>/dev/null | grep -qw "inet ${origem}" && break
       warn "O IP ${origem} não existe neste servidor. Informe um IP local ou deixe vazio."
     done
-    firewall=""
-    read -r -p "$(pergunta "Nome do firewall no NOC, para tráfego por SNMP" "" "ENTER para pular")" firewall || entrada_encerrada
+    read -r -p "$(pergunta "Nome do firewall no NOC, para cruzar com o tráfego SNMP" "" "opcional")" firewall || entrada_encerrada
     firewall="$(trim "$firewall")"
     [[ -n "$firewall" ]] && firewall="$(normalize_slug "$firewall")"
-    interface=""
     while [[ -n "$firewall" ]]; do
       read -r -p "$(pergunta "Interface WAN do link no firewall" "" "ex.: igb1")" interface || entrada_encerrada
       interface="$(trim "$interface")"
       [[ "$interface" =~ $RE_INTERFACE ]] && break
       warn "Interface inválida. Use o nome como aparece no firewall, ex.: igb1, ether1, wan1."
     done
-    LINKS+=("$(ini_value "$nome")|${papel}|$(ini_value "$operadora")|$(ini_value "$tipo")|$(ini_value "$suporte")|$(ini_value "$ip_publico")|$(ini_value "$gateway")|$(ini_value "$alvos")|$(ini_value "$origem")|$(ini_value "$firewall")|$(ini_value "$interface")")
-    ok "Link adicionado: ${nome} (${papel})"
-    ask_yes_no "Adicionar outro link?" n || break
+  fi
+
+  base="$(ini_value "${operadora} ${tipo_rotulo}")"
+  nome="$base"
+  n=2
+  while nome_existe "$nome" "${LINKS[@]}"; do
+    nome="${base} ${n}"
+    n=$((n+1))
   done
+  LINKS+=("${nome}|${papel}|$(ini_value "$operadora")|${tipo}|$(ini_value "$suporte")|$(ini_value "$ip_publico")|$(ini_value "$gateway")|$(ini_value "$alvos")|$(ini_value "$origem")|$(ini_value "$firewall")|$(ini_value "$interface")")
+  ok "Link ${nome} cadastrado ($(papel_rotulo "$papel"))."
+}
+
+collect_links_inputs() {
+  step "Links de internet"
+  local total=1 n
+  # Primeiro cadastro: pergunta quantos links o local tem e passa por cada um.
+  if (( ${#LINKS[@]} == 0 )); then
+    total="$(ask_pattern "Quantos links de internet este local tem?" "2" '^[1-6]$' "um número de 1 a 6")"
+  fi
+  for (( n = 1; n <= total; n++ )); do
+    collect_one_link "$n" "$total"
+  done
+  return 0
 }
 
 write_coleta_config() {
@@ -2808,6 +2902,7 @@ mostrar_status_instalacao() {
 descrever_item() {
   local a b
   IFS='|' read -r a b _ <<<"$1"
+  case "$b" in primario|failover|sdwan) b="$(papel_rotulo "$b")";; esac
   printf '%s (%s)' "$a" "$b"
 }
 

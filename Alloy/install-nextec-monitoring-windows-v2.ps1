@@ -36,6 +36,11 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.15.1 Console com fundo preto durante a instalação (o azul do
+           PowerShell apagava as cores). Cadastro de links refeito: pergunta
+           quantos links o local tem e, por link, só operadora, tipo, função
+           e telefone; o nome sai da operadora e do tipo, o IP público é
+           detectado e o resto fica em "opções avançadas".
     2.15.0 Saída com a mesma hierarquia visual do instalador Linux (títulos
            de etapa, símbolos, perguntas, resumo e quadro final). Download do
            Alloy, do Speedtest, da Coleta e do atualizador com porcentagem.
@@ -252,7 +257,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.15.0"
+$InstallerVersion = "2.15.1"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -393,6 +398,7 @@ $script:LokiPassword = ""
 # ==============================================================================
 
 $script:LarguraConsole = 60
+$script:TemaOriginal = $null
 
 # Símbolos do conjunto WGL4, presentes nas fontes do console clássico
 # (Consolas, Lucida Console) do Windows Server 2016+; caractere fora dele
@@ -467,6 +473,41 @@ function Write-Fail {
     param([Parameter(Mandatory=$true)][string]$Message)
     Write-Host "x  " -ForegroundColor Red -NoNewline
     Write-Host $Message -ForegroundColor Red
+}
+
+function Write-Hint {
+    # Texto de ajuda, sem símbolo: explica a próxima pergunta.
+    param([Parameter(Mandatory=$true)][string]$Message)
+    Write-Host ("  {0}" -f $Message) -ForegroundColor DarkGray
+}
+
+function Set-NextecConsoleTheme {
+    <#
+        Fundo preto enquanto o instalador roda: no azul padrão do Windows
+        PowerShell, ciano, cinza e verde perdem contraste e a tela fica
+        "chapada". Volta às cores originais no fim (Restore-NextecConsoleTheme).
+    #>
+    if ($Silent -or $null -ne $script:TemaOriginal) { return }
+    try {
+        $ui = $Host.UI.RawUI
+        $script:TemaOriginal = @{ Fundo = $ui.BackgroundColor; Texto = $ui.ForegroundColor }
+        $ui.BackgroundColor = [ConsoleColor]::Black
+        $ui.ForegroundColor = [ConsoleColor]::Gray
+    }
+    catch {
+        $script:TemaOriginal = $null
+    }
+}
+
+function Restore-NextecConsoleTheme {
+    if ($null -eq $script:TemaOriginal) { return }
+    try {
+        $Host.UI.RawUI.BackgroundColor = $script:TemaOriginal.Fundo
+        $Host.UI.RawUI.ForegroundColor = $script:TemaOriginal.Texto
+    }
+    catch {
+    }
+    $script:TemaOriginal = $null
 }
 
 function Get-NextecTextoTamanho {
@@ -588,6 +629,8 @@ function Show-Banner {
     # Alguns hosts de RMM não implementam RawUI, e ali Clear-Host lança. Com
     # $ErrorActionPreference = "Stop" isso derrubaria o script na primeira
     # linha útil, com uma mensagem que não tem relação com o problema real.
+    Set-NextecConsoleTheme
+
     try {
         Clear-Host
     }
@@ -1099,7 +1142,7 @@ function Read-NextecAddress {
     while ($true) {
         if ($Optional) {
             $value = Read-NextecInput -Prompt $Prompt -Hint "ENTER para pular"
-            if ([string]::IsNullOrWhiteSpace($value)) { Write-Host ""; return "" }
+            if ([string]::IsNullOrWhiteSpace($value)) { return "" }
             $value = $value.Trim()
         }
         else {
@@ -1137,7 +1180,7 @@ function Read-NextecSlug {
     while ($true) {
         if ($AllowKeep) {
             $raw = Read-NextecInput -Prompt $Prompt -Hint "ENTER mantém"
-            if ([string]::IsNullOrWhiteSpace($raw)) { Write-Host ""; return "" }
+            if ([string]::IsNullOrWhiteSpace($raw)) { return "" }
             $raw = $raw.Trim()
         }
         else {
@@ -1169,7 +1212,7 @@ function Read-NextecPattern {
     while ($true) {
         if ($Optional) {
             $value = Read-NextecInput -Prompt $Prompt -Hint "ENTER para pular"
-            if ([string]::IsNullOrWhiteSpace($value)) { Write-Host ""; return "" }
+            if ([string]::IsNullOrWhiteSpace($value)) { return "" }
             $value = $value.Trim()
         }
         else {
@@ -5658,33 +5701,118 @@ function ConvertTo-ColetaIniValue {
     return ($Valor -replace "[\r\n]+", " " -replace "\[", "(" -replace "\]", ")").Trim()
 }
 
+$script:PapeisLink = [ordered]@{ primario = "principal"; failover = "reserva"; sdwan = "SD-WAN" }
+$script:TiposLink = [ordered]@{ fibra = "Fibra"; radio = "Rádio"; "4g" = "4G/5G"; satelite = "Satélite"; dedicado = "Dedicado" }
+$script:TiposLinkNome = @{ fibra = "Fibra"; radio = "Rádio"; "4g" = "4G"; satelite = "Satélite"; dedicado = "Dedicado" }
+# Um destino diferente por link: cada um precisa de uma rota própria no firewall.
+$script:DestinosLink = @("8.8.8.8", "1.1.1.1", "9.9.9.9", "208.67.222.222", "8.8.4.4", "1.0.0.1")
+
+function Get-NextecIpPublico {
+    # IP público de saída agora (o do link em uso). Vazio se não conseguir.
+    foreach ($url in @("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com")) {
+        try {
+            $pedido = [Net.HttpWebRequest]::Create($url)
+            $pedido.Timeout = 5000
+            $pedido.UserAgent = "nextec-instalador/" + $InstallerVersion
+            $resposta = $pedido.GetResponse()
+            try {
+                $leitor = New-Object IO.StreamReader($resposta.GetResponseStream())
+                $ip = $leitor.ReadToEnd().Trim()
+            }
+            finally {
+                $resposta.Close()
+            }
+            $endereco = $null
+            if ([Net.IPAddress]::TryParse($ip, [ref]$endereco)) { return $ip }
+        }
+        catch {
+        }
+    }
+    return ""
+}
+
+function Get-NomeLinkUnico {
+    param([string]$Base)
+    $nome = $Base
+    $n = 2
+    while (@($script:ColetaLinks | Where-Object { $_.nome -eq $nome }).Count -gt 0) {
+        $nome = "{0} {1}" -f $Base, $n
+        $n++
+    }
+    return $nome
+}
+
 function Read-ColetaLinkDefinition {
-    Write-Info "O destino de cada link precisa sair SOMENTE por ele: use uma rota por link"
-    Write-Info "no firewall (ex.: 8.8.8.8 pelo link 1, 1.1.1.1 pelo link 2) ou um IP de origem"
-    Write-Info "deste servidor que saia pela WAN do link."
+    <#
+        Um link por vez. Só o essencial é perguntado: operadora, tipo, função
+        e telefone. O nome sai da operadora e do tipo; com mais de um link,
+        pede o destino de teste exclusivo e confirma o IP público detectado
+        para o link principal (os demais a Coleta aprende quando ficam
+        sozinhos no ar). Gateway, IP de origem e firewall ficam em opções
+        avançadas.
+    #>
+    param(
+        [int]$Numero = 1,
+        [int]$Total = 1
+    )
 
-    $nome = ConvertTo-ColetaIniValue (Read-Required -Prompt "Nome do link (ex.: Cyberline Fibra)")
-    $papelEscolha = Read-Choice -Prompt "Papel do link" -Options @("primario", "failover", "sdwan") -Default 1
-    $papel = @("primario", "failover", "sdwan")[$papelEscolha - 1]
-    $operadora = ConvertTo-ColetaIniValue (Read-Required -Prompt "Operadora" -Default $nome)
-    $tipo = ConvertTo-ColetaIniValue (Read-Required -Prompt "Tipo (fibra, radio, 4g, satelite, dedicado)" -Default "fibra")
-    $suporte = ConvertTo-ColetaIniValue (Read-NextecInput -Prompt "Telefone/protocolo de suporte da operadora" -Hint "ENTER para pular")
-    $ipPublico = Read-NextecAddress -Prompt "IP público fixo do link (dinâmico: deixe vazio)" -Kind ip -Optional
-    $gateway = Read-NextecAddress -Prompt "Gateway da operadora para testar" -Kind host -Optional
-    $alvos = Read-NextecAddress -Prompt "Destinos que saem por este link, separados por vírgula" -Default "8.8.8.8" -Kind host -List
-    while ($true) {
-        $origem = Read-NextecAddress -Prompt "IP de origem neste servidor para este link" -Kind ip -Optional
-        if (-not $origem -or (Get-NetIPAddress -IPAddress $origem -ErrorAction SilentlyContinue)) { break }
-        Write-Warn ("O IP {0} não existe neste servidor. Informe um IP local ou deixe vazio." -f $origem)
+    $variosLinks = ($Total -gt 1) -or ($script:ColetaLinks.Count -gt 0)
+    if ($Total -gt 1) {
+        Write-Section ("Link {0} de {1}" -f $Numero, $Total)
     }
-    $firewall = ""
-    $firewallRaw = Read-NextecInput -Prompt "Nome do firewall no NOC, para tráfego por SNMP" -Hint "ENTER para pular"
-    if (-not [string]::IsNullOrWhiteSpace($firewallRaw)) { $firewall = ConvertTo-Slug $firewallRaw }
-    $interface = ""
-    if ($firewall) {
-        $interface = Read-NextecPattern -Prompt "Interface WAN do link no firewall (ex.: igb1)" -Pattern '^[A-Za-z0-9._:/-]+$' -Hint "o nome como aparece no firewall, ex.: igb1, ether1, wan1"
+    else {
+        Write-Section "Novo link"
     }
 
+    $operadora = ConvertTo-ColetaIniValue (Read-Required -Prompt "Operadora" )
+    $tipos = @($script:TiposLink.Keys)
+    $tipo = $tipos[(Read-Choice -Prompt "Tipo de conexão" -Options @($script:TiposLink.Values) -Default 1) - 1]
+
+    $temPrincipal = @($script:ColetaLinks | Where-Object { $_.papel -eq "primario" }).Count -gt 0
+    if (-not $variosLinks) {
+        $papel = "primario"
+    }
+    else {
+        $papeis = @($script:PapeisLink.Keys)
+        $padraoPapel = if ($temPrincipal) { 2 } else { 1 }
+        $papel = $papeis[(Read-Choice -Prompt "Função deste link" -Options @("principal", "reserva (entra quando o principal cai)", "SD-WAN (os dois em uso ao mesmo tempo)") -Default $padraoPapel) - 1]
+    }
+
+    $suporte = ConvertTo-ColetaIniValue (Read-NextecInput -Prompt "Telefone de suporte da operadora" -Hint "opcional")
+
+    $alvos = "1.1.1.1, 8.8.8.8"
+    $ipPublico = ""
+    if ($variosLinks) {
+        $padraoDestino = $script:DestinosLink[[Math]::Min($script:ColetaLinks.Count, $script:DestinosLink.Count - 1)]
+        Write-Hint "Para medir cada link separado, o firewall manda um destino só por este link"
+        Write-Hint ("(rota por link). Use um destino diferente em cada link, ex.: {0}." -f $padraoDestino)
+        $alvos = Read-NextecAddress -Prompt "Destino de teste deste link" -Default $padraoDestino -Kind host -List
+
+        if ($papel -eq "primario") {
+            $detectado = Get-NextecIpPublico
+            if ($detectado -and (Read-YesNo -Prompt ("O IP público atual ({0}) é deste link?" -f $detectado) -Default $true)) {
+                $ipPublico = $detectado
+            }
+        }
+    }
+
+    $gateway = ""; $origem = ""; $firewall = ""; $interface = ""
+    if (Read-YesNo -Prompt "Opções avançadas (gateway da operadora, IP de origem, firewall)?" -Default $false) {
+        Write-Hint "Gateway: separa queda da operadora de problema no firewall."
+        $gateway = Read-NextecAddress -Prompt "IP do gateway da operadora" -Kind host -Optional
+        while ($true) {
+            $origem = Read-NextecAddress -Prompt "IP deste servidor que sai só por este link" -Kind ip -Optional
+            if (-not $origem -or (Get-NetIPAddress -IPAddress $origem -ErrorAction SilentlyContinue)) { break }
+            Write-Warn ("O IP {0} não existe neste servidor. Informe um IP local ou deixe vazio." -f $origem)
+        }
+        $firewallRaw = Read-NextecInput -Prompt "Nome do firewall no NOC, para cruzar com o tráfego SNMP" -Hint "opcional"
+        if (-not [string]::IsNullOrWhiteSpace($firewallRaw)) { $firewall = ConvertTo-Slug $firewallRaw }
+        if ($firewall) {
+            $interface = Read-NextecPattern -Prompt "Interface WAN do link no firewall" -Pattern '^[A-Za-z0-9._:/-]+$' -Hint "o nome como aparece no firewall, ex.: igb1, ether1, wan1"
+        }
+    }
+
+    $nome = Get-NomeLinkUnico -Base (ConvertTo-ColetaIniValue ("{0} {1}" -f $operadora, $script:TiposLinkNome[$tipo]))
     return [pscustomobject]@{
         nome = $nome; papel = $papel; operadora = $operadora; tipo = $tipo; suporte = $suporte
         ip_publico = $ipPublico; gateway = $gateway; alvos = $alvos; origem = $origem
@@ -5692,29 +5820,50 @@ function Read-ColetaLinkDefinition {
     }
 }
 
+function Show-ColetaLinks {
+    if ($script:ColetaLinks.Count -eq 0) {
+        Write-Hint "Nenhum link cadastrado."
+        return
+    }
+    Write-Host ("    {0,-24} {1,-10} {2,-17} {3}" -f "LINK", "FUNÇÃO", "IP PÚBLICO", "DESTINO DE TESTE") -ForegroundColor Gray
+    foreach ($link in $script:ColetaLinks) {
+        $funcao = if ($script:PapeisLink.Contains([string]$link.papel)) { $script:PapeisLink[[string]$link.papel] } else { $link.papel }
+        $ip = if ($link.ip_publico) { $link.ip_publico } else { "automático" }
+        Write-Host ("    {0,-24} " -f $link.nome) -ForegroundColor White -NoNewline
+        Write-Host ("{0,-10} {1,-17} {2}" -f $funcao, $ip, $link.alvos)
+    }
+}
+
 function Edit-ColetaLinks {
     Write-Step "Links de internet"
 
-    while ($true) {
-        if ($script:ColetaLinks.Count -gt 0) {
-            Write-Host ("    {0,-24} {1,-10} {2,-18} {3}" -f "LINK", "PAPEL", "IP PÚBLICO", "DESTINOS") -ForegroundColor DarkGray
-            foreach ($link in $script:ColetaLinks) {
-                Write-Host ("    {0,-24} {1,-10} {2,-18} {3}" -f $link.nome, $link.papel, $link.ip_publico, $link.alvos)
+    if ($script:ColetaLinks.Count -eq 0) {
+        $total = 0
+        while ($total -lt 1 -or $total -gt 6) {
+            $texto = Read-Required -Prompt "Quantos links de internet este local tem?" -Default "2"
+            if (-not [int]::TryParse($texto, [ref]$total) -or $total -lt 1 -or $total -gt 6) {
+                Write-Warn "Informe um número de 1 a 6."
+                $total = 0
             }
-            Write-Host ""
         }
-        else {
-            Write-Info "Nenhum link cadastrado."
+        for ($n = 1; $n -le $total; $n++) {
+            $novo = Read-ColetaLinkDefinition -Numero $n -Total $total
+            $script:ColetaLinks = @($script:ColetaLinks) + $novo
+            Write-Ok ("Link {0} cadastrado ({1})." -f $novo.nome, $script:PapeisLink[$novo.papel])
         }
+    }
 
-        $opcoes = @("Adicionar link", "Remover link", "Concluir")
-        $escolha = Read-Choice -Prompt "Links" -Options $opcoes -Default $(if ($script:ColetaLinks.Count -eq 0) { 1 } else { 3 })
+    while ($true) {
+        Write-Host ""
+        Show-ColetaLinks
+        Write-Host ""
+        $escolha = Read-Choice -Prompt "Links" -Options @("Adicionar link", "Remover link", "Concluir") -Default 3
 
         switch ($escolha) {
             1 {
                 $novo = Read-ColetaLinkDefinition
-                $script:ColetaLinks = @(@($script:ColetaLinks | Where-Object { $_.nome -ne $novo.nome }) + $novo)
-                Write-Ok ("Link {0} ({1}) registrado." -f $novo.nome, $novo.papel)
+                $script:ColetaLinks = @($script:ColetaLinks) + $novo
+                Write-Ok ("Link {0} cadastrado ({1})." -f $novo.nome, $script:PapeisLink[$novo.papel])
             }
             2 {
                 if ($script:ColetaLinks.Count -eq 0) { continue }
@@ -5883,7 +6032,14 @@ function Edit-ColetaSettings {
     }
 
     if ($script:ColetaLinks.Count -eq 0) { Import-ColetaLinks }
-    if (Read-YesNo -Prompt "Cadastrar ou alterar links de internet?" -Default ($script:ColetaLinks.Count -eq 0)) {
+    if ($script:ColetaLinks.Count -eq 0) {
+        $querLinks = Read-YesNo -Prompt "Este local tem mais de um link de internet?" -Default $false
+    }
+    else {
+        Show-ColetaLinks
+        $querLinks = Read-YesNo -Prompt "Alterar os links cadastrados?" -Default $false
+    }
+    if ($querLinks) {
         Edit-ColetaLinks
     }
 
@@ -7400,6 +7556,7 @@ finally {
     if (-not $Silent -and -not $script:Relaunched) {
         Wait-NextecOperator
     }
+    Restore-NextecConsoleTheme
 }
 
 # Dot-source (". .\script.ps1") roda no processo do operador, e ali "exit"

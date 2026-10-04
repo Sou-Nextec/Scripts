@@ -39,7 +39,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
-$Versao = "1.1.0"
+$Versao = "1.2.0"
 $PastaBase = Join-Path $env:ProgramData "GrafanaLabs\Alloy\coleta-complementar"
 if ([string]::IsNullOrWhiteSpace($Config)) {
     $Config = Join-Path $PastaBase "coleta-complementar.ini"
@@ -459,15 +459,44 @@ function Update-Destinos {
     }
 }
 
+function Get-IpAprendido {
+    # Último IP público visto quando só este link estava no ar.
+    param([string]$Nome)
+    $melhor = ""; $quando = 0
+    $aprendidos = Get-Secao "ip_links"
+    foreach ($ip in @($aprendidos.Keys)) {
+        $info = $aprendidos[$ip]
+        if ($info -is [hashtable] -and $info.link -eq $Nome -and [double]$info.visto -gt $quando) {
+            $melhor = $ip; $quando = [double]$info.visto
+        }
+    }
+    return $melhor
+}
+
+function Set-IpAprendido {
+    # Com um só link no ar, o IP público de saída é dele: guarda o par. Assim
+    # ninguém precisa informar o IP de cada link na instalação.
+    param([string]$Nome)
+    $aprendidos = Get-Secao "ip_links"
+    $aprendidos[$script:IpAtual] = @{ link = $Nome; visto = [math]::Round((Get-Agora)) }
+    if ($aprendidos.Count -gt 20) {
+        $maisAntigo = @($aprendidos.Keys | Sort-Object { if ($aprendidos[$_] -is [hashtable]) { [double]$aprendidos[$_].visto } else { 0 } })[0]
+        $aprendidos.Remove($maisAntigo)
+    }
+}
+
 function Get-LinkAtivo {
     param($Estados)
     if ($script:Links.Count -eq 0) { return $null }
+    $noAr = @($script:Links | Where-Object { $Estados[$_.nome].status -ne $script:Fora })
     if ($script:IpAtual) {
         foreach ($link in $script:Links) {
             if ($link.ip_publico -and $link.ip_publico -eq $script:IpAtual) { return $link.nome }
         }
+        if ($noAr.Count -eq 1) { Set-IpAprendido $noAr[0].nome }
+        $info = (Get-Secao "ip_links")[$script:IpAtual]
+        if ($info -is [hashtable] -and @($noAr | Where-Object { $_.nome -eq $info.link }).Count -gt 0) { return $info.link }
     }
-    $noAr = @($script:Links | Where-Object { $Estados[$_.nome].status -ne $script:Fora })
     if ($noAr.Count -eq 1) { return $noAr[0].nome }
     $primarios = @($noAr | Where-Object { $_.papel -eq "primario" })
     if ($primarios.Count -gt 0) { return $primarios[0].nome }
@@ -576,7 +605,7 @@ function Invoke-RodadaLinks {
         }
         Add-Metrica $metricas "nextec_link_info" 1 ([ordered]@{
             link = $link.nome; papel = $link.papel; operadora = $link.operadora; tipo = $link.tipo
-            suporte = $link.suporte; ip_publico = $link.ip_publico; gateway = $link.gateway
+            suporte = $link.suporte; ip_publico = $(if ($link.ip_publico) { $link.ip_publico } else { Get-IpAprendido $link.nome }); gateway = $link.gateway
             alvos = ($link.alvos -join ", "); firewall = $link.firewall
             interface_firewall = $link.interface_firewall; teste_velocidade = $link.teste_velocidade
         })

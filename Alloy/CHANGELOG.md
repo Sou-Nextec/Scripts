@@ -10,8 +10,8 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.5.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.15.0 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.5.1 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.15.1 |
 | Coleta Complementar | `coleta-complementar/` | 1.1.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
@@ -36,6 +36,17 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 - **Horário do atualizador.** Passa a rodar entre 01h e 05h no horário de Brasília, mesmo em servidor com outro fuso (o timer usa `America/Sao_Paulo`, no systemd 235 ou mais novo).
 - **Banner.** Mostra a versão do instalador.
 - **Correção SNMP.** O tipo "ups" era gravado como "storage".
+
+### Instaladores Linux 2.5.1 e Windows 2.15.1
+
+- **Cadastro de links.** Primeiro pergunta quantos links o local tem e passa por um de cada vez.
+- **Perguntas por link.** Só operadora, tipo (lista), função (principal, reserva ou SD-WAN) e telefone de suporte.
+- **Nome do link.** Sai da operadora e do tipo (ex.: "UAU Fibra"); a pergunta do nome saiu.
+- **IP público.** É detectado e só confirmado para o link principal. Nos demais, a Coleta aprende sozinha.
+- **Destino de teste.** Só é pedido com mais de um link, já sugerindo um destino diferente por link.
+- **Opções avançadas.** Gateway da operadora, IP de origem e firewall ficam nelas (padrão: não).
+- **Windows: links.** "Este local tem mais de um link?" passa a ter "não" como padrão. Antes, ENTER levava ao cadastro de links mesmo com um link só.
+- **Windows: console.** Fundo preto durante a instalação; o azul do PowerShell apagava as cores. As cores originais voltam no fim.
 
 ### Instalador Windows 2.15.0
 

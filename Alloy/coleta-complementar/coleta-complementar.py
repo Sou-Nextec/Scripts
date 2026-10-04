@@ -48,7 +48,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-VERSAO = "1.1.0"
+VERSAO = "1.2.0"
 
 CONFIG_PADRAO = "/etc/coleta-complementar/coleta-complementar.ini"
 DIR_DADOS_PADRAO = "/var/lib/coleta-complementar"
@@ -572,7 +572,8 @@ class ModuloLinks:
                              {"link": link.nome, "alvo": resultado.alvo})
             metricas.add("nextec_link_info", 1, {
                 "link": link.nome, "papel": link.papel, "operadora": link.operadora,
-                "tipo": link.tipo, "suporte": link.suporte, "ip_publico": link.ip_publico,
+                "tipo": link.tipo, "suporte": link.suporte,
+                "ip_publico": link.ip_publico or self.ip_aprendido(link.nome),
                 "gateway": link.gateway, "alvos": ", ".join(link.alvos),
                 "firewall": link.firewall, "interface_firewall": link.interface_firewall,
                 "teste_velocidade": link.teste_velocidade,
@@ -628,14 +629,37 @@ class ModuloLinks:
         gravar_atomico(self.arquivo, metricas.texto())
         self.estado.salvar()
 
+    def ip_aprendido(self, nome):
+        """Último IP público visto quando só este link estava no ar."""
+        melhor, quando = "", 0
+        for ip, info in self.estado.secao("ip_links").items():
+            if isinstance(info, dict) and info.get("link") == nome and info.get("visto", 0) > quando:
+                melhor, quando = ip, info.get("visto", 0)
+        return melhor
+
+    def aprender_ip(self, nome):
+        """Com um só link no ar, o IP público de saída é dele: guarda o par.
+        Assim ninguém precisa informar o IP de cada link na instalação."""
+        aprendidos = self.estado.secao("ip_links")
+        aprendidos[self._ip_atual] = {"link": nome, "visto": round(agora())}
+        if len(aprendidos) > 20:
+            mais_antigo = min(aprendidos, key=lambda ip: aprendidos[ip].get("visto", 0)
+                              if isinstance(aprendidos[ip], dict) else 0)
+            aprendidos.pop(mais_antigo, None)
+
     def descobrir_link_ativo(self, estados_links):
         if not self.links:
             return None
+        no_ar = [l for l in self.links if estados_links.get(l.nome, (FORA, None))[0] != FORA]
         if self._ip_atual:
             for link in self.links:
                 if link.ip_publico and link.ip_publico == self._ip_atual:
                     return link.nome
-        no_ar = [l for l in self.links if estados_links.get(l.nome, (FORA, None))[0] != FORA]
+            if len(no_ar) == 1:
+                self.aprender_ip(no_ar[0].nome)
+            info = self.estado.secao("ip_links").get(self._ip_atual)
+            if isinstance(info, dict) and any(l.nome == info.get("link") for l in no_ar):
+                return info["link"]
         if len(no_ar) == 1:
             return no_ar[0].nome
         primarios = [l for l in no_ar if l.papel == "primario"]
