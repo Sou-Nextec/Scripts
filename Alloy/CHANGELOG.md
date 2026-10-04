@@ -11,11 +11,21 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
 | Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.6.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.15.4 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.16.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.2.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
 ## 2026-10-04
+
+### Instalador Windows 2.16.0
+
+- **Tela de instalação.** Com área de trabalho, o instalador abre uma janela com abas: identificação, recursos, links de internet, conectividade, SNMP, exporters, credenciais e resumo. Cada aba confere os campos ao avançar (cliente, endereços, velocidade, host:porta, credencial SNMP) e mostra o erro no rodapé. A instalação em si continua a mesma do console, com o andamento na janela do PowerShell.
+- **Quando a tela não abre.** RMM e tarefas como SYSTEM, sessão sem área de trabalho, Server Core, `-Silent`, `-Atualizar` e `-Console` seguem no console, como antes.
+- **Exporters em árvore na tela.** Marcar um exporter já traz o endereço padrão; "Outro endpoint" abre uma linha livre.
+- **Credencial SNMP na tela.** Botão "Definir..." por equipamento, com v2c ou v3 (authPriv ou authNoPriv). Senha não aparece na tela nem no resumo.
+- **Simulação.** `-Simular` abre as telas e mostra o resumo sem instalar nada e sem pedir Administrador. As respostas, sem senha, ficam em `%TEMP%\nextec-simulacao.json`. Serve para treinar e para conferir antes de ir ao cliente.
+- **SNMP.** SonicWall entra no catálogo. Baixar de novo um fabricante atualiza o módulo dele no snmp.yml (antes o antigo ficava). Com mais de um fabricante no arquivo, o técnico escolhe qual vale para o equipamento; antes o equipamento recebia os módulos de todos.
+- **Menu de instalação existente igual ao Linux.** Mostra o pacote Nextec aplicado pelo atualizador e as coletas ligadas. Ao ligar logs ou a Coleta num host sem credencial do Loki, pede só a do Loki (antes pedia de novo a do remote_write).
 
 ### Instalador Linux 2.6.0
 

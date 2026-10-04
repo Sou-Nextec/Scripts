@@ -36,6 +36,19 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.16.0 Tela de instalação (WinForms dentro do próprio script): abre
+           sozinha quando há área de trabalho, com abas para identificação,
+           recursos (exporters em árvore), links, conectividade, SNMP,
+           exporters, credenciais e resumo, validando cada campo na hora.
+           A instalação em si é a mesma do console. -Console força o
+           console; RMM, sessão sem tela e Server Core seguem no console.
+           -Simular abre as telas e mostra o resumo sem instalar nada.
+           SNMP: SonicWall no catálogo; módulo atualizado do repositório
+           substitui o antigo no snmp.yml; com mais de um fabricante no
+           arquivo, o técnico escolhe qual vale para o equipamento.
+           Menu de instalação existente igual ao Linux: mostra o pacote
+           Nextec aplicado e as coletas ligadas, e ao ligar logs ou a Coleta
+           pede só a credencial do Loki.
     2.15.4 Teste de velocidade: o nome do servidor da Ookla chegava com
            acento quebrado ("Claro M├│vel"). A saída do speedtest.exe
            passa a ser lida como UTF-8, e o script da tarefa é gravado com
@@ -216,6 +229,12 @@ param(
 
     # Executa o script sem interação, usando os parâmetros fornecidos e variáveis de ambiente para credenciais.
     [switch]$Silent,
+    # Usa as perguntas no console mesmo quando há área de trabalho (sem a tela).
+    [switch]$Console,
+    # Abre as telas e mostra o resumo, sem instalar nem alterar nada. Não
+    # precisa de Administrador. Grava as respostas (sem senha) em
+    # %TEMP%\nextec-simulacao.json.
+    [switch]$Simular,
     # Modo do atualizador automático: reaplica a configuração atual sem
     # perguntas e sem pedir credencial. Os arquivos chegam já conferidos pela
     # assinatura do manifesto da Nextec.
@@ -271,7 +290,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.15.4"
+$InstallerVersion = "2.16.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -299,6 +318,7 @@ $NextecSnmpVendors = [ordered]@{
     "1" = @{ Label = "pfSense"; File = "pfsense.yml" }
     "2" = @{ Label = "Fortigate"; File = "fortigate.yml" }
     "3" = @{ Label = "Mikrotik"; File = "mikrotik.yml" }
+    "4" = @{ Label = "SonicWall"; File = "sonicwall.yml" }
 }
 
 # Nome do serviço Windows. Resolve-AlloyInstallation substitui pelo nome real
@@ -402,6 +422,7 @@ $script:SnmpTargets = @()
 $script:SnmpSourceFile = $null
 $script:SnmpAuthBlocks = @()
 $script:CustomExporters = @()
+$script:UsarTela = $false
 $script:RwUsername = ""
 $script:RwPassword = ""
 $script:LokiUsername = ""
@@ -1468,7 +1489,7 @@ function Test-ListeningPort {
 function Set-NocDestination {
     $script:NocHost = $NocTarget
 
-    if (-not $Silent) {
+    if (-not $Silent -and -not $script:UsarTela) {
         # O banner já mostra o destino: aqui só a confirmação.
         $action = Read-NextecInput -Prompt "Destino do monitoramento" -Hint "ENTER mantém, D altera" -Default $script:NocHost
 
@@ -1568,8 +1589,56 @@ function Show-MaintenanceStatus {
     Write-Field -Label "Grafana Alloy" -Value ("{0} ({1})" -f $alloy, (Get-NextecEstadoServico -Servico $service)) -ValueColor White
     Write-Field -Label "Coleta Complementar" -Value $coleta -ValueColor $(if ($versaoColeta) { [ConsoleColor]::White } else { [ConsoleColor]::DarkGray })
     Write-Field -Label "Atualizador" -Value $atualizador -ValueColor $(if ($versaoAtualizador) { [ConsoleColor]::White } else { [ConsoleColor]::Yellow })
+    Write-Field -Label "Pacote Nextec aplicado" -Value (Get-NextecPacoteAplicado) -ValueColor White
+    if ($configExists) {
+        $atual = $null
+        try { $atual = Read-CurrentAlloyConfiguration } catch { $atual = $null }
+        if ($null -ne $atual) {
+            $ligadas = @()
+            if ($atual.MonitorHost) { $ligadas += $(if ($atual.TipoLabel -eq "estacao") { "estação" } else { "servidor" }) }
+            if ($atual.EnableLogs) { $ligadas += "logs" }
+            if ($atual.EnableSecurity) { $ligadas += "segurança" }
+            if (@($atual.BlackboxTargets).Count -gt 0) { $ligadas += "conectividade" }
+            if (@($atual.SnmpTargets).Count -gt 0) { $ligadas += "snmp" }
+            if (@($atual.CustomExporters).Count -gt 0) { $ligadas += "exporters" }
+            if ($atual.EnableInternet) { $ligadas += "velocidade" }
+            if ($atual.EnableColeta) { $ligadas += "internet e links" }
+            Write-Field -Label "Coletas ligadas" -Value $(if ($ligadas.Count -gt 0) { $ligadas -join ", " } else { "nenhuma" }) -ValueColor White
+        }
+    }
     Write-Field -Label "Configuração" -Value $(if ($configExists) { $ConfigFile } else { "não encontrada" }) -ValueColor Gray
     Write-Host ""
+}
+
+function Get-NextecPacoteAplicado {
+    # Versão publicada pela Nextec que o atualizador aplicou neste host.
+    $estado = Join-Path $AtualizadorDir "estado.json"
+    if (-not (Test-Path -LiteralPath $estado -PathType Leaf)) { return "nenhum" }
+    try {
+        $obj = [IO.File]::ReadAllText($estado) | ConvertFrom-Json
+        if ($obj.PSObject.Properties.Name -contains "versao_instalada" -and $obj.versao_instalada) { return [string]$obj.versao_instalada }
+        return "nenhum"
+    }
+    catch {
+        return "não identificada"
+    }
+}
+
+function Read-LokiCredentials {
+    <#
+        Pede só a credencial do Loki, como o instalador Linux, quando logs ou a
+        Coleta são ligados num host que ainda não envia para o Loki. A do
+        remote_write continua a gravada.
+    #>
+    Write-Info "Este host ainda não envia logs e eventos e não tem credencial do Loki."
+    if (-not [string]::IsNullOrWhiteSpace($script:RwUsername) -and
+        (Read-YesNo -Prompt "Usar a mesma credencial do remote_write no Loki?" -Default $true)) {
+        $script:LokiUsername = $script:RwUsername
+        $script:LokiPassword = $script:RwPassword
+        return
+    }
+    $script:LokiUsername = Read-Required "Usuário do Loki"
+    $script:LokiPassword = Read-RequiredSecret "Senha do Loki"
 }
 
 function Get-VersaoNoArquivo {
@@ -2238,8 +2307,7 @@ function Edit-LogSettings {
     # não existir se o host nunca enviou log até agora.
     if ((Test-NextecNeedsLoki) -and
         [string]::IsNullOrWhiteSpace($script:LokiUsername)) {
-        Write-Info "Este host ainda não tem credencial de Loki gravada."
-        Read-NocCredentials
+        Read-LokiCredentials
     }
 }
 
@@ -3965,9 +4033,14 @@ function Merge-SnmpModuleFile {
 
     $merged = Get-SnmpModuleBlocksFromFile -Path $Destination
     $added = @()
+    $updated = @()
 
+    # Módulo que já existe é substituído: baixar o fabricante de novo traz a
+    # versão homologada mais nova (ex.: correção de OID no repositório).
     foreach ($name in @($newBlocks.Keys)) {
         if ($merged.Contains($name)) {
+            $merged[$name] = $newBlocks[$name]
+            $updated += $name
             continue
         }
 
@@ -3993,7 +4066,11 @@ function Merge-SnmpModuleFile {
         Write-Info ("Módulos acrescentados ao snmp.yml: {0}" -f ($added -join ", "))
     }
 
-    $preserved = @($merged.Keys | Where-Object { $added -notcontains $_ })
+    if ($updated.Count -gt 0) {
+        Write-Info ("Módulos atualizados no snmp.yml: {0}" -f ($updated -join ", "))
+    }
+
+    $preserved = @($merged.Keys | Where-Object { $added -notcontains $_ -and $updated -notcontains $_ })
     if ($preserved.Count -gt 0) {
         Write-Info ("Módulos preservados: {0}" -f ($preserved -join ", "))
     }
@@ -4022,6 +4099,19 @@ function Select-SnmpModules {
 
     if ($Modules.Count -eq 0) {
         return ""
+    }
+
+    # snmp.yml com mais de um fabricante (ex.: FortiGate e MikroTik no mesmo
+    # host): o equipamento usa só a família escolhida. Sem isso o alvo
+    # recebia os módulos de todos os fabricantes do arquivo.
+    $bases = @()
+    foreach ($module in $Modules) {
+        $base = $module -replace "_(v1|v2c|v2|v3)$", ""
+        if ($bases -notcontains $base) { $bases += $base }
+    }
+    if ($bases.Count -gt 1 -and -not $Silent) {
+        $escolhida = $bases[(Read-Choice -Prompt "Módulo deste equipamento" -Options $bases -Default 1) - 1]
+        $Modules = @($Modules | Where-Object { ($_ -replace "_(v1|v2c|v2|v3)$", "") -eq $escolhida })
     }
 
     $selected = @()
@@ -4264,15 +4354,9 @@ function Read-SnmpTargets {
     # Fabricantes diferentes convivem no mesmo host: os módulos do arquivo
     # escolhido são somados aos que já estão instalados, então a lista
     # oferecida ao operador precisa considerar as duas origens.
+    # Só os módulos do arquivo escolhido: os do snmp.yml instalado continuam
+    # lá para os equipamentos que já usam, mas não entram no novo.
     $availableModules = @(Get-SnmpConfigSectionKeys -Path $script:SnmpSourceFile -Section "modules")
-
-    if ($temArquivoInstalado) {
-        foreach ($instalado in @(Get-SnmpConfigSectionKeys -Path $SnmpFile -Section "modules")) {
-            if ($availableModules -notcontains $instalado) {
-                $availableModules += $instalado
-            }
-        }
-    }
 
     if ($availableModules.Count -eq 0) {
         throw ("Nenhum módulo encontrado na seção 'modules' de {0}." -f $script:SnmpSourceFile)
@@ -4645,7 +4729,7 @@ function Show-Plan {
     Write-Field -Label "Exporters adicionais" -Value ([string]$script:CustomExporters.Count) -Width 26
     Write-Host ""
 
-    if (-not $Silent) {
+    if (-not $Silent -and -not $script:ConfirmadoNaTela -and -not $Simular) {
         if (-not (Read-YesNo -Prompt "Confirmar instalação/configuração?" -Default $true)) {
             throw "Instalação cancelada pelo operador."
         }
@@ -6134,8 +6218,7 @@ function Edit-ColetaSettings {
     Invoke-ColetaLinksPrompt
 
     if ((Test-NextecNeedsLoki) -and [string]::IsNullOrWhiteSpace($script:LokiUsername)) {
-        Write-Info "Os eventos da Coleta Complementar vão para o Loki; este host ainda não tem credencial."
-        Read-NocCredentials
+        Read-LokiCredentials
     }
 }
 
@@ -7491,8 +7574,1098 @@ function Invoke-NextecAtualizacao {
     Write-Ok "Atualização concluída."
 }
 
+# ==============================================================================
+# INTERFACE GRÁFICA (WINFORMS)
+# ==============================================================================
+# A tela só coleta as respostas. Validação, geração do config.alloy, SNMP,
+# Coleta, serviço e atualizador são as mesmas funções do console: uma lógica,
+# duas telas. A tela abre quando há área de trabalho; RMM, sessão sem tela,
+# Server Core e -Console continuam no console.
+
+function Test-NextecUseGui {
+    if ($Silent -or $Atualizar -or $Console) { return $false }
+    try {
+        if (-not [Environment]::UserInteractive) { return $false }
+        if ((Get-Process -Id $PID).SessionId -eq 0) { return $false }
+        if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.ApartmentState]::STA) { return $false }
+        $tipoInstalacao = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name InstallationType -ErrorAction SilentlyContinue).InstallationType
+        if ($tipoInstalacao -eq "Server Core") { return $false }
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+# Cores da marca. Preenchidas por Initialize-GuiCores, depois de carregar o
+# System.Drawing (no Windows PowerShell 5.1 ele não vem carregado no console).
+$script:GuiCores = @{}
+$script:GuiFabricantesSnmp = @()
+$script:ConfirmadoNaTela = $false
+
+function Initialize-GuiCores {
+    $script:GuiCores = @{
+        Marinho = [Drawing.Color]::FromArgb(13, 0, 53)
+        Roxo    = [Drawing.Color]::FromArgb(92, 80, 255)
+        Fundo   = [Drawing.Color]::FromArgb(244, 244, 244)
+        Texto   = [Drawing.Color]::FromArgb(33, 33, 33)
+        Cinza   = [Drawing.Color]::FromArgb(110, 110, 110)
+        Erro    = [Drawing.Color]::FromArgb(200, 40, 40)
+    }
+}
+
+$script:GuiModulosBlackbox = [ordered]@{
+    icmp_ipv4        = "Ping (o host responde)"
+    http_2xx         = "HTTP 2xx (status da página)"
+    http_2xx_ssl     = "HTTPS 2xx com certificado"
+    http_2xx_content = "HTTP 2xx com conteúdo (pega página quebrada)"
+    tcp_connect      = "TCP (a porta aceita conexão)"
+    dns_udp          = "DNS (o servidor responde)"
+}
+$script:GuiSufixoBlackbox = @{ icmp_ipv4 = "ping"; http_2xx = "http"; http_2xx_ssl = "https"; tcp_connect = "tcp"; dns_udp = "dns"; http_2xx_content = "content" }
+
+function Get-GuiSlug {
+    # ConvertTo-Slug exige valor; campo vazio da tela vira "" sem erro.
+    param([AllowNull()][AllowEmptyString()][string]$Valor)
+    if ([string]::IsNullOrWhiteSpace($Valor)) { return "" }
+    return (ConvertTo-Slug $Valor)
+}
+
+function Get-GuiClienteSlug {
+    param([AllowNull()][AllowEmptyString()][string]$Valor)
+    if ([string]::IsNullOrWhiteSpace($Valor)) { return "" }
+    return (ConvertTo-ClienteSlug $Valor)
+}
+
+function New-GuiLabel {
+    param([string]$Texto, [int]$X, [int]$Y, [int]$Largura = 640, [switch]$Dica, [switch]$Titulo)
+    $l = New-Object Windows.Forms.Label
+    $l.Text = $Texto
+    $l.Location = New-Object Drawing.Point($X, $Y)
+    $l.AutoSize = $false
+    $l.Width = $Largura
+    $l.Height = 22
+    if ($Dica) { $l.ForeColor = $script:GuiCores.Cinza; $l.Font = New-Object Drawing.Font("Segoe UI", 8.5) }
+    if ($Titulo) { $l.Font = New-Object Drawing.Font("Segoe UI Semibold", 11); $l.ForeColor = $script:GuiCores.Marinho; $l.Height = 28 }
+    return $l
+}
+
+function New-GuiTextBox {
+    param([int]$X, [int]$Y, [int]$Largura = 300, [string]$Texto = "", [switch]$Senha)
+    $t = New-Object Windows.Forms.TextBox
+    $t.Location = New-Object Drawing.Point($X, $Y)
+    $t.Width = $Largura
+    $t.Text = $Texto
+    if ($Senha) { $t.UseSystemPasswordChar = $true }
+    return $t
+}
+
+function New-GuiCombo {
+    param([int]$X, [int]$Y, [int]$Largura = 300, [string[]]$Itens, [int]$Indice = 0)
+    $c = New-Object Windows.Forms.ComboBox
+    $c.Location = New-Object Drawing.Point($X, $Y)
+    $c.Width = $Largura
+    $c.DropDownStyle = [Windows.Forms.ComboBoxStyle]::DropDownList
+    foreach ($i in $Itens) { [void]$c.Items.Add($i) }
+    if ($c.Items.Count -gt $Indice) { $c.SelectedIndex = $Indice }
+    return $c
+}
+
+function New-GuiGrid {
+    param([int]$X, [int]$Y, [int]$Largura, [int]$Altura)
+    $g = New-Object Windows.Forms.DataGridView
+    $g.Location = New-Object Drawing.Point($X, $Y)
+    $g.Size = New-Object Drawing.Size($Largura, $Altura)
+    $g.AllowUserToAddRows = $false
+    $g.AllowUserToResizeRows = $false
+    $g.RowHeadersVisible = $false
+    $g.BackgroundColor = [Drawing.Color]::White
+    $g.SelectionMode = [Windows.Forms.DataGridViewSelectionMode]::CellSelect
+    $g.AutoSizeColumnsMode = [Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
+    $g.EditMode = [Windows.Forms.DataGridViewEditMode]::EditOnEnter
+    $g.ColumnHeadersDefaultCellStyle.Font = New-Object Drawing.Font("Segoe UI Semibold", 9)
+    # Valor fora da lista de uma coluna de escolha não abre caixa de erro.
+    $g.Add_DataError({ param($s, $e) $e.ThrowException = $false })
+    return $g
+}
+
+function Add-GuiColunaTexto {
+    param($Grid, [string]$Nome, [string]$Titulo, [int]$Peso = 100, [switch]$SomenteLeitura)
+    $c = New-Object Windows.Forms.DataGridViewTextBoxColumn
+    $c.Name = $Nome; $c.HeaderText = $Titulo; $c.FillWeight = $Peso; $c.ReadOnly = [bool]$SomenteLeitura
+    [void]$Grid.Columns.Add($c)
+}
+
+function Add-GuiColunaLista {
+    param($Grid, [string]$Nome, [string]$Titulo, [string[]]$Itens, [int]$Peso = 100)
+    $c = New-Object Windows.Forms.DataGridViewComboBoxColumn
+    $c.Name = $Nome; $c.HeaderText = $Titulo; $c.FillWeight = $Peso
+    $c.FlatStyle = [Windows.Forms.FlatStyle]::Flat
+    foreach ($i in $Itens) { [void]$c.Items.Add($i) }
+    [void]$Grid.Columns.Add($c)
+}
+
+function New-GuiBotao {
+    param([string]$Texto, [int]$X, [int]$Y, [int]$Largura = 140, [switch]$Principal)
+    $b = New-Object Windows.Forms.Button
+    $b.Text = $Texto
+    $b.Location = New-Object Drawing.Point($X, $Y)
+    $b.Size = New-Object Drawing.Size($Largura, 32)
+    $b.FlatStyle = [Windows.Forms.FlatStyle]::Flat
+    if ($Principal) {
+        $b.BackColor = $script:GuiCores.Roxo
+        $b.ForeColor = [Drawing.Color]::White
+        $b.FlatAppearance.BorderSize = 0
+    }
+    return $b
+}
+
+function Get-GuiCelula {
+    param($Linha, [string]$Coluna)
+    $v = $Linha.Cells[$Coluna].Value
+    if ($null -eq $v) { return "" }
+    return ([string]$v).Trim()
+}
+
+function Show-GuiCredencialSnmp {
+    <#
+        Janela da credencial de um equipamento SNMP. Devolve um objeto com a
+        versão e os campos, ou $null se o técnico cancelar. Senha nunca
+        aparece na grade: a linha guarda o objeto na propriedade Tag.
+    #>
+    param([string]$Equipamento, [object]$Atual)
+
+    $f = New-Object Windows.Forms.Form
+    $f.Text = "Credencial SNMP · $Equipamento"
+    $f.Size = New-Object Drawing.Size(460, 400)
+    $f.StartPosition = "CenterParent"
+    $f.FormBorderStyle = "FixedDialog"
+    $f.MaximizeBox = $false; $f.MinimizeBox = $false
+    $f.Font = New-Object Drawing.Font("Segoe UI", 9.5)
+    $f.BackColor = [Drawing.Color]::White
+
+    $f.Controls.Add((New-GuiLabel "Versão SNMP" 20 18 140))
+    $versao = New-GuiCombo 170 15 250 @("v2c (community)", "v3 (usuário e senha)")
+    $f.Controls.Add($versao)
+
+    $f.Controls.Add((New-GuiLabel "Community" 20 58 140))
+    $community = New-GuiTextBox 170 55 250 "public" -Senha
+    $f.Controls.Add($community)
+
+    $f.Controls.Add((New-GuiLabel "Usuário SNMPv3" 20 98 140))
+    $usuario = New-GuiTextBox 170 95 250 "nextec_monitoramento"
+    $f.Controls.Add($usuario)
+    $f.Controls.Add((New-GuiLabel "Segurança" 20 133 140))
+    $nivel = New-GuiCombo 170 130 250 @("authPriv (autenticação e criptografia)", "authNoPriv (só autenticação)")
+    $f.Controls.Add($nivel)
+    $f.Controls.Add((New-GuiLabel "Autenticação" 20 168 140))
+    $protAuth = New-GuiCombo 170 165 120 @("SHA", "SHA256", "SHA512", "MD5")
+    $f.Controls.Add($protAuth)
+    $senhaAuth = New-GuiTextBox 300 165 120 "" -Senha
+    $f.Controls.Add($senhaAuth)
+    $f.Controls.Add((New-GuiLabel "Criptografia" 20 203 140))
+    $protPriv = New-GuiCombo 170 200 120 @("AES", "AES256", "DES")
+    $f.Controls.Add($protPriv)
+    $senhaPriv = New-GuiTextBox 300 200 120 "" -Senha
+    $f.Controls.Add($senhaPriv)
+    $f.Controls.Add((New-GuiLabel "Protocolo à esquerda, senha à direita. Senhas não aparecem na tela." 20 235 410 -Dica))
+
+    $erro = New-GuiLabel "" 20 262 410
+    $erro.ForeColor = $script:GuiCores.Erro
+    $f.Controls.Add($erro)
+
+    if ($null -ne $Atual) {
+        if ($Atual.Versao -eq "v3") {
+            $versao.SelectedIndex = 1
+            $usuario.Text = $Atual.Usuario
+            $nivel.SelectedIndex = $(if ($Atual.Nivel -eq "authNoPriv") { 1 } else { 0 })
+            $protAuth.SelectedItem = $Atual.ProtocoloAuth
+            $senhaAuth.Text = $Atual.SenhaAuth
+            if ($Atual.ProtocoloPriv) { $protPriv.SelectedItem = $Atual.ProtocoloPriv }
+            $senhaPriv.Text = $Atual.SenhaPriv
+        }
+        else {
+            $community.Text = $Atual.Community
+        }
+    }
+
+    $atualizar = {
+        $v3 = ($versao.SelectedIndex -eq 1)
+        $community.Enabled = -not $v3
+        $usuario.Enabled = $v3; $nivel.Enabled = $v3; $protAuth.Enabled = $v3; $senhaAuth.Enabled = $v3
+        $comPriv = $v3 -and ($nivel.SelectedIndex -eq 0)
+        $protPriv.Enabled = $comPriv; $senhaPriv.Enabled = $comPriv
+    }
+    $versao.Add_SelectedIndexChanged($atualizar)
+    $nivel.Add_SelectedIndexChanged($atualizar)
+    & $atualizar
+
+    $ok = New-GuiBotao "Salvar" 200 300 110 -Principal
+    $cancelar = New-GuiBotao "Cancelar" 320 300 100
+    $cancelar.DialogResult = [Windows.Forms.DialogResult]::Cancel
+    $f.CancelButton = $cancelar
+    $f.Controls.Add($ok); $f.Controls.Add($cancelar)
+
+    $script:GuiCredencialResultado = $null
+    $ok.Add_Click({
+        if ($versao.SelectedIndex -eq 0) {
+            if ([string]::IsNullOrWhiteSpace($community.Text)) { $erro.Text = "Informe a community."; return }
+            $script:GuiCredencialResultado = [pscustomobject]@{ Versao = "v2c"; Community = $community.Text }
+        }
+        else {
+            if ([string]::IsNullOrWhiteSpace($usuario.Text)) { $erro.Text = "Informe o usuário."; return }
+            if ([string]::IsNullOrEmpty($senhaAuth.Text)) { $erro.Text = "Informe a senha de autenticação."; return }
+            $nivelTexto = $(if ($nivel.SelectedIndex -eq 0) { "authPriv" } else { "authNoPriv" })
+            if ($nivelTexto -eq "authPriv" -and [string]::IsNullOrEmpty($senhaPriv.Text)) { $erro.Text = "Informe a senha de criptografia."; return }
+            $script:GuiCredencialResultado = [pscustomobject]@{
+                Versao = "v3"; Usuario = $usuario.Text.Trim(); Nivel = $nivelTexto
+                ProtocoloAuth = [string]$protAuth.SelectedItem; SenhaAuth = $senhaAuth.Text
+                ProtocoloPriv = $(if ($nivelTexto -eq "authPriv") { [string]$protPriv.SelectedItem } else { "" })
+                SenhaPriv = $(if ($nivelTexto -eq "authPriv") { $senhaPriv.Text } else { "" })
+            }
+        }
+        $f.DialogResult = [Windows.Forms.DialogResult]::OK
+        $f.Close()
+    })
+
+    [void]$f.ShowDialog()
+    $f.Dispose()
+    return $script:GuiCredencialResultado
+}
+
+function ConvertTo-SnmpAuthYaml {
+    # Mesmo formato de Read-SnmpAuthDefinition.
+    param([string]$Nome, [object]$Credencial)
+    $linhas = @(("  {0}:" -f $Nome))
+    if ($Credencial.Versao -eq "v2c") {
+        $linhas += "    version: 2"
+        $linhas += ("    community: {0}" -f (ConvertTo-YamlSingleQuoted $Credencial.Community))
+    }
+    else {
+        $linhas += "    version: 3"
+        $linhas += ("    username: {0}" -f (ConvertTo-YamlSingleQuoted $Credencial.Usuario))
+        $linhas += ("    auth_protocol: {0}" -f $Credencial.ProtocoloAuth)
+        $linhas += ("    password: {0}" -f (ConvertTo-YamlSingleQuoted $Credencial.SenhaAuth))
+        if ($Credencial.Nivel -eq "authPriv") {
+            $linhas += "    security_level: authPriv"
+            $linhas += ("    priv_protocol: {0}" -f $Credencial.ProtocoloPriv)
+            $linhas += ("    priv_password: {0}" -f (ConvertTo-YamlSingleQuoted $Credencial.SenhaPriv))
+        }
+        else {
+            $linhas += "    security_level: authNoPriv"
+        }
+    }
+    return ($linhas -join [Environment]::NewLine)
+}
+
+function Show-NextecInstallerGui {
+    <#
+        Abre a tela de instalação e preenche as mesmas variáveis que o fluxo
+        do console preenche. Devolve $true se o técnico confirmou e $false
+        se fechou a janela.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][object]$Inventory,
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$DetectedFeatures
+    )
+
+    [Windows.Forms.Application]::EnableVisualStyles()
+    Initialize-GuiCores
+    $g = @{}
+    $script:Gui = $g
+    $g.Inventory = $Inventory
+    $g.Features = @($DetectedFeatures)
+    $g.Confirmado = $false
+    # Com Set-StrictMode, ler chave que não existe no hashtable dá erro: toda
+    # chave lida por um evento precisa nascer aqui.
+    $g.Ocupado = $false
+    $estacao = ($Inventory.ProductType -eq 1)
+
+    $form = New-Object Windows.Forms.Form
+    $form.Text = "Nextec · Instalação do monitoramento"
+    $form.Size = New-Object Drawing.Size(900, 680)
+    $form.MinimumSize = New-Object Drawing.Size(900, 680)
+    $form.StartPosition = "CenterScreen"
+    $form.Font = New-Object Drawing.Font("Segoe UI", 9.5)
+    $form.BackColor = $script:GuiCores.Fundo
+    $form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::Dpi
+    $g.Form = $form
+
+    $topo = New-Object Windows.Forms.Panel
+    $topo.Dock = "Top"; $topo.Height = 64; $topo.BackColor = $script:GuiCores.Marinho
+    $titulo = New-Object Windows.Forms.Label
+    $titulo.Text = "Monitoramento Nextec"
+    $titulo.ForeColor = [Drawing.Color]::White
+    $titulo.Font = New-Object Drawing.Font("Segoe UI Semibold", 15)
+    $titulo.Location = New-Object Drawing.Point(20, 8); $titulo.AutoSize = $true
+    $sub = New-Object Windows.Forms.Label
+    $sub.Text = ("Instalador Windows v{0} · {1} · {2}" -f $InstallerVersion, $Inventory.Hostname, $Inventory.Caption)
+    $sub.ForeColor = [Drawing.Color]::FromArgb(217, 214, 255)
+    $sub.Location = New-Object Drawing.Point(22, 38); $sub.AutoSize = $true
+    $topo.Controls.Add($titulo); $topo.Controls.Add($sub)
+
+    $rodape = New-Object Windows.Forms.Panel
+    $rodape.Dock = "Bottom"; $rodape.Height = 56; $rodape.BackColor = [Drawing.Color]::White
+    $g.Erro = New-GuiLabel "" 16 18 520
+    $g.Erro.ForeColor = $script:GuiCores.Erro
+    $g.Voltar = New-GuiBotao "Voltar" 560 12 100
+    $g.Avancar = New-GuiBotao "Avançar" 670 12 200 -Principal
+    $rodape.Controls.Add($g.Erro); $rodape.Controls.Add($g.Voltar); $rodape.Controls.Add($g.Avancar)
+
+    $abas = New-Object Windows.Forms.TabControl
+    $abas.Dock = "Fill"
+    $abas.Padding = New-Object Drawing.Point(14, 6)
+    $g.Abas = $abas
+
+    $form.Controls.Add($abas)
+    $form.Controls.Add($rodape)
+    $form.Controls.Add($topo)
+
+    # ---------------- Identificação ----------------
+    $p = New-Object Windows.Forms.TabPage; $p.Text = "Identificação"; $p.BackColor = [Drawing.Color]::White
+    $g.PaginaIdentificacao = $p
+    $p.Controls.Add((New-GuiLabel "Quem é este servidor no NOC" 24 16 600 -Titulo))
+    $p.Controls.Add((New-GuiLabel "Cliente" 24 62 200))
+    $g.Cliente = New-GuiTextBox 230 59 360 $(if ($script:Cliente) { [string]$script:Cliente } else { "" })
+    $p.Controls.Add($g.Cliente)
+    $g.ClienteSlug = New-GuiLabel "Identificador da empresa, não do servidor. Ex.: advocacia_martins" 230 84 600 -Dica
+    $p.Controls.Add($g.ClienteSlug)
+    $g.Cliente.Add_TextChanged({
+        $s = Get-GuiClienteSlug $script:Gui.Cliente.Text
+        if ($s) { $script:Gui.ClienteSlug.Text = "No NOC vai ficar: $s" } else { $script:Gui.ClienteSlug.Text = "Identificador da empresa, não do servidor. Ex.: advocacia_martins" }
+    })
+
+    $p.Controls.Add((New-GuiLabel "Nome do host" 24 117 200))
+    $hostPadrao = $(if ($script:HostLabel) { [string]$script:HostLabel } else { Get-GuiSlug $Inventory.Hostname })
+    $g.Host = New-GuiTextBox 230 114 360 $hostPadrao
+    $p.Controls.Add($g.Host)
+
+    $ambientes = @("producao", "homologacao", "desenvolvimento", "backup", "teste")
+    $p.Controls.Add((New-GuiLabel "Ambiente" 24 157 200))
+    $g.Ambiente = New-GuiCombo 230 154 200 $ambientes ([Math]::Max(0, [Array]::IndexOf($ambientes, [string]$script:Ambiente)))
+    $p.Controls.Add($g.Ambiente)
+
+    $p.Controls.Add((New-GuiLabel "Local" 24 197 200))
+    $g.Local = New-GuiTextBox 230 194 200 $(if ($script:Local) { [string]$script:Local } else { "matriz" })
+    $p.Controls.Add($g.Local)
+    $p.Controls.Add((New-GuiLabel "Ex.: matriz, filial_sp" 440 197 300 -Dica))
+
+    $criticidades = @("critico", "alto", "medio", "baixo")
+    $p.Controls.Add((New-GuiLabel "Criticidade" 24 237 200))
+    $indiceCrit = [Array]::IndexOf($criticidades, [string]$script:Criticidade)
+    if ($indiceCrit -lt 0) { $indiceCrit = 1 }
+    $g.Criticidade = New-GuiCombo 230 234 200 $criticidades $indiceCrit
+    $p.Controls.Add($g.Criticidade)
+
+    if ($estacao) { $modos = @("Estação monitorada", "Collector de rede (SNMP, conectividade, Speedtest)", "Estação + Collector de rede") }
+    else { $modos = @("Servidor monitorado", "Collector de rede (SNMP, conectividade, Speedtest)", "Servidor + Collector de rede") }
+    $indiceModo = 0
+    switch ($Modo) {
+        "collector" { $indiceModo = 1 }
+        "servidor_collector" { $indiceModo = 2 }
+        "estacao_collector" { $indiceModo = 2 }
+    }
+    $p.Controls.Add((New-GuiLabel "Função deste Alloy" 24 277 200))
+    $g.Modo = New-GuiCombo 230 274 420 $modos $indiceModo
+    $p.Controls.Add($g.Modo)
+    $p.Controls.Add((New-GuiLabel "Collector é o servidor que alcança firewall, switch, nobreak e os destinos de teste." 230 300 600 -Dica))
+
+    $p.Controls.Add((New-GuiLabel "Destino do NOC" 24 340 200))
+    $g.Destino = New-GuiTextBox 230 337 360 $script:NocHost
+    $p.Controls.Add($g.Destino)
+
+    # ---------------- Recursos ----------------
+    $p = New-Object Windows.Forms.TabPage; $p.Text = "Recursos"; $p.BackColor = [Drawing.Color]::White
+    $g.PaginaRecursos = $p
+    $p.Controls.Add((New-GuiLabel "O que coletar além do perfil básico" 24 16 600 -Titulo))
+    $g.Basico = New-GuiLabel "Sempre ligado: CPU, memória, discos, rede, uptime e serviços do Windows." 24 46 760 -Dica
+    $p.Controls.Add($g.Basico)
+    $arvore = New-Object Windows.Forms.TreeView
+    $arvore.CheckBoxes = $true
+    $arvore.Location = New-Object Drawing.Point(24, 74)
+    $arvore.Size = New-Object Drawing.Size(560, 420)
+    $arvore.Font = New-Object Drawing.Font("Segoe UI", 10)
+    $arvore.ItemHeight = 24
+    $arvore.ShowLines = $false
+    $arvore.FullRowSelect = $true
+    $g.Arvore = $arvore
+    $p.Controls.Add($arvore)
+    $p.Controls.Add((New-GuiLabel "Speedtest a cada (min)" 604 80 200))
+    $g.Intervalo = New-Object Windows.Forms.NumericUpDown
+    $g.Intervalo.Location = New-Object Drawing.Point(604, 104)
+    $g.Intervalo.Minimum = 5; $g.Intervalo.Maximum = 1440
+    $g.Intervalo.Value = [Math]::Max(5, [int]$InternetIntervalMinutes)
+    $p.Controls.Add($g.Intervalo)
+    $p.Controls.Add((New-GuiLabel "Clique no texto para marcar. Exporters: marque o grupo e escolha os filhos." 24 502 760 -Dica))
+
+    # Marcar o pai marca os filhos e vice-versa; os avisos dependem dos logs.
+    $arvore.Add_AfterCheck({
+        param($s, $e)
+        # Marcações feitas aqui disparam o evento de novo: a trava evita o laço.
+        if ($script:Gui.Ocupado) { return }
+        $script:Gui.Ocupado = $true
+        try {
+        $n = $e.Node
+        if ($n.Nodes.Count -gt 0 -and $n.Name -eq "exporter") {
+            if (-not $n.Checked) { foreach ($f in $n.Nodes) { $f.Checked = $false } }
+            $n.Expand()
+        }
+        if ($null -ne $n.Parent -and $n.Parent.Name -eq "exporter") {
+            $algum = $false
+            foreach ($f in $n.Parent.Nodes) { if ($f.Checked) { $algum = $true } }
+            $n.Parent.Checked = $algum
+        }
+        if ($n.Name -eq "logs_warning" -and $n.Checked) {
+            $logs = $script:Gui.Arvore.Nodes.Find("logs", $true)
+            if ($logs.Count -gt 0) { $logs[0].Checked = $true }
+        }
+        if ($n.Name -eq "logs" -and -not $n.Checked) {
+            $warn = $script:Gui.Arvore.Nodes.Find("logs_warning", $true)
+            if ($warn.Count -gt 0) { $warn[0].Checked = $false }
+        }
+        }
+        finally { $script:Gui.Ocupado = $false }
+        & $script:Gui.MontarAbas
+    })
+    $arvore.Add_NodeMouseClick({
+        param($s, $e)
+        if ($e.X -gt $e.Node.Bounds.Left) { $e.Node.Checked = -not $e.Node.Checked }
+    })
+
+    # ---------------- Links ----------------
+    $p = New-Object Windows.Forms.TabPage; $p.Text = "Links de internet"; $p.BackColor = [Drawing.Color]::White
+    $g.PaginaLinks = $p
+    $p.Controls.Add((New-GuiLabel "Links de internet deste local" 24 16 600 -Titulo))
+    $p.Controls.Add((New-GuiLabel "Velocidade: 500, 1 Giga, 600/300 (vazio se não souber). Destinos já vêm prontos, um conjunto por link." 24 46 820 -Dica))
+    $g.Links = New-GuiGrid 24 72 820 300
+    Add-GuiColunaTexto $g.Links "operadora" "Operadora" 110
+    Add-GuiColunaLista $g.Links "tipo" "Tipo" @($script:TiposLink.Values) 70
+    Add-GuiColunaLista $g.Links "papel" "Função" @("principal", "reserva", "SD-WAN") 70
+    Add-GuiColunaTexto $g.Links "velocidade" "Velocidade" 70
+    Add-GuiColunaTexto $g.Links "alvos" "Destinos de teste" 170
+    Add-GuiColunaTexto $g.Links "ip_publico" "IP público" 80
+    Add-GuiColunaTexto $g.Links "gateway" "Gateway" 70
+    Add-GuiColunaTexto $g.Links "origem" "IP de origem" 70
+    Add-GuiColunaTexto $g.Links "firewall" "Firewall no NOC" 70
+    Add-GuiColunaTexto $g.Links "interface_firewall" "Interface WAN" 60
+    $p.Controls.Add($g.Links)
+    $g.Avancado = New-Object Windows.Forms.CheckBox
+    $g.Avancado.Text = "Mostrar opções avançadas (gateway, IP de origem, firewall)"
+    $g.Avancado.Location = New-Object Drawing.Point(24, 380); $g.Avancado.AutoSize = $true
+    $p.Controls.Add($g.Avancado)
+    $atualizarColunasLinks = {
+        foreach ($c in @("gateway", "origem", "firewall", "interface_firewall")) { $script:Gui.Links.Columns[$c].Visible = $script:Gui.Avancado.Checked }
+    }
+    $g.Avancado.Add_CheckedChanged($atualizarColunasLinks)
+    & $atualizarColunasLinks
+    $bAdd = New-GuiBotao "Adicionar link" 24 410 140
+    $bDel = New-GuiBotao "Remover selecionado" 174 410 170
+    $p.Controls.Add($bAdd); $p.Controls.Add($bDel)
+    $g.AdicionarLink = {
+        param([object]$Link)
+        $gr = $script:Gui.Links
+        $i = $gr.Rows.Add()
+        $r = $gr.Rows[$i]
+        if ($null -ne $Link) {
+            $r.Cells["operadora"].Value = $Link.operadora
+            $tipoTexto = $(if ($script:TiposLink.Contains([string]$Link.tipo)) { $script:TiposLink[[string]$Link.tipo] } else { @($script:TiposLink.Values)[0] })
+            $r.Cells["tipo"].Value = $tipoTexto
+            $r.Cells["papel"].Value = $(if ($script:PapeisLink.Contains([string]$Link.papel)) { $script:PapeisLink[[string]$Link.papel] } else { "principal" })
+            $r.Cells["velocidade"].Value = $(if ($Link.velocidade_upload_mbps) { "{0}/{1}" -f $Link.velocidade_mbps, $Link.velocidade_upload_mbps } else { [string]$Link.velocidade_mbps })
+            foreach ($c in @("alvos", "ip_publico", "gateway", "origem", "firewall", "interface_firewall")) { $r.Cells[$c].Value = [string]$Link.$c }
+        }
+        else {
+            $r.Cells["tipo"].Value = @($script:TiposLink.Values)[0]
+            $r.Cells["papel"].Value = $(if ($i -eq 0) { "principal" } else { "reserva" })
+            $r.Cells["alvos"].Value = $(if ($i -lt $script:DestinosLink.Count) { $script:DestinosLink[$i] } else { "" })
+        }
+    }
+    $bAdd.Add_Click({ & $script:Gui.AdicionarLink $null })
+    $bDel.Add_Click({ if ($null -ne $script:Gui.Links.CurrentRow) { $script:Gui.Links.Rows.Remove($script:Gui.Links.CurrentRow) } })
+    if ($script:ColetaLinks.Count -gt 0) { foreach ($l in $script:ColetaLinks) { & $g.AdicionarLink $l } } else { & $g.AdicionarLink $null }
+
+    # ---------------- Conectividade ----------------
+    $p = New-Object Windows.Forms.TabPage; $p.Text = "Conectividade"; $p.BackColor = [Drawing.Color]::White
+    $g.PaginaBlackbox = $p
+    $p.Controls.Add((New-GuiLabel "Sistemas, sites e portas que este servidor vai testar" 24 16 700 -Titulo))
+    $p.Controls.Add((New-GuiLabel "Para dois testes no mesmo alvo (ex.: ping e HTTPS), cadastre duas linhas com o mesmo nome." 24 46 820 -Dica))
+    $g.Blackbox = New-GuiGrid 24 72 820 300
+    Add-GuiColunaTexto $g.Blackbox "nome" "Nome (ex.: fw_matriz)" 80
+    Add-GuiColunaTexto $g.Blackbox "endereco" "IP, FQDN ou URL" 120
+    Add-GuiColunaLista $g.Blackbox "modulo" "Teste" @($script:GuiModulosBlackbox.Values) 130
+    Add-GuiColunaLista $g.Blackbox "tipo" "Tipo do ativo" @("firewall", "switch", "link", "aplicacao", "site", "storage") 60
+    $p.Controls.Add($g.Blackbox)
+    $p.Controls.Add((New-GuiLabel "Testar a cada" 24 386 120))
+    $g.IntervaloBlackbox = New-GuiCombo 150 383 300 @("10 segundos (link: disponibilidade e jitter)", "15 segundos", "30 segundos (serviços e sites)", "60 segundos (site externo, padrão)") 3
+    $p.Controls.Add($g.IntervaloBlackbox)
+    $b1 = New-GuiBotao "Adicionar alvo" 24 420 140
+    $b2 = New-GuiBotao "Remover selecionado" 174 420 170
+    $b1.Add_Click({ $i = $script:Gui.Blackbox.Rows.Add(); $script:Gui.Blackbox.Rows[$i].Cells["modulo"].Value = @($script:GuiModulosBlackbox.Values)[0]; $script:Gui.Blackbox.Rows[$i].Cells["tipo"].Value = "firewall" })
+    $b2.Add_Click({ if ($null -ne $script:Gui.Blackbox.CurrentRow) { $script:Gui.Blackbox.Rows.Remove($script:Gui.Blackbox.CurrentRow) } })
+    $p.Controls.Add($b1); $p.Controls.Add($b2)
+
+    # ---------------- SNMP ----------------
+    $p = New-Object Windows.Forms.TabPage; $p.Text = "SNMP"; $p.BackColor = [Drawing.Color]::White
+    $g.PaginaSnmp = $p
+    $p.Controls.Add((New-GuiLabel "Equipamentos de rede (firewall, switch, nobreak, AP)" 24 16 700 -Titulo))
+    $p.Controls.Add((New-GuiLabel "O módulo do fabricante vem do repositório Nextec. A credencial fica só neste servidor (snmp-auth.yml)." 24 46 820 -Dica))
+    $g.Snmp = New-GuiGrid 24 72 820 300
+    Add-GuiColunaTexto $g.Snmp "nome" "Nome (ex.: fw_matriz)" 90
+    Add-GuiColunaTexto $g.Snmp "endereco" "IP ou FQDN" 90
+    Add-GuiColunaLista $g.Snmp "fabricante" "Fabricante" @($NextecSnmpVendors.Values | ForEach-Object { $_.Label }) 80
+    Add-GuiColunaLista $g.Snmp "tipo" "Tipo" @("firewall", "switch", "storage", "ap", "ups") 60
+    Add-GuiColunaTexto $g.Snmp "credencial" "Credencial" 80 -SomenteLeitura
+    $botaoCred = New-Object Windows.Forms.DataGridViewButtonColumn
+    $botaoCred.Name = "definir"; $botaoCred.HeaderText = ""; $botaoCred.Text = "Definir..."; $botaoCred.UseColumnTextForButtonValue = $true; $botaoCred.FillWeight = 50
+    [void]$g.Snmp.Columns.Add($botaoCred)
+    $g.Snmp.Add_CellContentClick({
+        param($s, $e)
+        if ($e.RowIndex -lt 0 -or $script:Gui.Snmp.Columns[$e.ColumnIndex].Name -ne "definir") { return }
+        $linha = $script:Gui.Snmp.Rows[$e.RowIndex]
+        $nome = Get-GuiCelula $linha "nome"
+        if (-not $nome) { $nome = "equipamento" }
+        $cred = Show-GuiCredencialSnmp -Equipamento $nome -Atual $linha.Tag
+        if ($null -ne $cred) {
+            $linha.Tag = $cred
+            $linha.Cells["credencial"].Value = $(if ($cred.Versao -eq "v2c") { "v2c, definida" } else { "v3 {0}, definida" -f $cred.Nivel })
+        }
+    })
+    $p.Controls.Add($g.Snmp)
+    $b1 = New-GuiBotao "Adicionar equipamento" 24 386 180
+    $b2 = New-GuiBotao "Remover selecionado" 214 386 170
+    $b1.Add_Click({ $i = $script:Gui.Snmp.Rows.Add(); $r = $script:Gui.Snmp.Rows[$i]; $r.Cells["fabricante"].Value = @($NextecSnmpVendors.Values)[0].Label; $r.Cells["tipo"].Value = "firewall"; $r.Cells["credencial"].Value = "não definida" })
+    $b2.Add_Click({ if ($null -ne $script:Gui.Snmp.CurrentRow) { $script:Gui.Snmp.Rows.Remove($script:Gui.Snmp.CurrentRow) } })
+    $p.Controls.Add($b1); $p.Controls.Add($b2)
+
+    # ---------------- Exporters ----------------
+    $p = New-Object Windows.Forms.TabPage; $p.Text = "Exporters"; $p.BackColor = [Drawing.Color]::White
+    $g.PaginaExporters = $p
+    $p.Controls.Add((New-GuiLabel "Endereço dos exporters marcados" 24 16 700 -Titulo))
+    $p.Controls.Add((New-GuiLabel "Só para exporter que já está rodando. O endereço padrão já vem preenchido." 24 46 820 -Dica))
+    $g.Exporters = New-GuiGrid 24 72 820 300
+    Add-GuiColunaTexto $g.Exporters "nome" "Exporter" 100
+    Add-GuiColunaTexto $g.Exporters "alvo" "host:porta" 100
+    Add-GuiColunaTexto $g.Exporters "servico" "Rótulo servico" 80
+    $p.Controls.Add($g.Exporters)
+    $b1 = New-GuiBotao "Outro endpoint" 24 386 150
+    $b2 = New-GuiBotao "Remover selecionado" 184 386 170
+    $b1.Add_Click({ $i = $script:Gui.Exporters.Rows.Add(); $script:Gui.Exporters.Rows[$i].Tag = "custom" })
+    $b2.Add_Click({ if ($null -ne $script:Gui.Exporters.CurrentRow) { $script:Gui.Exporters.Rows.Remove($script:Gui.Exporters.CurrentRow) } })
+    $p.Controls.Add($b1); $p.Controls.Add($b2)
+
+    # ---------------- Credenciais ----------------
+    $p = New-Object Windows.Forms.TabPage; $p.Text = "Credenciais"; $p.BackColor = [Drawing.Color]::White
+    $g.PaginaCredenciais = $p
+    $p.Controls.Add((New-GuiLabel "Credencial do NOC (Bitwarden)" 24 16 600 -Titulo))
+    $p.Controls.Add((New-GuiLabel "Usuário (métricas)" 24 62 200))
+    $g.RwUser = New-GuiTextBox 230 59 300 ([string]$script:RwUsername)
+    $p.Controls.Add($g.RwUser)
+    $p.Controls.Add((New-GuiLabel "Senha (métricas)" 24 102 200))
+    $g.RwSenha = New-GuiTextBox 230 99 300 ([string]$script:RwPassword) -Senha
+    $p.Controls.Add($g.RwSenha)
+    $g.MesmaLoki = New-Object Windows.Forms.CheckBox
+    $g.MesmaLoki.Text = "Usar a mesma credencial para logs e eventos (Loki)"
+    $g.MesmaLoki.Location = New-Object Drawing.Point(230, 140); $g.MesmaLoki.AutoSize = $true; $g.MesmaLoki.Checked = $true
+    $p.Controls.Add($g.MesmaLoki)
+    $p.Controls.Add((New-GuiLabel "Usuário (Loki)" 24 182 200))
+    $g.LokiUser = New-GuiTextBox 230 179 300
+    $p.Controls.Add($g.LokiUser)
+    $p.Controls.Add((New-GuiLabel "Senha (Loki)" 24 222 200))
+    $g.LokiSenha = New-GuiTextBox 230 219 300 "" -Senha
+    $p.Controls.Add($g.LokiSenha)
+    $p.Controls.Add((New-GuiLabel "As credenciais ficam no registro do serviço do Alloy, com acesso só de SYSTEM e Administradores." 24 262 820 -Dica))
+    $g.MesmaLoki.Add_CheckedChanged({ $script:Gui.LokiUser.Enabled = -not $script:Gui.MesmaLoki.Checked; $script:Gui.LokiSenha.Enabled = -not $script:Gui.MesmaLoki.Checked })
+    $g.LokiUser.Enabled = $false; $g.LokiSenha.Enabled = $false
+
+    # ---------------- Resumo ----------------
+    $p = New-Object Windows.Forms.TabPage; $p.Text = "Resumo"; $p.BackColor = [Drawing.Color]::White
+    $g.PaginaResumo = $p
+    $p.Controls.Add((New-GuiLabel "Confira antes de instalar" 24 16 600 -Titulo))
+    $g.Resumo = New-Object Windows.Forms.TextBox
+    $g.Resumo.Multiline = $true; $g.Resumo.ReadOnly = $true; $g.Resumo.ScrollBars = "Vertical"
+    $g.Resumo.Font = New-Object Drawing.Font("Consolas", 10)
+    $g.Resumo.BackColor = [Drawing.Color]::White
+    $g.Resumo.Location = New-Object Drawing.Point(24, 52); $g.Resumo.Size = New-Object Drawing.Size(820, 420)
+    $p.Controls.Add($g.Resumo)
+
+    # ---------------- Montagem da árvore e das abas ----------------
+    $g.MontarArvore = {
+        $gg = $script:Gui
+        $marcados = @{}
+        foreach ($n in $gg.Arvore.Nodes) {
+            $marcados[$n.Name] = $n.Checked
+            foreach ($f in $n.Nodes) { $marcados[$f.Name] = $f.Checked }
+        }
+        $primeira = ($gg.Arvore.Nodes.Count -eq 0)
+        $monitora = ($gg.Modo.SelectedIndex -ne 1)
+        $coleta = ($gg.Modo.SelectedIndex -ne 0)
+        $gg.Basico.Visible = $monitora
+        $gg.Arvore.BeginUpdate()
+        $gg.Arvore.Nodes.Clear()
+        $novo = {
+            param($Pai, [string]$Chave, [string]$Texto, [bool]$Padrao)
+            $n = New-Object Windows.Forms.TreeNode($Texto)
+            $n.Name = $Chave
+            $n.Checked = $(if ($primeira -or -not $marcados.ContainsKey($Chave)) { $Padrao } else { [bool]$marcados[$Chave] })
+            if ($null -eq $Pai) { [void]$gg.Arvore.Nodes.Add($n) } else { [void]$Pai.Nodes.Add($n) }
+            return $n
+        }
+        if ($monitora) {
+            $logs = & $novo $null "logs" "Logs do sistema (Critical e Error)" ([bool]$EnableLogs.IsPresent -or $script:EnableLogsResolved)
+            [void](& $novo $logs "logs_warning" "Incluir os avisos (Warning), aumenta muito o volume" ([bool]$EnableLogWarnings.IsPresent))
+            $logs.Expand()
+            [void](& $novo $null "security" "Logs de autenticação e segurança" ([bool]$EnableSecurityLogs.IsPresent -or $script:EnableSecurityLogsResolved))
+            foreach ($feature in $gg.Features) {
+                [void](& $novo $null ("feature:{0}" -f $feature.Key) ("{0} (detectado)" -f $feature.Label) ([bool]$feature.Selected))
+            }
+        }
+        if ($coleta) {
+            [void](& $novo $null "snmp" "SNMP: firewall, switch, nobreak, AP" ([bool]$EnableSnmp.IsPresent))
+            [void](& $novo $null "blackbox" "Conectividade: ping, HTTP, TCP, DNS" ([bool]$EnableBlackbox.IsPresent))
+            [void](& $novo $null "internet" "Teste de velocidade (Speedtest)" ([bool]$EnableInternet.IsPresent))
+        }
+        [void](& $novo $null "coleta" "Internet e links: status, DNS, IP público e causa das quedas" $true)
+        $exp = & $novo $null "exporter" "Exporters adicionais" ([bool]$EnableExporters.IsPresent)
+        foreach ($d in (Get-NextecExporterCatalog)) {
+            [void](& $novo $exp ("exporter:{0}" -f $d.Key) $d.Label $false)
+        }
+        if ($exp.Checked) { $exp.Expand() }
+        $gg.Arvore.EndUpdate()
+        $gg.Intervalo.Enabled = $coleta
+    }
+
+    $g.Marcado = {
+        param([string]$Chave)
+        $achados = $script:Gui.Arvore.Nodes.Find($Chave, $true)
+        return ($achados.Count -gt 0 -and $achados[0].Checked)
+    }
+
+    # Exporters marcados viram linhas com o endereço padrão; desmarcados saem.
+    $g.SincronizarExporters = {
+        $gg = $script:Gui
+        $catalogo = Get-NextecExporterCatalog
+        foreach ($d in $catalogo) {
+            if ($d.Key -eq "custom") { continue }
+            $linha = $null
+            foreach ($r in $gg.Exporters.Rows) { if ($r.Tag -eq $d.Key) { $linha = $r } }
+            $marcado = & $gg.Marcado ("exporter:{0}" -f $d.Key)
+            if ($marcado -and $null -eq $linha) {
+                $i = $gg.Exporters.Rows.Add($d.Key, $d.DefaultTarget, $d.DefaultService)
+                $gg.Exporters.Rows[$i].Tag = $d.Key
+                $gg.Exporters.Rows[$i].Cells["nome"].ReadOnly = $true
+            }
+            elseif (-not $marcado -and $null -ne $linha) {
+                $gg.Exporters.Rows.Remove($linha)
+            }
+        }
+        $temCustom = $false
+        foreach ($r in $gg.Exporters.Rows) { if ($r.Tag -eq "custom") { $temCustom = $true } }
+        if ((& $gg.Marcado "exporter:custom") -and -not $temCustom) {
+            $i = $gg.Exporters.Rows.Add()
+            $gg.Exporters.Rows[$i].Tag = "custom"
+        }
+        if (-not (& $gg.Marcado "exporter:custom")) {
+            foreach ($r in @($gg.Exporters.Rows)) { if ($r.Tag -eq "custom") { $gg.Exporters.Rows.Remove($r) } }
+        }
+    }
+
+    $g.MontarAbas = {
+        $gg = $script:Gui
+        $atual = $gg.Abas.SelectedTab
+        $lista = New-Object System.Collections.Generic.List[object]
+        [void]$lista.Add($gg.PaginaIdentificacao)
+        [void]$lista.Add($gg.PaginaRecursos)
+        if (& $gg.Marcado "coleta") { [void]$lista.Add($gg.PaginaLinks) }
+        if (& $gg.Marcado "blackbox") { [void]$lista.Add($gg.PaginaBlackbox) }
+        if (& $gg.Marcado "snmp") { [void]$lista.Add($gg.PaginaSnmp) }
+        if (& $gg.Marcado "exporter") { [void]$lista.Add($gg.PaginaExporters) }
+        [void]$lista.Add($gg.PaginaCredenciais)
+        [void]$lista.Add($gg.PaginaResumo)
+        $gg.Abas.SuspendLayout()
+        foreach ($pg in @($gg.Abas.TabPages)) { if (-not $lista.Contains($pg)) { $gg.Abas.TabPages.Remove($pg) } }
+        # TabPages.Insert não faz nada antes de a janela existir (limitação do
+        # WinForms): na montagem inicial as abas entram em ordem com Add.
+        for ($i = 0; $i -lt $lista.Count; $i++) {
+            if ($gg.Abas.TabPages.Contains($lista[$i])) { continue }
+            if ($gg.Abas.IsHandleCreated -and $i -lt $gg.Abas.TabPages.Count) { $gg.Abas.TabPages.Insert($i, $lista[$i]) }
+            else { $gg.Abas.TabPages.Add($lista[$i]) }
+        }
+        $gg.Abas.ResumeLayout()
+        if ($null -ne $atual -and $gg.Abas.TabPages.Contains($atual)) { $gg.Abas.SelectedTab = $atual }
+        & $gg.SincronizarExporters
+    }
+
+    $g.Modo.Add_SelectedIndexChanged({ & $script:Gui.MontarArvore; & $script:Gui.MontarAbas })
+
+    # Validação da aba ao avançar: devolve a mensagem de erro ou "".
+    $g.Validar = {
+        param($Pagina)
+        $gg = $script:Gui
+        if ($Pagina -eq $gg.PaginaIdentificacao) {
+            if (-not (Get-GuiClienteSlug $gg.Cliente.Text)) { [void]$gg.Cliente.Focus(); return "Informe o cliente." }
+            if (-not (Get-GuiSlug $gg.Host.Text)) { [void]$gg.Host.Focus(); return "Informe o nome do host." }
+            if (-not (Get-GuiSlug $gg.Local.Text)) { [void]$gg.Local.Focus(); return "Informe o local." }
+            $destino = ($gg.Destino.Text.Trim() -replace "^https?://", "") -replace "/.*$", ""
+            if ($destino -notmatch "^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$") { [void]$gg.Destino.Focus(); return "Destino do NOC inválido." }
+        }
+        if ($Pagina -eq $gg.PaginaLinks) {
+            if ($gg.Links.Rows.Count -eq 0) { return "Cadastre pelo menos um link ou desmarque Internet e links." }
+            $principais = 0
+            foreach ($r in $gg.Links.Rows) {
+                $n = $r.Index + 1
+                if (-not (Get-GuiCelula $r "operadora")) { return "Link ${n}: informe a operadora." }
+                $vel = Get-GuiCelula $r "velocidade"
+                if ($vel -and $null -eq (ConvertTo-NextecVelocidade $vel)) { return "Link ${n}: velocidade inválida ($vel). Use 500, 1 Giga ou 600/300." }
+                foreach ($a in ((Get-GuiCelula $r "alvos") -split ",")) {
+                    if ($a.Trim() -and -not (Test-NextecHost $a.Trim())) { return "Link ${n}: destino inválido ($($a.Trim()))." }
+                }
+                if (-not (Get-GuiCelula $r "alvos")) { return "Link ${n}: informe os destinos de teste." }
+                foreach ($c in @("ip_publico", "gateway", "origem")) {
+                    $v = Get-GuiCelula $r $c
+                    if ($v -and -not (Test-NextecHost $v)) { return "Link ${n}: $c inválido ($v)." }
+                }
+                if ((Get-GuiCelula $r "papel") -eq "principal") { $principais++ }
+            }
+            if ($principais -ne 1) { return "Marque exatamente um link como principal." }
+        }
+        if ($Pagina -eq $gg.PaginaBlackbox) {
+            if ($gg.Blackbox.Rows.Count -eq 0) { return "Cadastre pelo menos um alvo ou desmarque Conectividade." }
+            foreach ($r in $gg.Blackbox.Rows) {
+                $n = $r.Index + 1
+                if (-not (Get-GuiSlug (Get-GuiCelula $r "nome"))) { return "Alvo ${n}: informe o nome." }
+                $endereco = Get-GuiCelula $r "endereco"
+                if (-not (Test-NextecDestino $endereco)) { return "Alvo ${n}: endereço inválido. $(Get-NextecAddressExample destino)" }
+                $teste = Get-GuiCelula $r "modulo"
+                if (($teste -eq $script:GuiModulosBlackbox["icmp_ipv4"] -or $teste -eq $script:GuiModulosBlackbox["dns_udp"]) -and -not (Test-NextecHost $endereco)) { return "Alvo ${n}: ping e DNS usam só IP ou nome, sem http:// e sem porta." }
+                if ($teste -eq $script:GuiModulosBlackbox["tcp_connect"] -and -not (Test-NextecHostPort $endereco)) { return "Alvo ${n}: o teste TCP precisa de host:porta, ex.: 10.0.0.5:3389." }
+            }
+        }
+        if ($Pagina -eq $gg.PaginaSnmp) {
+            if ($gg.Snmp.Rows.Count -eq 0) { return "Cadastre pelo menos um equipamento ou desmarque SNMP." }
+            $nomes = @()
+            foreach ($r in $gg.Snmp.Rows) {
+                $n = $r.Index + 1
+                $nome = (Get-GuiSlug (Get-GuiCelula $r "nome")) -replace "[-.]", "_"
+                if (-not $nome) { return "Equipamento ${n}: informe o nome." }
+                if ($nomes -contains $nome) { return "Equipamento ${n}: nome repetido ($nome)." }
+                $nomes += $nome
+                if (-not (Test-NextecHost (Get-GuiCelula $r "endereco"))) { return "Equipamento ${n}: IP ou FQDN inválido." }
+                if ($null -eq $r.Tag) { return "Equipamento ${n}: defina a credencial (botão Definir...)." }
+            }
+        }
+        if ($Pagina -eq $gg.PaginaExporters) {
+            if ($gg.Exporters.Rows.Count -eq 0) { return "Marque um exporter em Recursos ou use Outro endpoint." }
+            foreach ($r in $gg.Exporters.Rows) {
+                $n = $r.Index + 1
+                if (-not (Get-GuiSlug (Get-GuiCelula $r "nome"))) { return "Exporter ${n}: informe o nome." }
+                if (-not (Test-NextecHostPort (Get-GuiCelula $r "alvo"))) { return "Exporter ${n}: use host:porta, ex.: 127.0.0.1:9121." }
+            }
+        }
+        if ($Pagina -eq $gg.PaginaCredenciais) {
+            if (-not $gg.RwUser.Text.Trim()) { [void]$gg.RwUser.Focus(); return "Informe o usuário do NOC." }
+            if (-not $gg.RwSenha.Text) { [void]$gg.RwSenha.Focus(); return "Informe a senha do NOC." }
+            if (-not $gg.MesmaLoki.Checked -and (-not $gg.LokiUser.Text.Trim() -or -not $gg.LokiSenha.Text)) { return "Informe usuário e senha do Loki." }
+        }
+        return ""
+    }
+
+    $g.AtualizarRodape = {
+        $gg = $script:Gui
+        $i = $gg.Abas.SelectedIndex
+        $gg.Voltar.Enabled = ($i -gt 0)
+        if ($gg.Abas.SelectedTab -eq $gg.PaginaResumo) {
+            $gg.Avancar.Text = $(if ($Simular) { "Concluir simulação" } else { "Instalar" })
+            $gg.Resumo.Text = (Get-GuiResumo)
+        }
+        else {
+            $gg.Avancar.Text = "Avançar"
+        }
+    }
+    $g.Abas.Add_SelectedIndexChanged({ $script:Gui.Erro.Text = ""; & $script:Gui.AtualizarRodape })
+
+    $g.Voltar.Add_Click({ $gg = $script:Gui; if ($gg.Abas.SelectedIndex -gt 0) { $gg.Abas.SelectedIndex-- } })
+    $g.Avancar.Add_Click({
+        $gg = $script:Gui
+        # Erro inesperado aparece no rodapé, sem a caixa de exceção do .NET.
+        try {
+        # No resumo, todas as abas visíveis precisam estar válidas.
+        if ($gg.Abas.SelectedTab -eq $gg.PaginaResumo) {
+            foreach ($pg in @($gg.Abas.TabPages)) {
+                $msg = & $gg.Validar $pg
+                if ($msg) { $gg.Abas.SelectedTab = $pg; $gg.Erro.Text = $msg; return }
+            }
+            $gg.Confirmado = $true
+            $gg.Form.Close()
+            return
+        }
+        $msg = & $gg.Validar $gg.Abas.SelectedTab
+        if ($msg) { $gg.Erro.Text = $msg; return }
+        $gg.Erro.Text = ""
+        $gg.Abas.SelectedIndex++
+        }
+        catch {
+            $gg.Erro.Text = ("Erro: {0}" -f $_.Exception.Message)
+        }
+    })
+
+    & $g.MontarArvore
+    & $g.MontarAbas
+    & $g.AtualizarRodape
+    $form.Add_Shown({ $script:Gui.Form.Activate(); [void]$script:Gui.Cliente.Focus() })
+    [void]$form.ShowDialog()
+    $confirmado = $g.Confirmado
+    if ($confirmado) { Set-NextecConfigurationFromGui }
+    $form.Dispose()
+    return $confirmado
+}
+
+function Get-GuiResumo {
+    $gg = $script:Gui
+    $linhas = New-Object System.Collections.Generic.List[string]
+    $simNao = { param($v) if ($v) { "sim" } else { "não" } }
+    [void]$linhas.Add(("Cliente ............ {0}" -f (Get-GuiClienteSlug $gg.Cliente.Text)))
+    [void]$linhas.Add(("Host ............... {0}" -f (Get-GuiSlug $gg.Host.Text)))
+    [void]$linhas.Add(("Ambiente ........... {0}" -f $gg.Ambiente.SelectedItem))
+    [void]$linhas.Add(("Local .............. {0}" -f (Get-GuiSlug $gg.Local.Text)))
+    [void]$linhas.Add(("Criticidade ........ {0}" -f $gg.Criticidade.SelectedItem))
+    [void]$linhas.Add(("Função ............. {0}" -f $gg.Modo.SelectedItem))
+    [void]$linhas.Add(("Destino ............ {0}" -f $gg.Destino.Text.Trim()))
+    [void]$linhas.Add("")
+    if ($gg.Modo.SelectedIndex -ne 1) {
+        [void]$linhas.Add("Perfil básico ...... CPU, memória, discos, rede, uptime, serviços")
+        [void]$linhas.Add(("Logs do sistema .... {0}{1}" -f (& $simNao (& $gg.Marcado "logs")), $(if (& $gg.Marcado "logs_warning") { " (com avisos)" } else { "" })))
+        [void]$linhas.Add(("Logs de segurança .. {0}" -f (& $simNao (& $gg.Marcado "security"))))
+        $feats = @($gg.Features | Where-Object { & $gg.Marcado ("feature:{0}" -f $_.Key) } | ForEach-Object { $_.Label })
+        if ($feats.Count -gt 0) { [void]$linhas.Add(("Detectados ......... {0}" -f ($feats -join ", "))) }
+    }
+    if (& $gg.Marcado "coleta") {
+        [void]$linhas.Add(("Links de internet .. {0}" -f $gg.Links.Rows.Count))
+        foreach ($r in $gg.Links.Rows) { [void]$linhas.Add(("    {0} {1} ({2}) {3}" -f (Get-GuiCelula $r "operadora"), (Get-GuiCelula $r "tipo"), (Get-GuiCelula $r "papel"), (Get-GuiCelula $r "velocidade"))) }
+    }
+    else { [void]$linhas.Add("Internet e links ... não") }
+    if (& $gg.Marcado "internet") { [void]$linhas.Add(("Speedtest .......... a cada {0} min" -f $gg.Intervalo.Value)) }
+    if (& $gg.Marcado "blackbox") {
+        [void]$linhas.Add(("Conectividade ...... {0} alvo(s), a cada {1}" -f $gg.Blackbox.Rows.Count, ($gg.IntervaloBlackbox.SelectedItem -replace " \(.*$", "")))
+        foreach ($r in $gg.Blackbox.Rows) { [void]$linhas.Add(("    {0}  {1}  {2}" -f (Get-GuiSlug (Get-GuiCelula $r "nome")), (Get-GuiCelula $r "endereco"), (Get-GuiCelula $r "modulo"))) }
+    }
+    if (& $gg.Marcado "snmp") {
+        [void]$linhas.Add(("SNMP ............... {0} equipamento(s)" -f $gg.Snmp.Rows.Count))
+        foreach ($r in $gg.Snmp.Rows) { [void]$linhas.Add(("    {0}  {1}  {2}  {3}" -f ((Get-GuiSlug (Get-GuiCelula $r "nome")) -replace "[-.]", "_"), (Get-GuiCelula $r "endereco"), (Get-GuiCelula $r "fabricante"), (Get-GuiCelula $r "credencial"))) }
+    }
+    if (& $gg.Marcado "exporter") {
+        [void]$linhas.Add(("Exporters .......... {0}" -f $gg.Exporters.Rows.Count))
+        foreach ($r in $gg.Exporters.Rows) { [void]$linhas.Add(("    {0}  {1}" -f (Get-GuiCelula $r "nome"), (Get-GuiCelula $r "alvo"))) }
+    }
+    [void]$linhas.Add("")
+    [void]$linhas.Add(("Credencial do NOC .. {0}" -f $(if ($gg.RwUser.Text.Trim()) { $gg.RwUser.Text.Trim() } else { "não informada" })))
+    if ($Simular) {
+        [void]$linhas.Add("")
+        [void]$linhas.Add("SIMULAÇÃO: nada será instalado nem alterado neste computador.")
+    }
+    return ($linhas -join [Environment]::NewLine)
+}
+
+function Set-NextecConfigurationFromGui {
+    # Copia as respostas da tela para as mesmas variáveis do fluxo do console.
+    $gg = $script:Gui
+    $inv = $gg.Inventory
+    $script:Cliente = Get-GuiClienteSlug $gg.Cliente.Text
+    $script:HostLabel = Get-GuiSlug $gg.Host.Text
+    $script:Ambiente = [string]$gg.Ambiente.SelectedItem
+    $script:Local = Get-GuiSlug $gg.Local.Text
+    $script:Criticidade = [string]$gg.Criticidade.SelectedItem
+    $script:NocHost = (($gg.Destino.Text.Trim() -replace "^https?://", "") -replace "/.*$", "").ToLowerInvariant()
+    $script:RemoteWriteUrl = "https://$($script:NocHost)/api/v1/write"
+    $script:LokiUrl = "https://$($script:NocHost)/loki/api/v1/push"
+
+    $script:MonitorHost = ($gg.Modo.SelectedIndex -ne 1)
+    $script:Collector = ($gg.Modo.SelectedIndex -ne 0)
+    $estacao = ($inv.ProductType -eq 1)
+    if (-not $script:MonitorHost) { $script:ResolvedMode = "collector" }
+    elseif ($estacao) { $script:ResolvedMode = $(if ($script:Collector) { "estacao_collector" } else { "estacao" }) }
+    else { $script:ResolvedMode = $(if ($script:Collector) { "servidor_collector" } else { "servidor" }) }
+    $script:TipoLabel = $(if ($estacao) { "estacao" } else { "servidor" })
+
+    $script:DetectedHostFeatures = @($gg.Features)
+    $script:SelectedHostFeatureKeys = [string[]]@($gg.Features | Where-Object { & $gg.Marcado ("feature:{0}" -f $_.Key) } | ForEach-Object { $_.Key })
+    $script:EnableLogsResolved = [bool](& $gg.Marcado "logs")
+    $script:EnableLogWarningsResolved = [bool](& $gg.Marcado "logs_warning")
+    $script:EnableSecurityLogsResolved = [bool](& $gg.Marcado "security")
+    $script:EnableSnmpResolved = [bool](& $gg.Marcado "snmp")
+    $script:EnableBlackboxResolved = [bool](& $gg.Marcado "blackbox")
+    $script:EnableInternetResolved = [bool](& $gg.Marcado "internet")
+    $script:InternetIntervalMinutesResolved = [int]$gg.Intervalo.Value
+    $script:EnableColetaResolved = [bool](& $gg.Marcado "coleta")
+    $script:SelectedExporterKeys = [string[]]@((Get-NextecExporterCatalog) | Where-Object { & $gg.Marcado ("exporter:{0}" -f $_.Key) } | ForEach-Object { $_.Key })
+
+    # Links
+    $script:ColetaLinks = @()
+    if ($script:EnableColetaResolved) {
+        $papelPorTexto = @{}
+        foreach ($k in $script:PapeisLink.Keys) { $papelPorTexto[$script:PapeisLink[$k]] = $k }
+        $tipoPorTexto = @{}
+        foreach ($k in $script:TiposLink.Keys) { $tipoPorTexto[$script:TiposLink[$k]] = $k }
+        foreach ($r in $gg.Links.Rows) {
+            $tipo = $tipoPorTexto[(Get-GuiCelula $r "tipo")]
+            $operadora = ConvertTo-ColetaIniValue (Get-GuiCelula $r "operadora")
+            $vel = [pscustomobject]@{ Download = ""; Upload = "" }
+            if (Get-GuiCelula $r "velocidade") { $vel = ConvertTo-NextecVelocidade (Get-GuiCelula $r "velocidade") }
+            $firewall = Get-GuiSlug (Get-GuiCelula $r "firewall")
+            $nome = Get-NomeLinkUnico -Base (ConvertTo-ColetaIniValue ("{0} {1}" -f $operadora, $script:TiposLinkNome[$tipo]))
+            $script:ColetaLinks = @($script:ColetaLinks) + [pscustomobject]@{
+                nome = $nome; papel = $papelPorTexto[(Get-GuiCelula $r "papel")]; operadora = $operadora; tipo = $tipo; suporte = ""
+                ip_publico = Get-GuiCelula $r "ip_publico"; gateway = Get-GuiCelula $r "gateway"
+                alvos = ((Get-GuiCelula $r "alvos") -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ", "
+                origem = Get-GuiCelula $r "origem"; firewall = $firewall
+                interface_firewall = $(if ($firewall) { Get-GuiCelula $r "interface_firewall" } else { "" })
+                velocidade_mbps = $vel.Download; velocidade_upload_mbps = $vel.Upload
+            }
+        }
+    }
+    $script:EnableLinksResolved = ($script:ColetaLinks.Count -gt 0)
+
+    # Conectividade: nome repetido ganha o sufixo do teste, como no console.
+    $script:BlackboxTargets = @()
+    if ($script:EnableBlackboxResolved) {
+        $moduloPorTexto = @{}
+        foreach ($k in $script:GuiModulosBlackbox.Keys) { $moduloPorTexto[$script:GuiModulosBlackbox[$k]] = $k }
+        $contagem = @{}
+        foreach ($r in $gg.Blackbox.Rows) { $n = Get-GuiSlug (Get-GuiCelula $r "nome"); $contagem[$n] = 1 + [int]$contagem[$n] }
+        foreach ($r in $gg.Blackbox.Rows) {
+            $n = Get-GuiSlug (Get-GuiCelula $r "nome")
+            $modulo = $moduloPorTexto[(Get-GuiCelula $r "modulo")]
+            if (-not $modulo) { $modulo = "icmp_ipv4" }
+            $nomeFinal = $(if ($contagem[$n] -gt 1) { "{0}_{1}" -f $n, $script:GuiSufixoBlackbox[$modulo] } else { $n })
+            $script:BlackboxTargets += [pscustomobject]@{ Name = $nomeFinal; Address = Get-GuiCelula $r "endereco"; Module = $modulo; Type = Get-GuiCelula $r "tipo" }
+        }
+        $script:BlackboxIntervalSecondsResolved = @(10, 15, 30, 60)[$gg.IntervaloBlackbox.SelectedIndex]
+    }
+
+    # SNMP: o arquivo de cada fabricante é baixado na instalação (Install-SnmpConfiguration).
+    $script:SnmpTargets = @()
+    $script:SnmpAuthBlocks = @()
+    $script:GuiFabricantesSnmp = @()
+    if ($script:EnableSnmpResolved) {
+        $chavePorRotulo = @{}
+        foreach ($k in $NextecSnmpVendors.Keys) { $chavePorRotulo[$NextecSnmpVendors[$k].Label] = $k }
+        foreach ($r in $gg.Snmp.Rows) {
+            $nome = (Get-GuiSlug (Get-GuiCelula $r "nome")) -replace "[-.]", "_"
+            $vendor = $NextecSnmpVendors[$chavePorRotulo[(Get-GuiCelula $r "fabricante")]]
+            $base = [IO.Path]::GetFileNameWithoutExtension($vendor.File)
+            $cred = $r.Tag
+            $auth = "{0}_{1}" -f $nome, $cred.Versao
+            $script:SnmpAuthBlocks += (ConvertTo-SnmpAuthYaml -Nome $auth -Credencial $cred)
+            if ($script:GuiFabricantesSnmp -notcontains $vendor.File) { $script:GuiFabricantesSnmp += $vendor.File }
+            $script:SnmpTargets += [pscustomobject]@{
+                Name = $nome; Address = Get-GuiCelula $r "endereco"; Module = ("{0}_{1}" -f $base, $cred.Versao)
+                Auth = $auth; Type = Get-GuiCelula $r "tipo"; Os = $base
+            }
+        }
+    }
+
+    $script:CustomExporters = @()
+    foreach ($r in $gg.Exporters.Rows) {
+        if (-not (& $gg.Marcado "exporter")) { break }
+        $script:CustomExporters += [pscustomobject]@{
+            Name = Get-GuiSlug (Get-GuiCelula $r "nome"); Target = Get-GuiCelula $r "alvo"
+            Service = $(if (Get-GuiCelula $r "servico") { Get-GuiSlug (Get-GuiCelula $r "servico") } else { Get-GuiSlug (Get-GuiCelula $r "nome") })
+        }
+    }
+    $script:EnableExportersResolved = ($script:CustomExporters.Count -gt 0)
+
+    $script:RwUsername = $gg.RwUser.Text.Trim()
+    $script:RwPassword = $gg.RwSenha.Text
+    if ($gg.MesmaLoki.Checked) {
+        $script:LokiUsername = $script:RwUsername
+        $script:LokiPassword = $script:RwPassword
+    }
+    else {
+        $script:LokiUsername = $gg.LokiUser.Text.Trim()
+        $script:LokiPassword = $gg.LokiSenha.Text
+    }
+    if (-not (Test-NextecNeedsLoki)) {
+        $script:LokiUsername = ""
+        $script:LokiPassword = ""
+    }
+    $script:ConfirmadoNaTela = $true
+}
+
+function Get-NextecSnmpVendorFiles {
+    <#
+        Baixa os snmp.yml dos fabricantes escolhidos na tela e junta os
+        módulos num arquivo temporário, que Install-SnmpConfiguration soma ao
+        snmp.yml do host.
+    #>
+    param([string[]]$Arquivos)
+    $junto = Join-Path $env:TEMP ("nextec-snmp-tela-{0}.yml" -f $PID)
+    if (Test-Path -LiteralPath $junto) { Remove-Item -LiteralPath $junto -Force }
+    foreach ($arquivo in $Arquivos) {
+        $destino = Join-Path $env:TEMP ("nextec-snmp-{0}" -f $arquivo)
+        Invoke-NextecDownload -Url ("{0}/{1}" -f $NextecSnmpRepoBaseUrl, $arquivo) -Destino $destino -Descricao ("snmp.yml {0}" -f $arquivo) -TimeoutSec 120
+        Merge-SnmpModuleFile -NewFile $destino -Destination $junto
+    }
+    return $junto
+}
+
+function Save-NextecSimulacao {
+    # -Simular: grava o que seria instalado, sem senha, para conferência.
+    $saida = Join-Path $env:TEMP "nextec-simulacao.json"
+    $dados = [ordered]@{
+        instalador = $InstallerVersion
+        cliente = $script:Cliente; host = $script:HostLabel; ambiente = $script:Ambiente; local = $script:Local
+        criticidade = $script:Criticidade; modo = $script:ResolvedMode; destino = $script:NocHost
+        recursos_detectados = @($script:SelectedHostFeatureKeys)
+        logs = $script:EnableLogsResolved; avisos = $script:EnableLogWarningsResolved; seguranca = $script:EnableSecurityLogsResolved
+        coleta = $script:EnableColetaResolved; links = @($script:ColetaLinks)
+        speedtest = $script:EnableInternetResolved; speedtest_min = $script:InternetIntervalMinutesResolved
+        blackbox = @($script:BlackboxTargets); blackbox_intervalo = $script:BlackboxIntervalSecondsResolved
+        snmp = @($script:SnmpTargets); snmp_fabricantes = @($script:GuiFabricantesSnmp)
+        snmp_credenciais = @($script:SnmpAuthBlocks | ForEach-Object { Get-SnmpAuthBlockName -Block $_ })
+        exporters = @($script:CustomExporters)
+        usuario_noc = $script:RwUsername
+        loki_mesma_credencial = ($script:LokiUsername -eq $script:RwUsername -and $script:LokiPassword -eq $script:RwPassword)
+    }
+    [IO.File]::WriteAllText($saida, ($dados | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+    Write-Ok ("Simulação concluída. Nada foi instalado. Respostas em {0}" -f $saida)
+}
+
+function Invoke-NextecSimulacao {
+    # Mesmo caminho da instalação até o resumo, sem tocar no computador.
+    Write-Step "Simulação: nada será instalado"
+    $script:NocHost = $NocTarget
+    $script:RemoteWriteUrl = "https://$($script:NocHost)/api/v1/write"
+    $script:LokiUrl = "https://$($script:NocHost)/loki/api/v1/push"
+    $inventory = Get-WindowsInventory
+    $serverRoles = @(Get-WindowsServerRoles -Inventory $inventory)
+    $sql = Get-SqlServerDetection
+    $firebird = Get-FirebirdDetection
+    $detectedFeatures = @(Get-DetectedHostFeatures -Inventory $inventory -ServerRoles $serverRoles -Sql $sql -Firebird $firebird)
+    Show-DetectionSummary -Inventory $inventory -DetectedFeatures @($detectedFeatures)
+    if ($script:UsarTela) {
+        if (-not (Show-NextecInstallerGui -Inventory $inventory -DetectedFeatures $detectedFeatures)) {
+            Write-Info "Tela fechada sem concluir."
+            return
+        }
+    }
+    else {
+        Get-NextecConfiguration -Inventory $inventory -DetectedFeatures $detectedFeatures
+        Read-NocCredentials
+    }
+    Show-Plan -Inventory $inventory
+    Save-NextecSimulacao
+}
+
 function Invoke-NextecInstaller {
     Show-Banner
+    $script:UsarTela = Test-NextecUseGui
+
+    if ($Simular) {
+        Invoke-NextecSimulacao
+        return
+    }
+
     Initialize-Logging
     Assert-Administrator
 
@@ -7515,8 +8688,16 @@ function Invoke-NextecInstaller {
         $detectedFeatures = @(Get-DetectedHostFeatures -Inventory $inventory -ServerRoles $serverRoles -Sql $sql -Firebird $firebird)
 
         Show-DetectionSummary -Inventory $inventory -DetectedFeatures @($detectedFeatures)
-        Get-NextecConfiguration -Inventory $inventory -DetectedFeatures $detectedFeatures
-        Read-NocCredentials
+        if ($script:UsarTela) {
+            Write-Info "Preencha a tela de instalação. O andamento aparece nesta janela."
+            if (-not (Show-NextecInstallerGui -Inventory $inventory -DetectedFeatures $detectedFeatures)) {
+                throw "Instalação cancelada pelo operador."
+            }
+        }
+        else {
+            Get-NextecConfiguration -Inventory $inventory -DetectedFeatures $detectedFeatures
+            Read-NocCredentials
+        }
         Show-Plan -Inventory $inventory
 
         Test-NocConnectivity
@@ -7545,6 +8726,9 @@ function Invoke-NextecInstaller {
 
         if ($script:EnableSnmpResolved) {
             Invoke-NextecOptionalStep -Nome "SNMP" -Acao {
+                if (@($script:GuiFabricantesSnmp).Count -gt 0) {
+                    $script:SnmpSourceFile = Get-NextecSnmpVendorFiles -Arquivos $script:GuiFabricantesSnmp
+                }
                 Install-SnmpConfiguration
             } -AoFalhar {
                 $script:EnableSnmpResolved = $false
@@ -7603,7 +8787,7 @@ try {
     # limpa a tela, e limpar a tela para em seguida abrir outra janela apaga o
     # contexto do operador sem necessidade.
     $precisaBitness = Test-NextecProcessNeedsBitnessRelaunch
-    $precisaElevar = -not (Test-NextecIsAdministrator)
+    $precisaElevar = (-not $Simular) -and (-not (Test-NextecIsAdministrator))
 
     if ($precisaBitness -or $precisaElevar) {
         $script:Relaunched = $true
