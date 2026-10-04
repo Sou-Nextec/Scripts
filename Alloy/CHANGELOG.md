@@ -10,12 +10,16 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.8.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.19.0 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.8.1 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.19.1 |
 | Coleta Complementar | `coleta-complementar/` | 1.2.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
 ## 2026-10-04
+
+### Instaladores Windows 2.19.1 e Linux 2.8.1
+
+- **Fabricantes SNMP em ordem alfabética** na tela e no console: Cisco, FortiGate, HP / Aruba, Intelbras, MikroTik, pfSense, SonicWall, TP-Link e Ubiquiti. No Linux, "Outro" continua por último. No Windows, FortiGate e MikroTik passam a ter a grafia do fabricante.
 
 ### Instalador Windows 2.19.0
 

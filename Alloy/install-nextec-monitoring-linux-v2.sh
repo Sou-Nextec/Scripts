@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.8.0 (SNMP: Ubiquiti, Cisco, HP / Aruba, TP-Link e Intelbras no catálogo de fabricantes)
+# Versão: 2.8.1 (Fabricantes SNMP em ordem alfabética)
 #
 # USO
 # ---
@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.8.0"
+INSTALLER_VERSION="2.8.1"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -2056,8 +2056,9 @@ EOF
 # público. A credencial (community ou usuário SNMPv3) é do cliente e fica só
 # neste servidor, em snmp-auth.yml. O Alloy junta os dois em memória. É o mesmo
 # desenho do instalador Windows.
-SNMP_FABRICANTES=(fortigate sonicwall pfsense mikrotik ubiquiti cisco hp tplink intelbras)
-SNMP_FABRICANTES_ROTULOS=("FortiGate" "SonicWall" "pfSense" "MikroTik" "Ubiquiti" "Cisco" "HP / Aruba" "TP-Link" "Intelbras")
+# Em ordem alfabética, como aparece para o técnico; "Outro" fica por último.
+SNMP_FABRICANTES=(cisco fortigate hp intelbras mikrotik pfsense sonicwall tplink ubiquiti)
+SNMP_FABRICANTES_ROTULOS=("Cisco" "FortiGate" "HP / Aruba" "Intelbras" "MikroTik" "pfSense" "SonicWall" "TP-Link" "Ubiquiti")
 SNMP_AUTH_BLOCKS=()
 SNMP_FONTES=()
 SNMP_TMPDIR=""
