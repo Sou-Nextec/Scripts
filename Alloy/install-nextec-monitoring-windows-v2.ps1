@@ -36,6 +36,10 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.15.4 Teste de velocidade: o nome do servidor da Ookla chegava com
+           acento quebrado ("Claro M├│vel"). A saída do speedtest.exe
+           passa a ser lida como UTF-8, e o script da tarefa é gravado com
+           BOM para o PowerShell 5.1 não quebrar os textos das métricas.
     2.15.3 Destino aparece uma vez só (no topo); a pergunta vira "Destino do
            monitoramento [ENTER mantém, D altera]". Arquivo pequeno aparece
            em KB, não "0.0 MB".
@@ -267,7 +271,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.15.3"
+$InstallerVersion = "2.15.4"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -5406,6 +5410,10 @@ $tempFile     = "__NEXTEC_SPEEDTEST_METRICS_FILE__.tmp"
 
 $timestamp = [int][double]::Parse((Get-Date -UFormat %s))
 
+# O speedtest.exe escreve UTF-8; sem isto o PowerShell 5.1 lê a saída na
+# página de código do console e quebra os acentos do nome do servidor.
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
+
 try {
     $raw = & $speedtestExe --accept-license --accept-gdpr --format=json --progress=no 2>$null
     $result = $raw | ConvertFrom-Json -ErrorAction Stop
@@ -5514,7 +5522,9 @@ if (Test-Path -LiteralPath (Split-Path -Parent $eventsFile)) {
     [IO.File]::WriteAllText(
         $SpeedtestRunnerScript,
         $runnerContent,
-        (New-Object Text.UTF8Encoding($false))
+        # Com BOM: sem ele o PowerShell 5.1 lê o script como ANSI e quebra
+        # os acentos dos textos de ajuda das métricas.
+        (New-Object Text.UTF8Encoding($true))
     )
 }
 

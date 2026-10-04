@@ -11,7 +11,7 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
 | Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.5.3 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.15.3 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.15.4 |
 | Coleta Complementar | `coleta-complementar/` | 1.2.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
@@ -36,6 +36,10 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 - **Horário do atualizador.** Passa a rodar entre 01h e 05h no horário de Brasília, mesmo em servidor com outro fuso (o timer usa `America/Sao_Paulo`, no systemd 235 ou mais novo).
 - **Banner.** Mostra a versão do instalador.
 - **Correção SNMP.** O tipo "ups" era gravado como "storage".
+
+### Instalador Windows 2.15.4
+
+- **Acentos no teste de velocidade.** O nome do servidor da Ookla chegava quebrado ao NOC ("Claro M├│vel"). A saída do Speedtest passa a ser lida como UTF-8, e o script da tarefa agendada é gravado com BOM.
 
 ### Instaladores Linux 2.5.3 e Windows 2.15.3
 
