@@ -10,9 +10,9 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.5.1 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.15.1 |
-| Coleta Complementar | `coleta-complementar/` | 1.1.0 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.5.2 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.15.2 |
+| Coleta Complementar | `coleta-complementar/` | 1.2.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
 ## 2026-10-03
@@ -36,6 +36,19 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 - **Horário do atualizador.** Passa a rodar entre 01h e 05h no horário de Brasília, mesmo em servidor com outro fuso (o timer usa `America/Sao_Paulo`, no systemd 235 ou mais novo).
 - **Banner.** Mostra a versão do instalador.
 - **Correção SNMP.** O tipo "ups" era gravado como "storage".
+
+### Instaladores Linux 2.5.2 e Windows 2.15.2
+
+- **Quantos links.** O instalador pergunta "Quantos links de internet este local tem?", com 1 como padrão. A pergunta substitui o item "Links de internet" do checklist e a pergunta "tem mais de um link?".
+- **Velocidade contratada.** Cada link tem a velocidade contratada, padronizada em Mbps. O técnico digita como quiser ("500", "500 Mega", "1 Giga", "1,5G", "600/300") e o instalador mostra como ficou registrada.
+- **Destinos de teste prontos.** São três por link, de provedores diferentes, e não se repetem entre links. O técnico só digita se quiser trocar.
+- **Telefone de suporte.** A pergunta saiu.
+- **Função do link.** Só é perguntada quando o local tem mais de um link.
+
+### Coleta Complementar 1.2.0
+
+- **IP público de cada link.** A Coleta aprende o IP sozinha quando só aquele link está no ar. Ele aparece em `nextec_link_info` sem precisar ser informado na instalação.
+- **Métrica nova.** `nextec_link_velocidade_contratada_mbps{link, sentido}` traz a velocidade contratada para comparar com o teste de velocidade.
 
 ### Instaladores Linux 2.5.1 e Windows 2.15.1
 

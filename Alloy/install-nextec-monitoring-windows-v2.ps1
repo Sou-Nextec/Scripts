@@ -36,6 +36,13 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.15.2 Links: "Quantos links de internet este local tem?" (padrão 1) no
+           lugar do item "Links de internet" do checklist e da pergunta "tem
+           mais de um link?". Por link: operadora, tipo e velocidade
+           contratada (padronizada em Mbps a partir de "500", "1 Giga",
+           "600/300"); função só com mais de um link. Destinos de teste
+           prontos (três por link, sem repetir entre links), trocados só se
+           o técnico quiser. Telefone de suporte saiu.
     2.15.1 Console com fundo preto durante a instalação (o azul do
            PowerShell apagava as cores). Cadastro de links refeito: pergunta
            quantos links o local tem e, por link, só operadora, tipo, função
@@ -257,7 +264,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.15.1"
+$InstallerVersion = "2.15.2"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -3516,8 +3523,7 @@ function Read-ResourceChecklist {
     # Coleta Complementar: vale para qualquer modo. Internet vem marcada por
     # padrão na instalação interativa; links só quando o local tem mais de um.
     $padraoColeta = $script:EnableColetaResolved -or (-not $Silent)
-    $items.Add((New-NextecChecklistItem -Key "coleta" -Label "Internet: status, DNS, IP público e diagnóstico das quedas" -Selected $padraoColeta))
-    $items.Add((New-NextecChecklistItem -Key "links" -Label "Links de internet (mais de um link neste local)" -Selected $script:EnableLinksResolved))
+    $items.Add((New-NextecChecklistItem -Key "coleta" -Label "Internet e links: status, DNS, IP público e causa das quedas" -Selected $padraoColeta))
 
     # "Exporters adicionais" agora é uma categoria em árvore: ESPAÇO/ENTER
     # expande e mostra o catálogo de exporters como filhos selecionáveis,
@@ -3583,11 +3589,6 @@ function Read-ResourceChecklist {
         $script:InternetIntervalMinutesResolved = $InternetIntervalMinutes
     }
     $script:EnableColetaResolved = ($selectedKeys -contains "coleta")
-    $script:EnableLinksResolved = ($selectedKeys -contains "links")
-    if ($script:EnableLinksResolved -and -not $script:EnableColetaResolved) {
-        Write-Info "Links usam a mesma medição da internet; a coleta de internet foi ligada junto."
-        $script:EnableColetaResolved = $true
-    }
 
     $featureKeys = New-Object System.Collections.Generic.List[string]
     $exporterKeys = New-Object System.Collections.Generic.List[string]
@@ -4540,7 +4541,7 @@ function Get-NextecConfiguration {
 
     Read-ResourceChecklist -MonitorHost $script:MonitorHost -Collector $script:Collector -DetectedFeatures @($script:DetectedHostFeatures)
     if ($script:EnableColetaResolved) { Import-ColetaLinks }
-    if ($script:EnableLinksResolved -and -not $Silent) { Edit-ColetaLinks }
+    if ($script:EnableColetaResolved -and -not $Silent) { Invoke-ColetaLinksPrompt }
     Read-BlackboxTargets
     Read-SnmpTargets
     Read-CustomExporters
@@ -5685,6 +5686,8 @@ function Get-ColetaLinksFromIni {
             origem             = & $valor "origem" ""
             firewall           = & $valor "firewall" ""
             interface_firewall = & $valor "interface_firewall" ""
+            velocidade_mbps    = & $valor "velocidade_mbps" ""
+            velocidade_upload_mbps = & $valor "velocidade_upload_mbps" ""
         })
     }
     return $links.ToArray()
@@ -5704,8 +5707,56 @@ function ConvertTo-ColetaIniValue {
 $script:PapeisLink = [ordered]@{ primario = "principal"; failover = "reserva"; sdwan = "SD-WAN" }
 $script:TiposLink = [ordered]@{ fibra = "Fibra"; radio = "Rádio"; "4g" = "4G/5G"; satelite = "Satélite"; dedicado = "Dedicado" }
 $script:TiposLinkNome = @{ fibra = "Fibra"; radio = "Rádio"; "4g" = "4G"; satelite = "Satélite"; dedicado = "Dedicado" }
-# Um destino diferente por link: cada um precisa de uma rota própria no firewall.
-$script:DestinosLink = @("8.8.8.8", "1.1.1.1", "9.9.9.9", "208.67.222.222", "8.8.4.4", "1.0.0.1")
+# Três destinos por link, de provedores diferentes (uma queda de provedor não
+# derruba a medição). Com mais de um link, cada conjunto precisa de uma rota
+# própria no firewall, por isso os conjuntos não se repetem.
+$script:DestinosLink = @(
+    "8.8.8.8, 1.1.1.1, 9.9.9.9",
+    "8.8.4.4, 1.0.0.1, 149.112.112.112",
+    "208.67.222.222, 208.67.220.220, 94.140.14.14",
+    "94.140.15.15, 76.76.2.0, 76.76.10.0"
+)
+
+function ConvertTo-NextecMbps {
+    # "500", "500m", "1g", "1.5giga" em Mbps (inteiro); $null se inválido.
+    param([string]$Texto)
+    $m = [Regex]::Match($Texto, '^(\d+(?:\.\d+)?)(g|gb|gbps|giga|gigas|m|mb|mbps|mega|megas)?$')
+    if (-not $m.Success) { return $null }
+    $valor = [double]::Parse($m.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture)
+    if ($m.Groups[2].Value.StartsWith("g")) { $valor = $valor * 1000 }
+    $inteiro = [int][Math]::Round($valor)
+    if ($inteiro -lt 1 -or $inteiro -gt 100000) { return $null }
+    return $inteiro
+}
+
+function ConvertTo-NextecVelocidade {
+    <#
+        Padroniza a velocidade contratada digitada pelo técnico: "500",
+        "500 Mega", "1 Giga", "1,5G", "600/300" viram download e upload em
+        Mbps. Devolve $null quando não entende.
+    #>
+    param([string]$Texto)
+    $v = ($Texto.ToLowerInvariant() -replace '\s', '') -replace ',', '.'
+    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+    $partes = $v.Split('/')
+    if ($partes.Count -gt 2) { return $null }
+    $down = ConvertTo-NextecMbps $partes[0]
+    if ($null -eq $down) { return $null }
+    $up = ""
+    if ($partes.Count -eq 2 -and $partes[1] -ne "") {
+        $upNum = ConvertTo-NextecMbps $partes[1]
+        if ($null -eq $upNum) { return $null }
+        $up = [string]$upNum
+    }
+    return [pscustomobject]@{ Download = [string]$down; Upload = $up }
+}
+
+function Get-NextecVelocidadeTexto {
+    param([string]$Download, [string]$Upload)
+    if ([string]::IsNullOrWhiteSpace($Download)) { return "não informada" }
+    if ($Upload) { return ("{0}/{1} Mbps" -f $Download, $Upload) }
+    return ("{0} Mbps" -f $Download)
+}
 
 function Get-NextecIpPublico {
     # IP público de saída agora (o do link em uso). Vazio se não conseguir.
@@ -5744,12 +5795,12 @@ function Get-NomeLinkUnico {
 
 function Read-ColetaLinkDefinition {
     <#
-        Um link por vez. Só o essencial é perguntado: operadora, tipo, função
-        e telefone. O nome sai da operadora e do tipo; com mais de um link,
-        pede o destino de teste exclusivo e confirma o IP público detectado
-        para o link principal (os demais a Coleta aprende quando ficam
-        sozinhos no ar). Gateway, IP de origem e firewall ficam em opções
-        avançadas.
+        Um link por vez: operadora, tipo e velocidade contratada; função só
+        com mais de um link. O nome sai da operadora e do tipo. Destinos de
+        teste vêm prontos (três por link) e só são digitados se o técnico
+        quiser trocar. Com mais de um link, confirma o IP público detectado
+        para o principal (os demais a Coleta aprende quando ficam sozinhos no
+        ar). Gateway, IP de origem e firewall ficam em opções avançadas.
     #>
     param(
         [int]$Numero = 1,
@@ -5761,12 +5812,25 @@ function Read-ColetaLinkDefinition {
         Write-Section ("Link {0} de {1}" -f $Numero, $Total)
     }
     else {
-        Write-Section "Novo link"
+        Write-Section "Link de internet"
     }
 
-    $operadora = ConvertTo-ColetaIniValue (Read-Required -Prompt "Operadora" )
+    $operadora = ConvertTo-ColetaIniValue (Read-Required -Prompt "Operadora")
     $tipos = @($script:TiposLink.Keys)
     $tipo = $tipos[(Read-Choice -Prompt "Tipo de conexão" -Options @($script:TiposLink.Values) -Default 1) - 1]
+
+    $velocidade = [pscustomobject]@{ Download = ""; Upload = "" }
+    while ($true) {
+        $texto = Read-NextecInput -Prompt "Velocidade contratada" -Hint "ex.: 500, 1 Giga, 600/300; ENTER se não souber"
+        if ([string]::IsNullOrWhiteSpace($texto)) { break }
+        $lida = ConvertTo-NextecVelocidade $texto
+        if ($null -ne $lida) {
+            $velocidade = $lida
+            Write-Info ("Registrada como {0}." -f (Get-NextecVelocidadeTexto $velocidade.Download $velocidade.Upload))
+            break
+        }
+        Write-Warn ("Velocidade inválida: {0}. Use Mega ou Giga, ex.: 500, 500 Mega, 1 Giga ou 600/300." -f $texto)
+    }
 
     $temPrincipal = @($script:ColetaLinks | Where-Object { $_.papel -eq "primario" }).Count -gt 0
     if (-not $variosLinks) {
@@ -5778,21 +5842,26 @@ function Read-ColetaLinkDefinition {
         $papel = $papeis[(Read-Choice -Prompt "Função deste link" -Options @("principal", "reserva (entra quando o principal cai)", "SD-WAN (os dois em uso ao mesmo tempo)") -Default $padraoPapel) - 1]
     }
 
-    $suporte = ConvertTo-ColetaIniValue (Read-NextecInput -Prompt "Telefone de suporte da operadora" -Hint "opcional")
-
-    $alvos = "1.1.1.1, 8.8.8.8"
-    $ipPublico = ""
+    $padraoDestino = ""
+    if ($script:ColetaLinks.Count -lt $script:DestinosLink.Count) {
+        $padraoDestino = $script:DestinosLink[$script:ColetaLinks.Count]
+    }
     if ($variosLinks) {
-        $padraoDestino = $script:DestinosLink[[Math]::Min($script:ColetaLinks.Count, $script:DestinosLink.Count - 1)]
-        Write-Hint "Para medir cada link separado, o firewall manda um destino só por este link"
-        Write-Hint ("(rota por link). Use um destino diferente em cada link, ex.: {0}." -f $padraoDestino)
-        $alvos = Read-NextecAddress -Prompt "Destino de teste deste link" -Default $padraoDestino -Kind host -List
+        Write-Hint "Com mais de um link, o firewall precisa mandar os destinos de teste deste"
+        Write-Hint "link só por ele (uma rota por link)."
+    }
+    if ($padraoDestino -and (Read-YesNo -Prompt ("Destinos de teste: {0}. Usar estes?" -f $padraoDestino) -Default $true)) {
+        $alvos = $padraoDestino
+    }
+    else {
+        $alvos = Read-NextecAddress -Prompt "Destinos de teste deste link, separados por vírgula" -Kind host -List
+    }
 
-        if ($papel -eq "primario") {
-            $detectado = Get-NextecIpPublico
-            if ($detectado -and (Read-YesNo -Prompt ("O IP público atual ({0}) é deste link?" -f $detectado) -Default $true)) {
-                $ipPublico = $detectado
-            }
+    $ipPublico = ""
+    if ($variosLinks -and $papel -eq "primario") {
+        $detectado = Get-NextecIpPublico
+        if ($detectado -and (Read-YesNo -Prompt ("O IP público atual ({0}) é deste link?" -f $detectado) -Default $true)) {
+            $ipPublico = $detectado
         }
     }
 
@@ -5814,9 +5883,10 @@ function Read-ColetaLinkDefinition {
 
     $nome = Get-NomeLinkUnico -Base (ConvertTo-ColetaIniValue ("{0} {1}" -f $operadora, $script:TiposLinkNome[$tipo]))
     return [pscustomobject]@{
-        nome = $nome; papel = $papel; operadora = $operadora; tipo = $tipo; suporte = $suporte
+        nome = $nome; papel = $papel; operadora = $operadora; tipo = $tipo; suporte = ""
         ip_publico = $ipPublico; gateway = $gateway; alvos = $alvos; origem = $origem
         firewall = $firewall; interface_firewall = $interface
+        velocidade_mbps = $velocidade.Download; velocidade_upload_mbps = $velocidade.Upload
     }
 }
 
@@ -5825,13 +5895,30 @@ function Show-ColetaLinks {
         Write-Hint "Nenhum link cadastrado."
         return
     }
-    Write-Host ("    {0,-24} {1,-10} {2,-17} {3}" -f "LINK", "FUNÇÃO", "IP PÚBLICO", "DESTINO DE TESTE") -ForegroundColor Gray
+    Write-Host ("    {0,-20} {1,-10} {2,-14} {3,-16} {4}" -f "LINK", "FUNÇÃO", "VELOCIDADE", "IP PÚBLICO", "DESTINOS DE TESTE") -ForegroundColor Gray
     foreach ($link in $script:ColetaLinks) {
         $funcao = if ($script:PapeisLink.Contains([string]$link.papel)) { $script:PapeisLink[[string]$link.papel] } else { $link.papel }
         $ip = if ($link.ip_publico) { $link.ip_publico } else { "automático" }
-        Write-Host ("    {0,-24} " -f $link.nome) -ForegroundColor White -NoNewline
-        Write-Host ("{0,-10} {1,-17} {2}" -f $funcao, $ip, $link.alvos)
+        $vel = if ($link.velocidade_mbps) { Get-NextecVelocidadeTexto $link.velocidade_mbps $link.velocidade_upload_mbps } else { "-" }
+        Write-Host ("    {0,-20} " -f $link.nome) -ForegroundColor White -NoNewline
+        Write-Host ("{0,-10} {1,-14} {2,-16} {3}" -f $funcao, $vel, $ip, $link.alvos)
     }
+}
+
+function Invoke-ColetaLinksPrompt {
+    # Sem links cadastrados: "Quantos links?" (padrão 1). Com links: mostra e
+    # pergunta se quer alterar.
+    if ($script:ColetaLinks.Count -eq 0) {
+        Edit-ColetaLinks
+    }
+    else {
+        Write-Host ""
+        Show-ColetaLinks
+        if (Read-YesNo -Prompt ("Alterar os {0} link(s) de internet cadastrado(s)?" -f $script:ColetaLinks.Count) -Default $false) {
+            Edit-ColetaLinks
+        }
+    }
+    $script:EnableLinksResolved = ($script:ColetaLinks.Count -gt 0)
 }
 
 function Edit-ColetaLinks {
@@ -5840,7 +5927,7 @@ function Edit-ColetaLinks {
     if ($script:ColetaLinks.Count -eq 0) {
         $total = 0
         while ($total -lt 1 -or $total -gt 6) {
-            $texto = Read-Required -Prompt "Quantos links de internet este local tem?" -Default "2"
+            $texto = Read-Required -Prompt "Quantos links de internet este local tem?" -Default "1"
             if (-not [int]::TryParse($texto, [ref]$total) -or $total -lt 1 -or $total -gt 6) {
                 Write-Warn "Informe um número de 1 a 6."
                 $total = 0
@@ -5849,7 +5936,7 @@ function Edit-ColetaLinks {
         for ($n = 1; $n -le $total; $n++) {
             $novo = Read-ColetaLinkDefinition -Numero $n -Total $total
             $script:ColetaLinks = @($script:ColetaLinks) + $novo
-            Write-Ok ("Link {0} cadastrado ({1})." -f $novo.nome, $script:PapeisLink[$novo.papel])
+            Write-Ok ("Link {0} cadastrado ({1}, {2})." -f $novo.nome, $script:PapeisLink[$novo.papel], (Get-NextecVelocidadeTexto $novo.velocidade_mbps $novo.velocidade_upload_mbps))
         }
     }
 
@@ -5863,7 +5950,7 @@ function Edit-ColetaLinks {
             1 {
                 $novo = Read-ColetaLinkDefinition
                 $script:ColetaLinks = @($script:ColetaLinks) + $novo
-                Write-Ok ("Link {0} cadastrado ({1})." -f $novo.nome, $script:PapeisLink[$novo.papel])
+                Write-Ok ("Link {0} cadastrado ({1}, {2})." -f $novo.nome, $script:PapeisLink[$novo.papel], (Get-NextecVelocidadeTexto $novo.velocidade_mbps $novo.velocidade_upload_mbps))
             }
             2 {
                 if ($script:ColetaLinks.Count -eq 0) { continue }
@@ -5919,8 +6006,9 @@ function Write-ColetaConfig {
     foreach ($link in $script:ColetaLinks) {
         $linhas.Add("")
         $linhas.Add(("[link:{0}]" -f $link.nome))
-        foreach ($chave in @("papel", "operadora", "tipo", "suporte", "ip_publico", "gateway", "alvos", "origem", "firewall", "interface_firewall")) {
-            $linhas.Add(("{0} = {1}" -f $chave, $link.$chave))
+        foreach ($chave in @("papel", "operadora", "tipo", "suporte", "ip_publico", "gateway", "alvos", "origem", "firewall", "interface_firewall", "velocidade_mbps", "velocidade_upload_mbps")) {
+            $valorLink = if ($link.PSObject.Properties[$chave]) { $link.$chave } else { "" }
+            $linhas.Add(("{0} = {1}" -f $chave, $valorLink))
         }
         $linhas.Add("teste_velocidade = nao")
     }
@@ -6032,16 +6120,7 @@ function Edit-ColetaSettings {
     }
 
     if ($script:ColetaLinks.Count -eq 0) { Import-ColetaLinks }
-    if ($script:ColetaLinks.Count -eq 0) {
-        $querLinks = Read-YesNo -Prompt "Este local tem mais de um link de internet?" -Default $false
-    }
-    else {
-        Show-ColetaLinks
-        $querLinks = Read-YesNo -Prompt "Alterar os links cadastrados?" -Default $false
-    }
-    if ($querLinks) {
-        Edit-ColetaLinks
-    }
+    Invoke-ColetaLinksPrompt
 
     if ((Test-NextecNeedsLoki) -and [string]::IsNullOrWhiteSpace($script:LokiUsername)) {
         Write-Info "Os eventos da Coleta Complementar vão para o Loki; este host ainda não tem credencial."

@@ -71,7 +71,8 @@ Rótulos `cliente`, `host`, `ambiente`, `local` etc. são acrescentados pelo All
 | `nextec_link_ativo` | link | 1 no link que carrega o tráfego |
 | `nextec_link_estado_desde_segundos` | link | Início do estado atual (epoch) |
 | `nextec_link_rodadas_total`, `_rodadas_fora_total`, `_rodadas_degradado_total`, `_segundos_fora_total` | link | Contadores de disponibilidade |
-| `nextec_link_info` | link, papel, operadora, tipo, suporte, ip_publico, gateway, alvos, firewall, interface_firewall | Ficha do link |
+| `nextec_link_info` | link, papel, operadora, tipo, suporte, ip_publico, gateway, alvos, firewall, interface_firewall, velocidade_mbps, velocidade_upload_mbps | Ficha do link. `ip_publico` vazio no INI é preenchido com o IP aprendido (visto quando só aquele link estava no ar) |
+| `nextec_link_velocidade_contratada_mbps` | link, sentido (download, upload) | Velocidade contratada, informada na instalação |
 | `nextec_dns_sucesso`, `nextec_dns_resposta_ms`, `nextec_dns_consultas_total`, `nextec_dns_falhas_total` | servidor | DNS |
 | `nextec_links_coletor_ultima_execucao_segundos`, `nextec_links_intervalo_segundos`, `nextec_links_limite_latencia_ms`, `nextec_links_limite_perda_percentual` | | Saúde e parâmetros do monitor |
 
@@ -164,3 +165,4 @@ $env:NEXTEC_COLETA_URL = "https://raw.githubusercontent.com/Sou-Nextec/Scripts/<
 | --- | --- | --- |
 | 1.0.0 | 03/10/2026 | Primeira versão: internet, links, Docker e velocidade (Linux); internet e links (Windows). |
 | 1.1.0 | 03/10/2026 | Módulo acessos (Linux e Windows) com origem e classificação para os alertas de acesso privilegiado; origem (usuário e IP da sessão SSH) no evento de terminal aberto em container. |
+| 1.2.0 | 03/10/2026 | IP público de cada link aprendido sozinho (quando só ele está no ar), sem precisar informar na instalação; velocidade contratada por link (`nextec_link_velocidade_contratada_mbps`). |

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.5.1 (cadastro de links mais curto: nome automático, IP público detectado)
+# Versão: 2.5.2 (links: quantos o local tem, velocidade contratada padronizada, destinos padrão)
 #
 # USO
 # ---
@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.5.1"
+INSTALLER_VERSION="2.5.2"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -1002,34 +1002,82 @@ ip_publico_atual() {
 LINK_TIPOS=(fibra radio 4g satelite dedicado)
 LINK_TIPOS_ROTULO=("Fibra" "Rádio" "4G/5G" "Satélite" "Dedicado")
 LINK_TIPOS_NOME=("Fibra" "Rádio" "4G" "Satélite" "Dedicado")
-# Um destino diferente por link: cada um precisa de uma rota própria no firewall.
-LINK_DESTINOS=(8.8.8.8 1.1.1.1 9.9.9.9 208.67.222.222 8.8.4.4 1.0.0.1)
+# Três destinos por link, de provedores diferentes (uma queda de provedor não
+# derruba a medição). Com mais de um link, cada conjunto precisa de uma rota
+# própria no firewall, por isso os conjuntos não se repetem.
+LINK_DESTINOS_PADRAO=(
+  "8.8.8.8, 1.1.1.1, 9.9.9.9"
+  "8.8.4.4, 1.0.0.1, 149.112.112.112"
+  "208.67.222.222, 208.67.220.220, 94.140.14.14"
+  "94.140.15.15, 76.76.2.0, 76.76.10.0"
+)
 
 papel_rotulo() {
   case "$1" in primario) echo "principal";; failover) echo "reserva";; sdwan) echo "SD-WAN";; *) echo "$1";; esac
 }
 
-# Um link por vez. Só o essencial é perguntado: operadora, tipo, função e
-# telefone. O nome sai da operadora e do tipo; com mais de um link, pede o
-# destino de teste exclusivo e confirma o IP público detectado para o link
-# principal (os demais a Coleta aprende quando ficam sozinhos no ar).
-# Gateway, IP de origem e firewall ficam em opções avançadas.
+# velocidade_mbps "500m" / "1g" / "1.5giga": valor em Mbps, inteiro.
+velocidade_mbps() {
+  local p="$1" mult=1
+  [[ "$p" =~ ^([0-9]+(\.[0-9]+)?)(g|gb|gbps|giga|gigas|m|mb|mbps|mega|megas)?$ ]] || return 1
+  [[ "${BASH_REMATCH[3]}" == g* ]] && mult=1000
+  awk -v n="${BASH_REMATCH[1]}" -v m="$mult" 'BEGIN { v = int(n * m + 0.5); if (v < 1 || v > 100000) exit 1; print v }'
+}
+
+# normalizar_velocidade "600 Mega/300": "600|300". Aceita "500", "500 Mega",
+# "1 Giga", "1,5G", "600/300". Sem upload: "500|".
+normalizar_velocidade() {
+  local v="${1,,}" d u
+  v="${v// /}"; v="${v//,/.}"
+  [[ -n "$v" ]] || return 1
+  IFS='/' read -r d u <<<"$v"
+  d="$(velocidade_mbps "$d")" || return 1
+  if [[ -n "$u" ]]; then
+    u="$(velocidade_mbps "$u")" || return 1
+  fi
+  printf '%s|%s' "$d" "$u"
+}
+
+velocidade_texto() {
+  [[ -n "$1" ]] || { echo "não informada"; return 0; }
+  if [[ -n "$2" ]]; then echo "$1/$2 Mbps"; else echo "$1 Mbps"; fi
+}
+
+# Um link por vez: operadora, tipo e velocidade contratada; função só com
+# mais de um link. O nome sai da operadora e do tipo. Destinos de teste vêm
+# prontos (três por link) e só são digitados se o técnico quiser trocar. Com
+# mais de um link, confirma o IP público detectado para o principal (os demais
+# a Coleta aprende quando ficam sozinhos no ar). Gateway, IP de origem e
+# firewall ficam em opções avançadas.
 collect_one_link() {
   local numero="$1" total="$2" varios=0 item tem_principal=0
-  local operadora tipo tipo_rotulo papel suporte alvos ip_publico detectado padrao_destino
+  local operadora tipo tipo_rotulo papel alvos ip_publico detectado padrao_destino
+  local velocidade="" vel_down="" vel_up="" resposta
   local gateway="" origem="" firewall="" interface="" nome base n
   (( total > 1 || ${#LINKS[@]} > 0 )) && varios=1
   echo
   if (( total > 1 )); then
     echo -e "  ${CYAN}${BOLD}Link ${numero} de ${total}${NC}"
   else
-    echo -e "  ${CYAN}${BOLD}Novo link${NC}"
+    echo -e "  ${CYAN}${BOLD}Link de internet${NC}"
   fi
 
   operadora="$(ini_value "$(ask_required "Operadora")")"
   choose_padrao "Tipo de conexão" 1 "${LINK_TIPOS_ROTULO[@]}"
   tipo="${LINK_TIPOS[$((CHOOSE_RESULT-1))]}"
   tipo_rotulo="${LINK_TIPOS_NOME[$((CHOOSE_RESULT-1))]}"
+
+  while true; do
+    read -r -p "$(pergunta "Velocidade contratada" "" "ex.: 500, 1 Giga, 600/300; ENTER se não souber")" resposta || entrada_encerrada
+    resposta="$(trim "$resposta")"
+    [[ -z "$resposta" ]] && break
+    if velocidade="$(normalizar_velocidade "$resposta")"; then
+      IFS='|' read -r vel_down vel_up <<<"$velocidade"
+      info "Registrada como $(velocidade_texto "$vel_down" "$vel_up")."
+      break
+    fi
+    warn "Velocidade inválida: ${resposta}. Use Mega ou Giga, ex.: 500, 500 Mega, 1 Giga ou 600/300."
+  done
 
   if [[ "$varios" == "0" ]]; then
     papel=primario
@@ -1043,22 +1091,23 @@ collect_one_link() {
     case "$CHOOSE_RESULT" in 1) papel=primario;; 2) papel=failover;; 3) papel=sdwan;; esac
   fi
 
-  read -r -p "$(pergunta "Telefone de suporte da operadora" "" "opcional")" suporte || entrada_encerrada
-
-  alvos="1.1.1.1, 8.8.8.8"
-  ip_publico=""
+  n=${#LINKS[@]}
+  padrao_destino="${LINK_DESTINOS_PADRAO[$n]:-}"
   if [[ "$varios" == "1" ]]; then
-    n=${#LINKS[@]}
-    (( n > ${#LINK_DESTINOS[@]} - 1 )) && n=$(( ${#LINK_DESTINOS[@]} - 1 ))
-    padrao_destino="${LINK_DESTINOS[$n]}"
-    dica "Para medir cada link separado, o firewall manda um destino só por este link"
-    dica "(rota por link). Use um destino diferente em cada link, ex.: ${padrao_destino}."
-    alvos="$(ask_address "Destino de teste deste link" "$padrao_destino" host 0 1)"
-    if [[ "$papel" == "primario" ]]; then
-      detectado="$(ip_publico_atual)"
-      if [[ -n "$detectado" ]] && ask_yes_no "O IP público atual (${detectado}) é deste link?" s; then
-        ip_publico="$detectado"
-      fi
+    dica "Com mais de um link, o firewall precisa mandar os destinos de teste deste"
+    dica "link só por ele (uma rota por link)."
+  fi
+  if [[ -n "$padrao_destino" ]] && ask_yes_no "Destinos de teste: ${padrao_destino}. Usar estes?" s; then
+    alvos="$padrao_destino"
+  else
+    alvos="$(ask_address "Destinos de teste deste link, separados por vírgula" "" host 0 1)"
+  fi
+
+  ip_publico=""
+  if [[ "$varios" == "1" && "$papel" == "primario" ]]; then
+    detectado="$(ip_publico_atual)"
+    if [[ -n "$detectado" ]] && ask_yes_no "O IP público atual (${detectado}) é deste link?" s; then
+      ip_publico="$detectado"
     fi
   fi
 
@@ -1089,8 +1138,11 @@ collect_one_link() {
     nome="${base} ${n}"
     n=$((n+1))
   done
-  LINKS+=("${nome}|${papel}|$(ini_value "$operadora")|${tipo}|$(ini_value "$suporte")|$(ini_value "$ip_publico")|$(ini_value "$gateway")|$(ini_value "$alvos")|$(ini_value "$origem")|$(ini_value "$firewall")|$(ini_value "$interface")")
-  ok "Link ${nome} cadastrado ($(papel_rotulo "$papel"))."
+  # Campos: nome|papel|operadora|tipo|suporte|ip_publico|gateway|alvos|origem|
+  # firewall|interface|velocidade_mbps|velocidade_upload_mbps (suporte ficou
+  # vazio a partir da 2.5.2; continua no formato para ler respostas antigas).
+  LINKS+=("${nome}|${papel}|$(ini_value "$operadora")|${tipo}||$(ini_value "$ip_publico")|$(ini_value "$gateway")|$(ini_value "$alvos")|$(ini_value "$origem")|$(ini_value "$firewall")|$(ini_value "$interface")|${vel_down}|${vel_up}")
+  ok "Link ${nome} cadastrado ($(papel_rotulo "$papel"), $(velocidade_texto "$vel_down" "$vel_up"))."
 }
 
 collect_links_inputs() {
@@ -1098,11 +1150,29 @@ collect_links_inputs() {
   local total=1 n
   # Primeiro cadastro: pergunta quantos links o local tem e passa por cada um.
   if (( ${#LINKS[@]} == 0 )); then
-    total="$(ask_pattern "Quantos links de internet este local tem?" "2" '^[1-6]$' "um número de 1 a 6")"
+    total="$(ask_pattern "Quantos links de internet este local tem?" "1" '^[1-6]$' "um número de 1 a 6")"
   fi
   for (( n = 1; n <= total; n++ )); do
     collect_one_link "$n" "$total"
   done
+  return 0
+}
+
+# Com a internet ligada: sem links cadastrados, pergunta quantos (padrão 1);
+# com links, mostra e pergunta se quer alterar.
+perguntar_links() {
+  if [[ "${ENABLE_INTERNET:-0}" != "1" ]]; then
+    LINKS=()
+    ENABLE_LINKS=0
+    return 0
+  fi
+  if (( ${#LINKS[@]} == 0 )); then
+    collect_links_inputs
+  elif ask_yes_no "Alterar os ${#LINKS[@]} link(s) de internet cadastrado(s)?" n; then
+    editar_lista LINKS "Links de internet" collect_links_inputs ENABLE_LINKS
+  fi
+  ENABLE_LINKS=0
+  (( ${#LINKS[@]} > 0 )) && ENABLE_LINKS=1
   return 0
 }
 
@@ -1176,9 +1246,9 @@ horario = seg-sex 07:00-19:00; sab 07:00-14:00
 ; (ex.: VPN ou escritório da Nextec): 203.0.113.0/24, 198.51.100.7
 origens_conhecidas =
 EOF
-    local item nome papel operadora tipo suporte ip_publico gateway alvos origem firewall interface
+    local item nome papel operadora tipo suporte ip_publico gateway alvos origem firewall interface vel_down vel_up
     for item in "${LINKS[@]}"; do
-      IFS='|' read -r nome papel operadora tipo suporte ip_publico gateway alvos origem firewall interface <<<"$item"
+      IFS='|' read -r nome papel operadora tipo suporte ip_publico gateway alvos origem firewall interface vel_down vel_up <<<"$item"
       cat <<EOF
 
 [link:${nome}]
@@ -1192,6 +1262,8 @@ alvos = ${alvos}
 origem = ${origem}
 firewall = ${firewall}
 interface_firewall = ${interface}
+velocidade_mbps = ${vel_down}
+velocidade_upload_mbps = ${vel_up}
 teste_velocidade = nao
 EOF
     done
@@ -2036,8 +2108,8 @@ resource_checklist() {
   (( ${#DETECTED_DATABASES[@]} > 0 )) && db_available=1
 
   # Estado inicial recomendado.
-  local -a selected=(0 0 0 0 0 0 1 0 1 1)
-  local -a disabled=(0 0 0 0 0 0 0 0 0 0)
+  local -a selected=(0 0 0 0 0 0 1 1 1)
+  local -a disabled=(0 0 0 0 0 0 0 0 0)
   local -a labels=(
     "Docker / containers"
     "Logs do sistema, warning/error/critical"
@@ -2045,19 +2117,18 @@ resource_checklist() {
     "SNMP, firewalls/switches/UPS/APs"
     "Conectividade e disponibilidade (Blackbox), ping/HTTP/TCP"
     "Exporters adicionais"
-    "Internet e DNS (saída padrão, IP público, diagnóstico)"
-    "Links de internet (mais de um link neste local)"
+    "Internet e links (status, DNS, IP público, cadastro dos links)"
     "Teste de velocidade (Speedtest)"
     "Acessos ao servidor (logins com origem, alerta de acesso privilegiado)"
   )
-  local -a details=("" "" "" "" "" "" "recomendado" "" "recomendado" "recomendado")
+  local -a details=("" "" "" "" "" "" "recomendado" "recomendado" "recomendado")
   # Na alteração de uma instalação existente, o checklist abre com o que já está ligado.
   local do_estado="${CHECKLIST_DO_ESTADO:-0}"
   if [[ "$do_estado" == "1" ]]; then
     selected=("${ENABLE_DOCKER:-0}" "${ENABLE_LOGS:-0}" "${ENABLE_DATABASES:-0}" "${ENABLE_SNMP:-0}"
-              "${ENABLE_BLACKBOX:-0}" "${ENABLE_EXPORTERS:-0}" "${ENABLE_INTERNET:-0}" "${ENABLE_LINKS:-0}"
+              "${ENABLE_BLACKBOX:-0}" "${ENABLE_EXPORTERS:-0}" "${ENABLE_INTERNET:-0}"
               "${ENABLE_VELOCIDADE:-0}" "${ENABLE_ACESSOS:-0}")
-    details[6]=""; details[8]=""; details[9]=""
+    details[6]=""; details[7]=""; details[8]=""
   fi
 
   if [[ "$DOCKER_DETECTED" == "1" && "${DOCKER_DAEMON_AVAILABLE:-0}" == "1" ]]; then
@@ -2258,11 +2329,8 @@ resource_checklist() {
   ENABLE_BLACKBOX="${selected[4]}"
   ENABLE_EXPORTERS="${selected[5]}"
   ENABLE_INTERNET="${selected[6]}"
-  ENABLE_LINKS="${selected[7]}"
-  ENABLE_VELOCIDADE="${selected[8]}"
-  ENABLE_ACESSOS="${selected[9]}"
-  # Links dependem do módulo de internet (mesmo laço de medição).
-  [[ "$ENABLE_LINKS" == "1" ]] && ENABLE_INTERNET=1
+  ENABLE_VELOCIDADE="${selected[7]}"
+  ENABLE_ACESSOS="${selected[8]}"
 
   if [[ "$ENABLE_SNMP" == "1" || "$ENABLE_BLACKBOX" == "1" ]]; then
     COLLECTOR=1
@@ -2481,9 +2549,7 @@ collect_inputs() {
   [[ "$ENABLE_SNMP" == "1" ]] && collect_snmp_targets
   [[ "$ENABLE_EXPORTERS" == "1" ]] && collect_custom_exporters
 
-  if [[ "$ENABLE_LINKS" == "1" ]]; then
-    collect_links_inputs
-  fi
+  perguntar_links
 
   step "Credenciais do NOC"
   info "Use a credencial cadastrada no NOC para autorizar o envio deste cliente."
@@ -2983,11 +3049,13 @@ editar_recursos() {
   else
     CUSTOM_EXPORTERS=()
   fi
-  if [[ "$ENABLE_LINKS" == "1" ]]; then
+  if [[ "$ENABLE_INTERNET" == "1" ]]; then
     (( ${#LINKS[@]} > 0 )) || collect_links_inputs
   else
     LINKS=()
   fi
+  ENABLE_LINKS=0
+  (( ${#LINKS[@]} > 0 )) && ENABLE_LINKS=1
   return 0
 }
 
@@ -3289,9 +3357,8 @@ main_somente_coleta() {
     info "Respostas atuais carregadas: ENTER mantém cada uma."
   fi
   sn() { [[ "$tem_estado" == "1" ]] && { [[ "${1:-0}" == "1" ]] && echo s || echo n; } || echo "$2"; }
-  local p_internet p_links p_velocidade p_docker p_acessos
+  local p_internet p_velocidade p_docker p_acessos
   p_internet="$(sn "${ENABLE_INTERNET:-0}" s)"
-  p_links="$(sn "${ENABLE_LINKS:-0}" n)"
   p_velocidade="$(sn "${ENABLE_VELOCIDADE:-0}" s)"
   p_docker="$(sn "${ENABLE_DOCKER:-0}" s)"
   p_acessos="$(sn "${ENABLE_ACESSOS:-0}" s)"
@@ -3311,13 +3378,7 @@ main_somente_coleta() {
   ENABLE_DOCKER=0
   ENABLE_ACESSOS=0
 
-  ask_yes_no "Medir a internet (status, DNS e IP público)?" "$p_internet" && ENABLE_INTERNET=1
-  if ask_yes_no "Cadastrar links de internet (local com mais de um link)?" "$p_links"; then
-    ENABLE_LINKS=1
-    ENABLE_INTERNET=1
-  else
-    LINKS=()
-  fi
+  ask_yes_no "Medir a internet e os links (status, DNS e IP público)?" "$p_internet" && ENABLE_INTERNET=1
   ask_yes_no "Teste de velocidade a cada 30 minutos?" "$p_velocidade" && ENABLE_VELOCIDADE=1
   if [[ "$DOCKER_DETECTED" == "1" ]]; then
     ask_yes_no "Coletar Docker (estado, consumo, health e eventos)?" "$p_docker" && ENABLE_DOCKER=1
@@ -3329,13 +3390,7 @@ main_somente_coleta() {
     desligar_coleta_complementar
     exit 0
   fi
-  if [[ "$ENABLE_LINKS" == "1" ]]; then
-    if (( ${#LINKS[@]} > 0 )); then
-      editar_lista LINKS "Links de internet" collect_links_inputs ENABLE_LINKS
-    else
-      collect_links_inputs
-    fi
-  fi
+  perguntar_links
 
   install_coleta_complementar
   install_atualizador

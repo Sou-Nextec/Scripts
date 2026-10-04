@@ -459,6 +459,13 @@ function Update-Destinos {
     }
 }
 
+function ConvertTo-Mbps {
+    param([string]$Texto)
+    $numero = 0
+    if ($Texto -and [int]::TryParse($Texto.Trim(), [ref]$numero) -and $numero -gt 0 -and $numero -le 100000) { return $numero }
+    return $null
+}
+
 function Get-IpAprendido {
     # Último IP público visto quando só este link estava no ar.
     param([string]$Nome)
@@ -608,7 +615,13 @@ function Invoke-RodadaLinks {
             suporte = $link.suporte; ip_publico = $(if ($link.ip_publico) { $link.ip_publico } else { Get-IpAprendido $link.nome }); gateway = $link.gateway
             alvos = ($link.alvos -join ", "); firewall = $link.firewall
             interface_firewall = $link.interface_firewall; teste_velocidade = $link.teste_velocidade
+            velocidade_mbps = [string]$link.velocidade_mbps; velocidade_upload_mbps = [string]$link.velocidade_upload_mbps
         })
+        foreach ($par in @(@("download", $link.velocidade_mbps), @("upload", $link.velocidade_upload_mbps))) {
+            if ($par[1]) {
+                Add-Metrica $metricas "nextec_link_velocidade_contratada_mbps" $par[1] ([ordered]@{ link = $link.nome; sentido = $par[0] })
+            }
+        }
     }
 
     # IP público e link em uso
@@ -943,6 +956,9 @@ function Initialize-Configuracao {
                 firewall           = Get-Valor $secao "firewall"
                 interface_firewall = Get-Valor $secao "interface_firewall"
                 teste_velocidade   = Get-Valor $secao "teste_velocidade" "nao"
+                # Velocidade contratada em Mbps, padronizada pelo instalador.
+                velocidade_mbps        = ConvertTo-Mbps (Get-Valor $secao "velocidade_mbps")
+                velocidade_upload_mbps = ConvertTo-Mbps (Get-Valor $secao "velocidade_upload_mbps")
             }
         }
     }

@@ -345,6 +345,14 @@ class Link:
         self.firewall = secao.get("firewall", "")
         self.interface_firewall = secao.get("interface_firewall", "")
         self.teste_velocidade = secao.get("teste_velocidade", "nao")
+        # Velocidade contratada em Mbps, padronizada pelo instalador.
+        self.velocidade_mbps = _mbps(secao.get("velocidade_mbps", ""))
+        self.velocidade_upload_mbps = _mbps(secao.get("velocidade_upload_mbps", ""))
+
+
+def _mbps(texto):
+    texto = (texto or "").strip()
+    return int(texto) if texto.isdigit() and 0 < int(texto) <= 100000 else None
 
 
 class ModuloLinks:
@@ -577,7 +585,13 @@ class ModuloLinks:
                 "gateway": link.gateway, "alvos": ", ".join(link.alvos),
                 "firewall": link.firewall, "interface_firewall": link.interface_firewall,
                 "teste_velocidade": link.teste_velocidade,
+                "velocidade_mbps": str(link.velocidade_mbps or ""),
+                "velocidade_upload_mbps": str(link.velocidade_upload_mbps or ""),
             })
+            for sentido, valor in (("download", link.velocidade_mbps), ("upload", link.velocidade_upload_mbps)):
+                if valor:
+                    metricas.add("nextec_link_velocidade_contratada_mbps", valor,
+                                 {"link": link.nome, "sentido": sentido})
 
         # IP público e link em uso
         if mudou_algum or momento - self._ultimo_ip >= self.intervalo_ip:
