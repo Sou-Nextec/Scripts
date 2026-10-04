@@ -11,11 +11,15 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
 | Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.7.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.17.0 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.17.1 |
 | Coleta Complementar | `coleta-complementar/` | 1.2.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
 ## 2026-10-04
+
+### Instalador Windows 2.17.1
+
+- **Ícone da janela.** A tela de instalação, a janela de andamento e a janela do equipamento SNMP mostram o emblema da Nextec na barra de título e na barra de tarefas, no lugar do ícone do PowerShell.
 
 ### Instalador Windows 2.17.0
 
