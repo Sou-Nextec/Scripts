@@ -33,9 +33,24 @@
 
     Codificação: UTF-8 com BOM.
 
+    Execução direta do GitHub (sem baixar o arquivo):
+      $u = "https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Alloy/install-nextec-monitoring-windows-v2.ps1"
+      & ([scriptblock]::Create((irm $u).TrimStart([char]0xFEFF)))
+
+    Parâmetros vão no fim da linha, por exemplo -Simular ou -Console.
+    O TrimStart é obrigatório: o irm entrega o BOM como primeiro caractere,
+    o parser do PowerShell não o trata como espaço e o param() deixa de ser
+    a primeira instrução ("Unexpected attribute 'CmdletBinding'"). O BOM
+    continua no arquivo porque o Windows PowerShell 5.1 lê .ps1 sem BOM
+    como ANSI e corromperia os acentos quando o script roda de um arquivo.
+
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.16.1 One-liner documentado com TrimStart([char]0xFEFF). Desde a
+           2.15.4 o arquivo tem BOM, e o [scriptblock]::Create(irm ...)
+           falhava com "Unexpected attribute 'CmdletBinding'".
+
     2.16.0 Tela de instalação (WinForms dentro do próprio script): abre
            sozinha quando há área de trabalho, com abas para identificação,
            recursos (exporters em árvore), links, conectividade, SNMP,
@@ -290,7 +305,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.16.0"
+$InstallerVersion = "2.16.1"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.

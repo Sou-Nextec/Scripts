@@ -11,11 +11,22 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
 | Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.6.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.16.0 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.16.1 |
 | Coleta Complementar | `coleta-complementar/` | 1.2.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
 ## 2026-10-04
+
+### Instalador Windows 2.16.1
+
+- **Execução direta do GitHub.** O comando `& ([scriptblock]::Create((irm <url>)))` falhava com `Unexpected attribute 'CmdletBinding'` desde a 2.15.4. O arquivo tem BOM (necessário para os acentos no Windows PowerShell 5.1), o `irm` entrega esse BOM como primeiro caractere e o PowerShell não o trata como espaço, então o `param()` deixava de ser a primeira instrução. O comando correto remove o BOM antes de montar o scriptblock:
+
+  ```powershell
+  $u = "https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Alloy/install-nextec-monitoring-windows-v2.ps1"
+  & ([scriptblock]::Create((irm $u).TrimStart([char]0xFEFF)))
+  ```
+
+  Parâmetros vão no fim (`-Simular`, `-Console`, etc.). Nenhuma mudança de comportamento no instalador.
 
 ### Instalador Windows 2.16.0
 
