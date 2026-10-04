@@ -47,7 +47,10 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
-    2.16.1 One-liner documentado com TrimStart([char]0xFEFF). Desde a
+    2.16.1 Tela Recursos: o perfil básico (CPU, memória, discos, rede,
+           uptime e serviços do Windows) aparece na árvore marcado e
+           travado, em cinza, em vez de só citado no texto.
+           One-liner documentado com TrimStart([char]0xFEFF). Desde a
            2.15.4 o arquivo tem BOM, e o [scriptblock]::Create(irm ...)
            falhava com "Unexpected attribute 'CmdletBinding'".
 
@@ -7995,7 +7998,7 @@ function Show-NextecInstallerGui {
     $p = New-Object Windows.Forms.TabPage; $p.Text = "Recursos"; $p.BackColor = [Drawing.Color]::White
     $g.PaginaRecursos = $p
     $p.Controls.Add((New-GuiLabel "O que coletar além do perfil básico" 24 16 600 -Titulo))
-    $g.Basico = New-GuiLabel "Sempre ligado: CPU, memória, discos, rede, uptime e serviços do Windows." 24 46 760 -Dica
+    $g.Basico = New-GuiLabel "Os itens em cinza são o perfil básico: vêm sempre ligados e não podem ser desmarcados." 24 46 760 -Dica
     $p.Controls.Add($g.Basico)
     $arvore = New-Object Windows.Forms.TreeView
     $arvore.CheckBoxes = $true
@@ -8014,6 +8017,13 @@ function Show-NextecInstallerGui {
     $g.Intervalo.Value = [Math]::Max(5, [int]$InternetIntervalMinutes)
     $p.Controls.Add($g.Intervalo)
     $p.Controls.Add((New-GuiLabel "Clique no texto para marcar. Exporters: marque o grupo e escolha os filhos." 24 502 760 -Dica))
+
+    # Itens do perfil básico são fixos: qualquer tentativa de desmarcar
+    # (clique, barra de espaço) é cancelada antes de acontecer.
+    $arvore.Add_BeforeCheck({
+        param($s, $e)
+        if ([string]$e.Node.Tag -eq "fixo") { $e.Cancel = $true }
+    })
 
     # Marcar o pai marca os filhos e vice-versa; os avisos dependem dos logs.
     $arvore.Add_AfterCheck({
@@ -8228,6 +8238,26 @@ function Show-NextecInstallerGui {
             return $n
         }
         if ($monitora) {
+            # Perfil básico: sempre coletado, aparece marcado e travado.
+            $fixo = {
+                param($Pai, [string]$Chave, [string]$Texto)
+                $n = & $novo $Pai $Chave $Texto $true
+                $n.Tag = "fixo"
+                $n.ForeColor = [Drawing.SystemColors]::GrayText
+                return $n
+            }
+            $basico = & $fixo $null "basico" "Perfil básico (sempre ligado)"
+            foreach ($item in @(
+                @("basico:cpu", "CPU"),
+                @("basico:memoria", "Memória"),
+                @("basico:discos", "Discos"),
+                @("basico:rede", "Rede"),
+                @("basico:uptime", "Uptime"),
+                @("basico:servicos", "Serviços do Windows")
+            )) {
+                [void](& $fixo $basico $item[0] $item[1])
+            }
+            $basico.Expand()
             $logs = & $novo $null "logs" "Logs do sistema (Critical e Error)" ([bool]$EnableLogs.IsPresent -or $script:EnableLogsResolved)
             [void](& $novo $logs "logs_warning" "Incluir os avisos (Warning), aumenta muito o volume" ([bool]$EnableLogWarnings.IsPresent))
             $logs.Expand()

@@ -26,7 +26,8 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
   & ([scriptblock]::Create((irm $u).TrimStart([char]0xFEFF)))
   ```
 
-  Parâmetros vão no fim (`-Simular`, `-Console`, etc.). Nenhuma mudança de comportamento no instalador.
+  Parâmetros vão no fim (`-Simular`, `-Console`, etc.). O `irm ... | iex` tinha o mesmo problema e foi substituído por esse comando na documentação.
+- **Perfil básico visível na tela Recursos.** CPU, memória, discos, rede, uptime e serviços do Windows aparecem no topo da árvore, marcados e em cinza, sem a opção de desmarcar. Antes eram só citados no texto acima da árvore. O que é coletado não mudou.
 
 ### Instalador Windows 2.16.0
 
