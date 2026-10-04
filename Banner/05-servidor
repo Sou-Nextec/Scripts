@@ -1,0 +1,31 @@
+#!/bin/bash
+# Banner de login informativo (servidores de clientes).
+# Lê NEXTEC_NOME_SERVIDOR, NEXTEC_FUNCAO e NEXTEC_AMBIENTE de /etc/environment.
+set -euo pipefail
+
+ler() {
+  grep -m1 "^$1=" /etc/environment 2>/dev/null | cut -d= -f2- \
+    | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | tr -d '\000-\037\\' || true
+}
+
+nome="$(ler NEXTEC_NOME_SERVIDOR)"
+funcao="$(ler NEXTEC_FUNCAO)"
+ambiente="$(ler NEXTEC_AMBIENTE)"
+[[ -n "$nome" ]] || nome="$(hostname -s)"
+
+CINZA=$'\033[38;2;154;150;184m'
+BRANCO=$'\033[38;2;244;244;244m'
+NEGRITO=$'\033[1m'
+PONTO=$'\033[1;38;2;140;132;255m'
+FIM=$'\033[0m'
+
+# Rótulos já alinhados (o printf conta bytes, e acento ocupa dois)
+linha() { [[ -n "$2" ]] && printf '  %s%s%s%s%s%s\n' "$CINZA" "$1" "$FIM" "$BRANCO$3" "$2" "$FIM"; return 0; }
+
+printf '\n'
+linha "Servidor      " "${nome^^}" "$NEGRITO"
+linha "Função        " "$funcao" ""
+linha "Ambiente      " "$ambiente" ""
+printf '\n  %sAlterações neste servidor devem ser combinadas com a Nextec.%s\n\n' "$CINZA" "$FIM"
+printf '  %sGerenciado pela %s%sNextec%s   %s(62) 3602-1667%s  %s·%s  %snoc@nex.tec.br%s\n\n' \
+  "$CINZA" "$FIM" "$NEGRITO$BRANCO" "$FIM" "$BRANCO" "$FIM" "$PONTO" "$FIM" "$BRANCO" "$FIM"
