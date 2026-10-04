@@ -11,11 +11,15 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
 | Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.7.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.17.1 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.17.2 |
 | Coleta Complementar | `coleta-complementar/` | 1.2.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
 ## 2026-10-04
+
+### Instalador Windows 2.17.2
+
+- **Correção.** Na 2.17.1 a tela de instalação não abria: o ícone da janela era lido antes de ser carregado e o modo estrito do PowerShell interrompia o instalador com "A variável '$script:GuiIconeJanela' não pode ser recuperada".
 
 ### Instalador Windows 2.17.1
 

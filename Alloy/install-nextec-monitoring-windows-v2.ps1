@@ -47,6 +47,8 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.17.2 Corrige a tela que não abria na 2.17.1 (ícone da janela lido
+           antes de existir, erro no modo estrito).
     2.17.1 Emblema da Nextec como ícone das janelas (barra de título e
            barra de tarefas), no lugar do ícone padrão do PowerShell.
     2.17.0 Tela mais clara: campos obrigatórios com asterisco vermelho;
@@ -325,7 +327,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.17.1"
+$InstallerVersion = "2.17.2"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -426,6 +428,7 @@ $script:InstallerLog = ""
 # para Ambiente, Local e Criticidade.
 $script:Cliente = $Cliente
 $script:HostLabel = ""
+$script:GuiIconeJanela = $null
 $script:Ambiente = $Ambiente
 $script:Local = $Local
 $script:Criticidade = $Criticidade
@@ -8271,7 +8274,10 @@ function Get-NextecIconeJanela {
         barra de tarefas. Embutido em Base64 pelo mesmo motivo da logo. Se
         não puder ser montado, a janela fica com o ícone padrão.
     #>
-    if ($null -ne $script:GuiIconeJanela) { return $script:GuiIconeJanela }
+    # Com Set-StrictMode, ler a variável antes da primeira atribuição é erro;
+    # Get-Variable devolve nada nesse caso.
+    $atual = Get-Variable -Name GuiIconeJanela -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -ne $atual) { return $atual }
     $base64 = (
         "AAABAAUAEBAAAAAAIACFAgAAVgAAABgYAAAAACAAUwQAANsCAAAgIAAAAAAgAEMGAAAuBwAAMDAAAAAAIACZCQAAcQ0AAEBAAAAA" +
         "ACAAag0AAAoXAACJUE5HDQoaCgAAAA1JSERSAAAAEAAAABAIBgAAAB/z/2EAAAJMSURBVHiclZLPa9VHFMU/585830sMEelCEBQq" +
