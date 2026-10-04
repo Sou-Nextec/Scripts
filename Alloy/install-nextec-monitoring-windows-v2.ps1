@@ -47,6 +47,7 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.19.1 Fabricantes SNMP em ordem alfabética.
     2.19.0 Instalação existente com área de trabalho: estado e opções numa
            janela; "Ver e alterar" abre as abas preenchidas com a
            configuração atual, inclusive equipamentos SNMP e credenciais.
@@ -332,7 +333,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.19.0"
+$InstallerVersion = "2.19.1"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -356,16 +357,17 @@ $SnmpAuthFile = Join-Path $AlloyDir "snmp-auth.yml"
 # Repositório Nextec com os snmp.yml homologados por fabricante. Usado para
 # baixar o arquivo certo sem depender de o operador já ter uma cópia local.
 $NextecSnmpRepoBaseUrl = "https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Alloy/snmp"
+# Em ordem alfabética, como aparece para o técnico.
 $NextecSnmpVendors = [ordered]@{
-    "1" = @{ Label = "pfSense"; File = "pfsense.yml" }
-    "2" = @{ Label = "Fortigate"; File = "fortigate.yml" }
-    "3" = @{ Label = "Mikrotik"; File = "mikrotik.yml" }
-    "4" = @{ Label = "SonicWall"; File = "sonicwall.yml" }
-    "5" = @{ Label = "Ubiquiti"; File = "ubiquiti.yml" }
-    "6" = @{ Label = "Cisco"; File = "cisco.yml" }
-    "7" = @{ Label = "HP / Aruba"; File = "hp.yml" }
+    "1" = @{ Label = "Cisco"; File = "cisco.yml" }
+    "2" = @{ Label = "FortiGate"; File = "fortigate.yml" }
+    "3" = @{ Label = "HP / Aruba"; File = "hp.yml" }
+    "4" = @{ Label = "Intelbras"; File = "intelbras.yml" }
+    "5" = @{ Label = "MikroTik"; File = "mikrotik.yml" }
+    "6" = @{ Label = "pfSense"; File = "pfsense.yml" }
+    "7" = @{ Label = "SonicWall"; File = "sonicwall.yml" }
     "8" = @{ Label = "TP-Link"; File = "tplink.yml" }
-    "9" = @{ Label = "Intelbras"; File = "intelbras.yml" }
+    "9" = @{ Label = "Ubiquiti"; File = "ubiquiti.yml" }
 }
 
 # Nome do serviço Windows. Resolve-AlloyInstallation substitui pelo nome real
