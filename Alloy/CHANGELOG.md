@@ -11,11 +11,17 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
 | Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.8.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.18.0 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.19.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.2.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
 ## 2026-10-04
+
+### Instalador Windows 2.19.0
+
+- **Instalação existente na tela.** Com área de trabalho, rodar o instalador num servidor que já tem o monitoramento abre uma janela com o estado de cada parte (versões, Alloy, Coleta Complementar, atualizador, coletas ligadas) e as opções: Ver e alterar, Reconfigurar do zero, Atualizar o Grafana Alloy, Validar e reiniciar. Sem área de trabalho, segue o menu do console.
+- **Ver e alterar preenchido.** As abas abrem com a configuração instalada: identificação, função, recursos marcados, links, alvos de conectividade, equipamentos SNMP com a credencial (mascarada), exporters e credenciais do NOC. Ao aplicar, a configuração é regravada, validada e o serviço reiniciado, com o andamento na janela.
+- **Credencial SNMP preservada.** Credencial que a tela não representa (formato fora do padrão do instalador) fica como está e aparece como "atual (mantida)". Equipamento de fabricante fora do catálogo continua com o módulo que já tinha.
 
 ### Instaladores Windows 2.18.0 e Linux 2.8.0, módulos SNMP
 

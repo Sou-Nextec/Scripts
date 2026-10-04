@@ -47,6 +47,9 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.19.0 Instalação existente com área de trabalho: estado e opções numa
+           janela; "Ver e alterar" abre as abas preenchidas com a
+           configuração atual, inclusive equipamentos SNMP e credenciais.
     2.18.0 SNMP: Ubiquiti, Cisco, HP / Aruba, TP-Link e Intelbras no
            catálogo de fabricantes.
     2.17.2 Corrige a tela que não abria na 2.17.1 (ícone da janela lido
@@ -329,7 +332,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.18.0"
+$InstallerVersion = "2.19.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -578,6 +581,13 @@ $script:GuiProgresso = $null
 $script:UsouTela = $false
 $script:UsouProgresso = $false
 $script:ConsoleEscondido = $false
+# Título do resultado na janela de andamento quando a operação não é uma
+# instalação (ex.: "Configuração atualizada"). Vazio usa o texto padrão.
+$script:GuiTituloSucesso = ""
+$script:GuiTituloFalha = ""
+# Fechar a tela de manutenção sem escolher nada encerra sem pedir ENTER.
+$script:DispensarEspera = $false
+$script:GuiManutencaoEscolha = 5
 
 function Set-NextecConsoleVisivel {
     param([bool]$Visivel)
@@ -1787,7 +1797,15 @@ function Get-NextecEstadoServico {
 }
 
 function Show-MaintenanceStatus {
-    # Mesmo quadro do instalador Linux: versões e estado de cada parte.
+    foreach ($linha in @(Get-MaintenanceStatusRows)) {
+        Write-Field -Label $linha.Rotulo -Value $linha.Valor -ValueColor $linha.Cor
+    }
+    Write-Host ""
+}
+
+function Get-MaintenanceStatusRows {
+    # Mesmo quadro do instalador Linux: versões e estado de cada parte. Cada
+    # linha traz rótulo, valor e cor; o console e a tela mostram a mesma lista.
     $service = Get-AlloyService
     $version = Get-AlloyInstalledVersion
     $configExists = Test-Path -LiteralPath $ConfigFile
@@ -1821,14 +1839,16 @@ function Show-MaintenanceStatus {
         $atualizador = if ($null -ne $tarefa) { "$versaoAtualizador (ligado)" } else { "$versaoAtualizador (tarefa ausente)" }
     }
 
-    Write-Field -Label "Este instalador" -Value ("v{0}" -f $InstallerVersion) -ValueColor White
-    Write-Field -Label "Instalado com" -Value $instaladoCom -ValueColor White
-    if ($cliente) { Write-Field -Label "Cliente" -Value $cliente -ValueColor White }
-    if ($hostLabel) { Write-Field -Label "Host" -Value $hostLabel -ValueColor White }
-    Write-Field -Label "Grafana Alloy" -Value ("{0} ({1})" -f $alloy, (Get-NextecEstadoServico -Servico $service)) -ValueColor White
-    Write-Field -Label "Coleta Complementar" -Value $coleta -ValueColor $(if ($versaoColeta) { [ConsoleColor]::White } else { [ConsoleColor]::DarkGray })
-    Write-Field -Label "Atualizador" -Value $atualizador -ValueColor $(if ($versaoAtualizador) { [ConsoleColor]::White } else { [ConsoleColor]::Yellow })
-    Write-Field -Label "Pacote Nextec aplicado" -Value (Get-NextecPacoteAplicado) -ValueColor White
+    $linhas = New-Object System.Collections.Generic.List[object]
+    $add = { param([string]$Rotulo, [string]$Valor, [ConsoleColor]$Cor) [void]$linhas.Add([pscustomobject]@{ Rotulo = $Rotulo; Valor = $Valor; Cor = $Cor }) }
+    & $add "Este instalador" ("v{0}" -f $InstallerVersion) White
+    & $add "Instalado com" $instaladoCom White
+    if ($cliente) { & $add "Cliente" $cliente White }
+    if ($hostLabel) { & $add "Host" $hostLabel White }
+    & $add "Grafana Alloy" ("{0} ({1})" -f $alloy, (Get-NextecEstadoServico -Servico $service)) White
+    & $add "Coleta Complementar" $coleta $(if ($versaoColeta) { [ConsoleColor]::White } else { [ConsoleColor]::DarkGray })
+    & $add "Atualizador" $atualizador $(if ($versaoAtualizador) { [ConsoleColor]::White } else { [ConsoleColor]::Yellow })
+    & $add "Pacote Nextec aplicado" (Get-NextecPacoteAplicado) White
     if ($configExists) {
         $atual = $null
         try { $atual = Read-CurrentAlloyConfiguration } catch { $atual = $null }
@@ -1842,11 +1862,11 @@ function Show-MaintenanceStatus {
             if (@($atual.CustomExporters).Count -gt 0) { $ligadas += "exporters" }
             if ($atual.EnableInternet) { $ligadas += "velocidade" }
             if ($atual.EnableColeta) { $ligadas += "internet e links" }
-            Write-Field -Label "Coletas ligadas" -Value $(if ($ligadas.Count -gt 0) { $ligadas -join ", " } else { "nenhuma" }) -ValueColor White
+            & $add "Coletas ligadas" $(if ($ligadas.Count -gt 0) { $ligadas -join ", " } else { "nenhuma" }) White
         }
     }
-    Write-Field -Label "Configuração" -Value $(if ($configExists) { $ConfigFile } else { "não encontrada" }) -ValueColor Gray
-    Write-Host ""
+    & $add "Configuração" $(if ($configExists) { $ConfigFile } else { "não encontrada" }) Gray
+    return $linhas.ToArray()
 }
 
 function Get-NextecPacoteAplicado {
@@ -3090,29 +3110,45 @@ function Invoke-MaintenanceMenu {
     }
 
     Write-Step "Instalação existente detectada"
-    Show-MaintenanceStatus
 
-    $options = @(
-        "Ver e alterar a configuração atual",
-        "Reconfigurar tudo, fluxo completo (identificação, recursos, credenciais)",
-        "Atualizar o Grafana Alloy, mantendo a configuração",
-        "Validar a configuração e reiniciar os serviços",
-        "Cancelar"
-    )
+    # Com área de trabalho, o estado e as opções aparecem numa janela, com a
+    # mesma numeração do menu do console.
+    $inventarioTela = $null
+    if ($script:UsarTela) {
+        $inventarioTela = Get-WindowsInventory
+        $choice = Show-NextecGuiManutencao -Inventory $inventarioTela
+    }
+    else {
+        Show-MaintenanceStatus
 
-    # O default é "Cancelar": as outras opções alteram ou reiniciam o serviço
-    # em um servidor de produção, e ENTER não deve disparar isso.
-    $choice = Read-Choice -Prompt "O que deseja fazer?" -Options $options -Default 5
+        $options = @(
+            "Ver e alterar a configuração atual",
+            "Reconfigurar tudo, fluxo completo (identificação, recursos, credenciais)",
+            "Atualizar o Grafana Alloy, mantendo a configuração",
+            "Validar a configuração e reiniciar os serviços",
+            "Cancelar"
+        )
+
+        # O default é "Cancelar": as outras opções alteram ou reiniciam o
+        # serviço em um servidor de produção, e ENTER não deve disparar isso.
+        $choice = Read-Choice -Prompt "O que deseja fazer?" -Options $options -Default 5
+    }
 
     switch ($choice) {
         1 {
-            Invoke-ConfigurationMenu
+            if ($script:UsarTela) { Invoke-NextecConfiguracaoGui }
+            else { Invoke-ConfigurationMenu }
             return $false
         }
         2 {
             return $true
         }
         3 {
+            if ($script:UsarTela) {
+                Open-NextecGuiProgresso -Inventory $inventarioTela -Titulo "Atualizando o Grafana Alloy"
+                $script:GuiTituloSucesso = "Grafana Alloy atualizado"
+                $script:GuiTituloFalha = "A atualização do Alloy falhou"
+            }
             # ConfigChanged fica falso: esta opção não gera configuração nova,
             # e marcá-la faria o rollback remover a config existente.
             Backup-ExistingConfiguration
@@ -3121,6 +3157,11 @@ function Invoke-MaintenanceMenu {
             return $false
         }
         4 {
+            if ($script:UsarTela) {
+                Open-NextecGuiProgresso -Inventory $inventarioTela -Titulo "Validando e reiniciando"
+                $script:GuiTituloSucesso = "Configuração validada e serviço reiniciado"
+                $script:GuiTituloFalha = "A validação falhou"
+            }
             Backup-ExistingConfiguration
             Format-AndValidateAlloyConfiguration
             Restart-AlloyService
@@ -3129,6 +3170,11 @@ function Invoke-MaintenanceMenu {
             return $false
         }
         5 {
+            if ($script:UsarTela) {
+                Write-Info "Janela fechada sem alterar nada."
+                $script:DispensarEspera = $true
+                return $false
+            }
             throw "Operação cancelada pelo operador."
         }
     }
@@ -8165,7 +8211,7 @@ function Show-GuiEquipamentoSnmp {
     $rSenhaPriv = Add-GuiRotulo $f "Senha de criptografia" 20 497 170 -Obrigatorio
     $senhaPriv = New-GuiTextBox 200 494 280 "" -Senha
     $f.Controls.Add($senhaPriv)
-    $f.Controls.Add((New-GuiLabel "A credencial fica só neste servidor (snmp-auth.yml) e não aparece de novo na tela." 20 530 470 -Dica))
+    $f.Controls.Add((New-GuiLabel "A credencial fica só neste servidor (snmp-auth.yml); na tela aparece mascarada." 20 530 470 -Dica))
 
     $erro = New-GuiLabel "" 20 554 470
     $erro.ForeColor = $script:GuiCores.Erro
@@ -8546,6 +8592,167 @@ function New-GuiCabecalho {
     return $topo
 }
 
+function Show-NextecGuiManutencao {
+    <#
+        Janela inicial quando o monitoramento já está instalado: mostra o
+        estado de cada parte e devolve a opção escolhida, com a numeração do
+        menu do console (1 alterar, 2 reconfigurar, 3 atualizar o Alloy,
+        4 validar e reiniciar, 5 fechar).
+    #>
+    param([Parameter(Mandatory=$true)][object]$Inventory)
+
+    Initialize-GuiCores
+    [Windows.Forms.Application]::EnableVisualStyles()
+    $script:UsouTela = $true
+    Set-NextecConsoleVisivel $false
+    $script:GuiManutencaoEscolha = 5
+
+    $form = New-Object Windows.Forms.Form
+    $form.Text = "Nextec · Monitoramento já instalado"
+    Set-GuiIconeJanela -Form $form
+    $form.Size = New-Object Drawing.Size(900, 580)
+    $form.StartPosition = "CenterScreen"
+    $form.FormBorderStyle = "FixedDialog"
+    $form.MaximizeBox = $false
+    $form.Font = New-Object Drawing.Font("Segoe UI", 9.5)
+    $form.BackColor = [Drawing.Color]::White
+    $form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::None
+
+    $corpo = New-Object Windows.Forms.Panel
+    $corpo.Dock = "Fill"; $corpo.BackColor = [Drawing.Color]::White
+    $form.Controls.Add($corpo)
+    $form.Controls.Add((New-GuiCabecalho -Inventory $Inventory))
+
+    $corpo.Controls.Add((New-GuiLabel "Este computador já tem o monitoramento instalado" 24 16 560 -Titulo))
+    $y = 58
+    foreach ($linha in @(Get-MaintenanceStatusRows)) {
+        $corpo.Controls.Add((New-GuiLabel $linha.Rotulo 24 ($y + 2) 190 -Dica))
+        $valor = New-GuiLabel $linha.Valor 220 $y 370
+        $corpo.Controls.Add($valor)
+        if ($linha.Cor -eq [ConsoleColor]::Yellow) { $valor.ForeColor = [Drawing.Color]::FromArgb(176, 96, 0) }
+        elseif ($linha.Cor -eq [ConsoleColor]::Gray -or $linha.Cor -eq [ConsoleColor]::DarkGray) { $valor.ForeColor = $script:GuiCores.Cinza }
+        # Valor longo (coletas ligadas, caminho) quebra em mais linhas.
+        $medida = [Windows.Forms.TextRenderer]::MeasureText($linha.Valor, $valor.Font, (New-Object Drawing.Size(370, 0)), [Windows.Forms.TextFormatFlags]::WordBreak)
+        $valor.Height = [Math]::Max(22, $medida.Height + 2)
+        $y += [Math]::Max(28, $valor.Height + 6)
+    }
+
+    $acoes = @(
+        @(1, "Ver e alterar a configuração", "Abre as abas já preenchidas com a configuração atual.", $true),
+        @(2, "Reconfigurar do zero", "Abre as abas como numa instalação nova.", $false),
+        @(3, "Atualizar o Grafana Alloy", "Troca só a versão do Alloy; a configuração fica.", $false),
+        @(4, "Validar e reiniciar", "Confere a configuração e reinicia o serviço do Alloy.", $false)
+    )
+    $yBotao = 58
+    foreach ($acao in $acoes) {
+        $botao = New-GuiBotao $acao[1] 610 $yBotao 250 -Principal:($acao[3])
+        $botao.Tag = $acao[0]
+        $botao.Add_Click({
+            param($s, $e)
+            $script:GuiManutencaoEscolha = [int]$s.Tag
+            $s.FindForm().Close()
+        })
+        $corpo.Controls.Add($botao)
+        $dica = New-GuiLabel $acao[2] 610 ($yBotao + 36) 260 -Dica
+        $dica.Height = 34
+        $corpo.Controls.Add($dica)
+        $yBotao += 84
+    }
+    $fechar = New-GuiBotao "Fechar sem alterar" 610 $yBotao 250
+    $fechar.Add_Click({ param($s, $e) $script:GuiManutencaoEscolha = 5; $s.FindForm().Close() })
+    $corpo.Controls.Add($fechar)
+    $form.CancelButton = $fechar
+
+    Set-GuiEscala -Controle $form
+    $form.Add_Shown({ param($s, $e) $s.Activate() })
+    [void]$form.ShowDialog()
+    $form.Dispose()
+    return $script:GuiManutencaoEscolha
+}
+
+function ConvertFrom-SnmpAuthYaml {
+    <#
+        Lê um bloco da seção "auths" (como Get-SnmpAuthBlocksFromFile devolve)
+        e monta a credencial no formato da janela do equipamento. Devolve
+        $null quando o bloco usa algo que a janela não representa; nesse caso
+        o bloco é mantido como está.
+    #>
+    param([Parameter(Mandatory=$true)][string]$Bloco)
+
+    $campos = @{}
+    foreach ($linha in @($Bloco -split "`r?`n" | Select-Object -Skip 1)) {
+        $m = [Regex]::Match($linha, '^\s+([A-Za-z_]+)\s*:\s*(.*?)\s*$')
+        if (-not $m.Success) { continue }
+        $valor = $m.Groups[2].Value
+        if ($valor.Length -ge 2 -and $valor.StartsWith("'") -and $valor.EndsWith("'")) {
+            $valor = $valor.Substring(1, $valor.Length - 2).Replace("''", "'")
+        }
+        elseif ($valor.Length -ge 2 -and $valor.StartsWith('"') -and $valor.EndsWith('"')) {
+            $valor = $valor.Substring(1, $valor.Length - 2)
+        }
+        $campos[$m.Groups[1].Value.ToLowerInvariant()] = $valor
+    }
+
+    $versao = [string]$campos["version"]
+    if (@("2", "2c", "v2c") -contains $versao) {
+        if ([string]::IsNullOrEmpty([string]$campos["community"])) { return $null }
+        return [pscustomobject]@{ Versao = "v2c"; Community = [string]$campos["community"] }
+    }
+    if (@("3", "v3") -notcontains $versao) { return $null }
+
+    $usuario = [string]$campos["username"]
+    $senhaAuth = [string]$campos["password"]
+    $protAuth = $(if ($campos["auth_protocol"]) { [string]$campos["auth_protocol"] } else { "SHA" })
+    $nivel = $(if ([string]$campos["security_level"] -eq "authNoPriv") { "authNoPriv" } else { "authPriv" })
+    $protPriv = $(if ($campos["priv_protocol"]) { [string]$campos["priv_protocol"] } else { "AES" })
+    $senhaPriv = [string]$campos["priv_password"]
+    if (-not $usuario -or -not $senhaAuth) { return $null }
+    if (@("SHA", "SHA256", "SHA512", "MD5") -notcontains $protAuth) { return $null }
+    if ($nivel -eq "authPriv" -and (-not $senhaPriv -or @("AES", "AES256", "DES") -notcontains $protPriv)) { return $null }
+
+    return [pscustomobject]@{
+        Versao = "v3"; Usuario = $usuario; Nivel = $nivel
+        ProtocoloAuth = $protAuth; SenhaAuth = $senhaAuth
+        ProtocoloPriv = $(if ($nivel -eq "authPriv") { $protPriv } else { "" })
+        SenhaPriv = $(if ($nivel -eq "authPriv") { $senhaPriv } else { "" })
+    }
+}
+
+function Invoke-NextecConfiguracaoGui {
+    <#
+        "Ver e alterar" com área de trabalho: abre as abas preenchidas com a
+        configuração instalada e, ao confirmar, regrava tudo pelo mesmo
+        caminho do menu do console (Save-ReconfiguredAlloy).
+    #>
+    $configuracao = Read-CurrentAlloyConfiguration
+    if ($null -eq $configuracao -or [string]::IsNullOrWhiteSpace([string]$configuracao.Cliente)) {
+        throw ("Não foi possível ler a configuração atual em {0}. Rode de novo e use Reconfigurar do zero." -f $ConfigFile)
+    }
+
+    $inventario = Import-CurrentConfiguration -Configuration $configuracao
+    $destino = [Regex]::Match([string]$script:RemoteWriteUrl, '^https?://([^/]+)')
+    if ($destino.Success) { $script:NocHost = $destino.Groups[1].Value }
+    $script:SnmpSourceFile = $null
+
+    if (-not (Show-NextecInstallerGui -Inventory $inventario -DetectedFeatures @($script:DetectedHostFeatures) -Edicao)) {
+        Write-Info "Tela fechada sem alterar nada."
+        $script:DispensarEspera = $true
+        return
+    }
+
+    Open-NextecGuiProgresso -Inventory $inventario -Titulo "Aplicando as alterações"
+    $script:GuiTituloSucesso = "Configuração atualizada"
+    $script:GuiTituloFalha = "A alteração falhou; a configuração anterior foi mantida"
+
+    if ($script:EnableSnmpResolved -and @($script:GuiFabricantesSnmp).Count -gt 0) {
+        $script:SnmpSourceFile = Get-NextecSnmpVendorFiles -Arquivos $script:GuiFabricantesSnmp
+    }
+    Save-ReconfiguredAlloy -Inventory $inventario
+    Invoke-NextecOptionalStep -Nome "Atualizador automático" -Acao {
+        Install-Atualizador
+    } | Out-Null
+}
+
 function Show-NextecInstallerGui {
     <#
         Abre a tela de instalação e preenche as mesmas variáveis que o fluxo
@@ -8554,7 +8761,9 @@ function Show-NextecInstallerGui {
     #>
     param(
         [Parameter(Mandatory=$true)][object]$Inventory,
-        [Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$DetectedFeatures
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$DetectedFeatures,
+        # Abre preenchida com a configuração instalada (Import-CurrentConfiguration).
+        [switch]$Edicao
     )
 
     Initialize-GuiCores
@@ -8569,10 +8778,33 @@ function Show-NextecInstallerGui {
     # Com Set-StrictMode, ler chave que não existe no hashtable dá erro: toda
     # chave lida por um evento precisa nascer aqui.
     $g.Ocupado = $false
+    $g.Edicao = [bool]$Edicao
+    # Marcação inicial da árvore na edição, por chave do item. Nula na
+    # instalação nova, que usa os padrões de cada item.
+    $g.Inicial = $null
+    if ($Edicao) {
+        $inicial = @{
+            logs = [bool]$script:EnableLogsResolved
+            logs_warning = [bool]$script:EnableLogWarningsResolved
+            security = [bool]$script:EnableSecurityLogsResolved
+            snmp = [bool]$script:EnableSnmpResolved
+            blackbox = [bool]$script:EnableBlackboxResolved
+            internet = [bool]$script:EnableInternetResolved
+            coleta = [bool]$script:EnableColetaResolved
+            exporter = (@($script:CustomExporters).Count -gt 0)
+        }
+        foreach ($ft in @($DetectedFeatures)) { $inicial[("feature:{0}" -f $ft.Key)] = (@($script:SelectedHostFeatureKeys) -contains $ft.Key) }
+        $chavesCatalogo = @((Get-NextecExporterCatalog) | Where-Object { $_.Key -ne "custom" } | ForEach-Object { $_.Key })
+        foreach ($ce in @($script:CustomExporters)) {
+            if ($chavesCatalogo -contains [string]$ce.Name) { $inicial[("exporter:{0}" -f $ce.Name)] = $true }
+            else { $inicial["exporter:custom"] = $true }
+        }
+        $g.Inicial = $inicial
+    }
     $estacao = ($Inventory.ProductType -eq 1)
 
     $form = New-Object Windows.Forms.Form
-    $form.Text = "Nextec · Instalação do monitoramento"
+    $form.Text = $(if ($Edicao) { "Nextec · Alterar a configuração do monitoramento" } else { "Nextec · Instalação do monitoramento" })
     Set-GuiIconeJanela -Form $form
     $form.Size = New-Object Drawing.Size(900, 680)
     $form.MinimumSize = New-Object Drawing.Size(900, 680)
@@ -8646,6 +8878,7 @@ function Show-NextecInstallerGui {
         "servidor_collector" { $indiceModo = 2 }
         "estacao_collector" { $indiceModo = 2 }
     }
+    if ($Edicao) { $indiceModo = $(if (-not $script:MonitorHost) { 1 } elseif ($script:Collector) { 2 } else { 0 }) }
     $p.Controls.Add((New-GuiLabel "Função deste Alloy" 24 277 200))
     $g.Modo = New-GuiCombo 230 274 420 $modos $indiceModo
     $p.Controls.Add($g.Modo)
@@ -8676,6 +8909,7 @@ function Show-NextecInstallerGui {
     $g.Intervalo.Location = New-Object Drawing.Point(604, 104)
     $g.Intervalo.Minimum = 5; $g.Intervalo.Maximum = 1440
     $g.Intervalo.Value = [Math]::Max(5, [int]$InternetIntervalMinutes)
+    if ($Edicao -and [int]$script:InternetIntervalMinutesResolved -ge 5) { $g.Intervalo.Value = [Math]::Min(1440, [int]$script:InternetIntervalMinutesResolved) }
     $p.Controls.Add($g.Intervalo)
     $g.IntervaloDica = New-GuiLabel "Recomendado: 30 min." 604 134 250 -Dica
     $p.Controls.Add($g.IntervaloDica)
@@ -8803,6 +9037,23 @@ function Show-NextecInstallerGui {
     $b1.Add_Click({ $i = $script:Gui.Blackbox.Rows.Add(); $script:Gui.Blackbox.Rows[$i].Cells["modulo"].Value = @($script:GuiModulosBlackbox.Values)[0]; $script:Gui.Blackbox.Rows[$i].Cells["tipo"].Value = "firewall" })
     $b2.Add_Click({ if ($null -ne $script:Gui.Blackbox.CurrentRow) { $script:Gui.Blackbox.Rows.Remove($script:Gui.Blackbox.CurrentRow) } })
     $p.Controls.Add($b1); $p.Controls.Add($b2)
+    if ($Edicao) {
+        $iIntervalo = [Array]::IndexOf(@(10, 15, 30, 60), [int]$script:BlackboxIntervalSecondsResolved)
+        if ($iIntervalo -ge 0) { $g.IntervaloBlackbox.SelectedIndex = $iIntervalo }
+        foreach ($alvo in @($script:BlackboxTargets)) {
+            $r = $g.Blackbox.Rows[$g.Blackbox.Rows.Add()]
+            $r.Cells["nome"].Value = [string]$alvo.Name
+            $r.Cells["endereco"].Value = [string]$alvo.Address
+            # Teste ou tipo fora da lista da tela entram na lista, para não
+            # trocar em silêncio o que já está configurado.
+            $teste = $(if ($script:GuiModulosBlackbox.Contains([string]$alvo.Module)) { $script:GuiModulosBlackbox[[string]$alvo.Module] } elseif ($alvo.Module) { [string]$alvo.Module } else { @($script:GuiModulosBlackbox.Values)[0] })
+            if (-not $g.Blackbox.Columns["modulo"].Items.Contains($teste)) { [void]$g.Blackbox.Columns["modulo"].Items.Add($teste) }
+            $r.Cells["modulo"].Value = $teste
+            $tipoAlvo = $(if ($alvo.Type) { [string]$alvo.Type } else { "firewall" })
+            if (-not $g.Blackbox.Columns["tipo"].Items.Contains($tipoAlvo)) { [void]$g.Blackbox.Columns["tipo"].Items.Add($tipoAlvo) }
+            $r.Cells["tipo"].Value = $tipoAlvo
+        }
+    }
 
     # ---------------- SNMP ----------------
     $p = New-Object Windows.Forms.TabPage; $p.Text = "SNMP"; $p.BackColor = [Drawing.Color]::White
@@ -8819,6 +9070,9 @@ function Show-NextecInstallerGui {
     Add-GuiColunaTexto $g.Snmp "fabricante" "Fabricante" 70
     Add-GuiColunaTexto $g.Snmp "tipo" "Tipo" 60
     Add-GuiColunaTexto $g.Snmp "credencial" "Credencial" 90
+    # Módulo já configurado: vale quando o fabricante não está no catálogo.
+    Add-GuiColunaTexto $g.Snmp "modulo_atual" "" 10
+    $g.Snmp.Columns["modulo_atual"].Visible = $false
     $p.Controls.Add($g.Snmp)
     $p.Controls.Add((New-GuiLabel "Fabricante fora da lista? Solicite ao NOC a inclusão do fabricante antes de cadastrar o equipamento." 24 368 820 -Dica))
 
@@ -8837,9 +9091,13 @@ function Show-NextecInstallerGui {
         $gg = $script:Gui
         $linha = $gg.Snmp.CurrentRow
         if ($null -eq $linha) { $gg.Erro.Text = "Selecione um equipamento na lista."; return }
+        # Credencial mantida como texto (Bruto) não abre na janela: editar
+        # pede a credencial de novo.
+        $credAtual = $linha.Tag
+        if ($null -ne $credAtual -and $null -ne $credAtual.PSObject.Properties["Bruto"]) { $credAtual = $null }
         $atual = [pscustomobject]@{
             Nome = Get-GuiCelula $linha "nome"; Endereco = Get-GuiCelula $linha "endereco"
-            Fabricante = Get-GuiCelula $linha "fabricante"; Tipo = Get-GuiCelula $linha "tipo"; Credencial = $linha.Tag
+            Fabricante = Get-GuiCelula $linha "fabricante"; Tipo = Get-GuiCelula $linha "tipo"; Credencial = $credAtual
         }
         $eq = Show-GuiEquipamentoSnmp -Atual $atual
         if ($null -ne $eq) { & $gg.GravarEquipamento $linha $eq; $gg.Erro.Text = "" }
@@ -8860,6 +9118,31 @@ function Show-NextecInstallerGui {
     $b3.Add_Click({ & $script:Gui.EditarEquipamento })
     $b2.Add_Click({ if ($null -ne $script:Gui.Snmp.CurrentRow) { $script:Gui.Snmp.Rows.Remove($script:Gui.Snmp.CurrentRow) } })
     $p.Controls.Add($b1); $p.Controls.Add($b3); $p.Controls.Add($b2)
+    if ($Edicao) {
+        $authsAtuais = @{}
+        foreach ($bloco in @(Get-SnmpAuthBlocksFromFile -Path $SnmpAuthFile)) { $authsAtuais[(Get-SnmpAuthBlockName -Block $bloco)] = $bloco }
+        foreach ($alvo in @($script:SnmpTargets)) {
+            $rotuloFabricante = [string]$alvo.Os
+            foreach ($k in $NextecSnmpVendors.Keys) {
+                if ([IO.Path]::GetFileNameWithoutExtension($NextecSnmpVendors[$k].File) -eq [string]$alvo.Os) { $rotuloFabricante = $NextecSnmpVendors[$k].Label }
+            }
+            $r = $g.Snmp.Rows[$g.Snmp.Rows.Add()]
+            $r.Cells["nome"].Value = [string]$alvo.Name
+            $r.Cells["endereco"].Value = [string]$alvo.Address
+            $r.Cells["fabricante"].Value = $rotuloFabricante
+            $r.Cells["tipo"].Value = [string]$alvo.Type
+            $r.Cells["modulo_atual"].Value = [string]$alvo.Module
+            $cred = $null
+            if ($authsAtuais.ContainsKey([string]$alvo.Auth)) {
+                $cred = ConvertFrom-SnmpAuthYaml -Bloco $authsAtuais[[string]$alvo.Auth]
+                if ($null -eq $cred) { $cred = [pscustomobject]@{ Versao = ""; Bruto = $authsAtuais[[string]$alvo.Auth] } }
+            }
+            if ($null -eq $cred) { $r.Cells["credencial"].Value = "falta (editar)" }
+            elseif ($null -ne $cred.PSObject.Properties["Bruto"]) { $r.Cells["credencial"].Value = "atual (mantida)" }
+            else { $r.Cells["credencial"].Value = $(if ($cred.Versao -eq "v2c") { "v2c (community)" } else { "v3, {0}" -f $cred.Nivel }) }
+            $r.Tag = $cred
+        }
+    }
 
     # ---------------- Exporters ----------------
     $p = New-Object Windows.Forms.TabPage; $p.Text = "Exporters"; $p.BackColor = [Drawing.Color]::White
@@ -8923,6 +9206,11 @@ function Show-NextecInstallerGui {
         Set-GuiVisivel @($gg.RotuloLokiUser, $gg.LokiUser, $gg.RotuloLokiSenha, $gg.LokiSenha) (-not $gg.MesmaLoki.Checked)
     }
     $g.MesmaLoki.Add_CheckedChanged({ & $script:Gui.AtualizarLoki })
+    if ($Edicao -and $script:LokiUsername -and ($script:LokiUsername -ne $script:RwUsername -or $script:LokiPassword -ne $script:RwPassword)) {
+        $g.MesmaLoki.Checked = $false
+        $g.LokiUser.Text = [string]$script:LokiUsername
+        $g.LokiSenha.Text = [string]$script:LokiPassword
+    }
     & $g.AtualizarLoki
 
     # ---------------- Resumo ----------------
@@ -8952,6 +9240,7 @@ function Show-NextecInstallerGui {
         $gg.Arvore.Nodes.Clear()
         $novo = {
             param($Pai, [string]$Chave, [string]$Texto, [bool]$Padrao)
+            if ($null -ne $gg.Inicial -and $gg.Inicial.ContainsKey($Chave)) { $Padrao = [bool]$gg.Inicial[$Chave] }
             $n = New-Object Windows.Forms.TreeNode($Texto)
             $n.Name = $Chave
             $n.Checked = $(if ($primeira -or -not $marcados.ContainsKey($Chave)) { $Padrao } else { [bool]$marcados[$Chave] })
@@ -9117,6 +9406,9 @@ function Show-NextecInstallerGui {
                 if ($nomes -contains $nome) { return "Equipamento ${n}: nome repetido ($nome)." }
                 $nomes += $nome
                 if (-not (Test-NextecHost (Get-GuiCelula $r "endereco"))) { return "Equipamento ${n}: IP ou FQDN inválido." }
+                $fabricanteOk = $false
+                foreach ($k in $NextecSnmpVendors.Keys) { if ($NextecSnmpVendors[$k].Label -eq (Get-GuiCelula $r "fabricante")) { $fabricanteOk = $true } }
+                if (-not $fabricanteOk -and -not (Get-GuiCelula $r "modulo_atual")) { return "Equipamento ${n}: escolha o fabricante. Selecione a linha e clique em Editar selecionado." }
                 if ($null -eq $r.Tag) { return "Equipamento ${n}: falta a credencial. Selecione a linha e clique em Editar selecionado." }
             }
         }
@@ -9141,7 +9433,7 @@ function Show-NextecInstallerGui {
         $i = $gg.Abas.SelectedIndex
         $gg.Voltar.Enabled = ($i -gt 0)
         if ($gg.Abas.SelectedTab -eq $gg.PaginaResumo) {
-            $gg.Avancar.Text = $(if ($Simular) { "Concluir simulação" } else { "Instalar" })
+            $gg.Avancar.Text = $(if ($Simular) { "Concluir simulação" } elseif ($gg.Edicao) { "Aplicar alterações" } else { "Instalar" })
             $gg.Resumo.Text = (Get-GuiResumo)
         }
         else {
@@ -9183,6 +9475,23 @@ function Show-NextecInstallerGui {
     Set-GuiEscala -Controle $form
     & $g.MontarArvore
     & $g.MontarAbas
+    if ($Edicao) {
+        # Serviço do catálogo volta na linha dele; os demais em linhas livres.
+        foreach ($ce in @($script:CustomExporters)) {
+            $linha = $null
+            foreach ($r in $g.Exporters.Rows) { if ([string]$r.Tag -eq [string]$ce.Name) { $linha = $r } }
+            if ($null -eq $linha) {
+                foreach ($r in $g.Exporters.Rows) { if ($null -eq $linha -and [string]$r.Tag -eq "custom" -and -not (Get-GuiCelula $r "nome")) { $linha = $r } }
+            }
+            if ($null -eq $linha) {
+                $linha = $g.Exporters.Rows[$g.Exporters.Rows.Add()]
+                $linha.Tag = "custom"
+            }
+            if ([string]$linha.Tag -eq "custom") { $linha.Cells["nome"].Value = [string]$ce.Name }
+            $linha.Cells["alvo"].Value = [string]$ce.Target
+            $linha.Cells["servico"].Value = [string]$ce.Service
+        }
+    }
     & $g.AtualizarRodape
     $form.Add_Shown({ $script:Gui.Form.Activate(); [void]$script:Gui.Cliente.Focus() })
     [void]$form.ShowDialog()
@@ -9309,8 +9618,9 @@ function Set-NextecConfigurationFromGui {
         foreach ($r in $gg.Blackbox.Rows) { $n = Get-GuiSlug (Get-GuiCelula $r "nome"); $contagem[$n] = 1 + [int]$contagem[$n] }
         foreach ($r in $gg.Blackbox.Rows) {
             $n = Get-GuiSlug (Get-GuiCelula $r "nome")
-            $modulo = $moduloPorTexto[(Get-GuiCelula $r "modulo")]
-            if (-not $modulo) { $modulo = "icmp_ipv4" }
+            $textoTeste = Get-GuiCelula $r "modulo"
+            $modulo = $moduloPorTexto[$textoTeste]
+            if (-not $modulo) { $modulo = $(if ($textoTeste) { $textoTeste } else { "icmp_ipv4" }) }
             $nomeFinal = $(if ($contagem[$n] -gt 1) { "{0}_{1}" -f $n, $script:GuiSufixoBlackbox[$modulo] } else { $n })
             $script:BlackboxTargets += [pscustomobject]@{ Name = $nomeFinal; Address = Get-GuiCelula $r "endereco"; Module = $modulo; Type = Get-GuiCelula $r "tipo" }
         }
@@ -9326,14 +9636,33 @@ function Set-NextecConfigurationFromGui {
         foreach ($k in $NextecSnmpVendors.Keys) { $chavePorRotulo[$NextecSnmpVendors[$k].Label] = $k }
         foreach ($r in $gg.Snmp.Rows) {
             $nome = (Get-GuiSlug (Get-GuiCelula $r "nome")) -replace "[-.]", "_"
-            $vendor = $NextecSnmpVendors[$chavePorRotulo[(Get-GuiCelula $r "fabricante")]]
-            $base = [IO.Path]::GetFileNameWithoutExtension($vendor.File)
+            $rotulo = Get-GuiCelula $r "fabricante"
+            $vendor = $null
+            if ($chavePorRotulo.ContainsKey($rotulo)) { $vendor = $NextecSnmpVendors[$chavePorRotulo[$rotulo]] }
             $cred = $r.Tag
-            $auth = "{0}_{1}" -f $nome, $cred.Versao
-            $script:SnmpAuthBlocks += (ConvertTo-SnmpAuthYaml -Nome $auth -Credencial $cred)
-            if ($script:GuiFabricantesSnmp -notcontains $vendor.File) { $script:GuiFabricantesSnmp += $vendor.File }
+            $mantida = ($null -ne $cred.PSObject.Properties["Bruto"])
+            if ($mantida) {
+                # Credencial que a janela não representa: o bloco segue igual.
+                $auth = Get-SnmpAuthBlockName -Block $cred.Bruto
+                $script:SnmpAuthBlocks += $cred.Bruto
+            }
+            else {
+                $auth = "{0}_{1}" -f $nome, $cred.Versao
+                $script:SnmpAuthBlocks += (ConvertTo-SnmpAuthYaml -Nome $auth -Credencial $cred)
+            }
+            if ($null -ne $vendor -and -not $mantida) {
+                $base = [IO.Path]::GetFileNameWithoutExtension($vendor.File)
+                $modulo = "{0}_{1}" -f $base, $cred.Versao
+                if ($script:GuiFabricantesSnmp -notcontains $vendor.File) { $script:GuiFabricantesSnmp += $vendor.File }
+            }
+            else {
+                # Fabricante fora do catálogo ou credencial mantida: continua
+                # com o módulo que já estava configurado.
+                $base = $(if ($null -ne $vendor) { [IO.Path]::GetFileNameWithoutExtension($vendor.File) } else { $rotulo })
+                $modulo = Get-GuiCelula $r "modulo_atual"
+            }
             $script:SnmpTargets += [pscustomobject]@{
-                Name = $nome; Address = Get-GuiCelula $r "endereco"; Module = ("{0}_{1}" -f $base, $cred.Versao)
+                Name = $nome; Address = Get-GuiCelula $r "endereco"; Module = $modulo
                 Auth = $auth; Type = Get-GuiCelula $r "tipo"; Os = $base
             }
         }
@@ -9608,9 +9937,9 @@ finally {
             if ($script:ExitCode -eq 0) { Complete-NextecGuiProgresso -Sucesso $true -Titulo "Simulação concluída" -Mensagem "Nada foi instalado neste computador. Pode fechar." }
             else { Complete-NextecGuiProgresso -Sucesso $false -Titulo "A simulação parou com erro" -Mensagem "Veja a mensagem em vermelho acima." }
         }
-        elseif ($script:ExitCode -eq 0) { Complete-NextecGuiProgresso -Sucesso $true -Titulo "Instalação concluída" -Mensagem ("Confira o resumo acima.{0}" -f $logTexto) }
+        elseif ($script:ExitCode -eq 0) { Complete-NextecGuiProgresso -Sucesso $true -Titulo $(if ($script:GuiTituloSucesso) { $script:GuiTituloSucesso } else { "Instalação concluída" }) -Mensagem ("Confira o resumo acima.{0}" -f $logTexto) }
         elseif ($script:ExitCode -eq 2) { Complete-NextecGuiProgresso -Sucesso $true -Titulo "Instalação concluída com pendências" -Mensagem ("O monitoramento básico está ativo; veja os avisos acima.{0}" -f $logTexto) }
-        else { Complete-NextecGuiProgresso -Sucesso $false -Titulo "A instalação falhou" -Mensagem ("Veja a mensagem em vermelho acima.{0}" -f $logTexto) }
+        else { Complete-NextecGuiProgresso -Sucesso $false -Titulo $(if ($script:GuiTituloFalha) { $script:GuiTituloFalha } else { "A instalação falhou" }) -Mensagem ("Veja a mensagem em vermelho acima.{0}" -f $logTexto) }
     }
     Set-NextecConsoleVisivel $true
 
@@ -9618,7 +9947,7 @@ finally {
     # duplo clique ou atalho fecha assim que o script retorna. Quando o
     # trabalho foi delegado a outra sessão, quem espera o operador é ela; com a
     # tela, quem esperou foi a janela de andamento.
-    if (-not $Silent -and -not $script:Relaunched -and -not $script:UsouProgresso) {
+    if (-not $Silent -and -not $script:Relaunched -and -not $script:UsouProgresso -and -not $script:DispensarEspera) {
         Wait-NextecOperator
     }
     Restore-NextecConsoleTheme
