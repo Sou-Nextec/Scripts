@@ -54,8 +54,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
+            Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          }
       - name: Sintaxe e achados de severidade Error
         shell: pwsh
+        env:
+          EXIGIR_PSSA: "1"
         run: ./.github/scripts/validar_powershell.ps1
 
   powershell-51:

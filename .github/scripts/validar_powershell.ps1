@@ -20,7 +20,13 @@ foreach ($arquivo in $arquivos) {
     }
 }
 
-if (Get-Module -ListAvailable -Name PSScriptAnalyzer) {
+$temAnalisador = [bool](Get-Module -ListAvailable -Name PSScriptAnalyzer)
+if (-not $temAnalisador -and $env:EXIGIR_PSSA -eq '1') {
+    $falhas++
+    Write-Host "::error::PSScriptAnalyzer não está instalado."
+}
+if ($temAnalisador) {
+    Write-Host "PSScriptAnalyzer: severidade Error"
     foreach ($arquivo in $arquivos) {
         foreach ($achado in @(Invoke-ScriptAnalyzer -Path $arquivo -Severity Error)) {
             $falhas++
