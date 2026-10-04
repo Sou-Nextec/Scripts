@@ -10,10 +10,30 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.5.4 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.6.0 |
 | Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.15.4 |
 | Coleta Complementar | `coleta-complementar/` | 1.2.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
+
+## 2026-10-04
+
+### Instalador Linux 2.6.0
+
+- **SNMP por fabricante.** O técnico escolhe FortiGate, SonicWall, pfSense ou MikroTik e o instalador baixa o módulo homologado do repositório, como no Windows. Sem acesso ao GitHub, aceita o arquivo local. "Outro" usa um snmp.yml próprio.
+- **Credencial SNMP separada.** Community ou usuário SNMPv3 são perguntados na instalação, sem aparecer na tela, e ficam só em `/etc/alloy/snmp-auth.yml`. O `snmp.yml` guarda só os módulos e junta os fabricantes do mesmo servidor.
+- **Instalação antiga.** O snmp.yml com módulo e credencial juntos é separado sozinho na próxima alteração. Sem alteração, continua funcionando como está.
+- **Conferência antes de aplicar.** Equipamento com módulo ou credencial que não existe para o instalador, em vez de subir sem coletar.
+- **Nome do equipamento.** Hífen e ponto viram sublinhado: o nome é rótulo no config.alloy, e "fw-matriz" quebrava a validação.
+- **Intervalo do SNMP.** Coleta a cada 120 s com 60 s de limite, igual ao Windows. Walk em equipamento de entrada passa de 30 s.
+- **Exporters em árvore.** "Exporters adicionais" abre no próprio checklist com o catálogo (Redis, Nginx, Apache, RabbitMQ, Elasticsearch, MongoDB, NVIDIA DCGM e outro endpoint). Depois o instalador pergunta só o endereço dos marcados, com o padrão pronto. Na alteração, desmarcar tira o exporter e os que continuam marcados não são perguntados de novo.
+
+### Módulos SNMP (`snmp/`)
+
+- **SonicWall.** Módulo novo: CPU, memória, conexões, interfaces e firmware.
+- **FortiGate.** Ganhou interfaces com nome, tráfego de 64 bits, erros e velocidade, túneis IPsec, usuários da VPN SSL e versão do FortiOS. A taxa de sessões lia o OID errado.
+- **MikroTik.** CPU e memória passam a vir da HOST-RESOURCES-MIB: o OID usado antes era o do firmware. Ganhou as mesmas métricas de interface.
+- **Gerador.** `gerar_modulos.py` gera os três arquivos com os nomes que o painel Nextec | Firewall usa. Instruções em `snmp/README.md`.
+- O instalador Windows baixa os mesmos arquivos quando o fabricante ainda não está instalado no host. O SonicWall entra no catálogo do Windows na próxima versão dele.
 
 ## 2026-10-03
 

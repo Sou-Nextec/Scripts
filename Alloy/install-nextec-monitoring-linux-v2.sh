@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.5.4 (Exporters com opção Voltar; criticidade alto e modo servidor como padrão)
+# Versão: 2.6.0 (Catálogo SNMP por fabricante com credencial separada; exporters em árvore no checklist)
 #
 # USO
 # ---
@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.5.4"
+INSTALLER_VERSION="2.6.0"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -67,6 +67,10 @@ CONFIG_FILE="${CONFIG_DIR}/config.alloy"
 BACKUP_DIR="${CONFIG_DIR}/backup"
 BLACKBOX_FILE="${CONFIG_DIR}/blackbox.yml"
 SNMP_FILE="${CONFIG_DIR}/snmp.yml"
+# Credenciais SNMP do cliente, separadas do módulo do fabricante (público).
+SNMP_AUTH_FILE="${CONFIG_DIR}/snmp-auth.yml"
+# snmp.yml homologados por fabricante. Pode ser sobrescrita para testar uma branch.
+SNMP_REPO_URL="${SNMP_REPO_URL:-https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Alloy/snmp}"
 
 # Coleta Complementar Nextec: completa o que o Alloy não coleta sozinho.
 # COLETA_URL pode ser sobrescrita por variável de ambiente para testar uma branch.
@@ -1853,16 +1857,38 @@ EOF
 
 // -----------------------------------------------------------------------------
 // SNMP DE REDE, OPCIONAL
-// O arquivo nextec-snmp.yml deve ser homologado para os equipamentos escolhidos.
+// Módulos do fabricante em snmp.yml (homologados no repositório Nextec).
 // -----------------------------------------------------------------------------
+EOF
+      # Módulo do fabricante e credencial do cliente vivem em arquivos
+      # separados e são unidos em memória pelo Alloy, como no Windows. Sem
+      # snmp-auth.yml (instalação antiga, ainda não regravada), o snmp.yml
+      # traz as duas seções e é lido direto.
+      if [[ -f "$SNMP_AUTH_FILE" ]]; then
+        cat <<EOF
+local.file "snmp_modules" {
+  filename = "${SNMP_FILE}"
+}
+
+local.file "snmp_auth" {
+  filename  = "${SNMP_AUTH_FILE}"
+  is_secret = true
+}
+
+prometheus.exporter.snmp "network" {
+  config = local.file.snmp_auth.content + "\n" + local.file.snmp_modules.content
+EOF
+      else
+        cat <<EOF
 prometheus.exporter.snmp "network" {
   config_file = "${SNMP_FILE}"
 EOF
+      fi
       local item sn_name sn_addr sn_module sn_auth sn_type sn_os
       for item in "${SNMP_TARGETS[@]}"; do
         IFS='|' read -r sn_name sn_addr sn_module sn_auth sn_type sn_os <<<"$item"
         cat <<EOF
-  target "$(alloy_escape "$sn_name")" {
+  target "${sn_name//[^A-Za-z0-9_]/_}" {
     address = "$(alloy_escape "$sn_addr")"
     module  = "$(alloy_escape "$sn_module")"
     auth    = "$(alloy_escape "$sn_auth")"
@@ -1877,11 +1903,13 @@ EOF
       cat <<'EOF'
 }
 
+// Walk SNMP em equipamento de entrada leva de 15 a 45 segundos. Timeout curto
+// é a causa conhecida de up=0 intermitente em firewall.
 prometheus.scrape "snmp" {
   targets         = prometheus.exporter.snmp.network.targets
   forward_to      = [prometheus.remote_write.nextec.receiver]
-  scrape_interval = "60s"
-  scrape_timeout  = "30s"
+  scrape_interval = "120s"
+  scrape_timeout  = "60s"
 }
 EOF
     fi
@@ -1983,6 +2011,265 @@ EOF
   chown root:alloy "$BLACKBOX_FILE" 2>/dev/null || true
 }
 
+# ------------------------------------------------------------------------------
+# SNMP: CATÁLOGO POR FABRICANTE E CREDENCIAL SEPARADA
+# ------------------------------------------------------------------------------
+# O módulo de cada fabricante (o que coletar) vem do repositório Nextec e é
+# público. A credencial (community ou usuário SNMPv3) é do cliente e fica só
+# neste servidor, em snmp-auth.yml. O Alloy junta os dois em memória. É o mesmo
+# desenho do instalador Windows.
+SNMP_FABRICANTES=(fortigate sonicwall pfsense mikrotik)
+SNMP_FABRICANTES_ROTULOS=("FortiGate" "SonicWall" "pfSense" "MikroTik")
+SNMP_AUTH_BLOCKS=()
+SNMP_FONTES=()
+SNMP_TMPDIR=""
+
+snmp_tmpdir() {
+  if [[ -z "$SNMP_TMPDIR" || ! -d "$SNMP_TMPDIR" ]]; then
+    SNMP_TMPDIR="$(mktemp -d)"
+  fi
+  echo "$SNMP_TMPDIR"
+}
+
+# Nomes dos módulos (chaves de "modules:") de um snmp.yml.
+snmp_modulos_do_arquivo() {
+  awk '
+    /^modules[ \t]*:/ { dentro = 1; next }
+    dentro && /^[^ \t#]/ { dentro = 0 }
+    dentro && /^  [A-Za-z0-9_.-]+[ \t]*:[ \t]*$/ { n = $1; sub(/:.*/, "", n); print n }
+  ' "$1"
+}
+
+# Junta a seção "modules" de vários arquivos num só. O último arquivo vence
+# quando o mesmo módulo aparece de novo: baixar o fabricante outra vez traz
+# a versão homologada mais nova.
+snmp_juntar_modulos() {
+  awk '
+    FNR == 1 { dentro = 0; atual = "" }
+    /^modules[ \t]*:/ { dentro = 1; atual = ""; next }
+    dentro && /^[^ \t#]/ { dentro = 0; atual = "" }
+    dentro {
+      if ($0 ~ /^  [A-Za-z0-9_.-]+[ \t]*:[ \t]*$/) {
+        atual = $1; sub(/:.*/, "", atual)
+        if (!(atual in visto)) { visto[atual] = 1; ordem[++n] = atual }
+        corpo[atual] = ""
+      }
+      if (atual != "") corpo[atual] = corpo[atual] $0 "\n"
+    }
+    END {
+      print "# Gerado pelo instalador Nextec. Junta os módulos SNMP dos fabricantes"
+      print "# usados por este servidor. As credenciais ficam em snmp-auth.yml."
+      print "modules:"
+      for (i = 1; i <= n; i++) printf "%s", corpo[ordem[i]]
+    }
+  ' "$@"
+}
+
+snmp_nome_auth() {
+  local linha="${1%%$'\n'*}"
+  linha="${linha#"${linha%%[![:space:]]*}"}"
+  printf '%s' "${linha%%:*}"
+}
+
+# Guarda um bloco de credencial. Mesmo nome substitui o anterior, a não ser
+# que o segundo argumento seja "manter" (credencial já informada vence a lida
+# do disco).
+snmp_guardar_auth() {
+  local novo="$1" modo="${2:-substituir}" nome i
+  nome="$(snmp_nome_auth "$novo")"
+  [[ -n "$nome" ]] || return 0
+  for i in "${!SNMP_AUTH_BLOCKS[@]}"; do
+    if [[ "$(snmp_nome_auth "${SNMP_AUTH_BLOCKS[$i]}")" == "$nome" ]]; then
+      [[ "$modo" == "manter" ]] || SNMP_AUTH_BLOCKS[$i]="$novo"
+      return 0
+    fi
+  done
+  SNMP_AUTH_BLOCKS+=("$novo")
+}
+
+# Lê a seção "auths" de um arquivo (snmp-auth.yml ou o snmp.yml antigo, que
+# trazia módulo e credencial juntos).
+snmp_ler_auths() {
+  local arquivo="$1" modo="${2:-manter}" linha dentro=0 bloco=""
+  [[ -f "$arquivo" ]] || return 0
+  while IFS= read -r linha || [[ -n "$linha" ]]; do
+    linha="${linha%$'\r'}"
+    if (( dentro == 0 )); then
+      [[ "$linha" =~ ^auths[[:space:]]*: ]] && dentro=1
+      continue
+    fi
+    [[ "$linha" =~ ^[^[:space:]#] ]] && break
+    if [[ "$linha" =~ ^\ \ [A-Za-z0-9_.-]+[[:space:]]*:[[:space:]]*$ ]]; then
+      [[ -n "$bloco" ]] && snmp_guardar_auth "$bloco" "$modo"
+      bloco="$linha"
+      continue
+    fi
+    if [[ -n "$bloco" && -n "${linha//[[:space:]]/}" && ! "$linha" =~ ^[[:space:]]*# ]]; then
+      bloco+=$'\n'"$linha"
+    fi
+  done < "$arquivo"
+  [[ -n "$bloco" ]] && snmp_guardar_auth "$bloco" "$modo"
+  return 0
+}
+
+# Valor entre aspas simples no YAML: só a própria aspa precisa ser dobrada.
+# Senha SNMP costuma ter $, ! e #, que quebram aspas duplas.
+yaml_aspas() {
+  local v="$1"
+  printf "'%s'" "${v//\'/\'\'}"
+}
+
+# Segredo com valor padrão (ENTER aceita), sem eco no terminal.
+ask_secret_padrao() {
+  local prompt="$1" padrao="$2" value
+  read -r -s -p "$(pergunta "$prompt" "" "ENTER usa o padrão")" value || entrada_encerrada
+  echo >&2
+  printf '%s' "${value:-$padrao}"
+}
+
+# Monta a credencial do equipamento. Define SNMP_AUTH_NOME e SNMP_VERSAO.
+snmp_ler_credencial() {
+  local equipamento="$1" bloco usuario nivel protocolo senha cripto senha_cripto community
+  choose_padrao "Versão SNMP" 1 "v2c (community)" "v3 (usuário e senha)"
+  if [[ "$CHOOSE_RESULT" == "1" ]]; then
+    SNMP_VERSAO="v2c"
+    SNMP_AUTH_NOME="${equipamento}_v2c"
+    community="$(ask_secret_padrao "Community SNMP" "public")"
+    bloco="  ${SNMP_AUTH_NOME}:"$'\n'"    version: 2"$'\n'"    community: $(yaml_aspas "$community")"
+  else
+    SNMP_VERSAO="v3"
+    SNMP_AUTH_NOME="${equipamento}_v3"
+    usuario="$(ask_required "Usuário SNMPv3" "nextec_monitoramento")"
+    choose_padrao "Nível de segurança" 1 "authPriv (autenticação e criptografia)" "authNoPriv (só autenticação)"
+    nivel="$CHOOSE_RESULT"
+    choose_padrao "Protocolo de autenticação" 1 "SHA" "SHA256" "SHA512" "MD5"
+    case "$CHOOSE_RESULT" in 1) protocolo=SHA;; 2) protocolo=SHA256;; 3) protocolo=SHA512;; 4) protocolo=MD5;; esac
+    senha="$(ask_secret "Senha de autenticação")"
+    bloco="  ${SNMP_AUTH_NOME}:"$'\n'"    version: 3"$'\n'"    username: $(yaml_aspas "$usuario")"
+    bloco+=$'\n'"    auth_protocol: ${protocolo}"$'\n'"    password: $(yaml_aspas "$senha")"
+    if [[ "$nivel" == "1" ]]; then
+      choose_padrao "Protocolo de criptografia" 1 "AES" "AES256" "DES"
+      case "$CHOOSE_RESULT" in 1) cripto=AES;; 2) cripto=AES256;; 3) cripto=DES;; esac
+      senha_cripto="$(ask_secret "Senha de criptografia")"
+      bloco+=$'\n'"    security_level: authPriv"$'\n'"    priv_protocol: ${cripto}"$'\n'"    priv_password: $(yaml_aspas "$senha_cripto")"
+    else
+      bloco+=$'\n'"    security_level: authNoPriv"
+    fi
+  fi
+  snmp_guardar_auth "$bloco"
+}
+
+# Baixa o snmp.yml homologado do fabricante. Sem acesso ao GitHub, aceita um
+# caminho local. Define SNMP_FONTE (vazio se o operador desistir).
+snmp_obter_fabricante() {
+  local fab="$1" destino caminho
+  SNMP_FONTE=""
+  destino="$(snmp_tmpdir)/${fab}.yml"
+  [[ -s "$destino" ]] && { SNMP_FONTE="$destino"; return 0; }
+  info "Baixando o módulo ${fab} do repositório Nextec..."
+  if curl -fsSL --max-time 120 "${SNMP_REPO_URL}/${fab}.yml" -o "$destino" && [[ -n "$(snmp_modulos_do_arquivo "$destino")" ]]; then
+    ok "Módulo ${fab} baixado."
+    SNMP_FONTE="$destino"
+    return 0
+  fi
+  rm -f "$destino"
+  warn "Não foi possível baixar ${SNMP_REPO_URL}/${fab}.yml."
+  while true; do
+    read -r -p "$(pergunta "Caminho local do ${fab}.yml" "" "ENTER desiste")" caminho || entrada_encerrada
+    caminho="$(trim "$caminho")"
+    [[ -z "$caminho" ]] && return 0
+    if [[ -f "$caminho" && -n "$(snmp_modulos_do_arquivo "$caminho")" ]]; then
+      cp "$caminho" "$destino"
+      SNMP_FONTE="$destino"
+      return 0
+    fi
+    warn "Arquivo não encontrado ou sem seção 'modules': ${caminho}"
+  done
+}
+
+collect_snmp_targets() {
+  local choice
+  step "Equipamentos SNMP"
+  info "O módulo do fabricante vem do repositório Nextec. A credencial fica só neste servidor (${SNMP_AUTH_FILE})."
+
+  # Credenciais dos equipamentos já cadastrados continuam valendo.
+  snmp_ler_auths "$SNMP_AUTH_FILE" manter
+  snmp_ler_auths "$SNMP_FILE" manter
+
+  while true; do
+    local sn sa fab sm st sos rotulo_fab caminho
+    local -a modulos=()
+    while true; do
+      sn="$(ask_slug "Nome do equipamento" "" host)"
+      # O nome vira rótulo de bloco no config.alloy, que só aceita letra,
+      # número e sublinhado ("fw-matriz" quebra o validate).
+      sn="${sn//[-.]/_}"
+      nome_existe "$sn" "${SNMP_TARGETS[@]}" || break
+      warn "Já existe um equipamento chamado '${sn}'. Use outro nome."
+    done
+    sa="$(ask_address "IP/FQDN SNMP" "" host)"
+
+    choose_padrao "Fabricante" 1 "${SNMP_FABRICANTES_ROTULOS[@]}" "Outro (snmp.yml próprio)"
+    choice="$CHOOSE_RESULT"
+    if (( choice <= ${#SNMP_FABRICANTES[@]} )); then
+      fab="${SNMP_FABRICANTES[$((choice-1))]}"
+      rotulo_fab="${SNMP_FABRICANTES_ROTULOS[$((choice-1))]}"
+      snmp_obter_fabricante "$fab"
+      if [[ -z "$SNMP_FONTE" ]]; then
+        warn "Equipamento não cadastrado."
+        ask_yes_no "Cadastrar outro equipamento SNMP?" n || break
+        continue
+      fi
+    else
+      fab=""
+      rotulo_fab="Outro"
+      while true; do
+        caminho="$(ask_required "Caminho do snmp.yml (precisa ter a seção 'modules')")"
+        [[ -f "$caminho" && -n "$(snmp_modulos_do_arquivo "$caminho")" ]] && break
+        warn "Arquivo não encontrado ou sem seção 'modules': ${caminho}"
+      done
+      SNMP_FONTE="$(snmp_tmpdir)/proprio-${sn}.yml"
+      cp "$caminho" "$SNMP_FONTE"
+    fi
+
+    snmp_ler_credencial "$sn"
+
+    mapfile -t modulos < <(snmp_modulos_do_arquivo "$SNMP_FONTE")
+    if [[ -n "$fab" ]]; then
+      sm="${fab}_${SNMP_VERSAO}"
+      if ! printf '%s\n' "${modulos[@]}" | grep -qx "$sm"; then
+        err "O arquivo do ${rotulo_fab} não tem o módulo ${sm}."
+        exit 1
+      fi
+    elif (( ${#modulos[@]} == 1 )); then
+      sm="${modulos[0]}"
+    else
+      choose_padrao "Módulo SNMP" 1 "${modulos[@]}"
+      sm="${modulos[$((CHOOSE_RESULT-1))]}"
+    fi
+    info "Módulo aplicado: ${sm}"
+
+    choose_padrao "Tipo do equipamento" 1 "firewall" "switch" "storage" "ap" "ups"
+    choice="$CHOOSE_RESULT"
+    case "$choice" in 1) st=firewall;; 2) st=switch;; 3) st=storage;; 4) st=ap;; 5) st=ups;; esac
+
+    if [[ -n "$fab" ]]; then
+      sos="$fab"
+    else
+      sos="$(ask_slug "Sistema/fabricante" "network" label)"
+    fi
+
+    printf '%s\n' "${SNMP_FONTES[@]}" | grep -qxF "$SNMP_FONTE" || SNMP_FONTES+=("$SNMP_FONTE")
+    SNMP_TARGETS+=("${sn}|${sa}|${sm}|${SNMP_AUTH_NOME}|${st}|${sos}")
+    ok "Equipamento adicionado: ${sn} (${rotulo_fab}, ${sm})"
+    ask_yes_no "Adicionar outro equipamento SNMP?" n || break
+  done
+  return 0
+}
+
+# Grava snmp.yml (módulos) e snmp-auth.yml (credenciais). Credenciais de um
+# snmp.yml antigo, que trazia as duas coisas juntas, passam para o arquivo
+# separado. Só ficam as credenciais usadas por algum equipamento.
 prepare_snmp_config() {
   [[ "$ENABLE_SNMP" == "1" ]] || return 0
   if [[ "$MODO_ATUALIZACAO" == "1" ]]; then
@@ -1992,26 +2279,81 @@ prepare_snmp_config() {
   fi
 
   step "Preparando configuração SNMP"
-  if [[ "$EDICAO" == "1" && -f "$SNMP_FILE" ]] && ask_yes_no "Manter o snmp.yml atual (${SNMP_FILE})?" s; then
-    ok "snmp.yml mantido em ${SNMP_FILE}."
-    return 0
+  snmp_ler_auths "$SNMP_AUTH_FILE" manter
+  snmp_ler_auths "$SNMP_FILE" manter
+
+  local tmp item sn _a sm sau _t _o bloco achou faltando=0
+  local -a usadas=() modulos=()
+
+  if (( ${#SNMP_FONTES[@]} > 0 )); then
+    tmp="$(mktemp)"
+    if [[ -f "$SNMP_FILE" ]]; then
+      snmp_juntar_modulos "$SNMP_FILE" "${SNMP_FONTES[@]}" > "$tmp"
+    else
+      snmp_juntar_modulos "${SNMP_FONTES[@]}" > "$tmp"
+    fi
+    install -m 0640 -o root -g alloy "$tmp" "$SNMP_FILE"
+    rm -f "$tmp"
+    ok "Módulos SNMP gravados em ${SNMP_FILE}: $(snmp_modulos_do_arquivo "$SNMP_FILE" | paste -sd, -)"
+  elif [[ -f "$SNMP_FILE" ]]; then
+    # snmp.yml antigo com credencial junto: regrava só com os módulos.
+    if grep -qE '^auths[[:space:]]*:' "$SNMP_FILE"; then
+      tmp="$(mktemp)"
+      snmp_juntar_modulos "$SNMP_FILE" > "$tmp"
+      install -m 0640 -o root -g alloy "$tmp" "$SNMP_FILE"
+      rm -f "$tmp"
+      ok "Credenciais do snmp.yml movidas para ${SNMP_AUTH_FILE}."
+    else
+      ok "snmp.yml mantido em ${SNMP_FILE}."
+    fi
+  else
+    err "SNMP ligado, mas não há snmp.yml. Cadastre os equipamentos de novo pelo menu."
+    exit 1
   fi
-  warn "SNMP exige um snmp.yml homologado com módulos e autenticações compatíveis."
 
-  local src
-  while true; do
-    src="$(ask_required "Caminho do snmp.yml homologado pela Nextec")"
-    [[ -f "$src" ]] && break
-    warn "Arquivo não encontrado: $src"
+  mapfile -t modulos < <(snmp_modulos_do_arquivo "$SNMP_FILE")
+  for item in "${SNMP_TARGETS[@]}"; do
+    IFS='|' read -r sn _a sm sau _t _o <<<"$item"
+    if ! printf '%s\n' "${modulos[@]}" | grep -qxF "$sm"; then
+      err "O equipamento ${sn} usa o módulo ${sm}, que não está em ${SNMP_FILE}."
+      faltando=1
+    fi
+    achou=0
+    for bloco in "${usadas[@]}"; do
+      [[ "$(snmp_nome_auth "$bloco")" == "$sau" ]] && { achou=1; break; }
+    done
+    if [[ "$achou" == "0" ]]; then
+      for bloco in "${SNMP_AUTH_BLOCKS[@]}"; do
+        if [[ "$(snmp_nome_auth "$bloco")" == "$sau" ]]; then
+          achou=1
+          usadas+=("$bloco")
+          break
+        fi
+      done
+    fi
+    if [[ "$achou" == "0" ]]; then
+      err "O equipamento ${sn} usa a credencial ${sau}, que não foi encontrada. Cadastre o equipamento de novo."
+      faltando=1
+    fi
   done
+  # Módulo ou credencial inexistente passa pelo validate e o Alloy sobe
+  # "saudável", mas o equipamento nunca envia dado. Melhor parar aqui.
+  (( faltando == 0 )) || exit 1
 
-  install -m 0640 -o root -g alloy "$src" "$SNMP_FILE"
-  ok "snmp.yml instalado em ${SNMP_FILE}."
+  tmp="$(mktemp)"
+  {
+    echo "# Gerado pelo instalador Nextec. Credenciais SNMP deste cliente: não copie para o repositório."
+    echo "auths:"
+    for bloco in "${usadas[@]}"; do printf '%s\n' "$bloco"; done
+  } > "$tmp"
+  install -m 0640 -o root -g alloy "$tmp" "$SNMP_AUTH_FILE"
+  rm -f "$tmp"
+  ok "Credenciais SNMP gravadas em ${SNMP_AUTH_FILE} (${#usadas[@]})."
+  [[ -n "$SNMP_TMPDIR" ]] && rm -rf "$SNMP_TMPDIR"
+  SNMP_TMPDIR=""
+  return 0
 }
 
-# ------------------------------------------------------------------------------
-# VALIDAÇÃO E START
-# ------------------------------------------------------------------------------
 validate_and_start() {
   step "Validando e iniciando Alloy"
 
@@ -2121,6 +2463,15 @@ resource_checklist() {
     "Acessos ao servidor (logins com origem, alerta de acesso privilegiado)"
   )
   local -a details=("" "" "" "" "" "" "recomendado" "recomendado" "recomendado")
+
+  # "Exporters adicionais" é uma categoria em árvore, igual ao Windows: abre
+  # e mostra o catálogo como itens filhos. O item pai não é marcado direto;
+  # ele fica marcado quando algum filho está.
+  local pai_exporters=5 expandido=0
+  local -a filho_sel=()
+  local j
+  for j in "${!EXPORTER_CATALOGO_CHAVES[@]}"; do filho_sel[$j]=0; done
+
   # Na alteração de uma instalação existente, o checklist abre com o que já está ligado.
   local do_estado="${CHECKLIST_DO_ESTADO:-0}"
   if [[ "$do_estado" == "1" ]]; then
@@ -2128,6 +2479,11 @@ resource_checklist() {
               "${ENABLE_BLACKBOX:-0}" "${ENABLE_EXPORTERS:-0}" "${ENABLE_INTERNET:-0}"
               "${ENABLE_VELOCIDADE:-0}" "${ENABLE_ACESSOS:-0}")
     details[6]=""; details[7]=""; details[8]=""
+    local item_exp chave_exp
+    for item_exp in "${CUSTOM_EXPORTERS[@]}"; do
+      chave_exp="$(exporter_chave_catalogo "${item_exp%%|*}")"
+      filho_sel[$(exporter_indice "$chave_exp")]=1
+    done
   fi
 
   if [[ "$DOCKER_DETECTED" == "1" && "${DOCKER_DAEMON_AVAILABLE:-0}" == "1" ]]; then
@@ -2152,34 +2508,100 @@ resource_checklist() {
     details[2]="nenhum PostgreSQL, MySQL/MariaDB ou SQL Server detectado"
   fi
 
+  # Marca do pai: segue os filhos.
+  _sincronizar_pai() {
+    local k
+    selected[$pai_exporters]=0
+    for k in "${!filho_sel[@]}"; do
+      [[ "${filho_sel[$k]}" == "1" ]] && selected[$pai_exporters]=1
+    done
+    return 0
+  }
+  _sincronizar_pai
+  [[ "${selected[$pai_exporters]}" == "1" ]] && expandido=1
+
+  # Linhas visíveis: "t<i>" para item principal, "f<j>" para filho do catálogo.
+  local -a linhas=()
+  _montar_linhas() {
+    local k
+    linhas=()
+    for k in "${!labels[@]}"; do
+      linhas+=("t${k}")
+      if (( k == pai_exporters )) && [[ "$expandido" == "1" ]]; then
+        local f
+        for f in "${!EXPORTER_CATALOGO_CHAVES[@]}"; do linhas+=("f${f}"); done
+      fi
+    done
+    return 0
+  }
+
+  # Texto de uma linha: marca, seta do pai, recuo do filho e detalhe.
+  _texto_linha() {
+    local id="$1" k mark suffix seta
+    if [[ "$id" == f* ]]; then
+      k="${id#f}"
+      mark=" "; [[ "${filho_sel[$k]}" == "1" ]] && mark="✓"
+      printf '    [%s] %s' "$mark" "${EXPORTER_CATALOGO_ROTULOS[$k]}"
+      return 0
+    fi
+    k="${id#t}"
+    mark=" "; [[ "${selected[$k]}" == "1" ]] && mark="✓"
+    suffix=""; [[ -n "${details[$k]}" ]] && suffix=" (${details[$k]})"
+    seta=""
+    if (( k == pai_exporters )); then
+      [[ "$expandido" == "1" ]] && seta="▼ " || seta="▶ "
+      [[ "$expandido" == "1" ]] || suffix=" (abra para escolher)"
+    fi
+    printf '[%s] %s%s%s' "$mark" "$seta" "${labels[$k]}" "$suffix"
+  }
+
+  # Marca ou desmarca a linha; no pai, abre e fecha a lista de filhos.
+  _alternar_linha() {
+    local id="$1" k
+    if [[ "$id" == f* ]]; then
+      k="${id#f}"
+      [[ "${filho_sel[$k]}" == "1" ]] && filho_sel[$k]=0 || filho_sel[$k]=1
+      _sincronizar_pai
+      return 0
+    fi
+    k="${id#t}"
+    if (( k == pai_exporters )); then
+      [[ "$expandido" == "1" ]] && expandido=0 || expandido=1
+      return 0
+    fi
+    if [[ "${disabled[$k]}" == "1" ]]; then
+      MENSAGEM_CHECKLIST="${labels[$k]} não está disponível neste host."
+      return 0
+    fi
+    [[ "${selected[$k]}" == "1" ]] && selected[$k]=0 || selected[$k]=1
+    return 0
+  }
+
+  _linha_bloqueada() {
+    local id="$1"
+    [[ "$id" == t* && "${disabled[${id#t}]}" == "1" ]]
+  }
+
   # --------------------------------------------------------------------------
   # FALLBACK SEM TTY
   # --------------------------------------------------------------------------
   # Quando stdin/stdout não são terminais reais, setas e leitura por tecla não
   # são confiáveis. Nesse cenário, usa seleção numérica tradicional.
   if [[ ! -t 0 || ! -t 1 ]]; then
-    local input token
+    local input token n
     while true; do
+      _montar_linhas
       echo
       echo -e "${BOLD}Recursos adicionais${NC}"
-      echo -e "${DIM}Digite números separados por espaço para marcar/desmarcar. ENTER confirma.${NC}"
+      echo -e "${DIM}Digite números separados por espaço para marcar/desmarcar. O número de \"Exporters adicionais\" abre a lista. ENTER confirma.${NC}"
       echo
       if [[ "${MONITOR_SERVER:-0}" == "1" ]]; then
         echo -e "  ${GREEN}[✓]${NC} Servidor: CPU, memória, discos, rede, load e uptime ${DIM}(sempre ativo, não precisa marcar)${NC}"
         echo
       fi
 
-      local i
-      for i in "${!labels[@]}"; do
-        local mark=" "
-        [[ "${selected[$i]}" == "1" ]] && mark="✓"
-        if [[ "${disabled[$i]}" == "1" ]]; then
-          printf '  [%s] %d. %s %b(%s)%b\n' "$mark" "$((i+1))" "${labels[$i]}" "$DIM" "${details[$i]}" "$NC"
-        elif [[ -n "${details[$i]}" ]]; then
-          printf '  [%s] %d. %s %b(%s)%b\n' "$mark" "$((i+1))" "${labels[$i]}" "$DIM" "${details[$i]}" "$NC"
-        else
-          printf '  [%s] %d. %s\n' "$mark" "$((i+1))" "${labels[$i]}"
-        fi
+      for n in "${!linhas[@]}"; do
+        printf '  %2d. %s\n' "$((n+1))" "$(_texto_linha "${linhas[$n]}")"
       done
 
       echo
@@ -2187,21 +2609,21 @@ resource_checklist() {
       [[ -z "${input//[[:space:]]/}" ]] && break
 
       # O script globalmente remove espaço do IFS. Aqui definimos IFS localmente
-      # para que "2 6" seja interpretado como duas escolhas diferentes.
+      # para que "2 6" seja interpretado como duas escolhas diferentes. Os
+      # números valem para a lista mostrada; ela é remontada depois de cada
+      # entrada, então abrir o pai e marcar um filho pede duas entradas.
       local -a tokens=()
+      local -a vistas=("${linhas[@]}")
       IFS=' ,' read -r -a tokens <<< "$input"
 
       for token in "${tokens[@]}"; do
         [[ -z "$token" ]] && continue
-        if [[ "$token" =~ ^[0-9]+$ ]] && (( token >= 1 && token <= ${#labels[@]} )); then
-          local idx=$((token-1))
-          if [[ "${disabled[$idx]}" == "1" ]]; then
-            warn "${labels[$idx]} não está disponível neste host."
-          else
-            [[ "${selected[$idx]}" == "1" ]] && selected[$idx]=0 || selected[$idx]=1
-          fi
+        if [[ "$token" =~ ^[0-9]+$ ]] && (( token >= 1 && token <= ${#vistas[@]} )); then
+          MENSAGEM_CHECKLIST=""
+          _alternar_linha "${vistas[$((token-1))]}"
+          [[ -n "$MENSAGEM_CHECKLIST" ]] && warn "$MENSAGEM_CHECKLIST"
         else
-          warn "Opção inválida: ${token}. Use números de 1 a ${#labels[@]}."
+          warn "Opção inválida: ${token}. Use números de 1 a ${#vistas[@]}."
         fi
       done
     done
@@ -2211,16 +2633,18 @@ resource_checklist() {
     # ------------------------------------------------------------------------
     # Teclas:
     #   ↑ / ↓  navega
-    #   Espaço marca/desmarca
+    #   Espaço marca/desmarca (no pai, abre e fecha a lista)
+    #   → / ←  abre e fecha "Exporters adicionais"
     #   Enter  confirma
     #
     # Não depende de whiptail/dialog. Usa somente sequências ANSI e read Bash.
     local cursor=0
-    local key rest message=""
-    local count="${#labels[@]}"
+    local key rest message="" count n attempts
 
+    _montar_linhas
+    count="${#linhas[@]}"
     # Garante que o primeiro cursor fique em item utilizável quando possível.
-    while [[ "$cursor" -lt "$count" && "${disabled[$cursor]}" == "1" ]]; do
+    while [[ "$cursor" -lt "$count" ]] && _linha_bloqueada "${linhas[$cursor]}"; do
       cursor=$((cursor+1))
     done
     [[ "$cursor" -ge "$count" ]] && cursor=0
@@ -2229,38 +2653,36 @@ resource_checklist() {
     printf '\033[?25l'
 
     while true; do
+      _montar_linhas
+      count="${#linhas[@]}"
+      (( cursor >= count )) && cursor=$((count-1))
+
       clear 2>/dev/null || printf '\033[2J\033[H'
       banner
 
       echo -e "${BOLD}Recursos adicionais${NC}"
-      echo -e "${DIM}Use ↑/↓ para navegar, ESPAÇO para marcar/desmarcar e ENTER para continuar.${NC}"
+      echo -e "${DIM}Use ↑/↓ para navegar, ESPAÇO para marcar/desmarcar e ENTER para continuar. ESPAÇO em \"Exporters adicionais\" abre a lista.${NC}"
       echo
       if [[ "${MONITOR_SERVER:-0}" == "1" ]]; then
         echo -e "  ${GREEN}[✓]${NC} Servidor: CPU, memória, discos, rede, load e uptime ${DIM}(sempre ativo, não precisa marcar)${NC}"
         echo
       fi
 
-      local i mark prefix suffix
-      for i in "${!labels[@]}"; do
-        mark=" "
-        [[ "${selected[$i]}" == "1" ]] && mark="✓"
-
+      local prefix texto
+      for n in "${!linhas[@]}"; do
         prefix="  "
-        [[ "$i" -eq "$cursor" ]] && prefix="❯ "
-
-        suffix=""
-        [[ -n "${details[$i]}" ]] && suffix=" (${details[$i]})"
-
-        if [[ "${disabled[$i]}" == "1" ]]; then
-          if [[ "$i" -eq "$cursor" ]]; then
-            printf '%b%s[%s] %s%s%b\n' "$CYAN" "$prefix" "$mark" "${labels[$i]}" "$suffix" "$NC"
+        [[ "$n" -eq "$cursor" ]] && prefix="❯ "
+        texto="$(_texto_linha "${linhas[$n]}")"
+        if _linha_bloqueada "${linhas[$n]}"; then
+          if [[ "$n" -eq "$cursor" ]]; then
+            printf '%b%s%s%b\n' "$CYAN" "$prefix" "$texto" "$NC"
           else
-            printf '%b%s[%s] %s%s%b\n' "$DIM" "$prefix" "$mark" "${labels[$i]}" "$suffix" "$NC"
+            printf '%b%s%s%b\n' "$DIM" "$prefix" "$texto" "$NC"
           fi
-        elif [[ "$i" -eq "$cursor" ]]; then
-          printf '%b%b%s[%s] %s%s%b\n' "$CYAN" "$BOLD" "$prefix" "$mark" "${labels[$i]}" "$suffix" "$NC"
+        elif [[ "$n" -eq "$cursor" ]]; then
+          printf '%b%b%s%s%b\n' "$CYAN" "$BOLD" "$prefix" "$texto" "$NC"
         else
-          printf '%s[%s] %s%s\n' "$prefix" "$mark" "${labels[$i]}" "$suffix"
+          printf '%s%s\n' "$prefix" "$texto"
         fi
       done
 
@@ -2272,38 +2694,47 @@ resource_checklist() {
 
       case "$key" in
         $'\x1b')
-          # Sequência típica das setas: ESC [ A/B
+          # Sequência típica das setas: ESC [ A/B/C/D
           rest=""
           IFS= read -rsn2 -t 0.15 rest || true
           case "$rest" in
             "[A")
               # Sobe, pulando itens bloqueados quando houver opção disponível.
-              local attempts=0
+              attempts=0
               while (( attempts < count )); do
                 cursor=$(( (cursor - 1 + count) % count ))
-                [[ "${disabled[$cursor]}" != "1" ]] && break
+                _linha_bloqueada "${linhas[$cursor]}" || break
                 attempts=$((attempts+1))
               done
               ;;
             "[B")
               # Desce, pulando itens bloqueados quando houver opção disponível.
-              local attempts=0
+              attempts=0
               while (( attempts < count )); do
                 cursor=$(( (cursor + 1) % count ))
-                [[ "${disabled[$cursor]}" != "1" ]] && break
+                _linha_bloqueada "${linhas[$cursor]}" || break
                 attempts=$((attempts+1))
               done
+              ;;
+            "[C")
+              [[ "${linhas[$cursor]}" == "t${pai_exporters}" ]] && expandido=1
+              ;;
+            "[D")
+              # Fechar a lista com o cursor num filho leva o cursor para o pai.
+              if [[ "${linhas[$cursor]}" == f* || "${linhas[$cursor]}" == "t${pai_exporters}" ]]; then
+                expandido=0
+                _montar_linhas
+                cursor="$(indice_de "t${pai_exporters}" "${linhas[@]}")"
+                cursor=$((cursor-1))
+              fi
               ;;
           esac
           message=""
           ;;
         " ")
-          if [[ "${disabled[$cursor]}" == "1" ]]; then
-            message="${labels[$cursor]} não está disponível neste host."
-          else
-            [[ "${selected[$cursor]}" == "1" ]] && selected[$cursor]=0 || selected[$cursor]=1
-            message=""
-          fi
+          MENSAGEM_CHECKLIST=""
+          _alternar_linha "${linhas[$cursor]}"
+          message="$MENSAGEM_CHECKLIST"
           ;;
         "")
           break
@@ -2331,6 +2762,11 @@ resource_checklist() {
   ENABLE_VELOCIDADE="${selected[7]}"
   ENABLE_ACESSOS="${selected[8]}"
 
+  EXPORTERS_MARCADOS=()
+  for j in "${!filho_sel[@]}"; do
+    [[ "${filho_sel[$j]}" == "1" ]] && EXPORTERS_MARCADOS+=("${EXPORTER_CATALOGO_CHAVES[$j]}")
+  done
+
   if [[ "$ENABLE_SNMP" == "1" || "$ENABLE_BLACKBOX" == "1" ]]; then
     COLLECTOR=1
   fi
@@ -2340,10 +2776,16 @@ resource_checklist() {
   for i in "${!labels[@]}"; do
     if [[ "${selected[$i]}" == "1" ]]; then
       echo "  ✓ ${labels[$i]}"
+      if (( i == pai_exporters )); then
+        for j in "${!filho_sel[@]}"; do
+          [[ "${filho_sel[$j]}" == "1" ]] && echo "      · ${EXPORTER_CATALOGO_ROTULOS[$j]}"
+        done
+      fi
     fi
   done
   echo
 
+  unset -f _sincronizar_pai _montar_linhas _texto_linha _alternar_linha _linha_bloqueada
   return 0
 }
 
@@ -2352,39 +2794,160 @@ resource_checklist() {
 # ------------------------------------------------------------------------------
 # PostgreSQL e MySQL/MariaDB possuem fluxo próprio no instalador e são tratados
 # na etapa de detecção de bancos. Este catálogo serve para endpoints Prometheus
-# adicionais que JÁ ESTEJAM ativos.
+# adicionais que JÁ ESTEJAM ativos. É o mesmo do instalador Windows e alimenta
+# tanto a árvore do checklist quanto a lista do menu de alteração.
+EXPORTER_CATALOGO_CHAVES=(redis_exporter nginx_exporter apache_exporter rabbitmq_prometheus elasticsearch_exporter mongodb_exporter nvidia_dcgm_exporter outro)
+EXPORTER_CATALOGO_ROTULOS=(
+  "Redis Exporter, padrão :9121"
+  "Nginx Prometheus Exporter, padrão :9113"
+  "Apache Exporter, padrão :9117"
+  "RabbitMQ Prometheus, padrão :15692"
+  "Elasticsearch Exporter, padrão :9114"
+  "MongoDB Exporter, padrão :9216"
+  "NVIDIA DCGM Exporter, padrão :9400"
+  "Outro endpoint Prometheus"
+)
+EXPORTER_CATALOGO_ALVOS=(127.0.0.1:9121 127.0.0.1:9113 127.0.0.1:9117 127.0.0.1:15692 127.0.0.1:9114 127.0.0.1:9216 127.0.0.1:9400 "")
+EXPORTER_CATALOGO_SERVICOS=(redis nginx apache rabbitmq elasticsearch mongodb gpu "")
+EXPORTERS_MARCADOS=()
+
+# Posição da chave no catálogo; chave desconhecida cai em "outro" (último).
+exporter_indice() {
+  local i
+  for i in "${!EXPORTER_CATALOGO_CHAVES[@]}"; do
+    [[ "${EXPORTER_CATALOGO_CHAVES[$i]}" == "$1" ]] && { echo "$i"; return 0; }
+  done
+  echo $(( ${#EXPORTER_CATALOGO_CHAVES[@]} - 1 ))
+}
+
+# Nome gravado no exporter -> chave do catálogo ("outro" para nome livre).
+exporter_chave_catalogo() {
+  local i
+  for i in "${!EXPORTER_CATALOGO_CHAVES[@]}"; do
+    [[ "${EXPORTER_CATALOGO_CHAVES[$i]}" == "outro" ]] && continue
+    [[ "${EXPORTER_CATALOGO_CHAVES[$i]}" == "$1" ]] && { echo "$1"; return 0; }
+  done
+  echo outro
+}
+
 select_specialized_exporter() {
-  local choice
+  local choice voltar
+  voltar=$(( ${#EXPORTER_CATALOGO_ROTULOS[@]} + 1 ))
 
   echo
   echo -e "${BOLD}Exporters/integrações Prometheus que o instalador sabe cadastrar:${NC}"
   echo -e "${DIM}PostgreSQL e MySQL/MariaDB são tratados automaticamente na etapa de bancos.${NC}"
   echo
 
-  # ENTER escolhe "Voltar": quem marcou o item por engano sai sem cadastrar nada.
-  choose_padrao "Selecione o exporter/integração" 9 \
-    "Redis Exporter              (padrão :9121)" \
-    "Nginx Prometheus Exporter   (padrão :9113)" \
-    "Apache Exporter             (padrão :9117)" \
-    "RabbitMQ Prometheus         (padrão :15692)" \
-    "Elasticsearch Exporter      (padrão :9114)" \
-    "MongoDB Exporter            (padrão :9216)" \
-    "NVIDIA DCGM Exporter        (padrão :9400)" \
-    "Outro endpoint Prometheus" \
+  # ENTER escolhe "Voltar": quem entrou por engano sai sem cadastrar nada.
+  choose_padrao "Selecione o exporter/integração" "$voltar" \
+    "${EXPORTER_CATALOGO_ROTULOS[@]}" \
     "Voltar, sem adicionar exporter"
 
   choice="$CHOOSE_RESULT"
-  case "$choice" in
-    1) EXPORTER_NAME="redis_exporter"; EXPORTER_DEFAULT_TARGET="127.0.0.1:9121"; EXPORTER_SERVICE_LABEL="redis" ;;
-    2) EXPORTER_NAME="nginx_exporter"; EXPORTER_DEFAULT_TARGET="127.0.0.1:9113"; EXPORTER_SERVICE_LABEL="nginx" ;;
-    3) EXPORTER_NAME="apache_exporter"; EXPORTER_DEFAULT_TARGET="127.0.0.1:9117"; EXPORTER_SERVICE_LABEL="apache" ;;
-    4) EXPORTER_NAME="rabbitmq_prometheus"; EXPORTER_DEFAULT_TARGET="127.0.0.1:15692"; EXPORTER_SERVICE_LABEL="rabbitmq" ;;
-    5) EXPORTER_NAME="elasticsearch_exporter"; EXPORTER_DEFAULT_TARGET="127.0.0.1:9114"; EXPORTER_SERVICE_LABEL="elasticsearch" ;;
-    6) EXPORTER_NAME="mongodb_exporter"; EXPORTER_DEFAULT_TARGET="127.0.0.1:9216"; EXPORTER_SERVICE_LABEL="mongodb" ;;
-    7) EXPORTER_NAME="nvidia_dcgm_exporter"; EXPORTER_DEFAULT_TARGET="127.0.0.1:9400"; EXPORTER_SERVICE_LABEL="gpu" ;;
-    8) EXPORTER_NAME=""; EXPORTER_DEFAULT_TARGET=""; EXPORTER_SERVICE_LABEL="" ;;
-    9) EXPORTER_NAME="__voltar__"; EXPORTER_DEFAULT_TARGET=""; EXPORTER_SERVICE_LABEL="" ;;
-  esac
+  EXPORTER_NAME="__voltar__"
+  (( choice == voltar )) && return 0
+  # "outro" vira nome vazio: cadastrar_exporter pergunta o nome.
+  EXPORTER_NAME="${EXPORTER_CATALOGO_CHAVES[$((choice-1))]}"
+  [[ "$EXPORTER_NAME" == "outro" ]] && EXPORTER_NAME=""
+  return 0
+}
+
+# Pergunta endereço e serviço de um exporter do catálogo (chave) ou de um
+# endpoint livre (chave "outro") e acrescenta em CUSTOM_EXPORTERS.
+cadastrar_exporter() {
+  local chave="$1" idx cn ct cs
+  idx="$(exporter_indice "$chave")"
+  if [[ "$chave" != "outro" ]]; then
+    echo
+    info "${EXPORTER_CATALOGO_ROTULOS[$idx]}"
+    cn="$chave"
+    ct="$(ask_address "Target host:porta" "${EXPORTER_CATALOGO_ALVOS[$idx]}" hostport)"
+    cs="$(ask_slug "Label servico" "${EXPORTER_CATALOGO_SERVICOS[$idx]}" label)"
+  else
+    while true; do
+      cn="$(ask_slug "Nome do exporter" "" label)"
+      nome_existe "$cn" "${CUSTOM_EXPORTERS[@]}" || break
+      warn "Já existe um exporter chamado '${cn}'. Use outro nome."
+    done
+    ct="$(ask_address "Target host:porta" "" hostport)"
+    cs="$(ask_slug "Label servico" "$cn" label)"
+  fi
+  CUSTOM_EXPORTERS+=("${cn}|${ct}|${cs}")
+  ok "Integração adicionada: ${cn} -> ${ct} (servico=${cs})"
+}
+
+# Lista do menu "Exporters adicionais" (Adicionar): escolhe um item por vez.
+collect_custom_exporters() {
+  echo
+  echo -e "${BOLD}Exporters adicionais${NC}"
+  echo -e "${DIM}Use somente para exporter/endpoint Prometheus que já esteja ativo.${NC}"
+
+  while true; do
+    select_specialized_exporter
+    [[ "$EXPORTER_NAME" == "__voltar__" ]] && break
+
+    if [[ -n "$EXPORTER_NAME" ]] && nome_existe "$EXPORTER_NAME" "${CUSTOM_EXPORTERS[@]}"; then
+      warn "${EXPORTER_NAME} já está cadastrado. Para trocar o endereço, remova e cadastre de novo."
+    else
+      cadastrar_exporter "${EXPORTER_NAME:-outro}"
+    fi
+
+    ask_yes_no "Adicionar outro exporter?" n || break
+  done
+
+  # Sem nenhum exporter cadastrado, o item fica desligado no resumo e no estado.
+  if (( ${#CUSTOM_EXPORTERS[@]} == 0 )); then
+    ENABLE_EXPORTERS=0
+    info "Nenhum exporter adicionado."
+  fi
+  return 0
+}
+
+# Depois do checklist: mantém os exporters que continuam marcados, tira os
+# desmarcados e pergunta só o endereço dos que foram marcados agora.
+collect_exporters_marcados() {
+  local -a mantidos=()
+  local item chave marcado tem_outro=0
+
+  for item in "${CUSTOM_EXPORTERS[@]}"; do
+    chave="$(exporter_chave_catalogo "${item%%|*}")"
+    for marcado in "${EXPORTERS_MARCADOS[@]}"; do
+      if [[ "$marcado" == "$chave" ]]; then
+        mantidos+=("$item")
+        [[ "$chave" == "outro" ]] && tem_outro=1
+        break
+      fi
+    done
+  done
+  CUSTOM_EXPORTERS=("${mantidos[@]}")
+
+  if (( ${#EXPORTERS_MARCADOS[@]} > 0 )); then
+    step "Exporters adicionais"
+    echo -e "${DIM}Use somente para exporter/endpoint Prometheus que já esteja ativo. ENTER aceita o endereço padrão.${NC}"
+  fi
+
+  for chave in "${EXPORTERS_MARCADOS[@]}"; do
+    if [[ "$chave" == "outro" ]]; then
+      (( tem_outro == 1 )) && continue
+      while true; do
+        echo
+        info "Outro endpoint Prometheus"
+        cadastrar_exporter outro
+        ask_yes_no "Adicionar mais um endpoint Prometheus?" n || break
+      done
+      continue
+    fi
+    nome_existe "$chave" "${CUSTOM_EXPORTERS[@]}" && continue
+    cadastrar_exporter "$chave"
+  done
+
+  if (( ${#CUSTOM_EXPORTERS[@]} > 0 )); then
+    ENABLE_EXPORTERS=1
+  else
+    ENABLE_EXPORTERS=0
+  fi
+  return 0
 }
 
 collect_blackbox_targets() {
@@ -2410,66 +2973,6 @@ collect_blackbox_targets() {
     BLACKBOX_TARGETS+=("${bn}|${ba}|${bm}|${bt}")
     ask_yes_no "Adicionar outro alvo de conectividade/disponibilidade?" n || break
   done
-}
-
-collect_snmp_targets() {
-  local choice
-  step "Targets SNMP"
-  info "Nesta versão, módulo e auth precisam existir no snmp.yml homologado."
-  info "O catálogo automático por fabricante, FortiGate, SonicWall, pfSense, MikroTik etc., será integrado depois."
-
-  while true; do
-    local sn sa sm sau st sos
-    while true; do
-      sn="$(ask_slug "Nome do equipamento" "" host)"
-      nome_existe "$sn" "${SNMP_TARGETS[@]}" || break
-      warn "Já existe um equipamento chamado '${sn}'. Use outro nome."
-    done
-    sa="$(ask_address "IP/FQDN SNMP" "" host)"
-    sm="$(ask_pattern "Módulo SNMP" "system,if_mib" '^[A-Za-z0-9_,-]+$' "nomes de módulo do snmp.yml separados por vírgula, sem espaço")"
-    sau="$(ask_pattern "Auth SNMP" "public_v2" '^[A-Za-z0-9_-]+$' "nome da auth do snmp.yml")"
-
-    choose "Tipo" "firewall" "switch" "storage" "ap" "ups"
-    choice="$CHOOSE_RESULT"
-    case "$choice" in 1) st=firewall;; 2) st=switch;; 3) st=storage;; 4) st=ap;; 5) st=ups;; esac
-
-    sos="$(ask_slug "Sistema/fabricante" "network" label)"
-    SNMP_TARGETS+=("${sn}|${sa}|${sm}|${sau}|${st}|${sos}")
-    ask_yes_no "Adicionar outro equipamento SNMP?" n || break
-  done
-}
-
-collect_custom_exporters() {
-  echo
-  echo -e "${BOLD}Exporters adicionais${NC}"
-  echo -e "${DIM}Use somente para exporter/endpoint Prometheus que já esteja ativo.${NC}"
-
-  while true; do
-    local cn ct cs
-    select_specialized_exporter
-    [[ "$EXPORTER_NAME" == "__voltar__" ]] && break
-
-    if [[ -n "$EXPORTER_NAME" ]]; then
-      cn="$EXPORTER_NAME"
-      ct="$(ask_address "Target host:porta" "$EXPORTER_DEFAULT_TARGET" hostport)"
-      cs="$(ask_slug "Label servico" "$EXPORTER_SERVICE_LABEL" label)"
-    else
-      cn="$(ask_slug "Nome do exporter" "" label)"
-      ct="$(ask_address "Target host:porta" "" hostport)"
-      cs="$(ask_slug "Label servico" "$cn" label)"
-    fi
-
-    CUSTOM_EXPORTERS+=("${cn}|${ct}|${cs}")
-    ok "Integração adicionada: ${cn} -> ${ct} (servico=${cs})"
-
-    ask_yes_no "Adicionar outro exporter?" n || break
-  done
-
-  # Sem nenhum exporter cadastrado, o item fica desligado no resumo e no estado.
-  if (( ${#CUSTOM_EXPORTERS[@]} == 0 )); then
-    ENABLE_EXPORTERS=0
-    info "Nenhum exporter adicionado."
-  fi
 }
 
 # Identificação. Com uma instalação existente carregada, as respostas atuais
@@ -2556,7 +3059,7 @@ collect_inputs() {
 
   [[ "$ENABLE_BLACKBOX" == "1" ]] && collect_blackbox_targets
   [[ "$ENABLE_SNMP" == "1" ]] && collect_snmp_targets
-  [[ "$ENABLE_EXPORTERS" == "1" ]] && collect_custom_exporters
+  collect_exporters_marcados
 
   perguntar_links
 
@@ -3053,11 +3556,7 @@ editar_recursos() {
   else
     SNMP_TARGETS=()
   fi
-  if [[ "$ENABLE_EXPORTERS" == "1" ]]; then
-    (( ${#CUSTOM_EXPORTERS[@]} > 0 )) || collect_custom_exporters
-  else
-    CUSTOM_EXPORTERS=()
-  fi
+  collect_exporters_marcados
   if [[ "$ENABLE_INTERNET" == "1" ]]; then
     (( ${#LINKS[@]} > 0 )) || collect_links_inputs
   else

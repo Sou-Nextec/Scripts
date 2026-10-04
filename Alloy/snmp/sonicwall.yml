@@ -1,29 +1,24 @@
 # ============================================================================
-# Nextec, módulo SNMP para FortiGate (FortiOS)
+# Nextec, módulo SNMP para SonicWall (SonicOS)
 # Gerado por gerar_modulos.py. Não edite à mão: altere o gerador e rode de novo.
 #
-# Fontes: SNMPv2-MIB, IF-MIB, IF-X-MIB e FORTINET-FORTIGATE-MIB.
+# Fontes: SNMPv2-MIB, IF-MIB, IF-X-MIB e SONICWALL-FIREWALL-IP-STATISTICS-MIB.
 # Os nomes das métricas são os usados pelo painel Nextec | Firewall.
 #
 # Segurança: este arquivo NÃO contém community, usuário ou senha. As
 # credenciais ficam no snmp-auth.yml de cada cliente, gravado pelo instalador.
 # ============================================================================
 modules:
-  fortigate_v2c:
+  sonicwall_v2c:
     walk:
     - 1.3.6.1.2.1.1
     - 1.3.6.1.2.1.2.2
     - 1.3.6.1.2.1.31.1.1
-    - 1.3.6.1.4.1.12356.101.12.2.2.1
-    - 1.3.6.1.4.1.12356.101.12.2.3.1
     get:
-    - 1.3.6.1.4.1.12356.101.4.1.1.0
-    - 1.3.6.1.4.1.12356.101.4.1.3.0
-    - 1.3.6.1.4.1.12356.101.4.1.4.0
-    - 1.3.6.1.4.1.12356.101.4.1.5.0
-    - 1.3.6.1.4.1.12356.101.4.1.8.0
-    - 1.3.6.1.4.1.12356.101.4.1.11.0
-    - 1.3.6.1.4.1.12356.101.13.1.1.0
+    - 1.3.6.1.4.1.8741.1.3.1.1.0
+    - 1.3.6.1.4.1.8741.1.3.1.2.0
+    - 1.3.6.1.4.1.8741.1.3.1.3.0
+    - 1.3.6.1.4.1.8741.1.3.1.4.0
     metrics:
     - name: sysDescr
       oid: 1.3.6.1.2.1.1.1
@@ -33,34 +28,22 @@ modules:
       oid: 1.3.6.1.2.1.1.3
       type: gauge
       help: Tempo ligado, em centésimos de segundo
-    - name: fgSysVersion
-      oid: 1.3.6.1.4.1.12356.101.4.1.1
-      type: DisplayString
-      help: Versão do FortiOS
-    - name: fgSysCpuUsage
-      oid: 1.3.6.1.4.1.12356.101.4.1.3
+    - name: sonicMaxConnCacheEntries
+      oid: 1.3.6.1.4.1.8741.1.3.1.1
+      type: gauge
+      help: Máximo de conexões suportado
+    - name: sonicCurrentConnCacheEntries
+      oid: 1.3.6.1.4.1.8741.1.3.1.2
+      type: gauge
+      help: Conexões ativas
+    - name: sonicCurrentCPUUtil
+      oid: 1.3.6.1.4.1.8741.1.3.1.3
       type: gauge
       help: Uso de CPU em porcentagem
-    - name: fgSysMemUsage
-      oid: 1.3.6.1.4.1.12356.101.4.1.4
+    - name: sonicCurrentRAMUtil
+      oid: 1.3.6.1.4.1.8741.1.3.1.4
       type: gauge
       help: Uso de memória em porcentagem
-    - name: fgSysMemCapacity
-      oid: 1.3.6.1.4.1.12356.101.4.1.5
-      type: gauge
-      help: Memória total em KB
-    - name: fgSysSesCount
-      oid: 1.3.6.1.4.1.12356.101.4.1.8
-      type: gauge
-      help: Sessões ativas
-    - name: fgSysSesRate1
-      oid: 1.3.6.1.4.1.12356.101.4.1.11
-      type: gauge
-      help: Novas sessões por segundo, média de 1 minuto
-    - name: fgHaSystemMode
-      oid: 1.3.6.1.4.1.12356.101.13.1.1
-      type: gauge
-      help: Modo de HA (1=standalone 2=activeActive 3=activePassive)
     - name: ifAdminStatus
       oid: 1.3.6.1.2.1.2.2.1.7
       type: gauge
@@ -268,82 +251,16 @@ modules:
         labelname: ifDescr
         oid: 1.3.6.1.2.1.2.2.1.2
         type: DisplayString
-    - name: fgVpnTunEntInOctets
-      oid: 1.3.6.1.4.1.12356.101.12.2.2.1.18
-      type: counter
-      help: Bytes recebidos pelo túnel
-      indexes:
-      - labelname: fgVpnTunEntIndex
-        type: gauge
-      lookups:
-      - labels:
-        - fgVpnTunEntIndex
-        labelname: fgVpnTunEntPhase1Name
-        oid: 1.3.6.1.4.1.12356.101.12.2.2.1.2
-        type: DisplayString
-      - labels:
-        - fgVpnTunEntIndex
-        labelname: fgVpnTunEntPhase2Name
-        oid: 1.3.6.1.4.1.12356.101.12.2.2.1.3
-        type: DisplayString
-    - name: fgVpnTunEntOutOctets
-      oid: 1.3.6.1.4.1.12356.101.12.2.2.1.19
-      type: counter
-      help: Bytes enviados pelo túnel
-      indexes:
-      - labelname: fgVpnTunEntIndex
-        type: gauge
-      lookups:
-      - labels:
-        - fgVpnTunEntIndex
-        labelname: fgVpnTunEntPhase1Name
-        oid: 1.3.6.1.4.1.12356.101.12.2.2.1.2
-        type: DisplayString
-      - labels:
-        - fgVpnTunEntIndex
-        labelname: fgVpnTunEntPhase2Name
-        oid: 1.3.6.1.4.1.12356.101.12.2.2.1.3
-        type: DisplayString
-    - name: fgVpnTunEntStatus
-      oid: 1.3.6.1.4.1.12356.101.12.2.2.1.20
-      type: gauge
-      help: Estado do túnel (1=down 2=up)
-      indexes:
-      - labelname: fgVpnTunEntIndex
-        type: gauge
-      lookups:
-      - labels:
-        - fgVpnTunEntIndex
-        labelname: fgVpnTunEntPhase1Name
-        oid: 1.3.6.1.4.1.12356.101.12.2.2.1.2
-        type: DisplayString
-      - labels:
-        - fgVpnTunEntIndex
-        labelname: fgVpnTunEntPhase2Name
-        oid: 1.3.6.1.4.1.12356.101.12.2.2.1.3
-        type: DisplayString
-    - name: fgVpnSslStatsLoginUsers
-      oid: 1.3.6.1.4.1.12356.101.12.2.3.1.2
-      type: gauge
-      help: Usuários conectados na VPN SSL
-      indexes:
-      - labelname: fgVpnSslStatsIndex
-        type: gauge
-  fortigate_v3:
+  sonicwall_v3:
     walk:
     - 1.3.6.1.2.1.1
     - 1.3.6.1.2.1.2.2
     - 1.3.6.1.2.1.31.1.1
-    - 1.3.6.1.4.1.12356.101.12.2.2.1
-    - 1.3.6.1.4.1.12356.101.12.2.3.1
     get:
-    - 1.3.6.1.4.1.12356.101.4.1.1.0
-    - 1.3.6.1.4.1.12356.101.4.1.3.0
-    - 1.3.6.1.4.1.12356.101.4.1.4.0
-    - 1.3.6.1.4.1.12356.101.4.1.5.0
-    - 1.3.6.1.4.1.12356.101.4.1.8.0
-    - 1.3.6.1.4.1.12356.101.4.1.11.0
-    - 1.3.6.1.4.1.12356.101.13.1.1.0
+    - 1.3.6.1.4.1.8741.1.3.1.1.0
+    - 1.3.6.1.4.1.8741.1.3.1.2.0
+    - 1.3.6.1.4.1.8741.1.3.1.3.0
+    - 1.3.6.1.4.1.8741.1.3.1.4.0
     metrics:
     - name: sysDescr
       oid: 1.3.6.1.2.1.1.1
@@ -353,34 +270,22 @@ modules:
       oid: 1.3.6.1.2.1.1.3
       type: gauge
       help: Tempo ligado, em centésimos de segundo
-    - name: fgSysVersion
-      oid: 1.3.6.1.4.1.12356.101.4.1.1
-      type: DisplayString
-      help: Versão do FortiOS
-    - name: fgSysCpuUsage
-      oid: 1.3.6.1.4.1.12356.101.4.1.3
+    - name: sonicMaxConnCacheEntries
+      oid: 1.3.6.1.4.1.8741.1.3.1.1
+      type: gauge
+      help: Máximo de conexões suportado
+    - name: sonicCurrentConnCacheEntries
+      oid: 1.3.6.1.4.1.8741.1.3.1.2
+      type: gauge
+      help: Conexões ativas
+    - name: sonicCurrentCPUUtil
+      oid: 1.3.6.1.4.1.8741.1.3.1.3
       type: gauge
       help: Uso de CPU em porcentagem
-    - name: fgSysMemUsage
-      oid: 1.3.6.1.4.1.12356.101.4.1.4
+    - name: sonicCurrentRAMUtil
+      oid: 1.3.6.1.4.1.8741.1.3.1.4
       type: gauge
       help: Uso de memória em porcentagem
-    - name: fgSysMemCapacity
-      oid: 1.3.6.1.4.1.12356.101.4.1.5
-      type: gauge
-      help: Memória total em KB
-    - name: fgSysSesCount
-      oid: 1.3.6.1.4.1.12356.101.4.1.8
-      type: gauge
-      help: Sessões ativas
-    - name: fgSysSesRate1
-      oid: 1.3.6.1.4.1.12356.101.4.1.11
-      type: gauge
-      help: Novas sessões por segundo, média de 1 minuto
-    - name: fgHaSystemMode
-      oid: 1.3.6.1.4.1.12356.101.13.1.1
-      type: gauge
-      help: Modo de HA (1=standalone 2=activeActive 3=activePassive)
     - name: ifAdminStatus
       oid: 1.3.6.1.2.1.2.2.1.7
       type: gauge
@@ -588,64 +493,3 @@ modules:
         labelname: ifDescr
         oid: 1.3.6.1.2.1.2.2.1.2
         type: DisplayString
-    - name: fgVpnTunEntInOctets
-      oid: 1.3.6.1.4.1.12356.101.12.2.2.1.18
-      type: counter
-      help: Bytes recebidos pelo túnel
-      indexes:
-      - labelname: fgVpnTunEntIndex
-        type: gauge
-      lookups:
-      - labels:
-        - fgVpnTunEntIndex
-        labelname: fgVpnTunEntPhase1Name
-        oid: 1.3.6.1.4.1.12356.101.12.2.2.1.2
-        type: DisplayString
-      - labels:
-        - fgVpnTunEntIndex
-        labelname: fgVpnTunEntPhase2Name
-        oid: 1.3.6.1.4.1.12356.101.12.2.2.1.3
-        type: DisplayString
-    - name: fgVpnTunEntOutOctets
-      oid: 1.3.6.1.4.1.12356.101.12.2.2.1.19
-      type: counter
-      help: Bytes enviados pelo túnel
-      indexes:
-      - labelname: fgVpnTunEntIndex
-        type: gauge
-      lookups:
-      - labels:
-        - fgVpnTunEntIndex
-        labelname: fgVpnTunEntPhase1Name
-        oid: 1.3.6.1.4.1.12356.101.12.2.2.1.2
-        type: DisplayString
-      - labels:
-        - fgVpnTunEntIndex
-        labelname: fgVpnTunEntPhase2Name
-        oid: 1.3.6.1.4.1.12356.101.12.2.2.1.3
-        type: DisplayString
-    - name: fgVpnTunEntStatus
-      oid: 1.3.6.1.4.1.12356.101.12.2.2.1.20
-      type: gauge
-      help: Estado do túnel (1=down 2=up)
-      indexes:
-      - labelname: fgVpnTunEntIndex
-        type: gauge
-      lookups:
-      - labels:
-        - fgVpnTunEntIndex
-        labelname: fgVpnTunEntPhase1Name
-        oid: 1.3.6.1.4.1.12356.101.12.2.2.1.2
-        type: DisplayString
-      - labels:
-        - fgVpnTunEntIndex
-        labelname: fgVpnTunEntPhase2Name
-        oid: 1.3.6.1.4.1.12356.101.12.2.2.1.3
-        type: DisplayString
-    - name: fgVpnSslStatsLoginUsers
-      oid: 1.3.6.1.4.1.12356.101.12.2.3.1.2
-      type: gauge
-      help: Usuários conectados na VPN SSL
-      indexes:
-      - labelname: fgVpnSslStatsIndex
-        type: gauge
