@@ -36,6 +36,13 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.15.0 Saída com a mesma hierarquia visual do instalador Linux (títulos
+           de etapa, símbolos, perguntas, resumo e quadro final). Download do
+           Alloy, do Speedtest, da Coleta e do atualizador com porcentagem.
+           Variáveis NEXTEC_*_URL passam para a sessão reaberta como
+           Administrador (antes a elevação perdia a URL da branch de teste).
+           "Ver e alterar" instala o atualizador e repara componentes que
+           ficaram pendentes, mesmo sem outra alteração.
     2.14.1 O menu de instalação existente mostra a versão deste instalador,
            a versão que gerou o config.alloy atual e as versões da Coleta
            Complementar e do atualizador instalados.
@@ -245,7 +252,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.14.1"
+$InstallerVersion = "2.15.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -385,58 +392,161 @@ $script:LokiPassword = ""
 # SAÍDA
 # ==============================================================================
 
-$script:LarguraConsole = 64
+$script:LarguraConsole = 60
+
+# Símbolos do conjunto WGL4, presentes nas fontes do console clássico
+# (Consolas, Lucida Console) do Windows Server 2016+; caractere fora dele
+# vira um quadrado no conhost.
+$script:SimboloOk = [string][char]0x221A      # √
+$script:SimboloBarra = [string][char]0x258C   # ▌
+$script:SimboloLinha = [string][char]0x2500   # ─
+$script:SimboloCursor = [string][char]0x203A  # ›
 
 function Write-Step {
+    # Título de etapa: barra e linha, como no instalador Linux.
     param([Parameter(Mandatory=$true)][string]$Message)
     Write-Host ""
-    Write-Host ("  {0}" -f $Message.ToUpperInvariant()) -ForegroundColor Cyan
-    Write-Host ("  {0}" -f ("-" * [Math]::Min($script:LarguraConsole, $Message.Length + 4))) -ForegroundColor DarkCyan
+    Write-Host ("{0} {1}" -f $script:SimboloBarra, $Message) -ForegroundColor Cyan
+    Write-Host ($script:SimboloLinha * $script:LarguraConsole) -ForegroundColor DarkCyan
 }
 
 function Write-Section {
     # Subtítulo dentro de uma etapa, para separar blocos de informação.
     param([Parameter(Mandatory=$true)][string]$Message)
     Write-Host ""
-    Write-Host ("  {0}" -f $Message) -ForegroundColor White
+    Write-Host ("  {0}" -f $Message) -ForegroundColor Cyan
+}
+
+function Get-NextecCorDoValor {
+    # sim em verde, não/0 apagado, demais em branco (igual ao resumo Linux).
+    param([AllowEmptyString()][string]$Value)
+    if ($Value -match '^sim\b') { return [ConsoleColor]::Green }
+    if ($Value -eq "não" -or $Value -eq "0") { return [ConsoleColor]::DarkGray }
+    return [ConsoleColor]::White
 }
 
 function Write-Field {
     <#
         Par rótulo/valor com colunas alinhadas. Mantém o alinhamento mesmo
         quando o rótulo tem acento, porque o padding é aplicado depois da
-        formatação e conta caracteres, não bytes.
+        formatação e conta caracteres, não bytes. Sem -ValueColor, a cor
+        segue o valor (sim, não, demais).
     #>
     param(
         [Parameter(Mandatory=$true)][string]$Label,
         [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Value,
-        [ConsoleColor]$ValueColor = [ConsoleColor]::Gray,
-        [int]$Width = 16
+        [Nullable[ConsoleColor]]$ValueColor = $null,
+        [int]$Width = 24
     )
 
-    $rotulo = ("{0}:" -f $Label).PadRight($Width)
-    Write-Host ("    {0}" -f $rotulo) -ForegroundColor DarkGray -NoNewline
-    Write-Host $Value -ForegroundColor $ValueColor
+    $cor = if ($null -ne $ValueColor) { [ConsoleColor]$ValueColor } else { Get-NextecCorDoValor -Value $Value }
+    $rotulo = $Label.PadRight($Width)
+    Write-Host ("    {0}" -f $rotulo) -ForegroundColor Gray -NoNewline
+    Write-Host $Value -ForegroundColor $cor
 }
 
 function Write-Ok {
     param([Parameter(Mandatory=$true)][string]$Message)
-    Write-Host ("[OK] {0}" -f $Message) -ForegroundColor Green
+    Write-Host ("{0}  " -f $script:SimboloOk) -ForegroundColor Green -NoNewline
+    Write-Host $Message
 }
 
 function Write-Info {
     param([Parameter(Mandatory=$true)][string]$Message)
-    Write-Host ("[INFO] {0}" -f $Message) -ForegroundColor Gray
+    Write-Host "i  " -ForegroundColor Cyan -NoNewline
+    Write-Host $Message
 }
 
 function Write-Warn {
     param([Parameter(Mandatory=$true)][string]$Message)
-    Write-Host ("[AVISO] {0}" -f $Message) -ForegroundColor Yellow
+    Write-Host "!  " -ForegroundColor Yellow -NoNewline
+    Write-Host $Message -ForegroundColor Yellow
 }
 
 function Write-Fail {
     param([Parameter(Mandatory=$true)][string]$Message)
-    Write-Host ("[ERRO] {0}" -f $Message) -ForegroundColor Red
+    Write-Host "x  " -ForegroundColor Red -NoNewline
+    Write-Host $Message -ForegroundColor Red
+}
+
+function Get-NextecTextoTamanho {
+    param([double]$Bytes)
+    return ("{0:N1} MB" -f ($Bytes / 1MB))
+}
+
+function Invoke-NextecDownload {
+    <#
+        Baixa um arquivo mostrando a porcentagem na mesma linha:
+          ↓ Grafana Alloy  [████████░░░░░░░░░░░░]  41%  9,3 de 22,7 MB
+        Só HTTPS: redirecionamento para fora do HTTPS é recusado. Sem console
+        interativo (RMM, atualizador) não desenha a barra, só o resultado.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Url,
+        [Parameter(Mandatory=$true)][string]$Destino,
+        [Parameter(Mandatory=$true)][string]$Descricao,
+        [int]$TimeoutSec = 600
+    )
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $mostrar = (-not $Silent) -and (Test-NextecInteractiveConsole)
+    $seta = [string][char]0x2193
+    $cheio = [string][char]0x2588
+    $vazio = [string][char]0x2591
+
+    $pedido = [Net.HttpWebRequest]::Create($Url)
+    $pedido.Timeout = $TimeoutSec * 1000
+    $pedido.ReadWriteTimeout = 120000
+    $pedido.UserAgent = "nextec-instalador/" + $InstallerVersion
+    $pedido.AllowAutoRedirect = $true
+
+    $resposta = $null
+    $entrada = $null
+    $saida = $null
+    try {
+        $resposta = $pedido.GetResponse()
+        if ($Url.StartsWith("https://") -and $resposta.ResponseUri.Scheme -ne "https") {
+            throw ("Download redirecionado para fora do HTTPS: {0}" -f $resposta.ResponseUri)
+        }
+
+        $total = [double]$resposta.ContentLength
+        $entrada = $resposta.GetResponseStream()
+        $saida = [IO.File]::Create($Destino)
+        $buffer = New-Object byte[] 65536
+        $lido = [double]0
+        $relogio = [Diagnostics.Stopwatch]::StartNew()
+
+        while ($true) {
+            $n = $entrada.Read($buffer, 0, $buffer.Length)
+            if ($n -le 0) { break }
+            $saida.Write($buffer, 0, $n)
+            $lido += $n
+
+            if ($mostrar -and $relogio.ElapsedMilliseconds -ge 250) {
+                $relogio.Reset(); $relogio.Start()
+                if ($total -gt 0) {
+                    $pct = [int][Math]::Floor(100 * $lido / $total)
+                    $blocos = [int][Math]::Floor($pct / 5)
+                    $texto = ("`r{0} {1}  [{2}{3}] {4,3}%  {5} de {6}   " -f $seta, $Descricao, ($cheio * $blocos), ($vazio * (20 - $blocos)), $pct, (Get-NextecTextoTamanho $lido), (Get-NextecTextoTamanho $total))
+                }
+                else {
+                    $texto = ("`r{0} {1}  {2}   " -f $seta, $Descricao, (Get-NextecTextoTamanho $lido))
+                }
+                Write-Host $texto -ForegroundColor Cyan -NoNewline
+            }
+        }
+    }
+    finally {
+        if ($null -ne $saida) { $saida.Dispose() }
+        if ($null -ne $entrada) { $entrada.Dispose() }
+        if ($null -ne $resposta) { $resposta.Close() }
+        if ($mostrar) {
+            # Limpa a linha da barra antes da próxima mensagem.
+            Write-Host ("`r{0}`r" -f (" " * 78)) -NoNewline
+        }
+    }
+
+    Write-Ok ("{0}: {1} baixados." -f $Descricao, (Get-NextecTextoTamanho (Get-Item -LiteralPath $Destino).Length))
 }
 
 function Wait-NextecOperator {
@@ -484,12 +594,22 @@ function Show-Banner {
     catch {
     }
 
-    Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host "       NEXTEC NOC MONITORING INSTALLER, WINDOWS" -ForegroundColor White
-    Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host ("Versão:  {0}" -f $InstallerVersion)
+    $logo = @(
+        " _   _ _______  _______ _____ ____",
+        "| \ | | ____\ \/ /_   _| ____/ ___|",
+        "|  \| |  _|  \  /  | | |  _|| |",
+        "| |\  | |___ /  \  | | | |__| |___",
+        "|_| \_|_____/_/\_\ |_| |_____\____|"
+    )
+    foreach ($linhaLogo in $logo) {
+        Write-Host $linhaLogo -ForegroundColor Cyan
+    }
+    Write-Host ""
+    Write-Host "NOC Monitoring Installer, Windows" -ForegroundColor White -NoNewline
+    Write-Host ("  v{0}" -f $InstallerVersion) -ForegroundColor Gray
     if (-not [string]::IsNullOrEmpty($script:NocHost)) {
-        Write-Host ("Destino: {0}" -f $script:NocHost)
+        Write-Host "Destino: " -NoNewline
+        Write-Host $script:NocHost -ForegroundColor Cyan
     }
     Write-Host ""
 }
@@ -787,8 +907,22 @@ function Invoke-NextecRelaunch {
         $diretorio = $env:SystemRoot
     }
 
+    # A sessão elevada nasce do serviço AppInfo, sem as variáveis deste
+    # processo: as URLs de teste (branch) precisam ir no próprio comando.
+    $ambiente = ""
+    foreach ($nome in @("NEXTEC_COLETA_URL", "NEXTEC_ATUALIZADOR_URL")) {
+        $valor = [Environment]::GetEnvironmentVariable($nome, "Process")
+        if (-not [string]::IsNullOrWhiteSpace($valor)) {
+            if ($valor -notmatch '^https://[^\s''"`]+$') {
+                throw ("{0} precisa ser uma URL https sem espaços nem aspas." -f $nome)
+            }
+            $ambiente += ("`$env:{0} = '{1}'" -f $nome, $valor) + [Environment]::NewLine
+        }
+    }
+
     $comando = @"
 `$ErrorActionPreference = 'Continue'
+$ambiente
 Set-Location -LiteralPath '$($diretorio.Replace("'", "''"))'
 `$parametros = $hashtable
 `$global:LASTEXITCODE = 0
@@ -1071,7 +1205,7 @@ function Read-NextecInput {
         [switch]$AsSecureString
     )
 
-    Write-Host "  ? " -ForegroundColor Cyan -NoNewline
+    Write-Host "? " -ForegroundColor Cyan -NoNewline
     Write-Host $Prompt -ForegroundColor White -NoNewline
     if ($Hint) { Write-Host (" ({0})" -f $Hint) -ForegroundColor DarkGray -NoNewline }
     if ($Default) { Write-Host (" [{0}]" -f $Default) -ForegroundColor DarkGray -NoNewline }
@@ -1099,7 +1233,6 @@ function Read-Required {
         }
 
         if (-not [string]::IsNullOrWhiteSpace($value)) {
-            Write-Host ""
             return $value.Trim()
         }
 
@@ -1119,19 +1252,18 @@ function Read-YesNo {
         $answer = Read-NextecInput -Prompt $Prompt -Hint ($suffix.Trim("[]"))
 
         if ([string]::IsNullOrWhiteSpace($answer)) {
-            Write-Host ""
             return $Default
         }
 
         switch ($answer.Trim().ToLowerInvariant()) {
-            "s"   { Write-Host ""; return $true }
-            "sim" { Write-Host ""; return $true }
-            "y"   { Write-Host ""; return $true }
-            "yes" { Write-Host ""; return $true }
-            "n"   { Write-Host ""; return $false }
-            "nao" { Write-Host ""; return $false }
-            "não" { Write-Host ""; return $false }
-            "no"  { Write-Host ""; return $false }
+            "s"   { return $true }
+            "sim" { return $true }
+            "y"   { return $true }
+            "yes" { return $true }
+            "n"   { return $false }
+            "nao" { return $false }
+            "não" { return $false }
+            "no"  { return $false }
             default { Write-Warn "Responda S ou N." }
         }
     }
@@ -1144,26 +1276,29 @@ function Read-Choice {
         [int]$Default = 1
     )
 
-    Write-Host "  ? " -ForegroundColor Cyan -NoNewline
-    Write-Host $Prompt -ForegroundColor White
+    # Igual ao instalador Linux: número em ciano, "›" marca o padrão e
+    # ENTER escolhe o padrão.
+    Write-Host "? " -ForegroundColor Cyan -NoNewline
+    Write-Host $Prompt -ForegroundColor White -NoNewline
+    Write-Host (" [ENTER = {0}]" -f $Default) -ForegroundColor DarkGray
 
     for ($i = 0; $i -lt $Options.Count; $i++) {
-        Write-Host ("    {0}  " -f ($i + 1)) -ForegroundColor Cyan -NoNewline
+        $marca = if (($i + 1) -eq $Default) { $script:SimboloCursor } else { " " }
+        Write-Host ("  {0}{1,2}  " -f $marca, ($i + 1)) -ForegroundColor Cyan -NoNewline
         Write-Host $Options[$i]
     }
 
     while ($true) {
-        $choiceText = Read-NextecInput -Prompt "Escolha" -Default $Default
+        Write-Host ("{0} " -f $script:SimboloCursor) -ForegroundColor Cyan -NoNewline
+        $choiceText = Read-Host
 
         if ([string]::IsNullOrWhiteSpace($choiceText)) {
-            Write-Host ""
             return $Default
         }
 
         $number = 0
-        if ([int]::TryParse($choiceText, [ref]$number)) {
+        if ([int]::TryParse($choiceText.Trim(), [ref]$number)) {
             if ($number -ge 1 -and $number -le $Options.Count) {
-                Write-Host ""
                 return $number
             }
         }
@@ -1217,7 +1352,6 @@ function Read-RequiredSecret {
             continue
         }
 
-        Write-Host ""
         return $plainValue
     }
 }
@@ -1316,35 +1450,71 @@ function Get-AlloyInstalledVersion {
             return $null
         }
 
-        return [string](($result.Output -split "`r?`n") | Select-Object -First 1)
+        $linha = [string](($result.Output -split "`r?`n") | Select-Object -First 1)
+        $m = [Regex]::Match($linha, '\d+\.\d+\.\d+')
+        if ($m.Success) { return $m.Value }
+        return $linha
     }
     catch {
         return $null
     }
 }
 
+function Get-NextecEstadoServico {
+    param([AllowNull()][object]$Servico)
+    if ($null -eq $Servico) { return "não encontrado" }
+    switch ([string]$Servico.Status) {
+        "Running" { return "ativo" }
+        "StartPending" { return "iniciando" }
+        "Stopped" { return "parado" }
+        default { return [string]$Servico.Status }
+    }
+}
+
 function Show-MaintenanceStatus {
+    # Mesmo quadro do instalador Linux: versões e estado de cada parte.
     $service = Get-AlloyService
     $version = Get-AlloyInstalledVersion
     $configExists = Test-Path -LiteralPath $ConfigFile
 
-    $versionLabel = if ([string]::IsNullOrWhiteSpace($version)) { "instalado, versão não identificada" } else { $version }
-    $serviceLabel = if ($null -ne $service) { $service.Status } else { "não encontrado" }
-    $configLabel = if ($configExists) { $ConfigFile } else { "não encontrada" }
-
     # Versões lidas do texto dos arquivos (nada é executado).
-    $versaoConfig = Get-VersaoNoArquivo -Caminho $ConfigFile -Padrao '(?m)^\s*//\s*nextec:versao\s*=\s*(\S+)'
+    $conteudoConfig = ""
+    if ($configExists) {
+        try { $conteudoConfig = [IO.File]::ReadAllText($ConfigFile) } catch { $conteudoConfig = "" }
+    }
+    $cabecalho = { param($chave)
+        $m = [Regex]::Match($conteudoConfig, ('(?m)^\s*//\s*nextec:{0}\s*=\s*(\S+)' -f $chave))
+        if ($m.Success) { $m.Groups[1].Value } else { "" }
+    }
+    $versaoConfig = & $cabecalho "versao"
+    $cliente = & $cabecalho "cliente"
+    $hostLabel = & $cabecalho "host"
     $versaoColeta = Get-VersaoNoArquivo -Caminho $ColetaScript -Padrao '(?m)^\$Versao\s*=\s*"([^"]+)"'
     $versaoAtualizador = Get-VersaoNoArquivo -Caminho $AtualizadorScript -Padrao '(?m)^\$script:Versao\s*=\s*"([^"]+)"'
 
-    Write-Info ("Este instalador: {0}" -f $InstallerVersion)
-    Write-Info ("Config gerada:   {0}" -f $(if ($versaoConfig) { "versão $versaoConfig" } elseif ($configExists) { "versão não identificada (anterior à 2.x)" } else { "sem configuração" }))
-    Write-Info ("Binário Alloy:   {0}" -f $versionLabel)
-    Write-Info ("Caminho:         {0}" -f $AlloyExe)
-    Write-Info ("Serviço:         {0} ({1})" -f $script:AlloyServiceName, $serviceLabel)
-    Write-Info ("Configuração:    {0}" -f $configLabel)
-    Write-Info ("Coleta:          {0}" -f $(if ($versaoColeta) { $versaoColeta } else { "não instalada" }))
-    Write-Info ("Atualizador:     {0}" -f $(if ($versaoAtualizador) { $versaoAtualizador } else { "não instalado" }))
+    $instaladoCom = if ($versaoConfig) { "v$versaoConfig" } elseif ($configExists) { "versão anterior à 2.12 (não identificada)" } else { "sem configuração" }
+    $alloy = if ([string]::IsNullOrWhiteSpace($version)) { "versão não identificada" } else { $version }
+
+    $coleta = "não instalada"
+    if ($versaoColeta) {
+        $tarefaColeta = Get-ScheduledTask -TaskName $ColetaTaskName -ErrorAction SilentlyContinue
+        $coleta = if ($null -ne $tarefaColeta) { "$versaoColeta (ligada)" } else { "$versaoColeta (tarefa ausente)" }
+    }
+    $atualizador = "não instalado"
+    if ($versaoAtualizador) {
+        $tarefa = Get-ScheduledTask -TaskName $AtualizadorTaskName -ErrorAction SilentlyContinue
+        $atualizador = if ($null -ne $tarefa) { "$versaoAtualizador (ligado)" } else { "$versaoAtualizador (tarefa ausente)" }
+    }
+
+    Write-Field -Label "Este instalador" -Value ("v{0}" -f $InstallerVersion) -ValueColor White
+    Write-Field -Label "Instalado com" -Value $instaladoCom -ValueColor White
+    if ($cliente) { Write-Field -Label "Cliente" -Value $cliente -ValueColor White }
+    if ($hostLabel) { Write-Field -Label "Host" -Value $hostLabel -ValueColor White }
+    Write-Field -Label "Grafana Alloy" -Value ("{0} ({1})" -f $alloy, (Get-NextecEstadoServico -Servico $service)) -ValueColor White
+    Write-Field -Label "Coleta Complementar" -Value $coleta -ValueColor $(if ($versaoColeta) { [ConsoleColor]::White } else { [ConsoleColor]::DarkGray })
+    Write-Field -Label "Atualizador" -Value $atualizador -ValueColor $(if ($versaoAtualizador) { [ConsoleColor]::White } else { [ConsoleColor]::Yellow })
+    Write-Field -Label "Configuração" -Value $(if ($configExists) { $ConfigFile } else { "não encontrada" }) -ValueColor Gray
+    Write-Host ""
 }
 
 function Get-VersaoNoArquivo {
@@ -1934,6 +2104,18 @@ function Import-CurrentConfiguration {
     return $inventory
 }
 
+function Get-NextecComponentesPendentes {
+    # Componentes que a configuração atual pede e que não estão instalados.
+    $faltando = New-Object System.Collections.Generic.List[string]
+    if (-not (Test-Path -LiteralPath $AtualizadorScript) -or -not (Get-ScheduledTask -TaskName $AtualizadorTaskName -ErrorAction SilentlyContinue)) {
+        $faltando.Add("atualizador automático")
+    }
+    if ($script:EnableColetaResolved -and (-not (Test-Path -LiteralPath $ColetaScript) -or -not (Get-ScheduledTask -TaskName $ColetaTaskName -ErrorAction SilentlyContinue))) {
+        $faltando.Add("Coleta Complementar")
+    }
+    return $faltando.ToArray()
+}
+
 function Save-ReconfiguredAlloy {
     <#
         Regrava a configuração a partir do estado atual das variáveis, valida e
@@ -2509,12 +2691,21 @@ function Invoke-ConfigurationMenu {
                 Write-Info "O Bloco de Notas foi aberto. Alterações feitas por lá não passam pela validação deste instalador."
             }
             "Gravar e aplicar as alterações" {
-                if (-not $alterou) {
+                # Mesmo sem alteração, grava quando falta componente (ex.: o
+                # atualizador ou a Coleta não baixaram na instalação).
+                $pendentes = @(Get-NextecComponentesPendentes)
+                if (-not $alterou -and $pendentes.Count -eq 0) {
                     Write-Info "Nada foi alterado."
                     return
                 }
+                if (-not $alterou) {
+                    Write-Info ("Nada foi alterado, mas falta instalar: {0}. Aplicando a configuração atual." -f ($pendentes -join ", "))
+                }
 
                 Save-ReconfiguredAlloy -Inventory $inventory
+                Invoke-NextecOptionalStep -Nome "Atualizador automático" -Acao {
+                    Install-Atualizador
+                } | Out-Null
                 return
             }
             "Sair sem gravar" {
@@ -2542,8 +2733,8 @@ function Invoke-MaintenanceMenu {
     $options = @(
         "Ver e alterar a configuração atual",
         "Reconfigurar tudo, fluxo completo (identificação, recursos, credenciais)",
-        "Atualizar/reinstalar o binário do Grafana Alloy, mantém configuração atual",
-        "Validar configuração atual e reiniciar o serviço",
+        "Atualizar o Grafana Alloy, mantendo a configuração",
+        "Validar a configuração e reiniciar os serviços",
         "Cancelar"
     )
 
@@ -3035,21 +3226,21 @@ function Get-NextecMultiSelectionConsole {
 
             Clear-Host
             Show-Banner
-            Write-Host ("==> {0}" -f $Title) -ForegroundColor Cyan
-            Write-Host "Use as setas para navegar. ESPAÇO expande/retrai categorias e marca/desmarca itens. ENTER confirma." -ForegroundColor DarkGray
+            Write-Host $Title -ForegroundColor White
+            Write-Host "Setas navegam, ESPAÇO abre/fecha categorias e marca/desmarca, ENTER confirma." -ForegroundColor Gray
             Write-Host ""
 
             for ($vi = 0; $vi -lt $visibleIndexes.Count; $vi++) {
                 $item = $Items[$visibleIndexes[$vi]]
                 $indent = "  " * [int]$item.Depth
-                $prefix = if ($vi -eq $cursor) { ">" } else { " " }
+                $prefix = if ($vi -eq $cursor) { [string][char]0x00BB } else { " " }
 
                 if ([bool]$item.HasChildren) {
-                    $arrow = if ([bool]$item.Expanded) { "v" } else { ">" }
+                    $arrow = if ([bool]$item.Expanded) { [string][char]0x25BC } else { [string][char]0x25BA }
                     $line = ("{0} {1}{2} {3}" -f $prefix, $indent, $arrow, $item.Label)
                 }
                 else {
-                    $mark = if ($item.Selected) { "x" } else { " " }
+                    $mark = if ($item.Selected) { $script:SimboloOk } else { " " }
                     $line = ("{0} {1}[{2}] {3}" -f $prefix, $indent, $mark, $item.Label)
                 }
 
@@ -3533,7 +3724,7 @@ function Get-NextecSnmpConfigFromRepo {
     $destino = Join-Path $env:TEMP ("nextec-snmp-{0}" -f $vendor.File)
 
     try {
-        Invoke-WebRequest -Uri $url -OutFile $destino -UseBasicParsing
+        Invoke-NextecDownload -Url $url -Destino $destino -Descricao ("snmp.yml {0}" -f $vendor.File) -TimeoutSec 120
     }
     catch {
         Write-Warn ("Falha ao baixar {0}: {1}" -f $url, $_.Exception.Message)
@@ -4372,42 +4563,38 @@ function Show-Plan {
 
     Write-Step "Resumo antes da instalação"
 
-    $rows = [ordered]@{
-        "Cliente"       = $script:Cliente
-        "Host"          = $script:HostLabel
-        "Sistema"       = $Inventory.Caption
-        "Build"         = $Inventory.Build
-        "Tipo detectado"= $Inventory.Generation
-        "Modo Alloy"    = $script:ResolvedMode
-        "Ambiente"      = $script:Ambiente
-        "Local"         = $script:Local
-        "Criticidade"   = $script:Criticidade
-        "Destino"       = $script:NocHost
-    }
+    $simNao = { param($v) if ($v) { "sim" } else { "não" } }
 
-    foreach ($entry in $rows.GetEnumerator()) {
-        Write-Host ("  {0,-27} {1}" -f ($entry.Key + ":"), $entry.Value)
-    }
+    Write-Field -Label "Cliente" -Value $script:Cliente -ValueColor White -Width 26
+    Write-Field -Label "Host" -Value $script:HostLabel -ValueColor White -Width 26
+    Write-Field -Label "Sistema" -Value ("{0} (build {1})" -f $Inventory.Caption, $Inventory.Build) -Width 26
+    Write-Field -Label "Tipo detectado" -Value $Inventory.Generation -Width 26
+    Write-Field -Label "Modo Alloy" -Value $script:ResolvedMode -Width 26
+    Write-Field -Label "Ambiente" -Value $script:Ambiente -Width 26
+    Write-Field -Label "Local" -Value $script:Local -Width 26
+    Write-Field -Label "Criticidade" -Value $script:Criticidade -Width 26
+    Write-Field -Label "Destino" -Value $script:NocHost -Width 26
 
     if ($script:MonitorHost) {
-        Write-Host ("  {0,-27} {1}" -f "Perfil base:", "CPU, memória, discos, rede, uptime, serviços")
+        Write-Field -Label "Perfil base" -Value "sim (CPU, memória, discos, rede, uptime, serviços)" -Width 26
 
         $selectedFeatures = @($script:DetectedHostFeatures | Where-Object { $script:SelectedHostFeatureKeys -contains $_.Key })
-        $featureText = if ($selectedFeatures.Count -gt 0) { ($selectedFeatures | ForEach-Object { $_.Label }) -join ", " } else { "nenhum adicional" }
-        Write-Host ("  {0,-27} {1}" -f "Recursos detectados:", $featureText)
-        Write-Host ("  {0,-27} {1}" -f "Logs do sistema:", $(if ($script:EnableLogsResolved) { "sim" } else { "não" }))
-        Write-Host ("  {0,-27} {1}" -f "Logs de autenticação:", $(if ($script:EnableSecurityLogsResolved) { "sim" } else { "não" }))
+        $featureText = if ($selectedFeatures.Count -gt 0) { "sim (" + (($selectedFeatures | ForEach-Object { $_.Label }) -join ", ") + ")" } else { "não" }
+        Write-Field -Label "Recursos detectados" -Value $featureText -Width 26
+        Write-Field -Label "Logs do sistema" -Value (& $simNao $script:EnableLogsResolved) -Width 26
+        Write-Field -Label "Logs de autenticação" -Value (& $simNao $script:EnableSecurityLogsResolved) -Width 26
     }
 
     if ($script:Collector) {
-        Write-Host ("  {0,-27} {1}" -f "SNMP:", $(if ($script:EnableSnmpResolved) { "sim ($($script:SnmpTargets.Count))" } else { "não" }))
-        Write-Host ("  {0,-27} {1}" -f "Conectividade:", $(if ($script:EnableBlackboxResolved) { "sim ($($script:BlackboxTargets.Count))" } else { "não" }))
-        Write-Host ("  {0,-27} {1}" -f "Internet (Speedtest):", $(if ($script:EnableInternetResolved) { "sim (a cada $($script:InternetIntervalMinutesResolved) min)" } else { "não" }))
+        Write-Field -Label "SNMP" -Value $(if ($script:EnableSnmpResolved) { "sim ($($script:SnmpTargets.Count))" } else { "não" }) -Width 26
+        Write-Field -Label "Conectividade" -Value $(if ($script:EnableBlackboxResolved) { "sim ($($script:BlackboxTargets.Count))" } else { "não" }) -Width 26
+        Write-Field -Label "Internet (Speedtest)" -Value $(if ($script:EnableInternetResolved) { "sim (a cada $($script:InternetIntervalMinutesResolved) min)" } else { "não" }) -Width 26
     }
 
-    Write-Host ("  {0,-27} {1}" -f "Internet (Coleta):", $(if ($script:EnableColetaResolved) { "sim" } else { "não" }))
-    Write-Host ("  {0,-27} {1}" -f "Links de internet:", $(if ($script:ColetaLinks.Count -gt 0) { "sim ($($script:ColetaLinks.Count))" } else { "não" }))
-    Write-Host ("  {0,-27} {1}" -f "Exporters adicionais:", $script:CustomExporters.Count)
+    Write-Field -Label "Internet (Coleta)" -Value (& $simNao $script:EnableColetaResolved) -Width 26
+    Write-Field -Label "Links de internet" -Value $(if ($script:ColetaLinks.Count -gt 0) { "sim ($($script:ColetaLinks.Count))" } else { "não" }) -Width 26
+    Write-Field -Label "Exporters adicionais" -Value ([string]$script:CustomExporters.Count) -Width 26
+    Write-Host ""
 
     if (-not $Silent) {
         if (-not (Read-YesNo -Prompt "Confirmar instalação/configuração?" -Default $true)) {
@@ -4708,27 +4895,17 @@ function Install-OrUpdateAlloy {
             Write-Info ("Instalador do Alloy {0} entregue pelo atualizador." -f $AlloyVersao)
         }
         else {
-        Write-Info "Baixando instalador oficial do Grafana Alloy."
-
-        # $ProgressPreference é forçado para "SilentlyContinue" no topo do
-        # script (evita que outros comandos poluam a tela). Isso também
-        # suprime a barra de progresso nativa do Invoke-WebRequest, fazendo
-        # o download parecer travado sem nenhum feedback visual. Habilitamos
-        # a barra só durante este download e restauramos o valor original
-        # logo em seguida, mesmo se der erro.
-        # São ~130 MB pelo link do cliente. -TimeoutSec é obrigatório porque o
-        # default do PowerShell 5.1 é espera infinita: um proxy que aceita a
-        # conexão e não responde trava o instalador sem mensagem. As tentativas
-        # cobrem queda momentânea de link, que de outra forma descartaria todo
-        # o fluxo interativo já preenchido.
-        $previousProgressPreference = $ProgressPreference
-        $ProgressPreference = "Continue"
+        # Download com porcentagem na mesma linha (Invoke-NextecDownload). O
+        # tempo limite é obrigatório: o padrão do .NET é esperar para sempre,
+        # e um proxy que aceita a conexão e não responde travaria o
+        # instalador sem mensagem. As tentativas cobrem queda momentânea de
+        # link, que de outra forma descartaria o fluxo já preenchido.
         try {
             $maxTries = 3
 
             for ($try = 1; $try -le $maxTries; $try++) {
                 try {
-                    Invoke-WebRequest -Uri $LatestInstallerUrl -OutFile $installer -UseBasicParsing -TimeoutSec 600
+                    Invoke-NextecDownload -Url $LatestInstallerUrl -Destino $installer -Descricao "Grafana Alloy" -TimeoutSec 600
                     break
                 }
                 catch {
@@ -4742,7 +4919,6 @@ function Install-OrUpdateAlloy {
             }
         }
         finally {
-            $ProgressPreference = $previousProgressPreference
         }
         }
 
@@ -5140,7 +5316,7 @@ function Install-SpeedtestCli {
     $zipPath = Join-Path $SpeedtestDir "speedtest-cli.zip"
 
     try {
-        Invoke-WebRequest -Uri $SpeedtestCliUrl -OutFile $zipPath -UseBasicParsing
+        Invoke-NextecDownload -Url $SpeedtestCliUrl -Destino $zipPath -Descricao "Speedtest CLI" -TimeoutSec 300
     }
     catch {
         throw ("Falha ao baixar o Speedtest CLI em {0}: {1}. Confira se a versão pinada no instalador ({2}) ainda existe em https://www.speedtest.net/apps/cli." -f $SpeedtestCliUrl, $_.Exception.Message, $SpeedtestCliVersion)
@@ -5666,7 +5842,7 @@ function Install-ColetaComplementar {
             Copy-Item -LiteralPath $ColetaArquivo -Destination $temporario -Force
         }
         else {
-            Invoke-WebRequest -Uri $ColetaUrl -OutFile $temporario -UseBasicParsing
+            Invoke-NextecDownload -Url $ColetaUrl -Destino $temporario -Descricao "Coleta Complementar" -TimeoutSec 120
         }
         $erros = $null
         [void][System.Management.Automation.Language.Parser]::ParseFile($temporario, [ref]$null, [ref]$erros)
@@ -6776,86 +6952,89 @@ function Show-FinalSummary {
     $comPendencia = ($script:EtapasComFalha.Count -gt 0)
     $cor = if ($comPendencia) { [ConsoleColor]::Yellow } else { [ConsoleColor]::Green }
 
+    $simbolo = if ($comPendencia) { "!" } else { $script:SimboloOk }
     $titulo = if ($comPendencia) { "INSTALAÇÃO CONCLUÍDA COM PENDÊNCIAS" } else { "INSTALAÇÃO CONCLUÍDA" }
-    $linha = "=" * 58
+    $titulo = "{0}  {1}" -f $simbolo, $titulo
+    $largura = 54
+    $esquerda = [int][Math]::Floor(($largura - $titulo.Length) / 2)
+    $direita = $largura - $titulo.Length - $esquerda
+    $h = [string][char]0x2550
 
     Write-Host ""
-    Write-Host ("  {0}" -f $linha) -ForegroundColor $cor
-    Write-Host ("  {0}" -f $titulo.PadLeft([int](29 + $titulo.Length / 2))) -ForegroundColor $cor
-    Write-Host ("  {0}" -f $linha) -ForegroundColor $cor
+    Write-Host ("  {0}{1}{2}" -f [char]0x2554, ($h * $largura), [char]0x2557) -ForegroundColor $cor
+    Write-Host ("  {0}{1}{2}{3}{4}" -f [char]0x2551, (" " * $esquerda), $titulo, (" " * $direita), [char]0x2551) -ForegroundColor $cor
+    Write-Host ("  {0}{1}{2}" -f [char]0x255A, ($h * $largura), [char]0x255D) -ForegroundColor $cor
 
     # Estado real do serviço. O resumo é o que o técnico usa para encerrar o
     # atendimento, então não pode afirmar nada que não tenha sido verificado.
     $alloyService = Get-AlloyService
-    $alloyStatus = if ($null -ne $alloyService) { [string]$alloyService.Status } else { "não encontrado" }
-    $corAlloy = if ($alloyStatus -eq "Running") { [ConsoleColor]::Green } else { [ConsoleColor]::Red }
+    $alloyStatus = Get-NextecEstadoServico -Servico $alloyService
+    $corAlloy = if ($alloyStatus -eq "ativo") { [ConsoleColor]::Green } else { [ConsoleColor]::Red }
 
     Write-Section "Identificação"
-    Write-Field -Label "Cliente" -Value $script:Cliente -ValueColor White -Width 18
-    Write-Field -Label "Host" -Value $script:HostLabel -ValueColor White -Width 18
-    Write-Field -Label "Sistema" -Value $Inventory.Caption -Width 18
-    Write-Field -Label "Modo" -Value $script:ResolvedMode -Width 18
-    Write-Field -Label "Alloy" -Value $alloyStatus -ValueColor $corAlloy -Width 18
+    Write-Field -Label "Cliente" -Value $script:Cliente -ValueColor White -Width 20
+    Write-Field -Label "Host" -Value $script:HostLabel -ValueColor White -Width 20
+    Write-Field -Label "Sistema" -Value $Inventory.Caption -Width 20
+    Write-Field -Label "Modo" -Value $script:ResolvedMode -Width 20
+    Write-Field -Label "Alloy" -Value $alloyStatus -ValueColor $corAlloy -Width 20
 
     Write-Section "Envio para o NOC"
-    Write-Field -Label "Métricas" -Value $script:RemoteWriteUrl -Width 18
+    Write-Field -Label "Métricas" -Value $script:RemoteWriteUrl -Width 20
     if (Test-NextecNeedsLoki) {
-        Write-Field -Label "Logs e eventos" -Value $script:LokiUrl -Width 18
+        Write-Field -Label "Logs e eventos" -Value $script:LokiUrl -Width 20
     }
 
     Write-Section "Coletas ligadas"
     if ($script:MonitorHost) {
-        Write-Field -Label "Servidor" -Value "CPU, memória, discos, rede, serviços" -ValueColor Green -Width 18
+        Write-Field -Label "Servidor" -Value "CPU, memória, discos, rede, serviços" -ValueColor Green -Width 20
         $selectedFeatures = @($script:DetectedHostFeatures | Where-Object { $script:SelectedHostFeatureKeys -contains $_.Key })
         if ($selectedFeatures.Count -gt 0) {
-            Write-Field -Label "Recursos" -Value (($selectedFeatures | ForEach-Object { $_.Label }) -join ", ") -ValueColor Green -Width 18
+            Write-Field -Label "Recursos" -Value (($selectedFeatures | ForEach-Object { $_.Label }) -join ", ") -ValueColor Green -Width 20
         }
     }
     if ($script:EnableBlackboxResolved) {
-        Write-Field -Label "Conectividade" -Value ("{0} alvo(s)" -f $script:BlackboxTargets.Count) -ValueColor Green -Width 18
+        Write-Field -Label "Conectividade" -Value ("{0} alvo(s)" -f $script:BlackboxTargets.Count) -ValueColor Green -Width 20
     }
     if ($script:EnableSnmpResolved) {
-        Write-Field -Label "SNMP" -Value ("{0} equipamento(s)" -f $script:SnmpTargets.Count) -ValueColor Green -Width 18
+        Write-Field -Label "SNMP" -Value ("{0} equipamento(s)" -f $script:SnmpTargets.Count) -ValueColor Green -Width 20
     }
     if ($script:EnableInternetResolved) {
-        Write-Field -Label "Velocidade" -Value ("Speedtest a cada {0} min" -f $script:InternetIntervalMinutesResolved) -ValueColor Green -Width 18
+        Write-Field -Label "Velocidade" -Value ("Speedtest a cada {0} min" -f $script:InternetIntervalMinutesResolved) -ValueColor Green -Width 20
     }
     if ($script:EnableColetaResolved) {
-        Write-Field -Label "Internet e links" -Value ("Coleta Complementar, {0} link(s)" -f $script:ColetaLinks.Count) -ValueColor Green -Width 18
+        Write-Field -Label "Internet e links" -Value ("Coleta Complementar, {0} link(s)" -f $script:ColetaLinks.Count) -ValueColor Green -Width 20
     }
     if ($script:CustomExporters.Count -gt 0) {
-        Write-Field -Label "Exporters" -Value ([string]$script:CustomExporters.Count) -ValueColor Green -Width 18
+        Write-Field -Label "Exporters" -Value ([string]$script:CustomExporters.Count) -ValueColor Green -Width 20
     }
 
     Write-Section "Arquivos"
-    Write-Field -Label "Configuração" -Value $ConfigFile -Width 18
+    Write-Field -Label "Configuração" -Value $ConfigFile -Width 20
     if ($script:EnableInternetResolved) {
-        Write-Field -Label "Speedtest" -Value $SpeedtestMetricsFile -Width 18
+        Write-Field -Label "Speedtest" -Value $SpeedtestMetricsFile -Width 20
     }
     if ($script:EnableColetaResolved) {
-        Write-Field -Label "Coleta" -Value $ColetaConfig -Width 18
+        Write-Field -Label "Coleta" -Value $ColetaConfig -Width 20
     }
-    Write-Field -Label "Log do instalador" -Value $script:InstallerLog -Width 18
+    Write-Field -Label "Log do instalador" -Value $script:InstallerLog -Width 20
 
     Write-Section "Atualização automática"
     if (Get-ScheduledTask -TaskName $AtualizadorTaskName -ErrorAction SilentlyContinue) {
-        Write-Field -Label "Atualizador" -Value "ligado, todo dia de madrugada" -ValueColor Green -Width 18
+        Write-Field -Label "Atualizador" -Value "ligado, todo dia entre 01h e 05h" -ValueColor Green -Width 20
     }
     else {
-        Write-Field -Label "Atualizador" -Value "não instalado" -ValueColor Yellow -Width 18
+        Write-Field -Label "Atualizador" -Value "não instalado" -ValueColor Yellow -Width 20
     }
 
     if ($comPendencia) {
-        Write-Host ""
-        Write-Host "  PENDÊNCIAS" -ForegroundColor Yellow
-        Write-Host "  O host está sendo monitorado, mas estes itens não puderam ser" -ForegroundColor Yellow
-        Write-Host "  configurados. Rode o instalador de novo e use a opção" -ForegroundColor Yellow
-        Write-Host "  'Ver e alterar a configuração atual' para tentar só o que faltou." -ForegroundColor Yellow
-        Write-Host ""
-
+        Write-Section "Pendências"
+        Write-Host "    O host está sendo monitorado, mas estes itens ficaram de fora." -ForegroundColor Yellow
+        Write-Host "    Rode o instalador de novo e escolha 'Ver e alterar': ligue de" -ForegroundColor Yellow
+        Write-Host "    novo o que faltou e escolha 'Gravar'. O atualizador é refeito sozinho." -ForegroundColor Yellow
         foreach ($etapa in $script:EtapasComFalha) {
-            Write-Host ("    - {0}" -f $etapa.Nome) -ForegroundColor Yellow
-            Write-Host ("        {0}" -f $etapa.Erro) -ForegroundColor DarkGray
+            Write-Host "    ! " -ForegroundColor Yellow -NoNewline
+            Write-Host $etapa.Nome -ForegroundColor White
+            Write-Host ("      {0}" -f $etapa.Erro) -ForegroundColor Gray
         }
     }
 
@@ -6990,7 +7169,7 @@ function Install-Atualizador {
         }
         else {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri $AtualizadorUrl -OutFile $temporario -UseBasicParsing -TimeoutSec 120
+            Invoke-NextecDownload -Url $AtualizadorUrl -Destino $temporario -Descricao "Atualizador" -TimeoutSec 120
         }
         $erros = $null
         [void][System.Management.Automation.Language.Parser]::ParseFile($temporario, [ref]$null, [ref]$erros)

@@ -11,7 +11,7 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
 | Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.5.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.14.1 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.15.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.1.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
@@ -36,6 +36,20 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 - **Horário do atualizador.** Passa a rodar entre 01h e 05h no horário de Brasília, mesmo em servidor com outro fuso (o timer usa `America/Sao_Paulo`, no systemd 235 ou mais novo).
 - **Banner.** Mostra a versão do instalador.
 - **Correção SNMP.** O tipo "ups" era gravado como "storage".
+
+### Instalador Windows 2.15.0
+
+- **Saída.** Segue a mesma hierarquia visual do Linux:
+  - logotipo e versão no topo;
+  - etapas com barra e linha;
+  - símbolos de status;
+  - menus com o padrão marcado;
+  - resumo com sim/não coloridos;
+  - quadro final.
+- **Downloads com porcentagem na mesma linha.** Vale para o Alloy, o Speedtest, a Coleta, o atualizador e o snmp.yml. O download não sai do HTTPS.
+- **Correção na elevação.** Ao reabrir como Administrador, as variáveis `NEXTEC_COLETA_URL` e `NEXTEC_ATUALIZADOR_URL` passam para a nova sessão. Antes, a sessão elevada perdia a URL da branch de teste e baixava da `main`.
+- **"Ver e alterar".** Instala o atualizador e, mesmo sem outra alteração, grava quando falta componente.
+- **Status da instalação.** Mostra cliente, host e estado do Alloy em português. A versão do Alloy aparece só com os números.
 
 ### Instalador Windows 2.14.1
 
