@@ -10,8 +10,8 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.5.2 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.15.2 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.5.3 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.15.3 |
 | Coleta Complementar | `coleta-complementar/` | 1.2.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
@@ -36,6 +36,11 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 - **Horário do atualizador.** Passa a rodar entre 01h e 05h no horário de Brasília, mesmo em servidor com outro fuso (o timer usa `America/Sao_Paulo`, no systemd 235 ou mais novo).
 - **Banner.** Mostra a versão do instalador.
 - **Correção SNMP.** O tipo "ups" era gravado como "storage".
+
+### Instaladores Linux 2.5.3 e Windows 2.15.3
+
+- **Destino.** Aparece uma vez só, no topo. A pergunta passa a ser "Destino do monitoramento" (ENTER mantém, D altera).
+- **Arquivos pequenos.** O tamanho aparece em KB, não "0,0 MB".
 
 ### Instaladores Linux 2.5.2 e Windows 2.15.2
 

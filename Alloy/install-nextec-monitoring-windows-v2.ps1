@@ -36,6 +36,9 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.15.3 Destino aparece uma vez só (no topo); a pergunta vira "Destino do
+           monitoramento [ENTER mantém, D altera]". Arquivo pequeno aparece
+           em KB, não "0.0 MB".
     2.15.2 Links: "Quantos links de internet este local tem?" (padrão 1) no
            lugar do item "Links de internet" do checklist e da pergunta "tem
            mais de um link?". Por link: operadora, tipo e velocidade
@@ -264,7 +267,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.15.2"
+$InstallerVersion = "2.15.3"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -519,6 +522,7 @@ function Restore-NextecConsoleTheme {
 
 function Get-NextecTextoTamanho {
     param([double]$Bytes)
+    if ($Bytes -lt 1MB) { return ("{0:N0} KB" -f [Math]::Max(1, $Bytes / 1KB)) }
     return ("{0:N1} MB" -f ($Bytes / 1MB))
 }
 
@@ -1461,11 +1465,8 @@ function Set-NocDestination {
     $script:NocHost = $NocTarget
 
     if (-not $Silent) {
-        Write-Host ""
-        Write-Host "Destino: " -NoNewline -ForegroundColor White
-        Write-Host $script:NocHost -ForegroundColor Cyan
-
-        $action = Read-NextecInput -Prompt "ENTER para continuar ou D para alterar"
+        # O banner já mostra o destino: aqui só a confirmação.
+        $action = Read-NextecInput -Prompt "Destino do monitoramento" -Hint "ENTER mantém, D altera" -Default $script:NocHost
 
         if ($action.Trim().ToLowerInvariant() -eq "d") {
             while ($true) {

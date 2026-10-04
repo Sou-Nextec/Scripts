@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.5.2 (links: quantos o local tem, velocidade contratada padronizada, destinos padrão)
+# Versão: 2.5.3 (destino mostrado uma vez só)
 #
 # USO
 # ---
@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.5.2"
+INSTALLER_VERSION="2.5.3"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -481,9 +481,8 @@ configure_noc_destination() {
   RW_URL="https://${NOC_HOST}/api/v1/write"
   LOKI_URL="https://${NOC_HOST}/loki/api/v1/push"
 
-  echo
-  echo -e "${BOLD}Destino:${NC} ${CYAN}${NOC_HOST}${NC}"
-  read -r -p "$(pergunta "ENTER para continuar ou D para alterar")" action
+  # O banner já mostra o destino: aqui só a confirmação.
+  read -r -p "$(pergunta "Destino do monitoramento" "${NOC_HOST}" "ENTER mantém, D altera")" action
 
   # Qualquer coisa diferente de D mantém o destino padrão.
   [[ "${action,,}" != "d" ]] && return 0
