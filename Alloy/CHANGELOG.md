@@ -10,10 +10,18 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.8.1 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.9.0 |
 | Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.19.1 |
 | Coleta Complementar | `coleta-complementar/` | 1.2.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
+
+## 2026-10-05
+
+### Instalador Linux 2.9.0
+
+- **Banimentos do fail2ban nos logs.** Com os logs do sistema ligados e o fail2ban instalado (`/var/log/fail2ban.log` presente), a configuração passa a enviar banimentos, desbanimentos, avisos e erros do fail2ban, com `unit="fail2ban.service"` e o rótulo `nivel`. As linhas "Found" de cada tentativa ficam de fora, porque o SSH já manda as tentativas.
+- Antes, essa coleta só existia quando acrescentada à mão no `config.alloy`, e a atualização automática a removia ao regravar a configuração.
+- Se o fail2ban for instalado depois, a coleta entra na próxima atualização ou reinstalação.
 
 ## 2026-10-04
 
