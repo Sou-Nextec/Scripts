@@ -40,6 +40,18 @@ intervalo_segundos = 60
 ativo = nao
 intervalo_minutos = 30
 
+; Bancos sem exportador próprio, medidos pelo sistema (sem driver nem login):
+; no ar, conexões, memória, tempo ligado e tamanho das bases.
+; motores: os que o servidor deve ter (firebird, oracle, sqlanywhere, sqlite;
+;   no Linux também sqlserver). Esperado e não encontrado aparece como fora.
+; arquivos: bases para medir, como motor:caminho, separados por vírgula
+;   (curinga aceito). Para SQLite é o que define as bases.
+[bancos]
+ativo = nao
+intervalo_segundos = 60
+motores = firebird, sqlite
+arquivos = sqlite:/opt/sistema/dados/*.db
+
 ; Um bloco por link. O nome depois de "link:" é o que aparece no painel.
 ; Cada link precisa de pelo menos um destino que saia SOMENTE por ele:
 ;   a) rota por link no firewall (ex.: 8.8.8.8 pelo link 1, 1.1.1.1 pelo link 2), ou

@@ -1870,6 +1870,7 @@ function Get-MaintenanceStatusRows {
             if (@($atual.CustomExporters).Count -gt 0) { $ligadas += "exporters" }
             if ($atual.EnableInternet) { $ligadas += "velocidade" }
             if ($atual.EnableColeta) { $ligadas += "internet e links" }
+            if ($atual.BancosColeta) { $ligadas += ("bancos ({0})" -f $atual.BancosColeta) }
             & $add "Coletas ligadas" $(if ($ligadas.Count -gt 0) { $ligadas -join ", " } else { "nenhuma" }) White
         }
     }
@@ -2229,6 +2230,12 @@ function Read-CurrentAlloyConfiguration {
         @($iniColeta.Keys | Where-Object { $_ -like "link:*" }).Count -eq 0) {
         $enableColeta = $false
     }
+    $bancosColeta = ""
+    if ($iniColeta.Contains("bancos") -and $iniColeta["bancos"].Contains("motores") -and
+        -not ([string]$iniColeta["bancos"]["ativo"] -match '^(nao|não|n|0|false)$')) {
+        $bancosColeta = (@(([string]$iniColeta["bancos"]["motores"]) -split "," | ForEach-Object { $_.Trim() } |
+            Where-Object { $_ }) -join ", ")
+    }
     if ($iniColeta.Contains("bancos") -and $iniColeta["bancos"].Contains("arquivos")) {
         $bancosSqlite = (@(([string]$iniColeta["bancos"]["arquivos"]) -split "," | ForEach-Object { $_.Trim() } |
             Where-Object { $_ -like "sqlite:*" } | ForEach-Object { $_.Substring(7) }) -join ", ")
@@ -2276,6 +2283,7 @@ function Read-CurrentAlloyConfiguration {
         InternetIntervalMinutes  = $internetIntervalMinutes
         EnableColeta             = $enableColeta
         BancosSqlite             = $bancosSqlite
+        BancosColeta             = $bancosColeta
         BlackboxIntervalSeconds  = $blackboxIntervalSeconds
         Modificado               = (Get-Item -LiteralPath $ConfigFile).LastWriteTime
         Arquivo                  = $ConfigFile
