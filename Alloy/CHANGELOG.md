@@ -10,12 +10,22 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.10.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.20.0 |
-| Coleta Complementar | `coleta-complementar/` | 1.3.0 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.11.0 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.21.0 |
+| Coleta Complementar | `coleta-complementar/` | 1.4.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
 ## 2026-10-05
+
+### Instaladores Windows 2.21.0 e Linux 2.11.0, Coleta Complementar 1.4.0
+
+- **Relógio no Windows.** O coletor `time` entra no perfil básico de todo servidor, inclusive controlador de domínio: hora do sistema e desvio em relação à fonte NTP (`windows_time_*`). Base do alerta "Relógio fora de sincronia".
+- **Serviços no Linux.** Com systemd em execução, o Alloy liga o coletor `systemd` do node_exporter, só para unidades `.service`, e envia os estados `active` e `failed` (os únicos usados nos painéis e alertas). O textfile da Coleta Complementar continua como estava.
+- **Speedtest no Windows pela Coleta.** O teste de velocidade passa a ser o módulo `velocidade` da Coleta Complementar, como no Linux, com as mesmas métricas `nextec_speedtest_*`. O teste roda em segundo plano, sem atrasar a medição dos links.
+- **Speedtest antigo removido.** A atualização detecta a tarefa `NextecSpeedtest` (e um serviço `nextec-speedtest`, se houver), liga `[velocidade]` no .ini e remove a tarefa, o script e o `.prom` antigos depois que o Alloy sobe validado. Acaba o aviso "unexpected end of input stream" do Alloy, que vinha do `.prom` lido no meio da gravação.
+- **Hora do último teste.** No Windows, `nextec_speedtest_last_run_timestamp_seconds` saía 3 horas atrasado (hora local tratada como UTC). Corrigido no módulo novo.
+- **Painel NOC.** A Coleta passa a gravar `nextec_internet_estado_desde_segundos`, e a linha "Sem internet há" volta a mostrar a duração.
+- **Coleta só para bancos ou velocidade.** Instalação nova instala a Coleta também quando não há internet marcada, mas há banco ou Speedtest. Antes ela só entrava com a internet ligada.
 
 ### Instaladores Windows 2.20.0 e Linux 2.10.0, Coleta Complementar 1.3.0
 

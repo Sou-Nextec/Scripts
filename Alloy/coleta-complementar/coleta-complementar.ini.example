@@ -35,7 +35,8 @@ ativo = nao
 socket = /var/run/docker.sock
 intervalo_segundos = 60
 
-; Só Linux: no Windows o teste de velocidade fica com o instalador (tarefa NextecSpeedtest).
+; Teste de velocidade. No Windows, "speedtest" aponta para o speedtest.exe baixado
+; pelo instalador (C:\ProgramData\GrafanaLabs\Alloy\nextec-speedtest\speedtest.exe).
 [velocidade]
 ativo = nao
 intervalo_minutos = 30
