@@ -15,6 +15,10 @@
       acessos   logins RDP e de console (evento 4624) com IP de origem;
                 marca acesso privilegiado, origem nova e fora do horário
                 para os alertas de acesso privilegiado
+      bancos    bancos sem exportador próprio (Firebird, Oracle, SQL
+                Anywhere e arquivos SQLite): no ar, conexões, memória,
+                tempo ligado e tamanho das bases, no padrão nextec_banco_*.
+                O SQL Server segue com o coletor mssql do Alloy.
 
     O teste de velocidade no Windows continua com o instalador (tarefa
     NextecSpeedtest), que grava as mesmas métricas nextec_speedtest_*.
@@ -39,7 +43,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
-$Versao = "1.2.0"
+$Versao = "1.3.0"
 $PastaBase = Join-Path $env:ProgramData "GrafanaLabs\Alloy\coleta-complementar"
 if ([string]::IsNullOrWhiteSpace($Config)) {
     $Config = Join-Path $PastaBase "coleta-complementar.ini"
@@ -891,14 +895,173 @@ function Invoke-RodadaAcessos {
     Save-Estado
 }
 
-function Save-Saude {
-    param([bool]$Ok, [bool]$AcessosOk = $true)
+# -----------------------------------------------------------------------------
+# Módulo bancos
+# -----------------------------------------------------------------------------
+# Bancos sem exportador Prometheus de uso simples. Não usa driver nem senha:
+# olha os processos do banco, as portas em que escutam, as conexões
+# estabelecidas nessas portas e o tamanho dos arquivos das bases. Sai no
+# padrão nextec_banco_* que o painel "Nextec | Banco de dados" converte junto
+# com SQL Server, MySQL/MariaDB e PostgreSQL.
+
+$MotoresBanco = [ordered]@{ firebird = "Firebird"; oracle = "Oracle"; sqlanywhere = "SQL Anywhere"; sqlite = "SQLite" }
+
+function Get-BasesFirebird {
+    # Bases declaradas no databases.conf (Firebird 3+) ou aliases.conf (2.x),
+    # na pasta do executável do servidor.
+    param([string[]]$Pastas)
+    $bases = New-Object System.Collections.Generic.List[string]
+    foreach ($pasta in $Pastas) {
+        foreach ($nome in @("databases.conf", "aliases.conf")) {
+            $arquivo = Join-Path $pasta $nome
+            if (-not (Test-Path -LiteralPath $arquivo)) { continue }
+            foreach ($linha in [IO.File]::ReadAllLines($arquivo)) {
+                $limpa = ($linha -replace '#.*$', '').Trim()
+                if ($limpa -match '^[^{}=]+=\s*"?([A-Za-z]:\\[^"]+|\\\\[^"]+)"?\s*$' -and -not $bases.Contains($Matches[1].Trim())) {
+                    $bases.Add($Matches[1].Trim())
+                }
+            }
+        }
+    }
+    return ,$bases.ToArray()
+}
+
+function Get-InstanciasBanco {
+    <#
+        Agrupa os processos de cada banco por instância. Devolve uma lista de
+        objetos com Motor, Instancia, Pids e Bases.
+    #>
+    $instancias = [ordered]@{}
+    $anotar = {
+        param([string]$Motor, [string]$Instancia, [int]$ProcessoId, [string[]]$Bases)
+        $chave = "$Motor|$Instancia"
+        if (-not $instancias.Contains($chave)) {
+            $instancias[$chave] = [pscustomobject]@{ Motor = $Motor; Instancia = $Instancia; Pids = (New-Object System.Collections.Generic.List[int]); Bases = (New-Object System.Collections.Generic.List[string]) }
+        }
+        $instancias[$chave].Pids.Add($ProcessoId)
+        foreach ($b in @($Bases)) { if ($b -and -not $instancias[$chave].Bases.Contains($b)) { $instancias[$chave].Bases.Add($b) } }
+    }
+    $servicoPorPid = @{}
+    foreach ($servico in @(Get-CimInstance Win32_Service -Filter "State='Running'" -ErrorAction SilentlyContinue)) {
+        if ($servico.ProcessId) { $servicoPorPid[[int]$servico.ProcessId] = [string]$servico.Name }
+    }
+    $processos = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $temOracle = $false
+    foreach ($p in $processos) {
+        $nome = ([string]$p.Name).ToLowerInvariant()
+        $idProc = [int]$p.ProcessId
+        if ($nome -match '^(firebird|fbserver|fb_inet_server)\.exe$') {
+            $pastas = @()
+            if ($p.ExecutablePath) { $pasta = Split-Path -Parent $p.ExecutablePath; $pastas = @($pasta, (Split-Path -Parent $pasta)) }
+            $inst = if ($servicoPorPid.ContainsKey($idProc)) { $servicoPorPid[$idProc] } else { "padrao" }
+            & $anotar "firebird" $inst $idProc (Get-BasesFirebird -Pastas $pastas)
+        }
+        elseif ($nome -match '^(dbsrv|dbeng)\d+\.exe$') {
+            $linha = [string]$p.CommandLine
+            $inst = if ($linha -match '(?i)\s-n\s+"?([^"\s]+)') { $Matches[1] } elseif ($servicoPorPid.ContainsKey($idProc)) { $servicoPorPid[$idProc] } else { $nome -replace '\.exe$', '' }
+            $bases = @([regex]::Matches($linha, '(?i)"([^"]+\.db)"|(\S+\.db)\b') | ForEach-Object { if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value } })
+            & $anotar "sqlanywhere" $inst $idProc $bases
+        }
+        elseif ($nome -eq "oracle.exe") {
+            $temOracle = $true
+            $inst = "padrao"
+            if ($servicoPorPid.ContainsKey($idProc) -and $servicoPorPid[$idProc] -match '(?i)^OracleService(.+)$') { $inst = $Matches[1] }
+            & $anotar "oracle" $inst $idProc @()
+        }
+    }
+    # O listener (TNSLSNR) recebe as conexões e entrega ao oracle.exe; as
+    # portas dele contam para todas as instâncias.
+    if ($temOracle) {
+        foreach ($p in $processos | Where-Object { ([string]$_.Name) -ieq "tnslsnr.exe" }) {
+            foreach ($chave in @($instancias.Keys | Where-Object { $_ -like "oracle|*" })) { $instancias[$chave].Pids.Add([int]$p.ProcessId) }
+        }
+    }
+    return @($instancias.Values)
+}
+
+function Invoke-RodadaBancos {
     $metricas = New-Metricas
-    $modulos = if ($script:AcessosAtivo) { "internet,acessos" } else { "internet" }
-    Add-Metrica $metricas "nextec_coleta_complementar_info" 1 ([ordered]@{ versao = $script:Versao; modulos = $modulos })
-    Add-Metrica $metricas "nextec_coleta_complementar_modulo_ok" ([int]$Ok) @{ modulo = "internet" }
+    $agora = Get-Agora
+    $instancias = @(Get-InstanciasBanco)
+    $escutas = @(); $estabelecidas = @()
+    if ($instancias.Count -gt 0) {
+        $escutas = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue)
+        $estabelecidas = @(Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue)
+    }
+    $processos = @{}
+    foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) { $processos[[int]$p.Id] = $p }
+
+    $motoresVistos = @($instancias | ForEach-Object { $_.Motor } | Select-Object -Unique)
+    foreach ($motor in $script:BancosEsperados) {
+        if ($motor -ne "sqlite" -and $motoresVistos -notcontains $motor) {
+            Add-Metrica $metricas "nextec_banco_up" 0 ([ordered]@{ motor = $script:MotoresBanco[$motor]; instancia = "padrao" })
+        }
+    }
+    foreach ($inst in $instancias) {
+        $rotulos = [ordered]@{ motor = $script:MotoresBanco[$inst.Motor]; instancia = $inst.Instancia }
+        $portas = @($escutas | Where-Object { $inst.Pids.Contains([int]$_.OwningProcess) } | ForEach-Object { [int]$_.LocalPort } | Select-Object -Unique)
+        $conexoes = @($estabelecidas | Where-Object { $portas -contains [int]$_.LocalPort }).Count
+        Add-Metrica $metricas "nextec_banco_up" 1 $rotulos
+        Add-Metrica $metricas "nextec_banco_conexoes_total" $conexoes $rotulos
+        foreach ($porta in $portas) { Add-Metrica $metricas "nextec_banco_porta_info" 1 ([ordered]@{ motor = $rotulos.motor; instancia = $rotulos.instancia; porta = [string]$porta }) }
+        $memoria = 0; $inicio = $null
+        foreach ($processoId in $inst.Pids) {
+            if (-not $processos.ContainsKey($processoId)) { continue }
+            $proc = $processos[$processoId]
+            if (([string]$proc.ProcessName) -ieq "tnslsnr") { continue }
+            $memoria += [double]$proc.WorkingSet64
+            try { if ($null -eq $inicio -or $proc.StartTime -lt $inicio) { $inicio = $proc.StartTime } } catch { }
+        }
+        Add-Metrica $metricas "nextec_banco_memoria_bytes" $memoria $rotulos
+        if ($null -ne $inicio) {
+            Add-Metrica $metricas "nextec_banco_ligado_segundos" ([math]::Round(((Get-Date) - $inicio).TotalSeconds)) $rotulos
+        }
+    }
+
+    $bases = New-Object System.Collections.Generic.List[object]
+    foreach ($inst in $instancias) { foreach ($b in $inst.Bases) { $bases.Add(@($inst.Motor, $inst.Instancia, $b)) } }
+    foreach ($item in $script:BancosArquivos) {
+        $encontrados = @()
+        $pasta = Split-Path -Parent $item.Caminho
+        $filtro = Split-Path -Leaf $item.Caminho
+        if ($pasta -and (Test-Path -LiteralPath $pasta)) { $encontrados = @(Get-ChildItem -LiteralPath $pasta -Filter $filtro -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }) }
+        # SQLite não tem processo: a pasta das bases é a instância, e ela fica
+        # "no ar" enquanto o arquivo existir.
+        $instancia = if ($item.Motor -eq "sqlite") { $pasta } else { "padrao" }
+        if ($item.Motor -eq "sqlite") {
+            Add-Metrica $metricas "nextec_banco_up" ([int]($encontrados.Count -gt 0)) ([ordered]@{ motor = "SQLite"; instancia = $instancia })
+        }
+        foreach ($b in $encontrados) { $bases.Add(@($item.Motor, $instancia, $b)) }
+    }
+    $vistos = @{}
+    foreach ($b in $bases) {
+        $chave = "{0}|{1}" -f $b[0], ([string]$b[2]).ToLowerInvariant()
+        if ($vistos.ContainsKey($chave)) { continue }
+        $vistos[$chave] = $true
+        $arquivo = Get-Item -LiteralPath $b[2] -ErrorAction SilentlyContinue
+        if ($null -eq $arquivo) { continue }
+        Add-Metrica $metricas "nextec_banco_tamanho_bytes" $arquivo.Length ([ordered]@{ motor = $script:MotoresBanco[$b[0]]; instancia = $b[1]; banco = [IO.Path]::GetFileNameWithoutExtension($arquivo.Name) })
+    }
+    Add-Metrica $metricas "nextec_bancos_coletor_ultima_execucao_segundos" ([math]::Floor($agora))
+    Save-Metricas $metricas (Join-Path $script:PastaTextfile "coleta_complementar_bancos.prom")
+}
+
+function Save-Saude {
+    param([bool]$Ok, [bool]$AcessosOk = $true, [bool]$BancosOk = $true)
+    $metricas = New-Metricas
+    $lista = @()
+    if ($script:InternetAtivo) { $lista += "internet" }
+    if ($script:AcessosAtivo) { $lista += "acessos" }
+    if ($script:BancosAtivo) { $lista += "bancos" }
+    Add-Metrica $metricas "nextec_coleta_complementar_info" 1 ([ordered]@{ versao = $script:Versao; modulos = ($lista -join ",") })
+    if ($script:InternetAtivo) {
+        Add-Metrica $metricas "nextec_coleta_complementar_modulo_ok" ([int]$Ok) @{ modulo = "internet" }
+    }
     if ($script:AcessosAtivo) {
         Add-Metrica $metricas "nextec_coleta_complementar_modulo_ok" ([int]$AcessosOk) @{ modulo = "acessos" }
+    }
+    if ($script:BancosAtivo) {
+        Add-Metrica $metricas "nextec_coleta_complementar_modulo_ok" ([int]$BancosOk) @{ modulo = "bancos" }
     }
     Save-Metricas $metricas (Join-Path $script:PastaTextfile "coleta_complementar.prom")
 }
@@ -939,6 +1102,20 @@ function Initialize-Configuracao {
     $script:OrigensConhecidas = @(Split-Lista (Get-Valor $acessos "origens_conhecidas" ""))
     $script:DiasOrigemConhecida = [math]::Max(1, [int](Get-Valor $acessos "dias_origem_conhecida" "30"))
 
+    $bancos = if ($ini.Contains("bancos")) { $ini["bancos"] } else { @{} }
+    $script:BancosAtivo = @("sim", "s", "1", "true", "ligado") -contains (Get-Valor $bancos "ativo" "nao").ToLowerInvariant()
+    $script:IntervaloBancos = [math]::Max(30, [int](Get-Valor $bancos "intervalo_segundos" "60"))
+    $script:UltimaRodadaBancos = 0.0
+    $script:BancosEsperados = @(Split-Lista (Get-Valor $bancos "motores" "") | ForEach-Object { $_.ToLowerInvariant() } | Where-Object { $script:MotoresBanco.Contains($_) })
+    $script:BancosArquivos = @()
+    foreach ($item in @(Split-Lista (Get-Valor $bancos "arquivos" ""))) {
+        $posicao = $item.IndexOf(":")
+        if ($posicao -lt 1) { continue }
+        $motor = $item.Substring(0, $posicao).Trim().ToLowerInvariant()
+        $caminho = $item.Substring($posicao + 1).Trim()
+        if ($script:MotoresBanco.Contains($motor) -and $caminho) { $script:BancosArquivos += [pscustomobject]@{ Motor = $motor; Caminho = $caminho } }
+    }
+
     $script:Links = @()
     foreach ($nomeSecao in $ini.Keys) {
         if ($nomeSecao -match '^link:(.+)$') {
@@ -962,13 +1139,18 @@ function Initialize-Configuracao {
             }
         }
     }
+    # Mesma regra do Linux: "ativo = nao" em [internet] desliga o módulo,
+    # a menos que haja links cadastrados.
+    $script:InternetAtivo = (@("sim", "s", "1", "true", "ligado") -contains (Get-Valor $internet "ativo" "sim").ToLowerInvariant()) -or ($script:Links.Count -gt 0)
     $script:Estado = Read-Estado
 }
 
 function Invoke-Executar {
     Initialize-Configuracao
+    $script:BancosOk = $true
     Write-Log "info" "Coleta Complementar $script:Versao iniciada; links configurados: $($script:Links.Count)"
-    Write-Evento "sistema" "coletor_iniciado" "info" @{ detalhe = "Coleta Complementar $script:Versao (Windows): internet" }
+    $ligados = @(); if ($script:InternetAtivo) { $ligados += "internet" }; if ($script:AcessosAtivo) { $ligados += "acessos" }; if ($script:BancosAtivo) { $ligados += "bancos" }
+    Write-Evento "sistema" "coletor_iniciado" "info" @{ detalhe = "Coleta Complementar $script:Versao (Windows): $($ligados -join ', ')" }
     while ($true) {
         $inicio = Get-Agora
         # Um módulo com erro não derruba o outro.
@@ -980,13 +1162,21 @@ function Invoke-Executar {
                 Write-Log "erro" ("rodada de acessos falhou: {0}" -f $_.Exception.Message)
             }
         }
+        if ($script:BancosAtivo -and ($inicio - $script:UltimaRodadaBancos) -ge $script:IntervaloBancos) {
+            $script:UltimaRodadaBancos = $inicio
+            try { Invoke-RodadaBancos; $script:BancosOk = $true }
+            catch {
+                $script:BancosOk = $false
+                Write-Log "erro" ("rodada de bancos falhou: {0}" -f $_.Exception.Message)
+            }
+        }
         try {
-            Invoke-RodadaLinks
-            Save-Saude $true $acessosOk
+            if ($script:InternetAtivo) { Invoke-RodadaLinks }
+            Save-Saude $true $acessosOk $script:BancosOk
         }
         catch {
             Write-Log "erro" ("rodada falhou: {0} | {1}" -f $_.Exception.Message, ($_.ScriptStackTrace -replace "`r?`n", " <- "))
-            try { Save-Saude $false $acessosOk } catch { }
+            try { Save-Saude $false $acessosOk $script:BancosOk } catch { }
         }
         $espera = $script:Intervalo - ((Get-Agora) - $inicio)
         if ($espera -gt 0) { Start-Sleep -Milliseconds ([int]($espera * 1000)) }
@@ -995,7 +1185,8 @@ function Invoke-Executar {
 
 function Invoke-UmaVez {
     Initialize-Configuracao
-    Invoke-RodadaLinks
+    if ($script:InternetAtivo) { Invoke-RodadaLinks }
+    if ($script:BancosAtivo) { Invoke-RodadaBancos }
     Save-Saude $true
     Get-ChildItem -LiteralPath $script:PastaTextfile -Filter "coleta_complementar*.prom" | ForEach-Object {
         Write-Host "--- $($_.Name)"
@@ -1009,6 +1200,7 @@ function Invoke-Verificar {
     Write-Host "Configuração: $script:Config"
     Write-Host "Links configurados: $($script:Links.Count)"
     Write-Host ("Acessos (logins com origem): {0}" -f $(if ($script:AcessosAtivo) { "ligado" } else { "desligado" }))
+    Write-Host ("Bancos: {0}" -f $(if ($script:BancosAtivo) { "ligado ({0})" -f (@($script:BancosEsperados) -join ", ") } else { "desligado" }))
     if ($script:AcessosAtivo) {
         try { [void](Get-WinEvent -LogName Security -MaxEvents 1) }
         catch { $problemas += "log Security ilegível: o módulo acessos não registra logins ($($_.Exception.Message))" }
