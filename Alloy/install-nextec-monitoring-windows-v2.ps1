@@ -6521,13 +6521,13 @@ function Get-NextecBancosMotores {
         if ($script:MonitorHost -and @($script:SelectedHostFeatureKeys) -contains $chave) { $motores += $chave }
     }
     if (-not [string]::IsNullOrWhiteSpace([string]$script:BancosSqlite)) { $motores += "sqlite" }
-    return ,$motores
+    return $motores
 }
 
 function Test-NextecColetaNecessaria {
     # A Coleta Complementar roda quando a internet está ligada ou quando há
     # banco para ela medir.
-    return ($script:EnableColetaResolved -or (Get-NextecBancosMotores).Count -gt 0)
+    return ($script:EnableColetaResolved -or @(Get-NextecBancosMotores).Count -gt 0)
 }
 
 function Test-NextecCaminhosSqlite {
