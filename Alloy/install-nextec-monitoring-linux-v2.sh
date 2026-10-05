@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.8.1"
+INSTALLER_VERSION="2.9.0"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -1813,6 +1813,53 @@ loki.source.journal "journal_${lbl}" {
 }
 EOF
       done
+
+      # fail2ban: só entra quando o log existe na hora de gerar a configuração.
+      # Se o fail2ban for instalado depois, a próxima atualização ou reinstalação inclui.
+      if [[ -f /var/log/fail2ban.log ]]; then
+        cat <<EOF
+
+// Banimentos do fail2ban (SSH e lista negra de reincidentes). Só entram os
+// banimentos, desbanimentos, avisos e erros; as linhas "Found" de cada
+// tentativa ficam de fora, porque o SSH já manda as tentativas.
+loki.source.file "nextec_fail2ban" {
+  targets = [{
+    __path__ = "/var/log/fail2ban.log",
+    cliente = "$(alloy_escape "$CLIENTE")", host = "$(alloy_escape "$HOST_LABEL")", servico = "system", tipo = "servidor",
+    ambiente = "$(alloy_escape "$AMBIENTE")", local = "$(alloy_escape "$LOCAL")", os = "linux", origem = "alloy",
+    criticidade = "$(alloy_escape "$CRITICIDADE")", unit = "fail2ban.service",
+  }]
+  forward_to    = [loki.process.nextec_fail2ban.receiver]
+  tail_from_end = true
+}
+
+loki.process "nextec_fail2ban" {
+  forward_to = [loki.write.nextec.receiver]
+
+  stage.regex {
+    expression = \`^\\S+ \\S+ \\S+\\s+\\[\\d+\\]: (?P<nivel>[A-Z]+)\\s+(?P<mensagem>.*)$\`
+  }
+  stage.drop {
+    source = "nivel"
+    value  = "INFO"
+  }
+  stage.drop {
+    source = "nivel"
+    value  = "DEBUG"
+  }
+  stage.template {
+    source   = "nivel"
+    template = "{{ ToLower .Value }}"
+  }
+  stage.labels {
+    values = { nivel = "" }
+  }
+  stage.output {
+    source = "mensagem"
+  }
+}
+EOF
+      fi
     fi
 
     if [[ "$ENABLE_BLACKBOX" == "1" ]]; then
