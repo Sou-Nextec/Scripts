@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.10.0 (Bancos: Firebird, Oracle, SQL Anywhere, SQL Server e SQLite pela Coleta Complementar)
+# Versão: 2.11.0 (Coletor systemd do node_exporter: estado dos serviços)
 #
 # USO
 # ---
@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.10.0"
+INSTALLER_VERSION="2.11.0"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -189,6 +189,12 @@ need_root() {
     err "Execute como root: sudo bash $0"
     exit 1
   fi
+}
+
+# systemd em execução como init (não só instalado): é o que o coletor
+# systemd do node_exporter consulta pelo D-Bus.
+has_systemd_runtime() {
+  [[ -d /run/systemd/system ]]
 }
 
 need_systemd() {
@@ -1671,20 +1677,48 @@ EOF
 
 // -----------------------------------------------------------------------------
 // MÉTRICAS BÁSICAS DO SERVIDOR, PERFIL MÍNIMO NEXTEC
-// CPU, memória, filesystem, disco/I/O, rede, load, uptime e informações do SO.
-// Monitoramento de serviços não faz parte do perfil mínimo.
+// CPU, memória, filesystem, disco/I/O, rede, load, uptime, relógio (timex) e
+// informações do SO. Com systemd, também o estado dos serviços (.service).
 // -----------------------------------------------------------------------------
+EOF
+      if has_systemd_runtime; then
+        cat <<'EOF'
+prometheus.exporter.unix "system" {
+  enable_collectors = ["systemd"]
+
+  // Só serviços: timers, sockets e montagens multiplicam as séries sem uso
+  // nos painéis.
+  systemd {
+    unit_include = ".+\\.service"
+  }
+}
+EOF
+      else
+        cat <<'EOF'
 prometheus.exporter.unix "system" {
 }
 EOF
+      fi
       write_common_relabels 'prometheus.exporter.unix.system.targets' 'system_labels' 'system' 'servidor' 'linux' 'alloy'
       cat <<'EOF'
 
 prometheus.scrape "system" {
   targets         = discovery.relabel.system_labels.output
-  forward_to      = [prometheus.remote_write.nextec.receiver]
+  forward_to      = [prometheus.relabel.system.receiver]
   scrape_interval = "30s"
   scrape_timeout  = "10s"
+}
+
+// O coletor systemd grava cinco séries por serviço, uma por estado. Os
+// painéis e alertas usam active e failed; as demais ficam no servidor.
+prometheus.relabel "system" {
+  forward_to = [prometheus.remote_write.nextec.receiver]
+
+  rule {
+    source_labels = ["__name__", "state"]
+    regex         = "node_systemd_unit_state;(activating|deactivating|inactive)"
+    action        = "drop"
+  }
 }
 EOF
     fi

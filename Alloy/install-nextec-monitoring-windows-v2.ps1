@@ -47,6 +47,10 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.21.0 Coletor time no perfil básico (relógio e sincronia NTP, inclusive
+           em controlador de domínio). Speedtest passa a ser módulo da Coleta
+           Complementar: a tarefa NextecSpeedtest e o serviço antigo são
+           removidos depois que o Alloy sobe validado.
     2.20.0 Bancos: Firebird, Oracle e SQL Anywhere detectados e medidos pela
            Coleta Complementar (no ar, conexões, memória, tamanho das bases),
            e bases SQLite informadas na tela.
@@ -336,7 +340,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.20.0"
+$InstallerVersion = "2.21.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -392,6 +396,8 @@ $SpeedtestMetricsDir = Join-Path $SpeedtestDir "textfile"
 $SpeedtestMetricsFile = Join-Path $SpeedtestMetricsDir "nextec_speedtest.prom"
 $SpeedtestRunnerScript = Join-Path $SpeedtestDir "Invoke-NextecSpeedtest.ps1"
 $SpeedtestTaskName = "NextecSpeedtest"
+# Nomes do Speedtest antigo (tarefa até a 2.20; serviço de instalações à mão).
+$SpeedtestLegadoNomes = @($SpeedtestTaskName, "nextec-speedtest")
 
 # Coleta Complementar Nextec (internet e links). Arquivo único baixado do
 # repositório Scripts; roda por tarefa agendada como SYSTEM e só grava
@@ -2213,11 +2219,11 @@ function Read-CurrentAlloyConfiguration {
         }
     }
 
-    # O textfile collector só é adicionado por este instalador para o
-    # Speedtest, então a presença dele no config.alloy atual já identifica o
-    # recurso como habilitado. O intervalo real fica na tarefa agendada, não
-    # no config.alloy, então é lido de lá quando disponível.
-    $enableInternet = ($collectors -contains "textfile")
+    # Speedtest ligado: seção [velocidade] da Coleta ou, em instalação
+    # anterior à 2.21, o coletor textfile no exporter "system", a tarefa
+    # NextecSpeedtest ou o serviço antigo. O intervalo vem do .ini ou do
+    # gatilho da tarefa.
+    $enableInternet = ($collectors -contains "textfile") -or (Test-NextecSpeedtestLegado)
     $internetIntervalMinutes = 30
 
     # A Coleta pode rodar só pelos bancos: a internet conta como ligada quando
@@ -2241,7 +2247,14 @@ function Read-CurrentAlloyConfiguration {
             Where-Object { $_ -like "sqlite:*" } | ForEach-Object { $_.Substring(7) }) -join ", ")
     }
 
-    if ($enableInternet) {
+    if ($iniColeta.Contains("velocidade") -and [string]$iniColeta["velocidade"]["ativo"] -match '^(sim|s|1|true|ligado)$') {
+        $enableInternet = $true
+        $minutos = 0
+        if ([int]::TryParse([string]$iniColeta["velocidade"]["intervalo_minutos"], [ref]$minutos) -and $minutos -gt 0) {
+            $internetIntervalMinutes = $minutos
+        }
+    }
+    elseif ($enableInternet) {
         try {
             $existingTask = Get-ScheduledTask -TaskName $SpeedtestTaskName -ErrorAction SilentlyContinue
 
@@ -2270,7 +2283,7 @@ function Read-CurrentAlloyConfiguration {
         TipoLabel                = if ($labels.ContainsKey("tipo")) { $labels["tipo"] } else { "" }
         RemoteWriteUrl           = $remoteWriteUrl
         LokiUrl                  = $lokiUrl
-        MonitorHost              = (-not [string]::IsNullOrWhiteSpace($exporter))
+        MonitorHost              = (-not [string]::IsNullOrWhiteSpace($exporter)) -and @($collectors | Where-Object { $_ -ne "textfile" }).Count -gt 0
         Collectors               = $collectors
         LogComponents            = $logComponents
         EnableLogs               = @($logComponents | Where-Object { $_ -match "_(error|warning)$" }).Count -gt 0
@@ -2526,7 +2539,7 @@ function Get-NextecComponentesPendentes {
     if (-not (Test-Path -LiteralPath $AtualizadorScript) -or -not (Get-ScheduledTask -TaskName $AtualizadorTaskName -ErrorAction SilentlyContinue)) {
         $faltando.Add("atualizador automático")
     }
-    if ($script:EnableColetaResolved -and (-not (Test-Path -LiteralPath $ColetaScript) -or -not (Get-ScheduledTask -TaskName $ColetaTaskName -ErrorAction SilentlyContinue))) {
+    if ((Test-NextecColetaNecessaria) -and (-not (Test-Path -LiteralPath $ColetaScript) -or -not (Get-ScheduledTask -TaskName $ColetaTaskName -ErrorAction SilentlyContinue))) {
         $faltando.Add("Coleta Complementar")
     }
     return $faltando.ToArray()
@@ -2550,6 +2563,7 @@ function Save-ReconfiguredAlloy {
     Format-AndValidateAlloyConfiguration
     Restart-AlloyService
     Test-AlloyReadiness
+    Remove-NextecSpeedtestLegado
     Write-Ok "Configuração atualizada."
 }
 
@@ -5784,14 +5798,12 @@ function Protect-NextecSecretFile {
 # INTERNET (SPEEDTEST OOKLA)
 # ==============================================================================
 #
-# Desenho: em vez de subir um exporter Prometheus separado com porta própria,
-# o teste de velocidade roda por tarefa agendada e grava um arquivo .prom no
-# diretório que o coletor "textfile" do windows_exporter (já embutido no
-# Alloy) varre sozinho. Vantagens: nenhuma porta nova exposta, e o alvo
-# continua sendo o mesmo prometheus.exporter.windows "system", então as
-# labels de cliente/host/ambiente/criticidade já aplicadas em
-# discovery.relabel "system_labels" valem também para essas métricas, sem
-# precisar duplicar labelling em outro scrape job.
+# O teste de velocidade é o módulo "velocidade" da Coleta Complementar, que
+# roda o Speedtest CLI e grava nextec_speedtest_* na pasta textfile da Coleta.
+# O instalador só baixa o CLI (pasta nextec-speedtest) e liga [velocidade] no
+# .ini. Até a 2.20 o teste rodava pela tarefa NextecSpeedtest, com .prom
+# próprio; Remove-NextecSpeedtestLegado apaga esse formato depois que a
+# configuração nova sobe validada, para que um rollback ainda o encontre.
 
 function Install-SpeedtestCli {
     <#
@@ -5834,187 +5846,6 @@ function Install-SpeedtestCli {
     & $SpeedtestExe --accept-license --accept-gdpr --format=json 2>&1 | Out-Null
 }
 
-function New-SpeedtestRunnerScript {
-    <#
-        Grava o script que a tarefa agendada executa a cada intervalo. Fica
-        em arquivo próprio, não inline na definição da tarefa, para o log de
-        cada execução poder ser lido e para o comando não ficar refém do
-        limite de tamanho de linha do Task Scheduler.
-    #>
-    New-Item -ItemType Directory -Path $SpeedtestMetricsDir -Force | Out-Null
-
-    # Token de texto simples em vez de -f: o corpo do script tem vários "{ }"
-    # de controle de fluxo do PowerShell (if/else, blocos de script), e -f
-    # exigiria escapar cada um como "{{ }}" só para não colidir com os dois
-    # placeholders reais. Um Replace() de token único não tem esse risco.
-    $runnerContent = @'
-$ErrorActionPreference = "Continue"
-
-$speedtestExe = "__NEXTEC_SPEEDTEST_EXE__"
-$metricsFile  = "__NEXTEC_SPEEDTEST_METRICS_FILE__"
-$tempFile     = "__NEXTEC_SPEEDTEST_METRICS_FILE__.tmp"
-
-$timestamp = [int][double]::Parse((Get-Date -UFormat %s))
-
-# O speedtest.exe escreve UTF-8; sem isto o PowerShell 5.1 lê a saída na
-# página de código do console e quebra os acentos do nome do servidor.
-try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
-
-try {
-    $raw = & $speedtestExe --accept-license --accept-gdpr --format=json --progress=no 2>$null
-    $result = $raw | ConvertFrom-Json -ErrorAction Stop
-
-    if ($null -eq $result -or $result.type -ne "result") {
-        throw "Saída do Speedtest CLI sem resultado válido."
-    }
-
-    $downloadBps = [int64]$result.download.bandwidth * 8
-    $uploadBps   = [int64]$result.upload.bandwidth * 8
-    $latencyMs   = [double]$result.ping.latency
-    $jitterMs    = [double]$result.ping.jitter
-    $packetLoss  = if ($null -ne $result.packetLoss) { [double]$result.packetLoss } else { 0 }
-    $serverId    = [string]$result.server.id
-    $serverName  = ($result.server.name -replace '["\\]', '')
-
-    $lines = @(
-        "# HELP nextec_speedtest_up 1 se a última execução do speedtest terminou com sucesso, 0 caso contrário.",
-        "# TYPE nextec_speedtest_up gauge",
-        "nextec_speedtest_up 1",
-        "# HELP nextec_speedtest_download_bits_per_second Velocidade de download medida, em bits por segundo.",
-        "# TYPE nextec_speedtest_download_bits_per_second gauge",
-        "nextec_speedtest_download_bits_per_second $downloadBps",
-        "# HELP nextec_speedtest_upload_bits_per_second Velocidade de upload medida, em bits por segundo.",
-        "# TYPE nextec_speedtest_upload_bits_per_second gauge",
-        "nextec_speedtest_upload_bits_per_second $uploadBps",
-        "# HELP nextec_speedtest_ping_latency_milliseconds Latência do ping até o servidor de teste, em milissegundos.",
-        "# TYPE nextec_speedtest_ping_latency_milliseconds gauge",
-        "nextec_speedtest_ping_latency_milliseconds $latencyMs",
-        "# HELP nextec_speedtest_ping_jitter_milliseconds Variação da latência (jitter), em milissegundos.",
-        "# TYPE nextec_speedtest_ping_jitter_milliseconds gauge",
-        "nextec_speedtest_ping_jitter_milliseconds $jitterMs",
-        "# HELP nextec_speedtest_packet_loss_percent Perda de pacotes durante o teste, em percentual.",
-        "# TYPE nextec_speedtest_packet_loss_percent gauge",
-        "nextec_speedtest_packet_loss_percent $packetLoss",
-        "# HELP nextec_speedtest_last_run_timestamp_seconds Timestamp Unix da última execução do speedtest.",
-        "# TYPE nextec_speedtest_last_run_timestamp_seconds gauge",
-        "nextec_speedtest_last_run_timestamp_seconds $timestamp",
-        "# HELP nextec_speedtest_server_info Servidor Ookla usado no teste, sempre valor 1.",
-        "# TYPE nextec_speedtest_server_info gauge",
-        "nextec_speedtest_server_info{server_id=`"$serverId`",server_name=`"$serverName`"} 1"
-    )
-}
-catch {
-    # Falha registrada como métrica, não como arquivo ausente: nextec_speedtest_up
-    # em 0 aparece no Grafana; um arquivo .prom que some (ex.: erro apagando o
-    # antigo) só gera "sem dado", que é fácil de confundir com "sem problema".
-    $lines = @(
-        "# HELP nextec_speedtest_up 1 se a última execução do speedtest terminou com sucesso, 0 caso contrário.",
-        "# TYPE nextec_speedtest_up gauge",
-        "nextec_speedtest_up 0",
-        "# HELP nextec_speedtest_last_run_timestamp_seconds Timestamp Unix da última execução do speedtest.",
-        "# TYPE nextec_speedtest_last_run_timestamp_seconds gauge",
-        "nextec_speedtest_last_run_timestamp_seconds $timestamp"
-    )
-}
-
-# Escrita atômica: o coletor textfile do windows_exporter varre o diretório
-# em intervalos próprios e pode ler o arquivo no meio de uma escrita direta,
-# resultando em métrica truncada e scrape com erro de parsing. Grava em
-# arquivo temporário e troca com Move-Item, que no NTFS é atômico dentro do
-# mesmo volume.
-# UTF-8 sem BOM: "Set-Content -Encoding utf8" no Windows PowerShell 5.1 grava
-# COM BOM, e o parser do formato texto do Prometheus lê o BOM como parte do
-# primeiro nome de métrica, descartando o arquivo inteiro com
-# "invalid metric name".
-[IO.File]::WriteAllText($tempFile, (($lines -join "`n") + "`n"), (New-Object Text.UTF8Encoding($false)))
-Move-Item -LiteralPath $tempFile -Destination $metricsFile -Force
-
-# Histórico dos testes no NOC: com a Coleta Complementar instalada, cada teste
-# vira um evento no mesmo arquivo que o Alloy já envia ao Loki.
-$eventsFile = "__NEXTEC_COLETA_EVENTOS__"
-if (Test-Path -LiteralPath (Split-Path -Parent $eventsFile)) {
-    $sucesso = ($lines -contains "nextec_speedtest_up 1")
-    $evento = [ordered]@{
-        ts        = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-        tipo      = "links_evento"
-        categoria = "velocidade"
-        evento    = "teste_velocidade"
-        nivel     = if ($sucesso) { "info" } else { "aviso" }
-    }
-    if ($sucesso) {
-        $evento.download_mbps = [math]::Round($downloadBps / 1e6, 1)
-        $evento.upload_mbps   = [math]::Round($uploadBps / 1e6, 1)
-        $evento.latencia_ms   = [math]::Round($latencyMs, 1)
-        $evento.detalhe       = $serverName
-    }
-    else {
-        $evento.detalhe = "teste falhou"
-    }
-    try {
-        [IO.File]::AppendAllText($eventsFile, (($evento | ConvertTo-Json -Compress) + "`n"), (New-Object Text.UTF8Encoding($false)))
-    }
-    catch { }
-}
-'@
-
-    # Valor puro, sem ConvertTo-AlloyEscapedString: aquela função escapa para
-    # a sintaxe do .alloy (barra invertida dobrada), não para string do
-    # PowerShell. Os caminhos vêm de $env:ProgramData, sem aspas, então não
-    # há nada para escapar aqui.
-    $runnerContent = $runnerContent.Replace("__NEXTEC_SPEEDTEST_EXE__", $SpeedtestExe)
-    $runnerContent = $runnerContent.Replace("__NEXTEC_SPEEDTEST_METRICS_FILE__", $SpeedtestMetricsFile)
-    $runnerContent = $runnerContent.Replace("__NEXTEC_COLETA_EVENTOS__", $ColetaEventos)
-
-    [IO.File]::WriteAllText(
-        $SpeedtestRunnerScript,
-        $runnerContent,
-        # Com BOM: sem ele o PowerShell 5.1 lê o script como ANSI e quebra
-        # os acentos dos textos de ajuda das métricas.
-        (New-Object Text.UTF8Encoding($true))
-    )
-}
-
-function Register-SpeedtestScheduledTask {
-    <#
-        Tarefa como SYSTEM: não depende de nenhuma conta de usuário logada
-        nem de senha armazenada, sobrevive a logoff/reboot, e roda mesmo sem
-        ninguém interativo na máquina, igual ao próprio serviço do Alloy.
-    #>
-    $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-        -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $SpeedtestRunnerScript)
-
-    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
-
-    $intervalo = New-TimeSpan -Minutes $script:InternetIntervalMinutesResolved
-
-    # Início um minuto à frente: com -At (Get-Date) o instante de disparo já
-    # passou quando a tarefa termina de ser registrada.
-    $inicio = (Get-Date).AddMinutes(1)
-
-    $trigger = New-SpeedtestTrigger -Inicio $inicio -Intervalo $intervalo
-
-    try {
-        Register-ScheduledTask -TaskName $SpeedtestTaskName -Action $action -Trigger $trigger `
-            -Principal $principal -Settings $settings -Force | Out-Null
-    }
-    catch {
-        # Alguns builds preenchem a duração sozinhos mesmo sem o parâmetro, e
-        # aí o registro falha do mesmo jeito. Dez anos é longo o bastante para
-        # a prática e está dentro do intervalo que o agendador aceita.
-        Write-Warn "O agendador recusou a repetição indefinida; usando duração de 10 anos."
-
-        $trigger = New-ScheduledTaskTrigger -Once -At $inicio `
-            -RepetitionInterval $intervalo `
-            -RepetitionDuration (New-TimeSpan -Days 3650)
-
-        Register-ScheduledTask -TaskName $SpeedtestTaskName -Action $action -Trigger $trigger `
-            -Principal $principal -Settings $settings -Force | Out-Null
-    }
-}
-
 function New-SpeedtestTrigger {
     <#
         Monta o gatilho de repetição da tarefa do Speedtest.
@@ -6053,35 +5884,57 @@ function New-SpeedtestTrigger {
     return $trigger
 }
 
-function Install-InternetMonitoring {
-    if (-not $script:EnableInternetResolved) {
-        # Reconfiguração pode estar desligando o que já estava ligado: some
-        # a tarefa agendada, mas deixa o binário e o histórico de métricas
-        # (o próximo scrape simplesmente para de receber dado novo).
-        if (Get-ScheduledTask -TaskName $SpeedtestTaskName -ErrorAction SilentlyContinue) {
-            Unregister-ScheduledTask -TaskName $SpeedtestTaskName -Confirm:$false
-        }
-        return
+function Test-NextecSpeedtestLegado {
+    # Formato anterior à 2.21: tarefa agendada ou serviço do Speedtest.
+    foreach ($nome in $SpeedtestLegadoNomes) {
+        if (Get-ScheduledTask -TaskName $nome -ErrorAction SilentlyContinue) { return $true }
+        if (Get-Service -Name $nome -ErrorAction SilentlyContinue) { return $true }
     }
+    return $false
+}
+
+function Remove-NextecSpeedtestLegado {
+    <#
+        Remove a tarefa e o serviço do Speedtest antigo, o script que a tarefa
+        rodava e o .prom dele. Mantém o speedtest.exe, que a Coleta usa. Só
+        roda com o Speedtest já na Coleta, ou desligado, e depois do Alloy
+        validado.
+    #>
+    $removidos = New-Object System.Collections.Generic.List[string]
+    foreach ($nome in $SpeedtestLegadoNomes) {
+        if (Get-ScheduledTask -TaskName $nome -ErrorAction SilentlyContinue) {
+            Stop-ScheduledTask -TaskName $nome -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $nome -Confirm:$false
+            $removidos.Add("tarefa $nome")
+        }
+        $servico = Get-Service -Name $nome -ErrorAction SilentlyContinue
+        if ($null -ne $servico) {
+            Stop-Service -Name $nome -Force -ErrorAction SilentlyContinue
+            $saida = & (Join-Path $env:SystemRoot "System32\sc.exe") delete $nome 2>&1
+            if ($LASTEXITCODE -ne 0) { throw ("Não foi possível remover o serviço {0}: {1}" -f $nome, ($saida -join " ")) }
+            $removidos.Add("serviço $nome")
+        }
+    }
+    foreach ($arquivo in @($SpeedtestRunnerScript, $SpeedtestMetricsFile, "$SpeedtestMetricsFile.tmp")) {
+        if (Test-Path -LiteralPath $arquivo -PathType Leaf) {
+            Remove-Item -LiteralPath $arquivo -Force
+            $removidos.Add((Split-Path -Leaf $arquivo))
+        }
+    }
+    if ((Test-Path -LiteralPath $SpeedtestMetricsDir) -and @(Get-ChildItem -LiteralPath $SpeedtestMetricsDir -Force).Count -eq 0) {
+        Remove-Item -LiteralPath $SpeedtestMetricsDir -Force
+    }
+    if ($removidos.Count -gt 0) {
+        Write-Ok ("Speedtest antigo removido ({0}); o teste segue pela Coleta Complementar." -f ($removidos -join ", "))
+    }
+}
+
+function Install-InternetMonitoring {
+    # Só o binário: quem roda o teste é a Coleta Complementar ([velocidade]).
+    if (-not $script:EnableInternetResolved) { return }
 
     Write-Step "Internet (Speedtest)"
-
     Install-SpeedtestCli
-    New-SpeedtestRunnerScript
-    Register-SpeedtestScheduledTask
-
-    # Roda uma vez agora, na hora da instalação: sem isso o técnico só veria
-    # o primeiro dado depois de até $InternetIntervalMinutesResolved minutos,
-    # e o checklist de validação (ver documento 03, item 19) ficaria bloqueado
-    # esperando sem necessidade.
-    Write-Info ("Executando o primeiro teste de velocidade agora (pode levar até 30s)...")
-    try {
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $SpeedtestRunnerScript
-        Write-Info "Primeiro teste de velocidade concluído."
-    }
-    catch {
-        Write-Warn ("Primeiro teste de velocidade falhou, mas a tarefa agendada ({0} em {1} min) segue tentando: {2}" -f $SpeedtestTaskName, $script:InternetIntervalMinutesResolved, $_.Exception.Message)
-    }
 }
 
 # ==============================================================================
@@ -6472,6 +6325,13 @@ function Write-ColetaConfig {
     $linhas.Add(("ativo = {0}" -f $(if ($motores.Count -gt 0) { "sim" } else { "nao" })))
     $linhas.Add(("motores = {0}" -f ($motores -join ", ")))
     $linhas.Add(("arquivos = {0}" -f ($arquivosSqlite -join ", ")))
+    $linhas.Add("")
+    $linhas.Add("; Teste de velocidade (Speedtest CLI da Ookla). Satura o link durante o")
+    $linhas.Add("; teste: um servidor por local, a cada 30 min (recomendado).")
+    $linhas.Add("[velocidade]")
+    $linhas.Add(("ativo = {0}" -f $(if ($script:EnableInternetResolved) { "sim" } else { "nao" })))
+    $linhas.Add(("intervalo_minutos = {0}" -f $script:InternetIntervalMinutesResolved))
+    $linhas.Add(("speedtest = {0}" -f $SpeedtestExe))
 
     foreach ($link in $script:ColetaLinks) {
         $linhas.Add("")
@@ -6533,9 +6393,9 @@ function Get-NextecBancosMotores {
 }
 
 function Test-NextecColetaNecessaria {
-    # A Coleta Complementar roda quando a internet está ligada ou quando há
-    # banco para ela medir.
-    return ($script:EnableColetaResolved -or @(Get-NextecBancosMotores).Count -gt 0)
+    # A Coleta Complementar roda quando a internet está ligada, quando há
+    # banco para ela medir ou com o teste de velocidade.
+    return ($script:EnableColetaResolved -or $script:EnableInternetResolved -or @(Get-NextecBancosMotores).Count -gt 0)
 }
 
 function Test-NextecCaminhosSqlite {
@@ -6561,7 +6421,11 @@ function Install-ColetaComplementar {
         return
     }
 
-    Write-Step $(if ($script:EnableColetaResolved) { "Coleta Complementar (internet e links)" } else { "Coleta Complementar (bancos de dados)" })
+    $partes = @()
+    if ($script:EnableColetaResolved) { $partes += "internet e links" }
+    if ($script:EnableInternetResolved) { $partes += "velocidade" }
+    if (@(Get-NextecBancosMotores).Count -gt 0) { $partes += "bancos de dados" }
+    Write-Step ("Coleta Complementar ({0})" -f ($partes -join ", "))
 
     # Roda como SYSTEM: pasta protegida antes de gravar o script.
     Protect-NextecDirectory -Path $ColetaDir -LeituraUsuarios
@@ -6688,7 +6552,9 @@ function Get-WindowsCollectors {
     <#
         Monta a lista de coletores do windows_exporter.
 
-        A lista base é o perfil mínimo do documento 03.
+        A lista base é o perfil mínimo do documento 03. "time" traz o
+        relógio e o desvio em relação à fonte NTP (w32time), usado pelo
+        alerta de relógio fora de sincronia.
 
         "service" depende do bloco service { include } montado em
         New-AlloyConfiguration. Sem filtro ele gera de 7 a 13 séries por
@@ -6704,7 +6570,7 @@ function Get-WindowsCollectors {
     #>
     $collectors = New-Object System.Collections.Generic.List[string]
 
-    foreach ($collector in @("cpu","logical_disk","memory","net","os","service","system")) {
+    foreach ($collector in @("cpu","logical_disk","memory","net","os","service","system","time")) {
         if (-not $collectors.Contains($collector)) {
             $collectors.Add($collector)
         }
@@ -6828,17 +6694,10 @@ function New-AlloyConfiguration {
     [void]$builder.AppendLine("}")
     [void]$builder.AppendLine("")
 
-    # O bloco existe sempre que há algo para o windows_exporter coletar: seja
-    # o perfil completo de host monitorado, seja só o coletor "textfile" do
-    # Speedtest num host que é apenas captador (sem monitorar o próprio SO).
-    # Sem isso, "captador puro" com Internet habilitada nunca teria onde o
-    # coletor textfile rodar, e a métrica de speedtest não sairia do host.
-    if ($script:MonitorHost -or $script:EnableInternetResolved) {
-        $collectors = if ($script:MonitorHost) { New-Object System.Collections.Generic.List[string] (,[string[]](Get-WindowsCollectors)) } else { New-Object System.Collections.Generic.List[string] }
-
-        if ($script:EnableInternetResolved -and -not $collectors.Contains("textfile")) {
-            $collectors.Add("textfile")
-        }
+    # O exporter "system" existe só com o host monitorado. O Speedtest chega
+    # pela pasta textfile da Coleta Complementar, que tem exporter próprio.
+    if ($script:MonitorHost) {
+        $collectors = New-Object System.Collections.Generic.List[string] (,[string[]](Get-WindowsCollectors))
 
         $collectorLiteral = ($collectors | Sort-Object -Unique | ForEach-Object { '"{0}"' -f (ConvertTo-AlloyEscapedString $_) }) -join ", "
 
@@ -6900,20 +6759,6 @@ function New-AlloyConfiguration {
                 [void]$builder.AppendLine('    enabled_classes = ["accessmethods", "bufman", "genstats", "sqlstats", "memmgr", "transactions", "locks"]')
                 [void]$builder.AppendLine("  }")
             }
-        }
-
-        if ($script:EnableInternetResolved) {
-            # Diretório exclusivo do .prom do Speedtest. O coletor textfile
-            # varre TODO arquivo .prom da pasta, então ela não pode ser
-            # compartilhada com outra coisa que também escreva ali.
-            [void]$builder.AppendLine("")
-            [void]$builder.AppendLine("  // Internet (Speedtest): le o .prom gravado pela tarefa agendada.")
-            [void]$builder.AppendLine("  textfile {")
-            # O atributo do exporter windows chama-se text_file_directory.
-            # "directory" é o nome equivalente no exporter unix e o Alloy
-            # recusa a configuração inteira com "unrecognized attribute name".
-            [void]$builder.AppendLine(('    text_file_directory = "{0}"' -f (ConvertTo-AlloyEscapedString $SpeedtestMetricsDir)))
-            [void]$builder.AppendLine("  }")
         }
 
         [void]$builder.AppendLine("}")
@@ -7620,16 +7465,6 @@ function Restore-Configuration {
         # velocidade a cada 30 minutos num host que não coleta o resultado.
         if ($script:EnableColetaResolved -and -not $restored) {
             Unregister-ScheduledTask -TaskName $ColetaTaskName -Confirm:$false -ErrorAction SilentlyContinue
-        }
-
-        if ($script:EnableInternetResolved -and -not $restored) {
-            try {
-                Unregister-ScheduledTask -TaskName $SpeedtestTaskName -Confirm:$false -ErrorAction SilentlyContinue
-                Write-Warn ("Tarefa agendada {0} removida no rollback." -f $SpeedtestTaskName)
-            }
-            catch {
-                Write-Warn ("Não foi possível remover a tarefa {0}: {1}" -f $SpeedtestTaskName, $_.Exception.Message)
-            }
         }
 
         # O registro guarda as credenciais e os argumentos do serviço, e é
@@ -9995,11 +9830,12 @@ function Invoke-NextecInstaller {
             } | Out-Null
         }
 
-        if ($script:EnableColetaResolved) {
-            Invoke-NextecOptionalStep -Nome "Coleta Complementar (internet e links)" -Acao {
+        if (Test-NextecColetaNecessaria) {
+            Invoke-NextecOptionalStep -Nome "Coleta Complementar" -Acao {
                 Install-ColetaComplementar
             } -AoFalhar {
                 $script:EnableColetaResolved = $false
+                $script:EnableInternetResolved = $false
             } | Out-Null
         }
 
@@ -10013,6 +9849,7 @@ function Invoke-NextecInstaller {
         # Verificação não reverte nada: a configuração já está válida no disco
         # e o serviço já subiu. Falha aqui é informação para o técnico.
         Invoke-NextecVerification -Nome "Prontidão do Alloy" -Acao { Test-AlloyReadiness }
+        Invoke-NextecOptionalStep -Nome "Remoção do Speedtest antigo" -Acao { Remove-NextecSpeedtestLegado } -AoFalhar { } | Out-Null
         Invoke-NextecVerification -Nome "Teste de ingestão no NOC" -Acao { Test-AlloyIngestion }
 
         # Depois do Alloy validado: falha aqui não desfaz o monitoramento.
