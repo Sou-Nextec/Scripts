@@ -17,6 +17,9 @@ Módulos:
   acessos     logins no servidor (SSH e console), sudo e su, com IP de
               origem; marca acesso privilegiado, origem nova e fora do
               horário para os alertas de acesso privilegiado
+  bancos      bancos sem exportador próprio (Firebird, Oracle, SQL Anywhere,
+              SQL Server e arquivos SQLite): no ar, conexões, memória,
+              tempo ligado e tamanho das bases, no padrão nextec_banco_*
 
 Uso:
   coleta-complementar.py executar            roda os módulos ligados (serviço)
@@ -29,6 +32,7 @@ Configuração: /etc/coleta-complementar/coleta-complementar.ini
 """
 
 import configparser
+import glob
 import grp
 import http.client
 import ipaddress
@@ -48,7 +52,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-VERSAO = "1.2.0"
+VERSAO = "1.3.0"
 
 CONFIG_PADRAO = "/etc/coleta-complementar/coleta-complementar.ini"
 DIR_DADOS_PADRAO = "/var/lib/coleta-complementar"
@@ -1528,9 +1532,255 @@ class ModuloAcessos:
         gravar_atomico(self.arquivo, metricas.texto())
         self.estado.salvar()
 
+# ---------------------------------------------------------------------------
+# Módulo bancos
+# ---------------------------------------------------------------------------
+# Bancos que não têm exportador Prometheus de uso simples. A coleta não usa
+# driver nem senha: olha os processos do banco, as portas em que eles
+# escutam, as conexões estabelecidas nessas portas e o tamanho dos arquivos
+# das bases. Sai no padrão nextec_banco_* que o painel "Nextec | Banco de
+# dados" já converte junto com SQL Server, MySQL/MariaDB e PostgreSQL.
+#
+# Configuração ([bancos] no INI):
+#   ativo = sim
+#   motores = firebird, oracle, sqlanywhere, sqlserver
+#       motores esperados neste servidor. O que estiver na lista e não tiver
+#       processo no ar sai com nextec_banco_up 0. Os que não estão na lista
+#       entram quando são encontrados.
+#   arquivos = sqlite:/srv/app/dados/*.db, firebird:/dados/*.fdb
+#       bases para medir o tamanho, como motor:caminho (curinga aceito).
+#       Firebird e SQL Anywhere também têm as bases descobertas sozinhas.
+
+MOTORES_BANCO = {
+    "firebird": "Firebird",
+    "oracle": "Oracle",
+    "sqlanywhere": "SQL Anywhere",
+    "sqlserver": "SQL Server",
+    "sqlite": "SQLite",
+}
+RE_FIREBIRD = re.compile(r"^(firebird|fbserver|fb_smp_server|fb_inet_server|fbsuperserver)$")
+RE_SQLANYWHERE = re.compile(r"^(dbsrv|dbeng)\d+$")
+RE_ORACLE_PMON = re.compile(r"^ora_pmon_(.+)$")
+CONFIGS_FIREBIRD = [
+    "/opt/firebird/databases.conf", "/opt/firebird/aliases.conf",
+    "/etc/firebird/*/databases.conf", "/etc/firebird/*/aliases.conf",
+    "/etc/firebird*/databases.conf", "/etc/firebird*/aliases.conf",
+]
+PASTAS_SQLSERVER = ["/var/opt/mssql/data/*.mdf", "/var/opt/mssql/data/*.ndf"]
+
+
+def processos():
+    """Lista (pid, comm, argumentos) dos processos do sistema."""
+    lista_proc = []
+    for nome in os.listdir("/proc"):
+        if not nome.isdigit():
+            continue
+        try:
+            with open(f"/proc/{nome}/comm", encoding="utf-8", errors="replace") as arq:
+                comm = arq.read().strip()
+            with open(f"/proc/{nome}/cmdline", "rb") as arq:
+                args = [a.decode("utf-8", "replace") for a in arq.read().split(b"\0") if a]
+        except OSError:
+            continue
+        lista_proc.append((int(nome), comm, args))
+    return lista_proc
+
+
+def memoria_processo(pid):
+    try:
+        with open(f"/proc/{pid}/status", encoding="utf-8") as arq:
+            for linha in arq:
+                if linha.startswith("VmRSS:"):
+                    return int(linha.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def inicio_processo(pid):
+    """Momento (epoch) em que o processo começou."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as arq:
+            campos = arq.read().rsplit(")", 1)[1].split()
+        with open("/proc/stat", encoding="utf-8") as arq:
+            boot = next(int(l.split()[1]) for l in arq if l.startswith("btime"))
+        return boot + int(campos[19]) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
+
+
+def sockets_por_pid():
+    """inode do socket -> pid dono."""
+    donos = {}
+    for nome in os.listdir("/proc"):
+        if not nome.isdigit():
+            continue
+        try:
+            for fd in os.listdir(f"/proc/{nome}/fd"):
+                alvo = os.readlink(f"/proc/{nome}/fd/{fd}")
+                if alvo.startswith("socket:["):
+                    donos[alvo[8:-1]] = int(nome)
+        except OSError:
+            continue
+    return donos
+
+
+def tabela_tcp():
+    """Lista (porta_local, estado, inode) de /proc/net/tcp e tcp6."""
+    linhas = []
+    for arquivo in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(arquivo, encoding="utf-8") as arq:
+                next(arq)
+                for linha in arq:
+                    campos = linha.split()
+                    porta = int(campos[1].rsplit(":", 1)[1], 16)
+                    linhas.append((porta, campos[3], campos[9]))
+        except (OSError, ValueError, IndexError, StopIteration):
+            continue
+    return linhas
+
+
+def bases_firebird():
+    caminhos = set()
+    for padrao in CONFIGS_FIREBIRD:
+        for arquivo in glob.glob(padrao):
+            try:
+                with open(arquivo, encoding="utf-8", errors="replace") as arq:
+                    for linha in arq:
+                        linha = linha.split("#", 1)[0].strip()
+                        if "=" in linha and not linha.startswith(("{", "}")):
+                            valor = linha.split("=", 1)[1].strip().strip('"')
+                            if valor.startswith("/") and "{" not in valor:
+                                caminhos.add(valor)
+            except OSError:
+                continue
+    return sorted(caminhos)
+
+
+def nome_base(caminho):
+    return os.path.splitext(os.path.basename(caminho))[0]
+
+
+class ModuloBancos:
+    nome = "bancos"
+
+    def __init__(self, config, eventos, estado, dir_textfile):
+        secao = config["bancos"] if config.has_section("bancos") else {}
+        self.intervalo = max(30, int(secao.get("intervalo_segundos", "60")))
+        self.esperados = [m.lower() for m in lista(secao.get("motores", "")) if m.lower() in MOTORES_BANCO]
+        self.arquivos = []
+        for item in lista(secao.get("arquivos", "")):
+            motor, _, caminho = item.partition(":")
+            if motor.lower() in MOTORES_BANCO and caminho:
+                self.arquivos.append((motor.lower(), caminho.strip()))
+        self.arquivo = os.path.join(dir_textfile, "coleta_complementar_bancos.prom")
+
+    def instancias(self):
+        """motor -> instância -> {pids, bases}."""
+        achados = {}
+
+        def anotar(motor, instancia, pid, bases=()):
+            item = achados.setdefault(motor, {}).setdefault(instancia, {"pids": set(), "bases": set()})
+            item["pids"].add(pid)
+            item["bases"].update(bases)
+
+        lista_proc = processos()
+        # O comm do Linux corta em 15 caracteres; o nome completo dos
+        # processos do Oracle (ora_pmon_<SID>, oracle<SID>) está no argv[0].
+        nomes = {pid: (args[0].split()[0] if args else comm) for pid, comm, args in lista_proc}
+        sids = {RE_ORACLE_PMON.match(n).group(1) for n in nomes.values() if RE_ORACLE_PMON.match(n)}
+        for pid, comm, args in lista_proc:
+            if RE_FIREBIRD.match(comm):
+                anotar("firebird", "padrao", pid)
+            elif RE_SQLANYWHERE.match(comm):
+                nome = comm
+                if "-n" in args and args.index("-n") + 1 < len(args):
+                    nome = args[args.index("-n") + 1]
+                anotar("sqlanywhere", nome, pid, [a for a in args if a.lower().endswith(".db")])
+            elif comm == "sqlservr":
+                anotar("sqlserver", "MSSQLSERVER", pid)
+            elif comm == "tnslsnr" and sids:
+                for sid in sids:
+                    anotar("oracle", sid, pid)
+            else:
+                nome = nomes[pid]
+                for sid in sids:
+                    if (nome.startswith("ora_") and nome.endswith(f"_{sid}")) or nome == f"oracle{sid}":
+                        anotar("oracle", sid, pid)
+        return achados
+
+    def rodada(self):
+        metricas = Metricas()
+        achados = self.instancias()
+        donos = sockets_por_pid() if achados else {}
+        tcp = tabela_tcp() if achados else []
+        momento = agora()
+
+        for motor in sorted(set(achados) | set(self.esperados)):
+            rotulo_motor = MOTORES_BANCO[motor]
+            instancias = achados.get(motor, {})
+            if not instancias and motor in self.esperados and motor != "sqlite":
+                metricas.add("nextec_banco_up", 0, {"motor": rotulo_motor, "instancia": "padrao"},
+                             ajuda="1 no ar, 0 parado (processo do banco ausente)")
+            for instancia, dados in sorted(instancias.items()):
+                rotulos = {"motor": rotulo_motor, "instancia": instancia}
+                pids = dados["pids"]
+                portas = {porta for porta, est, inode in tcp if est == "0A" and donos.get(inode) in pids}
+                conexoes = sum(1 for porta, est, _ in tcp if est == "01" and porta in portas)
+                metricas.add("nextec_banco_up", 1, rotulos, ajuda="1 no ar, 0 parado (processo do banco ausente)")
+                metricas.add("nextec_banco_conexoes_total", conexoes, rotulos,
+                             ajuda="Conexões TCP estabelecidas nas portas do banco")
+                for porta in sorted(portas):
+                    metricas.add("nextec_banco_porta_info", 1, dict(rotulos, porta=str(porta)))
+                # No Oracle a memória é compartilhada entre os processos e a
+                # soma mostraria um valor várias vezes maior que o real.
+                if motor != "oracle":
+                    metricas.add("nextec_banco_memoria_bytes", sum(memoria_processo(p) for p in pids), rotulos,
+                                 ajuda="Memória residente dos processos do banco")
+                inicios = [i for i in (inicio_processo(p) for p in pids) if i]
+                if inicios:
+                    metricas.add("nextec_banco_ligado_segundos", round(momento - min(inicios)), rotulos,
+                                 ajuda="Tempo desde que o banco foi iniciado")
+
+        bases = []
+        for motor, instancias in achados.items():
+            for instancia, dados in instancias.items():
+                bases += [(motor, instancia, b) for b in dados["bases"]]
+        if "firebird" in achados:
+            bases += [("firebird", "padrao", b) for b in bases_firebird()]
+        if "sqlserver" in achados:
+            for padrao in PASTAS_SQLSERVER:
+                bases += [("sqlserver", "MSSQLSERVER", b) for b in glob.glob(padrao)]
+        for motor, padrao in self.arquivos:
+            encontrados = glob.glob(padrao)
+            # SQLite não tem processo: a pasta das bases é a instância, e ela
+            # fica "no ar" enquanto o arquivo existir.
+            instancia = os.path.dirname(padrao) or padrao if motor == "sqlite" else "padrao"
+            if motor == "sqlite":
+                metricas.add("nextec_banco_up", 1 if encontrados else 0, {"motor": "SQLite", "instancia": instancia})
+            bases += [(motor, instancia, b) for b in encontrados]
+        vistos = set()
+        for motor, instancia, caminho in bases:
+            chave = (motor, os.path.realpath(caminho))
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+            try:
+                tamanho = os.path.getsize(caminho)
+            except OSError:
+                continue
+            metricas.add("nextec_banco_tamanho_bytes", tamanho,
+                         {"motor": MOTORES_BANCO[motor], "instancia": instancia, "banco": nome_base(caminho)},
+                         ajuda="Tamanho do arquivo da base")
+
+        metricas.add("nextec_bancos_coletor_ultima_execucao_segundos", int(momento))
+        gravar_atomico(self.arquivo, metricas.texto())
+
+
 
 MODULOS = {"internet": ModuloLinks, "docker": ModuloDocker, "velocidade": ModuloVelocidade,
-           "acessos": ModuloAcessos}
+           "acessos": ModuloAcessos, "bancos": ModuloBancos}
 
 
 def carregar_config():
@@ -1552,6 +1802,8 @@ def modulos_ligados(config):
         ligados.append("velocidade")
     if config.has_section("acessos") and sim(config["acessos"].get("ativo"), False):
         ligados.append("acessos")
+    if config.has_section("bancos") and sim(config["bancos"].get("ativo"), False):
+        ligados.append("bancos")
     return ligados
 
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.8.1 (Fabricantes SNMP em ordem alfabética)
+# Versão: 2.10.0 (Bancos: Firebird, Oracle, SQL Anywhere, SQL Server e SQLite pela Coleta Complementar)
 #
 # USO
 # ---
@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.9.0"
+INSTALLER_VERSION="2.10.0"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -106,6 +106,9 @@ ESTADO_INSTALADOR_VERSAO=""
 SEGUIR_INSTALACAO=1
 # Listas preenchidas pelas perguntas ou pelas respostas gravadas.
 LINKS=(); BLACKBOX_TARGETS=(); SNMP_TARGETS=(); CUSTOM_EXPORTERS=(); DATABASE_TARGETS=(); DETECTED_DATABASES=()
+# Bases SQLite (caminhos com curinga, separados por vírgula) medidas pela
+# Coleta Complementar. SQLite não tem processo para detectar.
+BANCOS_SQLITE=""
 
 # O pacote oficial usa /etc/default/alloy em Debian. No fallback binário também
 # adotamos o mesmo local para manter um único padrão de manutenção.
@@ -613,10 +616,14 @@ detect_docker() {
 }
 
 detect_databases() {
-  # DETECTED_DATABASES contém valores únicos: postgres, mysql, sqlserver.
+  # DETECTED_DATABASES contém valores únicos: postgres, mysql, sqlserver,
+  # firebird, oracle, sqlanywhere.
   DETECTED_DATABASES=()
-  local found_pg=0 found_mysql=0 found_mssql=0 psout dockerout
+  local found_pg=0 found_mysql=0 found_mssql=0 found_fb=0 found_ora=0 found_sa=0 psout dockerout
   psout="$(ps -eo comm,args 2>/dev/null || true)"
+  grep -Eqi '^(firebird|fbserver|fb_smp_server|fb_inet_server)[[:space:]]' <<<"$psout" && found_fb=1 || true
+  grep -Eqi '(^|[[:space:]])ora_pmon_' <<<"$psout" && found_ora=1 || true
+  grep -Eqi '^(dbsrv|dbeng)[0-9]+[[:space:]]' <<<"$psout" && found_sa=1 || true
 
   grep -Eqi '(^|[ /])(postgres|postmaster)([[:space:]]|$)' <<<"$psout" && found_pg=1 || true
   grep -Eqi '(^|[ /])(mysqld|mariadbd)([[:space:]]|$)' <<<"$psout" && found_mysql=1 || true
@@ -626,6 +633,7 @@ detect_databases() {
     systemctl list-units --type=service --all --no-legend 2>/dev/null | grep -Eqi 'postgresql|postgresql@' && found_pg=1 || true
     systemctl list-units --type=service --all --no-legend 2>/dev/null | grep -Eqi 'mysql|mariadb' && found_mysql=1 || true
     systemctl list-units --type=service --all --no-legend 2>/dev/null | grep -Eqi 'mssql-server' && found_mssql=1 || true
+    systemctl list-units --type=service --all --no-legend 2>/dev/null | grep -Eqi 'firebird' && found_fb=1 || true
   }
 
   if [[ "$DOCKER_DETECTED" == "1" ]] && command -v docker >/dev/null 2>&1; then
@@ -648,6 +656,15 @@ detect_databases() {
   fi
   if (( found_mssql == 1 )); then
     DETECTED_DATABASES+=("sqlserver")
+  fi
+  if (( found_fb == 1 )); then
+    DETECTED_DATABASES+=("firebird")
+  fi
+  if (( found_ora == 1 )); then
+    DETECTED_DATABASES+=("oracle")
+  fi
+  if (( found_sa == 1 )); then
+    DETECTED_DATABASES+=("sqlanywhere")
   fi
 
   return 0
@@ -676,7 +693,7 @@ show_detection() {
   if (( ${#DETECTED_DATABASES[@]} > 0 )); then
     ok "Banco(s) de dados detectado(s): ${DETECTED_DATABASES[*]}."
   else
-    info "Nenhum PostgreSQL, MySQL/MariaDB ou SQL Server detectado."
+    info "Nenhum banco de dados detectado (PostgreSQL, MySQL/MariaDB, SQL Server, Firebird, Oracle, SQL Anywhere)."
   fi
 }
 
@@ -955,7 +972,35 @@ append_env_var() {
 coleta_enabled() {
   [[ "${ENABLE_INTERNET:-0}" == "1" || "${ENABLE_LINKS:-0}" == "1" || \
      "${ENABLE_VELOCIDADE:-0}" == "1" || "${ENABLE_DOCKER:-0}" == "1" || \
-     "${ENABLE_ACESSOS:-0}" == "1" ]]
+     "${ENABLE_ACESSOS:-0}" == "1" ]] || [[ -n "$(bancos_motores)" ]]
+}
+
+# Bancos sem exportador próprio, medidos pela Coleta Complementar (módulo
+# bancos): motores confirmados, separados por vírgula.
+bancos_motores() {
+  [[ "${ENABLE_DATABASES:-0}" == "1" ]] || return 0
+  local item motores=()
+  for item in "${DATABASE_TARGETS[@]}"; do
+    case "${item%%|*}" in
+      firebird|oracle|sqlanywhere|sqlserver) motores+=("${item%%|*}") ;;
+    esac
+  done
+  [[ -n "$BANCOS_SQLITE" ]] && motores+=("sqlite")
+  local IFS=","
+  echo "${motores[*]}"
+}
+
+# Valor de "arquivos" do [bancos]: cada base SQLite como sqlite:caminho.
+bancos_arquivos() {
+  [[ "${ENABLE_DATABASES:-0}" == "1" && -n "$BANCOS_SQLITE" ]] || return 0
+  local caminho saida=() caminhos=()
+  IFS=',' read -ra caminhos <<<"$BANCOS_SQLITE"
+  for caminho in "${caminhos[@]}"; do
+    caminho="$(echo "$caminho" | xargs)"
+    [[ -n "$caminho" ]] && saida+=("sqlite:${caminho}")
+  done
+  local IFS=","
+  echo "${saida[*]}"
 }
 
 needs_loki() {
@@ -1186,9 +1231,9 @@ write_coleta_config() {
     # Reconfiguração sem links novos: preserva os links e limites já ajustados
     # e só atualiza quais módulos estão ligados.
     cp -a "$COLETA_CONFIG" "${COLETA_CONFIG}.$(date +%Y%m%d-%H%M%S).bak"
-    python3 - "$COLETA_CONFIG" "$ENABLE_INTERNET" "$ENABLE_DOCKER" "$ENABLE_VELOCIDADE" "${ENABLE_ACESSOS:-0}" <<'PY'
+    python3 - "$COLETA_CONFIG" "$ENABLE_INTERNET" "$ENABLE_DOCKER" "$ENABLE_VELOCIDADE" "${ENABLE_ACESSOS:-0}" "$(bancos_motores)" "$(bancos_arquivos)" <<'PY'
 import configparser, sys
-caminho, internet, docker, velocidade, acessos = sys.argv[1:6]
+caminho, internet, docker, velocidade, acessos, motores, arquivos = sys.argv[1:8]
 config = configparser.ConfigParser(interpolation=None)
 config.optionxform = str
 config.read(caminho, encoding="utf-8")
@@ -1200,6 +1245,11 @@ for secao, ligado in (("internet", internet), ("docker", docker), ("velocidade",
     if not config.has_section(secao):
         config.add_section(secao)
     config[secao]["ativo"] = "sim" if ligado == "1" else "nao"
+if not config.has_section("bancos"):
+    config.add_section("bancos")
+config["bancos"]["ativo"] = "sim" if motores else "nao"
+config["bancos"]["motores"] = motores.replace(",", ", ")
+config["bancos"]["arquivos"] = arquivos.replace(",", ", ")
 with open(caminho, "w", encoding="utf-8") as arquivo:
     config.write(arquivo)
 PY
@@ -1249,6 +1299,14 @@ horario = seg-sex 07:00-19:00; sab 07:00-14:00
 ; Redes de origem conhecidas, além da rede interna e do IP público do local
 ; (ex.: VPN ou escritório da Nextec): 203.0.113.0/24, 198.51.100.7
 origens_conhecidas =
+
+[bancos]
+; Bancos sem exportador próprio: no ar, conexões, memória, tempo ligado e
+; tamanho das bases. motores: firebird, oracle, sqlanywhere, sqlserver.
+; arquivos: bases para medir, como motor:caminho (curinga aceito).
+ativo = $([[ -n "$(bancos_motores)" ]] && echo sim || echo nao)
+motores = $(bancos_motores | sed 's/,/, /g')
+arquivos = $(bancos_arquivos | sed 's/,/, /g')
 EOF
     local item nome papel operadora tipo suporte ip_publico gateway alvos origem firewall interface vel_down vel_up
     for item in "${LINKS[@]}"; do
@@ -1546,9 +1604,15 @@ EOF
         # Prometheus tradicional. Mantemos a detecção para não perder o ativo crítico.
         cat <<EOF
 
-// SQL Server foi detectado durante a instalação.
-// O monitoramento automático não foi habilitado nesta versão do instalador.
-// Registrar e configurar integração SQL Server homologada pela Nextec separadamente.
+// SQL Server: no ar, conexões, memória e tamanho das bases pela Coleta
+// Complementar (módulo bancos), lidos no bloco "coleta_complementar".
+EOF
+        ;;
+      firebird|oracle|sqlanywhere)
+        cat <<EOF
+
+// ${db_type}: no ar, conexões, memória e tamanho das bases pela Coleta
+// Complementar (módulo bancos), lidos no bloco "coleta_complementar".
 EOF
         ;;
     esac
@@ -2480,6 +2544,8 @@ collect_database_inputs() {
   local db choice dsn
 
   if (( ${#DETECTED_DATABASES[@]} == 0 )); then
+    step "Bancos de dados"
+    collect_sqlite_inputs
     return 0
   fi
 
@@ -2503,13 +2569,38 @@ collect_database_inputs() {
           DATABASE_TARGETS+=("mysql|${dsn}")
         fi
         ;;
-      sqlserver)
-        warn "SQL Server detectado. A versão 2.0 registra a detecção, mas não configura automaticamente a integração."
-        info "Motivo: a integração SQL Server do Alloy usa um fluxo diferente e será homologada separadamente para evitar configuração insegura."
-        DATABASE_TARGETS+=("sqlserver|")
+      sqlserver|firebird|oracle|sqlanywhere)
+        # Sem credencial: a Coleta Complementar olha processo, portas,
+        # conexões e arquivos das bases.
+        local rotulo_db
+        case "$db" in
+          sqlserver) rotulo_db="SQL Server" ;;
+          firebird) rotulo_db="Firebird" ;;
+          oracle) rotulo_db="Oracle" ;;
+          sqlanywhere) rotulo_db="SQL Anywhere" ;;
+        esac
+        if ask_yes_no "${rotulo_db} detectado. Monitorar (no ar, conexões, memória e tamanho das bases)?" s; then
+          DATABASE_TARGETS+=("${db}|")
+        fi
         ;;
     esac
   done
+  collect_sqlite_inputs
+}
+
+# SQLite não tem processo: o técnico informa onde ficam as bases.
+collect_sqlite_inputs() {
+  local resposta
+  dica "SQLite é só arquivo: informe as bases para medir o tamanho e saber se existem."
+  dica "Ex.: /srv/sistema/dados/*.db, /opt/app/banco.sqlite. ENTER para pular."
+  read -r -p "$(pergunta "Bases SQLite" "${BANCOS_SQLITE}" "opcional")" resposta || entrada_encerrada
+  resposta="${resposta:-$BANCOS_SQLITE}"
+  if [[ -n "$resposta" && ! "$resposta" =~ ^/[^|\;]*$ ]]; then
+    warn "Use caminhos absolutos separados por vírgula. SQLite ignorado."
+    resposta=""
+  fi
+  BANCOS_SQLITE="$resposta"
+  return 0
 }
 
 
@@ -2590,9 +2681,9 @@ resource_checklist() {
     [[ "$do_estado" == "1" ]] || selected[2]=1
     details[2]="${#DETECTED_DATABASES[@]} detectado(s): ${DETECTED_DATABASES[*]}"
   else
-    disabled[2]=1
-    selected[2]=0
-    details[2]="nenhum PostgreSQL, MySQL/MariaDB ou SQL Server detectado"
+    # Fica disponível para cadastrar bases SQLite, que não têm processo.
+    [[ "$do_estado" == "1" ]] || selected[2]=0
+    details[2]="nenhum detectado; marque para informar bases SQLite"
   fi
 
   # Marca do pai: segue os filhos.
@@ -3217,7 +3308,7 @@ show_plan() {
   summary_row "Servidor monitorado:" "$([[ "$MONITOR_SERVER" == 1 ]] && echo sim || echo não)"
   summary_row "Métricas básicas do host:" "$([[ "$MONITOR_SERVER" == 1 ]] && echo sim || echo não)"
   summary_row "Docker:" "$([[ "$ENABLE_DOCKER" == 1 ]] && echo sim || echo não)"
-  summary_row "Banco de dados:" "$([[ "${ENABLE_DATABASES:-0}" == 1 ]] && echo "sim (${#DATABASE_TARGETS[@]})" || echo não)"
+  summary_row "Banco de dados:" "$([[ "${ENABLE_DATABASES:-0}" == 1 ]] && echo "sim (${#DATABASE_TARGETS[@]}$([[ -n "$BANCOS_SQLITE" ]] && echo " + SQLite"))" || echo não)"
   summary_row "Logs:" "$([[ "$ENABLE_LOGS" == 1 ]] && echo sim || echo não)"
   summary_row "Conectividade (Blackbox):" "$([[ "$ENABLE_BLACKBOX" == 1 ]] && echo "sim (${#BLACKBOX_TARGETS[@]})" || echo não)"
   summary_row "SNMP:" "$([[ "$ENABLE_SNMP" == 1 ]] && echo "sim (${#SNMP_TARGETS[@]})" || echo não)"
@@ -3343,6 +3434,7 @@ salvar_estado_instalacao() {
     for item in "${CUSTOM_EXPORTERS[@]}"; do echo "EXPORTER=${item}"; done
     # Só o tipo do banco: a DSN fica em NEXTEC_DB_DSN_n, na mesma ordem.
     for item in "${DATABASE_TARGETS[@]}"; do echo "BANCO=${item%%|*}"; done
+    echo "BANCOS_SQLITE=${BANCOS_SQLITE}"
   } > "$tmp"
   install -m 0600 "$tmp" "$ESTADO_INSTALACAO"
   rm -f "$tmp"
@@ -3389,8 +3481,11 @@ carregar_estado_instalacao() {
       SNMP) SNMP_TARGETS+=("$valor") ;;
       EXPORTER) CUSTOM_EXPORTERS+=("$valor") ;;
       BANCO)
-        [[ "$valor" =~ ^(postgres|mysql|sqlserver)$ ]] || { err "BANCO inválido."; return 1; }
+        [[ "$valor" =~ ^(postgres|mysql|sqlserver|firebird|oracle|sqlanywhere)$ ]] || { err "BANCO inválido."; return 1; }
         DATABASE_TARGETS+=("${valor}|") ;;
+      BANCOS_SQLITE)
+        [[ -z "$valor" || "$valor" =~ ^/[^|\;]*$ ]] || { err "BANCOS_SQLITE inválido."; return 1; }
+        BANCOS_SQLITE="$valor" ;;
       *) ;;
     esac
   done < "$ESTADO_INSTALACAO"
@@ -3657,9 +3752,9 @@ editar_recursos() {
   if [[ "$ENABLE_DATABASES" == "1" && "$db_antes" != "1" ]]; then
     collect_database_inputs
     DB_REDEFINIDO=1
-    (( ${#DATABASE_TARGETS[@]} > 0 )) || ENABLE_DATABASES=0
+    (( ${#DATABASE_TARGETS[@]} > 0 )) || [[ -n "$BANCOS_SQLITE" ]] || ENABLE_DATABASES=0
   fi
-  [[ "$ENABLE_DATABASES" == "1" ]] || DATABASE_TARGETS=()
+  [[ "$ENABLE_DATABASES" == "1" ]] || { DATABASE_TARGETS=(); BANCOS_SQLITE=""; }
 
   if [[ "$ENABLE_BLACKBOX" == "1" ]]; then
     (( ${#BLACKBOX_TARGETS[@]} > 0 )) || collect_blackbox_targets
@@ -3690,11 +3785,12 @@ editar_bancos() {
   step "Bancos de dados"
   local item
   for item in "${DATABASE_TARGETS[@]}"; do echo "  • ${item%%|*}"; done
+  [[ -n "$BANCOS_SQLITE" ]] && echo "  • SQLite: ${BANCOS_SQLITE}"
   info "As credenciais (DSN) não são exibidas; ficam em ${ENV_FILE}."
-  ask_yes_no "Cadastrar as credenciais dos bancos de novo?" n || return 0
+  ask_yes_no "Cadastrar os bancos de novo?" n || return 0
   collect_database_inputs
   DB_REDEFINIDO=1
-  if (( ${#DATABASE_TARGETS[@]} == 0 )); then
+  if (( ${#DATABASE_TARGETS[@]} == 0 )) && [[ -z "$BANCOS_SQLITE" ]]; then
     ENABLE_DATABASES=0
     info "Nenhum banco confirmado: coleta de banco desligada."
   fi

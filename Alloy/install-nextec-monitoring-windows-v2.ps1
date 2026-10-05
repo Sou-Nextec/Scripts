@@ -47,6 +47,9 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.20.0 Bancos: Firebird, Oracle e SQL Anywhere detectados e medidos pela
+           Coleta Complementar (no ar, conexões, memória, tamanho das bases),
+           e bases SQLite informadas na tela.
     2.19.1 Fabricantes SNMP em ordem alfabética.
     2.19.0 Instalação existente com área de trabalho: estado e opções numa
            janela; "Ver e alterar" abre as abas preenchidas com a
@@ -333,7 +336,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.19.1"
+$InstallerVersion = "2.20.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -460,6 +463,9 @@ $script:SelectedExporterKeys = [string[]]@()
 $script:EnableInternetResolved = $false
 $script:InternetIntervalMinutesResolved = 30
 $script:EnableColetaResolved = $false
+# Bases SQLite (caminhos com curinga, separados por vírgula) medidas pela
+# Coleta Complementar. SQLite não tem serviço para detectar.
+$script:BancosSqlite = ""
 $script:EnableLinksResolved = $false
 $script:ColetaLinks = @()
 
@@ -1864,6 +1870,7 @@ function Get-MaintenanceStatusRows {
             if (@($atual.CustomExporters).Count -gt 0) { $ligadas += "exporters" }
             if ($atual.EnableInternet) { $ligadas += "velocidade" }
             if ($atual.EnableColeta) { $ligadas += "internet e links" }
+            if ($atual.BancosColeta) { $ligadas += ("bancos ({0})" -f $atual.BancosColeta) }
             & $add "Coletas ligadas" $(if ($ligadas.Count -gt 0) { $ligadas -join ", " } else { "nenhuma" }) White
         }
     }
@@ -2213,6 +2220,27 @@ function Read-CurrentAlloyConfiguration {
     $enableInternet = ($collectors -contains "textfile")
     $internetIntervalMinutes = 30
 
+    # A Coleta pode rodar só pelos bancos: a internet conta como ligada quando
+    # o .ini não diz "ativo = nao" ou quando há link cadastrado.
+    $enableColeta = ($content -match 'prometheus\.exporter\.windows\s+"coleta_complementar"')
+    $bancosSqlite = ""
+    $iniColeta = Read-ColetaIniFile -Caminho $ColetaConfig
+    if ($enableColeta -and $iniColeta.Contains("internet") -and $iniColeta["internet"].Contains("ativo") -and
+        [string]$iniColeta["internet"]["ativo"] -match '^(nao|não|n|0|false)$' -and
+        @($iniColeta.Keys | Where-Object { $_ -like "link:*" }).Count -eq 0) {
+        $enableColeta = $false
+    }
+    $bancosColeta = ""
+    if ($iniColeta.Contains("bancos") -and $iniColeta["bancos"].Contains("motores") -and
+        -not ([string]$iniColeta["bancos"]["ativo"] -match '^(nao|não|n|0|false)$')) {
+        $bancosColeta = (@(([string]$iniColeta["bancos"]["motores"]) -split "," | ForEach-Object { $_.Trim() } |
+            Where-Object { $_ }) -join ", ")
+    }
+    if ($iniColeta.Contains("bancos") -and $iniColeta["bancos"].Contains("arquivos")) {
+        $bancosSqlite = (@(([string]$iniColeta["bancos"]["arquivos"]) -split "," | ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -like "sqlite:*" } | ForEach-Object { $_.Substring(7) }) -join ", ")
+    }
+
     if ($enableInternet) {
         try {
             $existingTask = Get-ScheduledTask -TaskName $SpeedtestTaskName -ErrorAction SilentlyContinue
@@ -2253,7 +2281,9 @@ function Read-CurrentAlloyConfiguration {
         CustomExporters          = $customExporters
         EnableInternet           = $enableInternet
         InternetIntervalMinutes  = $internetIntervalMinutes
-        EnableColeta             = ($content -match 'prometheus\.exporter\.windows\s+"coleta_complementar"')
+        EnableColeta             = $enableColeta
+        BancosSqlite             = $bancosSqlite
+        BancosColeta             = $bancosColeta
         BlackboxIntervalSeconds  = $blackboxIntervalSeconds
         Modificado               = (Get-Item -LiteralPath $ConfigFile).LastWriteTime
         Arquivo                  = $ConfigFile
@@ -2436,6 +2466,7 @@ function Import-CurrentConfiguration {
     $script:EnableSnmpResolved         = ($c.SnmpTargets.Count -gt 0)
     $script:EnableInternetResolved     = $c.EnableInternet
     $script:EnableColetaResolved       = [bool]$c.EnableColeta
+    $script:BancosSqlite               = [string]$c.BancosSqlite
     if ($script:EnableColetaResolved) { Import-ColetaLinks }
     $script:EnableLinksResolved        = ($script:ColetaLinks.Count -gt 0)
 
@@ -3460,6 +3491,27 @@ function Get-FirebirdDetection {
 }
 
 
+function Get-OracleDetection {
+    # Instância Oracle: serviço OracleService<SID> ou processo oracle.exe.
+    $services = @(Get-Service -Name "OracleService*" -ErrorAction SilentlyContinue)
+    $processes = @(Get-Process -Name "oracle" -ErrorAction SilentlyContinue)
+    [pscustomobject]@{
+        Detected  = ($services.Count -gt 0 -or $processes.Count -gt 0)
+        Instances = @($services | ForEach-Object { $_.Name -replace '^OracleService', '' })
+    }
+}
+
+function Get-SqlAnywhereDetection {
+    # SAP SQL Anywhere (antigo Sybase), usado por sistemas como o Domínio:
+    # servidor dbsrvNN.exe ou dbengNN.exe, como serviço ou processo.
+    $processes = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '^(dbsrv|dbeng)\d+$' })
+    $services = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.PathName -match '(?i)\\(dbsrv|dbeng)\d+\.exe' })
+    [pscustomobject]@{
+        Detected = ($services.Count -gt 0 -or $processes.Count -gt 0)
+        Services = @($services | ForEach-Object { $_.Name })
+    }
+}
+
 function Get-DetectedHostFeatures {
     # [AllowEmptyCollection()] é necessário: parâmetro Mandatory recusa array
     # vazio, e coleção vazia é entrada válida aqui (estação Windows não tem
@@ -3540,8 +3592,17 @@ function Get-DetectedHostFeatures {
         $features.Add([pscustomobject]@{ Key="sql_server"; Label="SQL Server (coleta requer homologação, ver documento 03)"; Collectors=@("mssql"); Selected=$false })
     }
 
+    # Firebird, Oracle e SQL Anywhere: no ar, conexões, memória e tamanho
+    # das bases pela Coleta Complementar (módulo bancos), sem credencial; o
+    # coletor "process" do Alloy acrescenta CPU e handles dos processos.
     if ($Firebird.Detected) {
-        $features.Add([pscustomobject]@{ Key="firebird"; Label="Firebird (apenas processos do servidor)"; Collectors=@("process"); Selected=$true })
+        $features.Add([pscustomobject]@{ Key="firebird"; Label="Firebird (no ar, conexões e tamanho das bases)"; Collectors=@("process"); Selected=$true })
+    }
+    if ((Get-OracleDetection).Detected) {
+        $features.Add([pscustomobject]@{ Key="oracle"; Label="Oracle (no ar, conexões e memória)"; Collectors=@("process"); Selected=$true })
+    }
+    if ((Get-SqlAnywhereDetection).Detected) {
+        $features.Add([pscustomobject]@{ Key="sqlanywhere"; Label="SQL Anywhere (no ar, conexões e tamanho das bases)"; Collectors=@("process"); Selected=$true })
     }
 
     return @($features | Sort-Object Label -Unique)
@@ -3964,6 +4025,16 @@ function Read-ResourceChecklist {
 
     $script:SelectedHostFeatureKeys = [string[]]@($featureKeys)
     $script:SelectedExporterKeys = [string[]]@($exporterKeys)
+
+    # SQLite não tem serviço para detectar: o técnico informa as bases.
+    if ($script:MonitorHost -and -not $Silent) {
+        while ($true) {
+            $resposta = Read-NextecInput -Prompt "Bases SQLite para medir" -Hint "opcional, ex.: C:\Sistema\dados\*.db" -Default $script:BancosSqlite
+            if ([string]::IsNullOrWhiteSpace($resposta)) { $resposta = $script:BancosSqlite }
+            if (Test-NextecCaminhosSqlite $resposta) { $script:BancosSqlite = ([string]$resposta).Trim(); break }
+            Write-Warn "Use caminhos completos separados por vírgula (C:\... ou \\servidor\...)."
+        }
+    }
 
     # No modo -Silent, "exporter" pode vir marcado diretamente (via -EnableExporters,
     # sem filhos na árvore). No modo interativo, o pai nunca é retornado como
@@ -5012,6 +5083,8 @@ function Show-Plan {
         Write-Field -Label "Internet (Speedtest)" -Value $(if ($script:EnableInternetResolved) { "sim (a cada $($script:InternetIntervalMinutesResolved) min)" } else { "não" }) -Width 26
     }
 
+    $motoresPlano = @(Get-NextecBancosMotores)
+    Write-Field -Label "Bancos (Coleta)" -Value $(if ($motoresPlano.Count -gt 0) { $motoresPlano -join ", " } else { "não" }) -Width 26
     Write-Field -Label "Internet (Coleta)" -Value (& $simNao $script:EnableColetaResolved) -Width 26
     Write-Field -Label "Links de internet" -Value $(if ($script:ColetaLinks.Count -gt 0) { "sim ($($script:ColetaLinks.Count))" } else { "não" }) -Width 26
     Write-Field -Label "Exporters adicionais" -Value ([string]$script:CustomExporters.Count) -Width 26
@@ -6368,6 +6441,10 @@ function Write-ColetaConfig {
             foreach ($chave in $existente[$par[0]].Keys) { $par[1][$chave] = $existente[$par[0]][$chave] }
         }
     }
+    # A internet fica desligada quando a Coleta roda só pelos bancos.
+    $internet["ativo"] = $(if ($script:EnableColetaResolved) { "sim" } else { "nao" })
+    $motores = @(Get-NextecBancosMotores)
+    $arquivosSqlite = @(([string]$script:BancosSqlite) -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { "sqlite:$_" })
 
     $linhas = New-Object System.Collections.Generic.List[string]
     $linhas.Add("; Coleta Complementar Nextec")
@@ -6386,6 +6463,15 @@ function Write-ColetaConfig {
     $linhas.Add("; da Nextec ou VPN que não contam como origem nova (ex.: 203.0.113.0/24).")
     $linhas.Add("[acessos]")
     foreach ($chave in $acessos.Keys) { $linhas.Add(("{0} = {1}" -f $chave, $acessos[$chave])) }
+    $linhas.Add("")
+    $linhas.Add("; Bancos sem exportador próprio: no ar, conexões, memória, tempo ligado e")
+    $linhas.Add("; tamanho das bases. motores: firebird, oracle, sqlanywhere. arquivos: bases")
+    $linhas.Add("; para medir, como motor:caminho (curinga aceito). O SQL Server segue com o")
+    $linhas.Add("; coletor mssql do Alloy.")
+    $linhas.Add("[bancos]")
+    $linhas.Add(("ativo = {0}" -f $(if ($motores.Count -gt 0) { "sim" } else { "nao" })))
+    $linhas.Add(("motores = {0}" -f ($motores -join ", ")))
+    $linhas.Add(("arquivos = {0}" -f ($arquivosSqlite -join ", ")))
 
     foreach ($link in $script:ColetaLinks) {
         $linhas.Add("")
@@ -6436,8 +6522,34 @@ function Stop-ColetaComplementar {
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
+function Get-NextecBancosMotores {
+    # Bancos medidos pela Coleta Complementar (módulo bancos).
+    $motores = @()
+    foreach ($chave in @("firebird", "oracle", "sqlanywhere")) {
+        if ($script:MonitorHost -and @($script:SelectedHostFeatureKeys) -contains $chave) { $motores += $chave }
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:BancosSqlite)) { $motores += "sqlite" }
+    return $motores
+}
+
+function Test-NextecColetaNecessaria {
+    # A Coleta Complementar roda quando a internet está ligada ou quando há
+    # banco para ela medir.
+    return ($script:EnableColetaResolved -or @(Get-NextecBancosMotores).Count -gt 0)
+}
+
+function Test-NextecCaminhosSqlite {
+    # Caminhos absolutos (C:\... ou \\servidor\...), separados por vírgula.
+    param([string]$Texto)
+    if ([string]::IsNullOrWhiteSpace($Texto)) { return $true }
+    foreach ($item in ($Texto -split ",")) {
+        if ($item.Trim() -notmatch '^([A-Za-z]:\\|\\\\)[^|;]+$') { return $false }
+    }
+    return $true
+}
+
 function Install-ColetaComplementar {
-    if (-not $script:EnableColetaResolved) {
+    if (-not (Test-NextecColetaNecessaria)) {
         # Desligando numa reconfiguração: para e remove a tarefa, mas mantém o
         # .ini (links cadastrados) para uma eventual religação.
         if (Get-ScheduledTask -TaskName $ColetaTaskName -ErrorAction SilentlyContinue) {
@@ -6449,7 +6561,7 @@ function Install-ColetaComplementar {
         return
     }
 
-    Write-Step "Coleta Complementar (internet e links)"
+    Write-Step $(if ($script:EnableColetaResolved) { "Coleta Complementar (internet e links)" } else { "Coleta Complementar (bancos de dados)" })
 
     # Roda como SYSTEM: pasta protegida antes de gravar o script.
     Protect-NextecDirectory -Path $ColetaDir -LeituraUsuarios
@@ -6768,12 +6880,16 @@ function New-AlloyConfiguration {
             [void]$builder.AppendLine('    include = "^[A-Za-z]:$"')
             [void]$builder.AppendLine("  }")
 
-            if ($script:SelectedHostFeatureKeys -contains "firebird") {
+            $processosBanco = @()
+            if ($script:SelectedHostFeatureKeys -contains "firebird") { $processosBanco += "firebird|firebird_server|fbserver|fb_inet_server|fbguard" }
+            if ($script:SelectedHostFeatureKeys -contains "oracle") { $processosBanco += "oracle|tnslsnr" }
+            if ($script:SelectedHostFeatureKeys -contains "sqlanywhere") { $processosBanco += "dbsrv[0-9]+|dbeng[0-9]+" }
+            if ($processosBanco.Count -gt 0) {
                 [void]$builder.AppendLine("")
-                [void]$builder.AppendLine("  // Coletor process restrito ao Firebird. Sem include ele gera uma")
+                [void]$builder.AppendLine("  // Coletor process restrito aos bancos. Sem include ele gera uma")
                 [void]$builder.AppendLine("  // serie por processo do host.")
                 [void]$builder.AppendLine('  process {')
-                [void]$builder.AppendLine('    include = "^(firebird|firebird_server|fbserver|fb_inet_server|fbguard).*"')
+                [void]$builder.AppendLine(('    include = "^({0}).*"' -f ($processosBanco -join "|")))
                 [void]$builder.AppendLine('  }')
             }
 
@@ -6844,7 +6960,7 @@ function New-AlloyConfiguration {
     # grava as métricas dele (versão, onda, resultado) na mesma pasta. Com a
     # Coleta desligada o bloco leva outro nome, porque a leitura da
     # configuração atual usa "coleta_complementar" para saber se ela está ligada.
-    $nomeTextfile = if ($script:EnableColetaResolved) { "coleta_complementar" } else { "atualizador" }
+    $nomeTextfile = if (Test-NextecColetaNecessaria) { "coleta_complementar" } else { "atualizador" }
     if ($true) {
         # Exporter próprio só com o textfile da Coleta Complementar. Separado
         # do "system" para valer em qualquer modo e para poder usar
@@ -8594,6 +8710,18 @@ function New-GuiCabecalho {
     return $topo
 }
 
+function Get-NextecExporterDoCatalogo {
+    # Chave do catálogo de um exporter já configurado: pelo nome (redis_exporter)
+    # ou pelo serviço de costume (redis) com o endereço padrão.
+    param([object]$Exporter)
+    foreach ($d in (Get-NextecExporterCatalog)) {
+        if ($d.Key -eq "custom") { continue }
+        if ([string]$Exporter.Name -eq $d.Key) { return $d.Key }
+        if ([string]$Exporter.Service -eq $d.DefaultService) { return $d.Key }
+    }
+    return $null
+}
+
 function Show-NextecGuiManutencao {
     <#
         Janela inicial quando o monitoramento já está instalado: mostra o
@@ -8796,9 +8924,9 @@ function Show-NextecInstallerGui {
             exporter = (@($script:CustomExporters).Count -gt 0)
         }
         foreach ($ft in @($DetectedFeatures)) { $inicial[("feature:{0}" -f $ft.Key)] = (@($script:SelectedHostFeatureKeys) -contains $ft.Key) }
-        $chavesCatalogo = @((Get-NextecExporterCatalog) | Where-Object { $_.Key -ne "custom" } | ForEach-Object { $_.Key })
         foreach ($ce in @($script:CustomExporters)) {
-            if ($chavesCatalogo -contains [string]$ce.Name) { $inicial[("exporter:{0}" -f $ce.Name)] = $true }
+            $doCatalogo = Get-NextecExporterDoCatalogo -Exporter $ce
+            if ($doCatalogo) { $inicial[("exporter:{0}" -f $doCatalogo)] = $true }
             else { $inicial["exporter:custom"] = $true }
         }
         $g.Inicial = $inicial
@@ -8918,6 +9046,12 @@ function Show-NextecInstallerGui {
     $g.IntervaloAviso = New-GuiLabel "Cada teste satura o link por alguns segundos. Abaixo de 15 min o cliente sente lentidão e o consumo de franquia cresce muito." 604 156 250 -Dica
     $g.IntervaloAviso.Height = 70
     $p.Controls.Add($g.IntervaloAviso)
+    $p.Controls.Add((New-GuiLabel "Bases SQLite (opcional)" 604 248 250))
+    $g.Sqlite = New-GuiTextBox 604 272 250 ([string]$script:BancosSqlite)
+    $p.Controls.Add($g.Sqlite)
+    $g.SqliteDica = New-GuiLabel "Caminho completo, curinga aceito, separados por vírgula. Ex.: C:\Sistema\dados\*.db" 604 300 250 -Dica
+    $g.SqliteDica.Height = 52
+    $p.Controls.Add($g.SqliteDica)
     $g.Intervalo.Add_ValueChanged({
         $gg = $script:Gui
         $gg.IntervaloAviso.ForeColor = $(if ($gg.Intervalo.Value -lt 15) { $script:GuiCores.Erro } else { $script:GuiCores.Cinza })
@@ -9366,6 +9500,9 @@ function Show-NextecInstallerGui {
             $destino = ($gg.Destino.Text.Trim() -replace "^https?://", "") -replace "/.*$", ""
             if ($destino -notmatch "^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$") { [void]$gg.Destino.Focus(); return "Destino do NOC inválido." }
         }
+        if ($Pagina -eq $gg.PaginaRecursos -and -not (Test-NextecCaminhosSqlite $gg.Sqlite.Text)) {
+            [void]$gg.Sqlite.Focus(); return "Bases SQLite: use caminhos completos separados por vírgula (C:\... ou \\servidor\...)."
+        }
         if ($Pagina -eq $gg.PaginaLinks) {
             if ($gg.Links.Rows.Count -eq 0) { return "Cadastre pelo menos um link ou desmarque Internet e links." }
             $principais = 0
@@ -9481,7 +9618,8 @@ function Show-NextecInstallerGui {
         # Serviço do catálogo volta na linha dele; os demais em linhas livres.
         foreach ($ce in @($script:CustomExporters)) {
             $linha = $null
-            foreach ($r in $g.Exporters.Rows) { if ([string]$r.Tag -eq [string]$ce.Name) { $linha = $r } }
+            $doCatalogo = Get-NextecExporterDoCatalogo -Exporter $ce
+            if ($doCatalogo) { foreach ($r in $g.Exporters.Rows) { if ([string]$r.Tag -eq $doCatalogo) { $linha = $r } } }
             if ($null -eq $linha) {
                 foreach ($r in $g.Exporters.Rows) { if ($null -eq $linha -and [string]$r.Tag -eq "custom" -and -not (Get-GuiCelula $r "nome")) { $linha = $r } }
             }
@@ -9489,7 +9627,9 @@ function Show-NextecInstallerGui {
                 $linha = $g.Exporters.Rows[$g.Exporters.Rows.Add()]
                 $linha.Tag = "custom"
             }
-            if ([string]$linha.Tag -eq "custom") { $linha.Cells["nome"].Value = [string]$ce.Name }
+            # No config.alloy o bloco se chama custom_N; o nome que o técnico
+            # reconhece é o serviço.
+            if ([string]$linha.Tag -eq "custom") { $linha.Cells["nome"].Value = $(if ([string]$ce.Name -match '^custom_\d+$' -and $ce.Service) { [string]$ce.Service } else { [string]$ce.Name }) }
             $linha.Cells["alvo"].Value = [string]$ce.Target
             $linha.Cells["servico"].Value = [string]$ce.Service
         }
@@ -9521,6 +9661,7 @@ function Get-GuiResumo {
         [void]$linhas.Add(("Logs de segurança .. {0}" -f (& $simNao (& $gg.Marcado "security"))))
         $feats = @($gg.Features | Where-Object { & $gg.Marcado ("feature:{0}" -f $_.Key) } | ForEach-Object { $_.Label })
         if ($feats.Count -gt 0) { [void]$linhas.Add(("Detectados ......... {0}" -f ($feats -join ", "))) }
+        if ($gg.Sqlite.Text.Trim()) { [void]$linhas.Add(("Bases SQLite ....... {0}" -f $gg.Sqlite.Text.Trim())) }
     }
     if (& $gg.Marcado "coleta") {
         [void]$linhas.Add(("Links de internet .. {0}" -f $gg.Links.Rows.Count))
@@ -9584,6 +9725,7 @@ function Set-NextecConfigurationFromGui {
     $script:InternetIntervalMinutesResolved = [int]$gg.Intervalo.Value
     $script:EnableColetaResolved = [bool](& $gg.Marcado "coleta")
     $script:SelectedExporterKeys = [string[]]@((Get-NextecExporterCatalog) | Where-Object { & $gg.Marcado ("exporter:{0}" -f $_.Key) } | ForEach-Object { $_.Key })
+    $script:BancosSqlite = $(if ($script:MonitorHost) { $gg.Sqlite.Text.Trim() } else { "" })
 
     # Links
     $script:ColetaLinks = @()
@@ -9729,6 +9871,7 @@ function Save-NextecSimulacao {
         snmp = @($script:SnmpTargets); snmp_fabricantes = @($script:GuiFabricantesSnmp)
         snmp_credenciais = @($script:SnmpAuthBlocks | ForEach-Object { Get-SnmpAuthBlockName -Block $_ })
         exporters = @($script:CustomExporters)
+        bancos_coleta = @(Get-NextecBancosMotores); bancos_sqlite = $script:BancosSqlite
         usuario_noc = $script:RwUsername
         loki_mesma_credencial = ($script:LokiUsername -eq $script:RwUsername -and $script:LokiPassword -eq $script:RwPassword)
     }

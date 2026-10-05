@@ -10,12 +10,23 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.9.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.19.1 |
-| Coleta Complementar | `coleta-complementar/` | 1.2.0 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.10.0 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.20.0 |
+| Coleta Complementar | `coleta-complementar/` | 1.3.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
 ## 2026-10-05
+
+### Instaladores Windows 2.20.0 e Linux 2.10.0, Coleta Complementar 1.3.0
+
+- **Bancos cobertos.** SQL Server, MySQL, MariaDB, PostgreSQL, Firebird, Oracle, SQL Anywhere (Domínio) e SQLite. Os três primeiros seguem com os coletores do Alloy; os demais (e o SQL Server no Linux) são medidos pela Coleta Complementar.
+- **Sem driver e sem usuário no banco.** O módulo bancos lê processo, portas, conexões TCP e arquivos: no ar, conexões, memória, tempo ligado e tamanho de cada base (`nextec_banco_*`). Requisições, cache e deadlocks desses motores ficam vazios no painel, porque exigem SQL.
+- **Detecção.** Firebird, Oracle e SQL Anywhere são detectados e aparecem marcados em Recursos. Desmarcar tira o motor da coleta.
+- **SQLite.** Campo "Bases SQLite (opcional)" em Recursos (Windows) e pergunta no Linux: caminhos completos, curinga aceito, separados por vírgula.
+- **Coleta só para bancos.** A Coleta Complementar é instalada também quando há banco a medir, sem internet ou links marcados. Nesse caso o .ini sai com `[internet] ativo = nao`.
+- **Painel único.** "Nextec | Banco de dados" converte as métricas de todos os motores para os mesmos indicadores.
+- **Manutenção.** Em "Coletas ligadas" aparecem os bancos medidos pela Coleta (Windows).
+- **Limitação no Linux.** O serviço roda com `ProtectHome=true`: base SQLite dentro de `/home` não é lida.
 
 ### Instalador Linux 2.9.0
 
