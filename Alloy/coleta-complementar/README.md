@@ -10,7 +10,7 @@ Completa o que o Grafana Alloy não coleta sozinho. É um arquivo único por sis
 | Execução | serviço `coleta-complementar` (systemd) | tarefa agendada `NextecColetaComplementar` (SYSTEM) |
 | Métricas | `/var/lib/coleta-complementar/textfile/*.prom` | `...\coleta-complementar\textfile\*.prom` |
 | Eventos | `/var/log/coleta-complementar/eventos.jsonl` | `...\coleta-complementar\eventos.jsonl` |
-| Módulos | internet, links, docker, velocidade, acessos, bancos | internet, links, acessos, bancos, velocidade |
+| Módulos | internet, links, docker, velocidade, acessos, bancos, virtualizacao | internet, links, acessos, bancos, velocidade, virtualizacao |
 
 Quem instala e liga é o instalador do Alloy (`install-nextec-monitoring-linux-v2.sh` 2.1.0+ e `install-nextec-monitoring-windows-v2.ps1` 2.12.0+; módulo acessos a partir de 2.4.0 e 2.14.0, que também instalam o [atualizador automático](../atualizador/README.md)): ao marcar Docker, Internet, Links, Velocidade ou um banco sem exportador próprio (Firebird, Oracle, SQL Anywhere, SQLite e, no Linux, SQL Server), ele baixa o arquivo deste diretório, grava a configuração, cria o serviço ou a tarefa e acrescenta no `config.alloy` a leitura dos arquivos. Modelo comentado da configuração: `coleta-complementar.ini.example`.
 
@@ -29,6 +29,7 @@ Quem instala e liga é o instalador do Alloy (`install-nextec-monitoring-linux-v
 | Acessos: logins com IP de origem, acesso privilegiado, origem nova, fora do horário | | Sim (journal no Linux; evento 4624 no Windows) |
 | Bancos SQL Server (Windows), MySQL, MariaDB, PostgreSQL | Sim (coletores e exportadores do Alloy) | |
 | Bancos Firebird, Oracle, SQL Anywhere, SQLite e SQL Server no Linux: no ar, conexões, memória, tempo ligado, tamanho das bases | | Sim (processo, portas e arquivos, sem driver nem login no banco) |
+| Virtualização: hosts, VMs, armazenamento, snapshots, cluster, replicação Hyper-V | | Sim (Hyper-V, Proxmox VE e KVM/libvirt locais; VMware, Proxmox e XCP-ng pela API, usuário só leitura) |
 
 ## Comandos
 
@@ -119,6 +120,27 @@ Causas de queda: `rede local: firewall sem resposta`, `operadora: gateway sem re
 
 `motor`: `Firebird`, `Oracle`, `SQL Anywhere`, `SQL Server` (só Linux) e `SQLite`. O painel "Nextec \| Banco de dados" converte essas métricas e as dos exportadores (`windows_mssql_*`, `mysql_*`, `pg_*`) para os mesmos indicadores, então todos os motores aparecem do mesmo jeito. No Linux o serviço roda com `ProtectHome=true`: base SQLite dentro de `/home` não é lida.
 
+**Virtualização** (Linux e Windows). Mesmo contrato para todas as plataformas. `plataforma`: `Hyper-V`, `Proxmox VE`, `KVM/libvirt`, `VMware`, `XCP-ng`; `hipervisor`: nome da fonte (o servidor, quando local, ou o nome em `[hipervisor:<nome>]`); `no`: host físico.
+
+| Métrica | Rótulos | Significado |
+| --- | --- | --- |
+| `nextec_hipervisor_up` | plataforma, hipervisor | 1 com a fonte respondendo, 0 sem resposta (credencial, rede, API) |
+| `nextec_hipervisor_info` | plataforma, hipervisor, no, versao, cluster | Ficha do host |
+| `nextec_hipervisor_host_up` | plataforma, hipervisor, no | 1 host conectado, 0 desconectado ou fora do cluster |
+| `nextec_hipervisor_cpus`, `_cpu_percentual`, `_memoria_usada_bytes`, `_memoria_total_bytes`, `_ligado_segundos` | plataforma, hipervisor, no | Consumo do host |
+| `nextec_hipervisor_armazenamento_usado_bytes`, `_armazenamento_total_bytes` | plataforma, hipervisor, no, armazenamento, tipo | Datastore, storage, pool ou SR (compartilhado sai com `no` vazio) |
+| `nextec_hipervisor_armazenamento_saude` | plataforma, hipervisor, no, armazenamento, tipo | 1 normal, 0 com falha (ZFS degradado, datastore inacessível, volume com problema) |
+| `nextec_hipervisor_cluster_quorum`, `_cluster_nos_online`, `_cluster_nos` | plataforma, hipervisor, cluster | Cluster Proxmox |
+| `nextec_hipervisor_coleta_duracao_segundos` | plataforma, hipervisor | Tempo da consulta |
+| `nextec_hipervisor_coletor_ultima_execucao_segundos` | | Saúde do módulo |
+| `nextec_vm_info` | plataforma, hipervisor, no, vm, vmid, tipo, so | Ficha da VM (`tipo`: vm ou container) |
+| `nextec_vm_estado` | plataforma, hipervisor, no, vm, vmid | 1 ligada, 0 desligada, 2 pausada |
+| `nextec_vm_cpus`, `_cpu_percentual`, `_memoria_usada_bytes`, `_memoria_total_bytes`, `_disco_usado_bytes`, `_disco_total_bytes`, `_ligado_segundos` | plataforma, hipervisor, no, vm, vmid | Consumo da VM |
+| `nextec_vm_snapshots`, `nextec_vm_snapshot_mais_antigo_segundos` | plataforma, hipervisor, no, vm, vmid | Quantidade e data do mais antigo (epoch) |
+| `nextec_vm_replicacao_saude` | plataforma, hipervisor, no, vm, vmid | Só Hyper-V: 1 normal, 2 aviso, 0 crítico |
+
+VMs e hosts a cada `intervalo_segundos` (padrão 120); snapshots, discos e saúde do ZFS a cada 30 minutos. Senhas e tokens ficam em `segredos.ini` (Linux `/etc/coleta-complementar/segredos.ini`, 0600 root; Windows na pasta da coleta, só SYSTEM e Administradores), nunca no .ini. Proxmox local roda `pvesh` como root; KVM/libvirt usa `virsh` em `qemu:///system`.
+
 **A própria coleta**: `nextec_coleta_complementar_info{versao, modulos}` e `nextec_coleta_complementar_modulo_ok{modulo}`.
 
 ## Eventos (Loki)
@@ -183,5 +205,6 @@ $env:NEXTEC_COLETA_URL = "https://raw.githubusercontent.com/Sou-Nextec/Scripts/<
 | 1.0.0 | 03/10/2026 | Primeira versão: internet, links, Docker e velocidade (Linux); internet e links (Windows). |
 | 1.1.0 | 03/10/2026 | Módulo acessos (Linux e Windows) com origem e classificação para os alertas de acesso privilegiado; origem (usuário e IP da sessão SSH) no evento de terminal aberto em container. |
 | 1.2.0 | 03/10/2026 | IP público de cada link aprendido sozinho (quando só ele está no ar), sem precisar informar na instalação; velocidade contratada por link (`nextec_link_velocidade_contratada_mbps`). |
-| 1.4.0 | 05/10/2026 | Módulo velocidade no Windows (Speedtest CLI em segundo plano, sem atrasar os links), no lugar da tarefa NextecSpeedtest; `nextec_internet_estado_desde_segundos` (Linux e Windows), usado no painel NOC. |
 | 1.3.0 | 05/10/2026 | Módulo bancos (Linux e Windows): Firebird, Oracle, SQL Anywhere, SQLite e SQL Server no Linux, com `nextec_banco_*`. No Windows, `[internet] ativo = nao` desliga a rodada de internet quando a coleta é instalada só para bancos. |
+| 1.4.0 | 05/10/2026 | Módulo velocidade no Windows (Speedtest CLI em segundo plano, sem atrasar os links), no lugar da tarefa NextecSpeedtest; `nextec_internet_estado_desde_segundos` (Linux e Windows), usado no painel NOC. |
+| 1.5.0 | 06/10/2026 | Módulo virtualizacao (Linux e Windows): Hyper-V, Proxmox VE e KVM/libvirt locais; VMware ESXi/vCenter, Proxmox e XCP-ng pela API com usuário só leitura, segredos em `segredos.ini`; `nextec_hipervisor_*` e `nextec_vm_*`. |

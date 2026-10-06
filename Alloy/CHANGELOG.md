@@ -10,10 +10,22 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.11.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.21.0 |
-| Coleta Complementar | `coleta-complementar/` | 1.4.0 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.12.0 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.22.0 |
+| Coleta Complementar | `coleta-complementar/` | 1.5.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
+
+## 2026-10-06
+
+### Instaladores Windows 2.22.0 e Linux 2.12.0, Coleta Complementar 1.5.0
+
+- **Virtualização.** Módulo `virtualizacao` da Coleta Complementar: hosts, VMs, armazenamento, snapshots e cluster, com as mesmas métricas (`nextec_hipervisor_*` e `nextec_vm_*`) para Hyper-V, Proxmox VE, KVM/libvirt, VMware ESXi/vCenter e XCP-ng.
+- **Local, sem senha.** No Windows, o Hyper-V marcado em Recursos liga a coleta local (VMs, checkpoints, replicação e volumes). No Linux, Proxmox VE (`pvesh`) e KVM/libvirt (`virsh`) são detectados e o item "Virtualização" já vem marcado.
+- **Pela rede, usuário só leitura.** ESXi e vCenter (API SOAP), Proxmox (token de API com PVEAuditor) e XCP-ng (XAPI) são cadastrados como hipervisores: aba "Virtualização" na tela do Windows, perguntas no console e opção "Hipervisores (virtualização)" na manutenção dos dois instaladores.
+- **Segredos fora do .ini.** Senha e token ficam em `segredos.ini` (Windows: só SYSTEM e Administradores; Linux: `/etc/coleta-complementar/segredos.ini`, 0600 root). Na alteração, segredo não redigitado continua o gravado; hipervisor removido sai do arquivo. Senha pode ter `;` e `#`.
+- **Certificado.** Por padrão a conexão não confere o certificado (o de fábrica é autoassinado); continua cifrada. "Conferir certificado" liga a verificação por hipervisor.
+- **Carga.** VMs e hosts a cada 120 s; snapshots, discos e saúde do ZFS a cada 30 min.
+- **Verificar.** `-Acao verificar` (Windows) e `coleta-complementar.py verificar` (Linux) listam cada hipervisor com hosts, VMs e armazenamentos, ou o motivo da falha.
 
 ## 2026-10-05
 

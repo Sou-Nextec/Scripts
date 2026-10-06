@@ -47,6 +47,9 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.22.0 Virtualização: Hyper-V do próprio servidor (VMs, checkpoints,
+           replicação, armazenamento) e hipervisores pela rede (VMware ESXi ou
+           vCenter, Proxmox VE e XCP-ng), com senha ou token protegido.
     2.21.0 Coletor time no perfil básico (relógio e sincronia NTP, inclusive
            em controlador de domínio). Speedtest passa a ser módulo da Coleta
            Complementar: a tarefa NextecSpeedtest e o serviço antigo são
@@ -340,7 +343,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.21.0"
+$InstallerVersion = "2.22.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -407,6 +410,8 @@ $ColetaUrl = if ($env:NEXTEC_COLETA_URL) { $env:NEXTEC_COLETA_URL } else { "http
 $ColetaDir = Join-Path $ProgramDataDir "coleta-complementar"
 $ColetaScript = Join-Path $ColetaDir "coleta-complementar.ps1"
 $ColetaConfig = Join-Path $ColetaDir "coleta-complementar.ini"
+# Senhas e tokens dos hipervisores consultados pela rede (só SYSTEM e Administradores).
+$ColetaSegredos = Join-Path $ColetaDir "segredos.ini"
 $ColetaTextfileDir = Join-Path $ColetaDir "textfile"
 $ColetaEventos = Join-Path $ColetaDir "eventos.jsonl"
 $ColetaTaskName = "NextecColetaComplementar"
@@ -472,6 +477,11 @@ $script:EnableColetaResolved = $false
 # Bases SQLite (caminhos com curinga, separados por vírgula) medidas pela
 # Coleta Complementar. SQLite não tem serviço para detectar.
 $script:BancosSqlite = ""
+# Hipervisores consultados pela rede pela Coleta Complementar: nome, tipo
+# (vmware, proxmox, xcpng), endereco, usuario, verificar e segredo. Segredo
+# nulo mantém o que já está gravado em $ColetaSegredos.
+$script:Hipervisores = @()
+$script:TiposHipervisor = [ordered]@{ vmware = "VMware ESXi/vCenter"; proxmox = "Proxmox VE"; xcpng = "XCP-ng" }
 $script:EnableLinksResolved = $false
 $script:ColetaLinks = @()
 
@@ -1877,6 +1887,7 @@ function Get-MaintenanceStatusRows {
             if ($atual.EnableInternet) { $ligadas += "velocidade" }
             if ($atual.EnableColeta) { $ligadas += "internet e links" }
             if ($atual.BancosColeta) { $ligadas += ("bancos ({0})" -f $atual.BancosColeta) }
+            if (@($atual.Hipervisores).Count -gt 0) { $ligadas += ("hipervisores pela rede ({0})" -f (@($atual.Hipervisores | ForEach-Object { $_.nome }) -join ", ")) }
             & $add "Coletas ligadas" $(if ($ligadas.Count -gt 0) { $ligadas -join ", " } else { "nenhuma" }) White
         }
     }
@@ -2242,6 +2253,21 @@ function Read-CurrentAlloyConfiguration {
         $bancosColeta = (@(([string]$iniColeta["bancos"]["motores"]) -split "," | ForEach-Object { $_.Trim() } |
             Where-Object { $_ }) -join ", ")
     }
+    $hipervisores = @()
+    foreach ($nomeSecao in @($iniColeta.Keys)) {
+        if ([string]$nomeSecao -notmatch '^hipervisor:(.+)$') { continue }
+        $nomeHv = $Matches[1].Trim()
+        $secaoHv = $iniColeta[$nomeSecao]
+        $tipoHv = if ($secaoHv.Contains("tipo")) { ([string]$secaoHv["tipo"]).Trim().ToLowerInvariant() -replace '^(xcp-ng|xenserver)$', 'xcpng' } else { "" }
+        if (-not $script:TiposHipervisor.Contains($tipoHv)) { continue }
+        $hipervisores += [pscustomobject]@{
+            nome = $nomeHv; tipo = $tipoHv
+            endereco = $(if ($secaoHv.Contains("endereco")) { [string]$secaoHv["endereco"] } else { "" })
+            usuario = $(if ($secaoHv.Contains("usuario")) { [string]$secaoHv["usuario"] } else { "" })
+            verificar = ($secaoHv.Contains("verificar_certificado") -and [string]$secaoHv["verificar_certificado"] -match '^(sim|s|1|true)$')
+            segredo = $null
+        }
+    }
     if ($iniColeta.Contains("bancos") -and $iniColeta["bancos"].Contains("arquivos")) {
         $bancosSqlite = (@(([string]$iniColeta["bancos"]["arquivos"]) -split "," | ForEach-Object { $_.Trim() } |
             Where-Object { $_ -like "sqlite:*" } | ForEach-Object { $_.Substring(7) }) -join ", ")
@@ -2297,6 +2323,7 @@ function Read-CurrentAlloyConfiguration {
         EnableColeta             = $enableColeta
         BancosSqlite             = $bancosSqlite
         BancosColeta             = $bancosColeta
+        Hipervisores             = $hipervisores
         BlackboxIntervalSeconds  = $blackboxIntervalSeconds
         Modificado               = (Get-Item -LiteralPath $ConfigFile).LastWriteTime
         Arquivo                  = $ConfigFile
@@ -2480,6 +2507,7 @@ function Import-CurrentConfiguration {
     $script:EnableInternetResolved     = $c.EnableInternet
     $script:EnableColetaResolved       = [bool]$c.EnableColeta
     $script:BancosSqlite               = [string]$c.BancosSqlite
+    $script:Hipervisores               = @($c.Hipervisores)
     if ($script:EnableColetaResolved) { Import-ColetaLinks }
     $script:EnableLinksResolved        = ($script:ColetaLinks.Count -gt 0)
 
@@ -3084,6 +3112,7 @@ function Invoke-ConfigurationMenu {
         # era justamente por esse item que se ativava o primeiro.
         [void]$opcoes.Add("Internet (Speedtest)")
         [void]$opcoes.Add("Internet e links (Coleta Complementar)")
+        [void]$opcoes.Add("Hipervisores (virtualização)")
         [void]$opcoes.Add("Exporters adicionais")
 
         [void]$opcoes.Add("Credenciais do NOC")
@@ -3103,6 +3132,7 @@ function Invoke-ConfigurationMenu {
             "Alvos SNMP" { Edit-SnmpTargets; $alterou = $true }
             "Internet (Speedtest)" { Edit-InternetSettings; $alterou = $true }
             "Internet e links (Coleta Complementar)" { Edit-ColetaSettings; $alterou = $true }
+            "Hipervisores (virtualização)" { Edit-HipervisoresSettings; $alterou = $true }
             "Exporters adicionais" { Edit-CustomExporters; $alterou = $true }
             "Credenciais do NOC" {
                 # Limpa o que veio do registro para que Read-NocCredentials
@@ -3573,7 +3603,7 @@ function Get-DetectedHostFeatures {
             }
             "hyper_v" {
                 if ($null -ne (Get-Service -Name "vmms" -ErrorAction SilentlyContinue)) {
-                    $features.Add([pscustomobject]@{ Key="hyper_v"; Label="Hyper-V"; Collectors=@("hyperv"); Selected=$true })
+                    $features.Add([pscustomobject]@{ Key="hyper_v"; Label="Hyper-V (VMs, checkpoints, replicação e armazenamento)"; Collectors=@("hyperv"); Selected=$true })
                 }
             }
             "file_server" {
@@ -4048,6 +4078,22 @@ function Read-ResourceChecklist {
             if (Test-NextecCaminhosSqlite $resposta) { $script:BancosSqlite = ([string]$resposta).Trim(); break }
             Write-Warn "Use caminhos completos separados por vírgula (C:\... ou \\servidor\...)."
         }
+    }
+
+    # Hipervisores pela rede: ESXi não aceita agente, e Proxmox ou XCP-ng de
+    # outro servidor podem ser lidos daqui com um usuário só leitura.
+    if (-not $Silent) {
+        $padraoHv = (@($script:Hipervisores).Count -gt 0)
+        if (Read-YesNo -Prompt "Consultar hipervisores pela rede (VMware ESXi/vCenter, Proxmox, XCP-ng)?" -Default $padraoHv) {
+            if (@($script:Hipervisores).Count -gt 0) { Edit-HipervisoresSettings }
+            else {
+                do {
+                    $novo = Read-NextecHipervisor
+                    $script:Hipervisores = @(@($script:Hipervisores | Where-Object { $_.nome -ne $novo.nome }) + $novo)
+                } while (Read-YesNo -Prompt "Cadastrar outro hipervisor?" -Default $false)
+            }
+        }
+        else { $script:Hipervisores = @() }
     }
 
     # No modo -Silent, "exporter" pode vir marcado diretamente (via -EnableExporters,
@@ -5099,6 +5145,10 @@ function Show-Plan {
 
     $motoresPlano = @(Get-NextecBancosMotores)
     Write-Field -Label "Bancos (Coleta)" -Value $(if ($motoresPlano.Count -gt 0) { $motoresPlano -join ", " } else { "não" }) -Width 26
+    $virtPlano = @()
+    if ((Get-NextecVirtLocal) -ne "nao") { $virtPlano += "Hyper-V local" }
+    foreach ($hv in @($script:Hipervisores)) { $virtPlano += ("{0} ({1})" -f $hv.nome, $script:TiposHipervisor[$hv.tipo]) }
+    Write-Field -Label "Virtualização" -Value $(if ($virtPlano.Count -gt 0) { $virtPlano -join ", " } else { "não" }) -Width 26
     Write-Field -Label "Internet (Coleta)" -Value (& $simNao $script:EnableColetaResolved) -Width 26
     Write-Field -Label "Links de internet" -Value $(if ($script:ColetaLinks.Count -gt 0) { "sim ($($script:ColetaLinks.Count))" } else { "não" }) -Width 26
     Write-Field -Label "Exporters adicionais" -Value ([string]$script:CustomExporters.Count) -Width 26
@@ -6326,6 +6376,21 @@ function Write-ColetaConfig {
     $linhas.Add(("motores = {0}" -f ($motores -join ", ")))
     $linhas.Add(("arquivos = {0}" -f ($arquivosSqlite -join ", ")))
     $linhas.Add("")
+    $linhas.Add("; VMs, armazenamento, snapshots e replicação. local: hyperv neste servidor")
+    $linhas.Add("; (sem senha) ou nao. Hipervisores da rede em [hipervisor:<nome>], com a")
+    $linhas.Add(("; senha ou o token em {0}." -f $ColetaSegredos))
+    $linhas.Add("[virtualizacao]")
+    $linhas.Add(("ativo = {0}" -f $(if (Test-NextecVirtualizacao) { "sim" } else { "nao" })))
+    $linhas.Add(("local = {0}" -f (Get-NextecVirtLocal)))
+    foreach ($hv in @($script:Hipervisores)) {
+        $linhas.Add("")
+        $linhas.Add(("[hipervisor:{0}]" -f $hv.nome))
+        $linhas.Add(("tipo = {0}" -f $hv.tipo))
+        $linhas.Add(("endereco = {0}" -f $hv.endereco))
+        $linhas.Add(("usuario = {0}" -f $hv.usuario))
+        $linhas.Add(("verificar_certificado = {0}" -f $(if ($hv.verificar) { "sim" } else { "nao" })))
+    }
+    $linhas.Add("")
     $linhas.Add("; Teste de velocidade (Speedtest CLI da Ookla). Satura o link durante o")
     $linhas.Add("; teste: um servidor por local, a cada 30 min (recomendado).")
     $linhas.Add("[velocidade]")
@@ -6346,6 +6411,7 @@ function Write-ColetaConfig {
     if (Test-Path -LiteralPath $ColetaConfig) {
         Copy-Item -LiteralPath $ColetaConfig -Destination ("{0}.{1}.bak" -f $ColetaConfig, (Get-Date -Format "yyyyMMdd-HHmmss")) -Force
     }
+    Write-ColetaSegredos
     [IO.File]::WriteAllText($ColetaConfig, (($linhas -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($false)))
 }
 
@@ -6392,10 +6458,131 @@ function Get-NextecBancosMotores {
     return $motores
 }
 
+function Get-NextecVirtLocal {
+    # Hyper-V deste servidor, medido pela Coleta sem senha.
+    if ($script:MonitorHost -and @($script:SelectedHostFeatureKeys) -contains "hyper_v") { return "hyperv" }
+    return "nao"
+}
+
+function Test-NextecVirtualizacao {
+    return ((Get-NextecVirtLocal) -ne "nao" -or @($script:Hipervisores).Count -gt 0)
+}
+
 function Test-NextecColetaNecessaria {
     # A Coleta Complementar roda quando a internet está ligada, quando há
-    # banco para ela medir ou com o teste de velocidade.
-    return ($script:EnableColetaResolved -or $script:EnableInternetResolved -or @(Get-NextecBancosMotores).Count -gt 0)
+    # banco ou hipervisor para ela medir ou com o teste de velocidade.
+    return ($script:EnableColetaResolved -or $script:EnableInternetResolved -or @(Get-NextecBancosMotores).Count -gt 0 -or (Test-NextecVirtualizacao))
+}
+
+function Read-ColetaSegredosArquivo {
+    # Segredo pode ter ; e #: aqui nada vira comentário no meio da linha.
+    $secoes = @{}
+    if (-not (Test-Path -LiteralPath $ColetaSegredos -PathType Leaf)) { return $secoes }
+    $atual = $null
+    foreach ($linha in [IO.File]::ReadAllLines($ColetaSegredos, (New-Object Text.UTF8Encoding($false)))) {
+        $limpa = $linha.Trim()
+        if ($limpa -eq "" -or $limpa.StartsWith(";") -or $limpa.StartsWith("#")) { continue }
+        if ($limpa -match '^\[(.+)\]$') { $atual = $Matches[1].Trim(); $secoes[$atual] = @{}; continue }
+        if ($null -ne $atual -and $limpa -match '^([^=]+)=(.*)$') { $secoes[$atual][$Matches[1].Trim()] = $Matches[2].Trim() }
+    }
+    return $secoes
+}
+
+function Write-ColetaSegredos {
+    <#
+        Grava o segredo de cada hipervisor. Segredo não redigitado continua o
+        que já estava no arquivo; hipervisor que saiu da lista sai do arquivo.
+        O arquivo é protegido antes de receber o conteúdo.
+    #>
+    $existente = Read-ColetaSegredosArquivo
+    $linhas = New-Object System.Collections.Generic.List[string]
+    $linhas.Add("; Senhas e tokens dos hipervisores da Coleta Complementar. Só SYSTEM e Administradores leem.")
+    $total = 0
+    foreach ($hv in @($script:Hipervisores)) {
+        $secao = "hipervisor:" + $hv.nome
+        $chave = if ($hv.tipo -eq "proxmox") { "token" } else { "senha" }
+        $valor = if ($hv.segredo) { [string]$hv.segredo } elseif ($existente.ContainsKey($secao)) { [string]$existente[$secao][$chave] } else { "" }
+        if (-not $valor) {
+            Write-Warn ("Hipervisor {0} sem senha ou token: ele aparece como sem resposta até a credencial ser informada." -f $hv.nome)
+            continue
+        }
+        $linhas.Add(""); $linhas.Add("[$secao]"); $linhas.Add("$chave = $valor")
+        $total++
+    }
+    if ($total -eq 0) {
+        Remove-Item -LiteralPath $ColetaSegredos -Force -ErrorAction SilentlyContinue
+        return
+    }
+    if (-not (Test-Path -LiteralPath $ColetaSegredos)) { [IO.File]::WriteAllText($ColetaSegredos, "", (New-Object Text.UTF8Encoding($false))) }
+    Protect-NextecSecretFile -Path $ColetaSegredos
+    [IO.File]::WriteAllText($ColetaSegredos, (($linhas -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($false)))
+}
+
+function Test-NextecEnderecoHipervisor {
+    param([string]$Valor)
+    return ([string]$Valor -match '^[A-Za-z0-9.-]+(:\d{1,5})?$')
+}
+
+function Read-NextecHipervisor {
+    # Cadastro de um hipervisor no console. Devolve o objeto ou $null.
+    $tipos = @($script:TiposHipervisor.Keys)
+    $tipo = $tipos[(Read-Choice -Prompt "Tipo do hipervisor" -Options @($script:TiposHipervisor.Values) -Default 1) - 1]
+    $nome = ""
+    while (-not $nome) {
+        $nome = Get-GuiSlug (Read-Required -Prompt "Nome no NOC (ex.: esxi01)")
+        if (-not $nome) { Write-Warn "Use letras, números, ponto ou hífen." }
+    }
+    $dica = switch ($tipo) { "vmware" { "IP ou nome; o vCenter cobre todos os hosts dele" } "proxmox" { "IP ou nome de um nó; a porta 8006 é a padrão" } default { "IP ou nome do mestre do pool" } }
+    while ($true) {
+        $endereco = Read-NextecInput -Prompt "Endereço" -Hint $dica
+        if (Test-NextecEnderecoHipervisor $endereco) { break }
+        Write-Warn "Use só IP ou nome, com porta opcional (ex.: 192.168.0.10 ou esxi.local:443)."
+    }
+    switch ($tipo) {
+        "proxmox" {
+            Write-Info "Token de API com o papel PVEAuditor, no formato usuario@realm!token (ex.: monitor@pve!nextec)."
+            while ($true) {
+                $usuario = Read-Required -Prompt "ID do token"
+                if ($usuario -match '^[^@!]+@[^@!]+![^@!]+$') { break }
+                Write-Warn "Formato esperado: usuario@realm!token."
+            }
+            $segredo = Read-RequiredSecret -Prompt "Segredo do token"
+        }
+        "vmware" {
+            Write-Info "Usuário só leitura no ESXi ou vCenter (papel Somente leitura), ex.: monitor@vsphere.local."
+            $usuario = Read-Required -Prompt "Usuário"
+            $segredo = Read-RequiredSecret -Prompt "Senha"
+        }
+        default {
+            Write-Info "Usuário com papel read-only no pool (ou root)."
+            $usuario = Read-Required -Prompt "Usuário"
+            $segredo = Read-RequiredSecret -Prompt "Senha"
+        }
+    }
+    Write-Info "Certificado próprio é o padrão desses hipervisores: responda n. A conexão continua cifrada."
+    $verificar = Read-YesNo -Prompt "Conferir o certificado HTTPS?" -Default $false
+    return [pscustomobject]@{ nome = $nome; tipo = $tipo; endereco = $endereco.Trim(); usuario = $usuario; verificar = [bool]$verificar; segredo = $segredo }
+}
+
+function Edit-HipervisoresSettings {
+    Write-Step "Hipervisores (virtualização)"
+    if ((Get-NextecVirtLocal) -ne "nao") { Write-Info "Hyper-V deste servidor: sempre coletado, sem senha." }
+    Write-Info ("Senhas e tokens não são exibidos; ficam em {0}." -f $ColetaSegredos)
+    while ($true) {
+        if (@($script:Hipervisores).Count -eq 0) { Write-Info "Nenhum hipervisor pela rede cadastrado." }
+        $i = 0
+        foreach ($hv in @($script:Hipervisores)) { $i++; Write-Host ("  {0}  {1} ({2}) {3}" -f $i, $hv.nome, $script:TiposHipervisor[$hv.tipo], $hv.endereco) }
+        $acao = Read-Choice -Prompt "O que deseja fazer?" -Options @("Voltar", "Adicionar", "Remover um") -Default 1
+        if ($acao -eq 1) { break }
+        if ($acao -eq 2) {
+            $novo = Read-NextecHipervisor
+            $script:Hipervisores = @(@($script:Hipervisores | Where-Object { $_.nome -ne $novo.nome }) + $novo)
+        }
+        elseif ($acao -eq 3 -and @($script:Hipervisores).Count -gt 0) {
+            $indice = Read-Choice -Prompt "Qual remover?" -Options @($script:Hipervisores | ForEach-Object { "{0} ({1})" -f $_.nome, $_.endereco }) -Default 1
+            $script:Hipervisores = @($script:Hipervisores | Where-Object { $_ -ne $script:Hipervisores[$indice - 1] })
+        }
+    }
 }
 
 function Test-NextecCaminhosSqlite {
@@ -6425,6 +6612,7 @@ function Install-ColetaComplementar {
     if ($script:EnableColetaResolved) { $partes += "internet e links" }
     if ($script:EnableInternetResolved) { $partes += "velocidade" }
     if (@(Get-NextecBancosMotores).Count -gt 0) { $partes += "bancos de dados" }
+    if (Test-NextecVirtualizacao) { $partes += "virtualização" }
     Write-Step ("Coleta Complementar ({0})" -f ($partes -join ", "))
 
     # Roda como SYSTEM: pasta protegida antes de gravar o script.
@@ -8757,6 +8945,7 @@ function Show-NextecInstallerGui {
             internet = [bool]$script:EnableInternetResolved
             coleta = [bool]$script:EnableColetaResolved
             exporter = (@($script:CustomExporters).Count -gt 0)
+            virtualizacao = (@($script:Hipervisores).Count -gt 0)
         }
         foreach ($ft in @($DetectedFeatures)) { $inicial[("feature:{0}" -f $ft.Key)] = (@($script:SelectedHostFeatureKeys) -contains $ft.Key) }
         foreach ($ce in @($script:CustomExporters)) {
@@ -9149,6 +9338,67 @@ function Show-NextecInstallerGui {
     }
     $p.Controls.Add($guia)
 
+    # ---------------- Virtualização ----------------
+    $p = New-Object Windows.Forms.TabPage; $p.Text = "Virtualização"; $p.BackColor = [Drawing.Color]::White
+    $g.PaginaVirt = $p
+    $p.Controls.Add((New-GuiLabel "Hipervisores consultados pela rede" 24 16 640 -Titulo))
+    Add-GuiLegendaObrigatorio $p
+    $p.Controls.Add((New-GuiLabel "Este servidor lê VMs, armazenamento e snapshots pela API, com um usuário só leitura. O Hyper-V deste servidor entra pela aba Recursos, sem senha." 24 46 820 -Dica))
+    $g.Hipervisores = New-GuiGrid 24 72 820 180
+    Add-GuiColunaTexto $g.Hipervisores "nome" "Nome no NOC *" 80
+    Add-GuiColunaLista $g.Hipervisores "tipo" "Tipo" @($script:TiposHipervisor.Values) 90
+    Add-GuiColunaTexto $g.Hipervisores "endereco" "Endereço *" 100
+    Add-GuiColunaTexto $g.Hipervisores "usuario" "Usuário ou ID do token *" 120
+    Add-GuiColunaTexto $g.Hipervisores "segredo" "Senha ou segredo do token *" 110
+    $cVerificar = New-Object Windows.Forms.DataGridViewCheckBoxColumn
+    $cVerificar.Name = "verificar"; $cVerificar.HeaderText = "Conferir certificado"; $cVerificar.FillWeight = 85
+    [void]$g.Hipervisores.Columns.Add($cVerificar)
+    # Senha nunca aparece: a célula mostra pontos, a edição usa caractere de
+    # senha e a já gravada aparece como "atual (mantida)".
+    $g.Hipervisores.Add_CellFormatting({
+        param($s, $e)
+        if ($e.RowIndex -lt 0 -or $s.Columns[$e.ColumnIndex].Name -ne "segredo") { return }
+        $linha = $s.Rows[$e.RowIndex]
+        if ($e.Value) { $e.Value = "●●●●●●●●"; $e.FormattingApplied = $true }
+        elseif ($linha.Tag -eq "mantida") { $e.Value = "atual (mantida)"; $e.FormattingApplied = $true }
+    })
+    $g.Hipervisores.Add_EditingControlShowing({
+        param($s, $e)
+        if ($e.Control -is [Windows.Forms.TextBox]) { $e.Control.UseSystemPasswordChar = ($s.CurrentCell.OwningColumn.Name -eq "segredo") }
+    })
+    $p.Controls.Add($g.Hipervisores)
+    $bHvAdd = New-GuiBotao "Adicionar hipervisor" 24 260 170
+    $bHvDel = New-GuiBotao "Remover selecionado" 204 260 170
+    $bHvAdd.Add_Click({ $gr = $script:Gui.Hipervisores; $i = $gr.Rows.Add(); $gr.Rows[$i].Cells["tipo"].Value = @($script:TiposHipervisor.Values)[0]; $gr.Rows[$i].Cells["verificar"].Value = $false })
+    $bHvDel.Add_Click({ if ($null -ne $script:Gui.Hipervisores.CurrentRow) { $script:Gui.Hipervisores.Rows.Remove($script:Gui.Hipervisores.CurrentRow) } })
+    $p.Controls.Add($bHvAdd); $p.Controls.Add($bHvDel)
+    $guiaHv = New-Object Windows.Forms.GroupBox
+    $guiaHv.Text = "Usuário só leitura em cada hipervisor"
+    $guiaHv.Location = New-Object Drawing.Point(24, 300); $guiaHv.Size = New-Object Drawing.Size(820, 172)
+    $y = 22
+    foreach ($passo in @(
+        "VMware: no ESXi ou vCenter, crie um usuário e dê a ele o papel Somente leitura na raiz. Endereço: o host ou o vCenter (cobre todos os hosts).",
+        "Proxmox: Datacenter > Permissões > Tokens de API, papel PVEAuditor no caminho /. Usuário: o ID do token (ex.: monitor@pve!nextec); senha: o segredo.",
+        "XCP-ng: usuário com papel read-only no pool, ou root. Endereço: o mestre do pool.",
+        "Conferir certificado: deixe desmarcado se o hipervisor usa o certificado que veio de fábrica. A conexão continua cifrada."
+    )) {
+        $l = New-GuiLabel $passo 12 $y 796
+        $l.Height = 36
+        $guiaHv.Controls.Add($l)
+        $y += 36
+    }
+    $p.Controls.Add($guiaHv)
+    foreach ($hv in @($script:Hipervisores)) {
+        $i = $g.Hipervisores.Rows.Add()
+        $r = $g.Hipervisores.Rows[$i]
+        $r.Cells["nome"].Value = $hv.nome
+        $r.Cells["tipo"].Value = $script:TiposHipervisor[$hv.tipo]
+        $r.Cells["endereco"].Value = $hv.endereco
+        $r.Cells["usuario"].Value = $hv.usuario
+        $r.Cells["verificar"].Value = [bool]$hv.verificar
+        if ($hv.segredo) { $r.Cells["segredo"].Value = $hv.segredo } else { $r.Tag = "mantida" }
+    }
+
     # ---------------- Credenciais ----------------
     $p = New-Object Windows.Forms.TabPage; $p.Text = "Credenciais"; $p.BackColor = [Drawing.Color]::White
     $g.PaginaCredenciais = $p
@@ -9252,6 +9502,7 @@ function Show-NextecInstallerGui {
             [void](& $novo $null "internet" "Teste de velocidade (Speedtest)" ([bool]$EnableInternet.IsPresent))
         }
         [void](& $novo $null "coleta" "Internet e links: status, DNS, IP público e causa das quedas" $true)
+        [void](& $novo $null "virtualizacao" "Hipervisores pela rede: VMware, Proxmox, XCP-ng" (@($script:Hipervisores).Count -gt 0))
         $exp = & $novo $null "exporter" "Exporters adicionais" ([bool]$EnableExporters.IsPresent)
         foreach ($d in (Get-NextecExporterCatalog)) {
             [void](& $novo $exp ("exporter:{0}" -f $d.Key) $d.Label $false)
@@ -9306,6 +9557,7 @@ function Show-NextecInstallerGui {
         if (& $gg.Marcado "blackbox") { [void]$lista.Add($gg.PaginaBlackbox) }
         if (& $gg.Marcado "snmp") { [void]$lista.Add($gg.PaginaSnmp) }
         if (& $gg.Marcado "exporter") { [void]$lista.Add($gg.PaginaExporters) }
+        if (& $gg.Marcado "virtualizacao") { [void]$lista.Add($gg.PaginaVirt) }
         [void]$lista.Add($gg.PaginaCredenciais)
         [void]$lista.Add($gg.PaginaResumo)
         $gg.Abas.SuspendLayout()
@@ -9386,6 +9638,22 @@ function Show-NextecInstallerGui {
                 if ($null -eq $r.Tag) { return "Equipamento ${n}: falta a credencial. Selecione a linha e clique em Editar selecionado." }
             }
         }
+        if ($Pagina -eq $gg.PaginaVirt) {
+            if ($gg.Hipervisores.Rows.Count -eq 0) { return "Cadastre pelo menos um hipervisor ou desmarque Hipervisores pela rede." }
+            $nomesHv = @()
+            foreach ($r in $gg.Hipervisores.Rows) {
+                $n = $r.Index + 1
+                $nome = Get-GuiSlug (Get-GuiCelula $r "nome")
+                if (-not $nome) { return "Hipervisor ${n}: informe o nome." }
+                if ($nomesHv -contains $nome) { return "Hipervisor ${n}: nome repetido ($nome)." }
+                $nomesHv += $nome
+                if (-not (Test-NextecEnderecoHipervisor (Get-GuiCelula $r "endereco"))) { return "Hipervisor ${n}: endereço inválido. Use IP ou nome, com porta opcional (ex.: 192.168.0.10)." }
+                $usuario = Get-GuiCelula $r "usuario"
+                if (-not $usuario) { return "Hipervisor ${n}: informe o usuário." }
+                if ((Get-GuiCelula $r "tipo") -eq $script:TiposHipervisor["proxmox"] -and $usuario -notmatch '^[^@!]+@[^@!]+![^@!]+$') { return "Hipervisor ${n}: no Proxmox o usuário é o ID do token, ex.: monitor@pve!nextec." }
+                if (-not (Get-GuiCelula $r "segredo") -and $r.Tag -ne "mantida") { return "Hipervisor ${n}: informe a senha ou o segredo do token." }
+            }
+        }
         if ($Pagina -eq $gg.PaginaExporters) {
             if ($gg.Exporters.Rows.Count -eq 0) { return "Marque um serviço em Recursos ou use Adicionar outro serviço." }
             foreach ($r in $gg.Exporters.Rows) {
@@ -9443,7 +9711,7 @@ function Show-NextecInstallerGui {
 
     # Todas as abas entram antes da escala: aba que ficasse de fora apareceria
     # depois com o layout de 96 DPI numa tela de 150%.
-    foreach ($pg in @($g.PaginaIdentificacao, $g.PaginaRecursos, $g.PaginaLinks, $g.PaginaBlackbox, $g.PaginaSnmp, $g.PaginaExporters, $g.PaginaCredenciais, $g.PaginaResumo)) {
+    foreach ($pg in @($g.PaginaIdentificacao, $g.PaginaRecursos, $g.PaginaLinks, $g.PaginaBlackbox, $g.PaginaSnmp, $g.PaginaExporters, $g.PaginaVirt, $g.PaginaCredenciais, $g.PaginaResumo)) {
         if (-not $abas.TabPages.Contains($pg)) { $abas.TabPages.Add($pg) }
     }
     Set-GuiEscala -Controle $form
@@ -9519,6 +9787,10 @@ function Get-GuiResumo {
         [void]$linhas.Add(("Exporters .......... {0}" -f $gg.Exporters.Rows.Count))
         foreach ($r in $gg.Exporters.Rows) { [void]$linhas.Add(("    {0}  {1}" -f (Get-GuiCelula $r "nome"), (Get-GuiCelula $r "alvo"))) }
     }
+    if (& $gg.Marcado "virtualizacao") {
+        [void]$linhas.Add(("Hipervisores ....... {0}" -f $gg.Hipervisores.Rows.Count))
+        foreach ($r in $gg.Hipervisores.Rows) { [void]$linhas.Add(("    {0}  {1}  {2}" -f (Get-GuiSlug (Get-GuiCelula $r "nome")), (Get-GuiCelula $r "tipo"), (Get-GuiCelula $r "endereco"))) }
+    }
     [void]$linhas.Add("")
     [void]$linhas.Add(("Credencial do NOC .. {0}" -f $(if ($gg.RwUser.Text.Trim()) { $gg.RwUser.Text.Trim() } else { "não informada" })))
     if ($Simular) {
@@ -9561,6 +9833,22 @@ function Set-NextecConfigurationFromGui {
     $script:EnableColetaResolved = [bool](& $gg.Marcado "coleta")
     $script:SelectedExporterKeys = [string[]]@((Get-NextecExporterCatalog) | Where-Object { & $gg.Marcado ("exporter:{0}" -f $_.Key) } | ForEach-Object { $_.Key })
     $script:BancosSqlite = $(if ($script:MonitorHost) { $gg.Sqlite.Text.Trim() } else { "" })
+
+    # Hipervisores pela rede
+    $hvs = @()
+    if (& $gg.Marcado "virtualizacao") {
+        $tipoHvPorTexto = @{}
+        foreach ($k in $script:TiposHipervisor.Keys) { $tipoHvPorTexto[$script:TiposHipervisor[$k]] = $k }
+        foreach ($r in $gg.Hipervisores.Rows) {
+            $segredoHv = Get-GuiCelula $r "segredo"
+            $hvs += [pscustomobject]@{
+                nome = Get-GuiSlug (Get-GuiCelula $r "nome"); tipo = $tipoHvPorTexto[(Get-GuiCelula $r "tipo")]
+                endereco = Get-GuiCelula $r "endereco"; usuario = Get-GuiCelula $r "usuario"
+                verificar = [bool]$r.Cells["verificar"].Value; segredo = $(if ($segredoHv) { $segredoHv } else { $null })
+            }
+        }
+    }
+    $script:Hipervisores = $hvs
 
     # Links
     $script:ColetaLinks = @()
@@ -9707,6 +9995,8 @@ function Save-NextecSimulacao {
         snmp_credenciais = @($script:SnmpAuthBlocks | ForEach-Object { Get-SnmpAuthBlockName -Block $_ })
         exporters = @($script:CustomExporters)
         bancos_coleta = @(Get-NextecBancosMotores); bancos_sqlite = $script:BancosSqlite
+        virtualizacao_local = (Get-NextecVirtLocal)
+        hipervisores = @($script:Hipervisores | ForEach-Object { [ordered]@{ nome = $_.nome; tipo = $_.tipo; endereco = $_.endereco; usuario = $_.usuario; verificar = $_.verificar; segredo_informado = [bool]$_.segredo } })
         usuario_noc = $script:RwUsername
         loki_mesma_credencial = ($script:LokiUsername -eq $script:RwUsername -and $script:LokiPassword -eq $script:RwPassword)
     }

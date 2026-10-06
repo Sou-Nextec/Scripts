@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.11.0 (Coletor systemd do node_exporter: estado dos serviços)
+# Versão: 2.12.0 (Virtualização: Proxmox VE e KVM/libvirt no servidor; VMware, Proxmox e XCP-ng pela rede)
 #
 # USO
 # ---
@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.11.0"
+INSTALLER_VERSION="2.12.0"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -78,6 +78,8 @@ COLETA_URL="${COLETA_URL:-https://raw.githubusercontent.com/Sou-Nextec/Scripts/m
 COLETA_BIN="/usr/local/lib/nextec/coleta-complementar.py"
 COLETA_CONFIG_DIR="/etc/coleta-complementar"
 COLETA_CONFIG="${COLETA_CONFIG_DIR}/coleta-complementar.ini"
+# Senhas e tokens dos hipervisores consultados pela rede (root, 0600).
+COLETA_SEGREDOS="${COLETA_CONFIG_DIR}/segredos.ini"
 COLETA_DADOS="/var/lib/coleta-complementar"
 COLETA_TEXTFILE="${COLETA_DADOS}/textfile"
 COLETA_EVENTOS="/var/log/coleta-complementar/eventos.jsonl"
@@ -109,6 +111,13 @@ LINKS=(); BLACKBOX_TARGETS=(); SNMP_TARGETS=(); CUSTOM_EXPORTERS=(); DATABASE_TA
 # Bases SQLite (caminhos com curinga, separados por vírgula) medidas pela
 # Coleta Complementar. SQLite não tem processo para detectar.
 BANCOS_SQLITE=""
+# Virtualização: VIRT_DETECTADA é proxmox, libvirt ou vazio. HIPERVISORES:
+# nome|tipo|endereco|usuario|verificar (vmware, proxmox, xcpng), sem senha.
+# A senha ou o token vai para HV_SEGREDOS e dali para ${COLETA_SEGREDOS}.
+VIRT_DETECTADA=""
+ENABLE_VIRT=0
+HIPERVISORES=()
+declare -A HV_SEGREDOS=()
 
 # O pacote oficial usa /etc/default/alloy em Debian. No fallback binário também
 # adotamos o mesmo local para manter um único padrão de manutenção.
@@ -676,6 +685,26 @@ detect_databases() {
   return 0
 }
 
+detect_virtualizacao() {
+  VIRT_DETECTADA=""
+  if [[ -d /etc/pve ]] && command -v pvesh >/dev/null 2>&1; then
+    VIRT_DETECTADA="proxmox"
+  elif command -v virsh >/dev/null 2>&1 && [[ -S /var/run/libvirt/libvirt-sock ]]; then
+    VIRT_DETECTADA="libvirt"
+  fi
+  return 0
+}
+
+virt_rotulo() {
+  case "$1" in
+    proxmox) echo "Proxmox VE" ;;
+    libvirt) echo "KVM/libvirt" ;;
+    vmware) echo "VMware ESXi/vCenter" ;;
+    xcpng) echo "XCP-ng" ;;
+    *) echo "$1" ;;
+  esac
+}
+
 show_detection() {
   step "Detecção automática"
   info "Sistema: ${PRETTY_OS}"
@@ -700,6 +729,9 @@ show_detection() {
     ok "Banco(s) de dados detectado(s): ${DETECTED_DATABASES[*]}."
   else
     info "Nenhum banco de dados detectado (PostgreSQL, MySQL/MariaDB, SQL Server, Firebird, Oracle, SQL Anywhere)."
+  fi
+  if [[ -n "$VIRT_DETECTADA" ]]; then
+    ok "Hipervisor detectado: $(virt_rotulo "$VIRT_DETECTADA") (VMs, armazenamento e snapshots sem senha)."
   fi
 }
 
@@ -978,7 +1010,66 @@ append_env_var() {
 coleta_enabled() {
   [[ "${ENABLE_INTERNET:-0}" == "1" || "${ENABLE_LINKS:-0}" == "1" || \
      "${ENABLE_VELOCIDADE:-0}" == "1" || "${ENABLE_DOCKER:-0}" == "1" || \
-     "${ENABLE_ACESSOS:-0}" == "1" ]] || [[ -n "$(bancos_motores)" ]]
+     "${ENABLE_ACESSOS:-0}" == "1" || "${ENABLE_VIRT:-0}" == "1" ]] || [[ -n "$(bancos_motores)" ]]
+}
+
+# Fonte local da virtualização no .ini: proxmox, libvirt ou nao.
+virt_local() {
+  [[ "${ENABLE_VIRT:-0}" == "1" && -n "$VIRT_DETECTADA" ]] && echo "$VIRT_DETECTADA" || echo "nao"
+}
+
+# Hipervisores remotos em uma linha por item, para o gerador do .ini.
+virt_remotos() {
+  [[ "${ENABLE_VIRT:-0}" == "1" ]] || return 0
+  local item
+  for item in "${HIPERVISORES[@]}"; do echo "$item"; done
+}
+
+# Grava ${COLETA_SEGREDOS}: mantém o segredo dos hipervisores que seguem na
+# lista e não foram redigitados, apaga os que saíram. Recebe os novos pela
+# descritor 3 (nome<TAB>segredo), para nunca aparecerem na linha de comando.
+gravar_segredos_virt() {
+  local nomes="" item nome
+  for item in "${HIPERVISORES[@]}"; do nomes+="${item%%|*}"$'\n'; done
+  [[ "${ENABLE_VIRT:-0}" == "1" ]] || nomes=""
+  local entrada=""
+  for nome in "${!HV_SEGREDOS[@]}"; do entrada+="${nome}"$'\t'"${HV_SEGREDOS[$nome]}"$'\n'; done
+  umask 077
+  NOMES="$nomes" python3 - "$COLETA_SEGREDOS" 3<<<"$entrada" <<'PY'
+import configparser, os, sys
+caminho = sys.argv[1]
+config = configparser.ConfigParser(interpolation=None)
+config.optionxform = str
+if os.path.exists(caminho):
+    config.read(caminho, encoding="utf-8")
+manter = {n for n in os.environ.get("NOMES", "").splitlines() if n}
+for secao in list(config.sections()):
+    if secao.startswith("hipervisor:") and secao.split(":", 1)[1] not in manter:
+        config.remove_section(secao)
+for linha in os.fdopen(3, encoding="utf-8").read().splitlines():
+    nome, _, segredo = linha.partition("\t")
+    if nome not in manter:
+        continue
+    secao = f"hipervisor:{nome}"
+    if not config.has_section(secao):
+        config.add_section(secao)
+    chave, _, valor = segredo.partition(":")
+    config.remove_option(secao, "senha")
+    config.remove_option(secao, "token")
+    config[secao]["token" if chave == "token" else "senha"] = valor
+if not config.sections():
+    if os.path.exists(caminho):
+        os.remove(caminho)
+    sys.exit(0)
+temporario = caminho + ".tmp"
+with open(os.open(temporario, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as arquivo:
+    arquivo.write("; Senhas e tokens dos hipervisores da Coleta Complementar. Só root lê.\n")
+    config.write(arquivo)
+os.replace(temporario, caminho)
+os.chmod(caminho, 0o600)
+PY
+  umask 022
+  HV_SEGREDOS=()
 }
 
 # Bancos sem exportador próprio, medidos pela Coleta Complementar (módulo
@@ -1233,13 +1324,14 @@ perguntar_links() {
 
 write_coleta_config() {
   mkdir -p "$COLETA_CONFIG_DIR"
+  gravar_segredos_virt
   if [[ -f "$COLETA_CONFIG" ]] && (( ${#LINKS[@]} == 0 )); then
     # Reconfiguração sem links novos: preserva os links e limites já ajustados
     # e só atualiza quais módulos estão ligados.
     cp -a "$COLETA_CONFIG" "${COLETA_CONFIG}.$(date +%Y%m%d-%H%M%S).bak"
-    python3 - "$COLETA_CONFIG" "$ENABLE_INTERNET" "$ENABLE_DOCKER" "$ENABLE_VELOCIDADE" "${ENABLE_ACESSOS:-0}" "$(bancos_motores)" "$(bancos_arquivos)" <<'PY'
-import configparser, sys
-caminho, internet, docker, velocidade, acessos, motores, arquivos = sys.argv[1:8]
+    VIRT_REMOTOS="$(virt_remotos)" python3 - "$COLETA_CONFIG" "$ENABLE_INTERNET" "$ENABLE_DOCKER" "$ENABLE_VELOCIDADE" "${ENABLE_ACESSOS:-0}" "$(bancos_motores)" "$(bancos_arquivos)" "${ENABLE_VIRT:-0}" "$(virt_local)" <<'PY'
+import configparser, os, sys
+caminho, internet, docker, velocidade, acessos, motores, arquivos, virt, virt_local = sys.argv[1:10]
 config = configparser.ConfigParser(interpolation=None)
 config.optionxform = str
 config.read(caminho, encoding="utf-8")
@@ -1256,6 +1348,20 @@ if not config.has_section("bancos"):
 config["bancos"]["ativo"] = "sim" if motores else "nao"
 config["bancos"]["motores"] = motores.replace(",", ", ")
 config["bancos"]["arquivos"] = arquivos.replace(",", ", ")
+if not config.has_section("virtualizacao"):
+    config.add_section("virtualizacao")
+config["virtualizacao"]["ativo"] = "sim" if virt == "1" else "nao"
+config["virtualizacao"]["local"] = virt_local
+for secao in [s for s in config.sections() if s.startswith("hipervisor:")]:
+    config.remove_section(secao)
+for linha in os.environ.get("VIRT_REMOTOS", "").splitlines():
+    nome, tipo, endereco, usuario, verificar = (linha.split("|") + [""] * 5)[:5]
+    secao = f"hipervisor:{nome}"
+    config.add_section(secao)
+    config[secao]["tipo"] = tipo
+    config[secao]["endereco"] = endereco
+    config[secao]["usuario"] = usuario
+    config[secao]["verificar_certificado"] = "sim" if verificar == "1" else "nao"
 with open(caminho, "w", encoding="utf-8") as arquivo:
     config.write(arquivo)
 PY
@@ -1313,7 +1419,26 @@ origens_conhecidas =
 ativo = $([[ -n "$(bancos_motores)" ]] && echo sim || echo nao)
 motores = $(bancos_motores | sed 's/,/, /g')
 arquivos = $(bancos_arquivos | sed 's/,/, /g')
+
+[virtualizacao]
+; VMs, armazenamento, snapshots e cluster. local: proxmox ou libvirt neste
+; servidor (sem senha), nao para só os hipervisores da rede ([hipervisor:...]).
+ativo = $([[ "${ENABLE_VIRT:-0}" == 1 ]] && echo sim || echo nao)
+local = $(virt_local)
 EOF
+    local hv_nome hv_tipo hv_endereco hv_usuario hv_verificar
+    while IFS='|' read -r hv_nome hv_tipo hv_endereco hv_usuario hv_verificar; do
+      [[ -n "$hv_nome" ]] || continue
+      cat <<EOF
+
+[hipervisor:${hv_nome}]
+; Senha ou token em ${COLETA_SEGREDOS}.
+tipo = ${hv_tipo}
+endereco = ${hv_endereco}
+usuario = ${hv_usuario}
+verificar_certificado = $([[ "$hv_verificar" == 1 ]] && echo sim || echo nao)
+EOF
+    done <<<"$(virt_remotos)"
     local item nome papel operadora tipo suporte ip_publico gateway alvos origem firewall interface vel_down vel_up
     for item in "${LINKS[@]}"; do
       IFS='|' read -r nome papel operadora tipo suporte ip_publico gateway alvos origem firewall interface vel_down vel_up <<<"$item"
@@ -2622,6 +2747,86 @@ collect_database_inputs() {
   collect_sqlite_inputs
 }
 
+# Virtualização: o hipervisor deste servidor entra sozinho; os da rede pedem
+# endereço e um usuário só leitura.
+collect_virt_inputs() {
+  step "Virtualização"
+  if [[ -n "$VIRT_DETECTADA" ]]; then
+    ok "$(virt_rotulo "$VIRT_DETECTADA") deste servidor: VMs, armazenamento e snapshots, sem senha."
+  fi
+  local padrao=n
+  [[ -z "$VIRT_DETECTADA" ]] && padrao=s
+  if ask_yes_no "Consultar hipervisores pela rede (VMware ESXi/vCenter, Proxmox, XCP-ng)?" "$padrao"; then
+    collect_hipervisor
+    while ask_yes_no "Cadastrar outro hipervisor?" n; do collect_hipervisor; done
+  fi
+  if [[ -z "$VIRT_DETECTADA" ]] && (( ${#HIPERVISORES[@]} == 0 )); then
+    warn "Nenhum hipervisor neste servidor nem cadastrado: virtualização desligada."
+    ENABLE_VIRT=0
+  fi
+  return 0
+}
+
+collect_hipervisor() {
+  local tipo nome endereco usuario segredo verificar=0 padrao_porta
+  choose_padrao "Tipo do hipervisor" 1 "VMware ESXi ou vCenter" "Proxmox VE (outro servidor)" "XCP-ng"
+  case "$CHOOSE_RESULT" in 1) tipo=vmware ;; 2) tipo=proxmox ;; 3) tipo=xcpng ;; esac
+  nome="$(ask_slug "Nome no NOC (ex.: esxi01)" "" host)"
+  case "$tipo" in
+    vmware) padrao_porta="IP ou nome; vCenter cobre todos os hosts dele" ;;
+    proxmox) padrao_porta="IP ou nome de um nó; porta 8006 é a padrão" ;;
+    xcpng) padrao_porta="IP ou nome do mestre do pool" ;;
+  esac
+  dica "$padrao_porta"
+  while true; do
+    endereco="$(ask_required "Endereço")"
+    [[ "$endereco" =~ ^[A-Za-z0-9.:-]+$ ]] && break
+    warn "Use só IP ou nome, com porta opcional (ex.: 192.168.0.10 ou esxi.local:443)."
+  done
+  case "$tipo" in
+    vmware)
+      dica "Usuário só leitura no ESXi/vCenter (papel Somente leitura), ex.: monitor@vsphere.local"
+      usuario="$(ask_required "Usuário")"
+      segredo="senha:$(ask_secret "Senha")" ;;
+    proxmox)
+      dica "Token de API com o papel PVEAuditor: usuario@realm!token (ex.: monitor@pve!nextec)"
+      while true; do
+        usuario="$(ask_required "ID do token")"
+        [[ "$usuario" =~ ^[^@!]+@[^@!]+![^@!]+$ ]] && break
+        warn "Formato esperado: usuario@realm!token."
+      done
+      segredo="token:$(ask_secret "Segredo do token")" ;;
+    xcpng)
+      dica "Usuário com papel read-only (ou root do pool)"
+      usuario="$(ask_required "Usuário")"
+      segredo="senha:$(ask_secret "Senha")" ;;
+  esac
+  dica "Certificado próprio (padrão desses hipervisores): responda n. A conexão continua cifrada."
+  ask_yes_no "Conferir o certificado HTTPS?" n && verificar=1
+  local i
+  for i in "${!HIPERVISORES[@]}"; do
+    [[ "${HIPERVISORES[$i]%%|*}" == "$nome" ]] && unset 'HIPERVISORES[i]'
+  done
+  HIPERVISORES=("${HIPERVISORES[@]}" "${nome}|${tipo}|${endereco}|${usuario}|${verificar}")
+  HV_SEGREDOS["$nome"]="$segredo"
+  ok "Hipervisor ${nome} ($(virt_rotulo "$tipo")) cadastrado."
+}
+
+editar_virt() {
+  if [[ "${ENABLE_VIRT:-0}" != "1" ]]; then
+    warn "Virtualização está desligada. Ligue em \"Recursos\" primeiro."
+    return 0
+  fi
+  [[ -n "$VIRT_DETECTADA" ]] && info "$(virt_rotulo "$VIRT_DETECTADA") deste servidor: sempre coletado, sem senha."
+  info "Senhas e tokens não são exibidos; ficam em ${COLETA_SEGREDOS}."
+  editar_lista HIPERVISORES "Hipervisores consultados pela rede" collect_hipervisor HV_LISTA_ATIVA
+  if [[ -z "$VIRT_DETECTADA" ]] && (( ${#HIPERVISORES[@]} == 0 )); then
+    ENABLE_VIRT=0
+    info "Nenhum hipervisor: virtualização desligada."
+  fi
+  return 0
+}
+
 # SQLite não tem processo: o técnico informa onde ficam as bases.
 collect_sqlite_inputs() {
   local resposta
@@ -2661,8 +2866,8 @@ resource_checklist() {
   (( ${#DETECTED_DATABASES[@]} > 0 )) && db_available=1
 
   # Estado inicial recomendado.
-  local -a selected=(0 0 0 0 0 0 1 1 1)
-  local -a disabled=(0 0 0 0 0 0 0 0 0)
+  local -a selected=(0 0 0 0 0 0 1 1 1 0)
+  local -a disabled=(0 0 0 0 0 0 0 0 0 0)
   local -a labels=(
     "Docker / containers"
     "Logs do sistema, warning/error/critical"
@@ -2673,8 +2878,9 @@ resource_checklist() {
     "Internet e links (status, DNS, IP público, cadastro dos links)"
     "Teste de velocidade (Speedtest, a cada 30 min)"
     "Acessos ao servidor (logins com origem, alerta de acesso privilegiado)"
+    "Virtualização (VMs, armazenamento, snapshots: Proxmox, KVM, VMware, XCP-ng)"
   )
-  local -a details=("" "" "" "" "" "" "recomendado" "recomendado" "recomendado")
+  local -a details=("" "" "" "" "" "" "recomendado" "recomendado" "recomendado" "")
 
   # "Exporters adicionais" é uma categoria em árvore, igual ao Windows: abre
   # e mostra o catálogo como itens filhos. O item pai não é marcado direto;
@@ -2689,7 +2895,7 @@ resource_checklist() {
   if [[ "$do_estado" == "1" ]]; then
     selected=("${ENABLE_DOCKER:-0}" "${ENABLE_LOGS:-0}" "${ENABLE_DATABASES:-0}" "${ENABLE_SNMP:-0}"
               "${ENABLE_BLACKBOX:-0}" "${ENABLE_EXPORTERS:-0}" "${ENABLE_INTERNET:-0}"
-              "${ENABLE_VELOCIDADE:-0}" "${ENABLE_ACESSOS:-0}")
+              "${ENABLE_VELOCIDADE:-0}" "${ENABLE_ACESSOS:-0}" "${ENABLE_VIRT:-0}")
     details[6]=""; details[7]=""; details[8]=""
     local item_exp chave_exp
     for item_exp in "${CUSTOM_EXPORTERS[@]}"; do
@@ -2718,6 +2924,13 @@ resource_checklist() {
     # Fica disponível para cadastrar bases SQLite, que não têm processo.
     [[ "$do_estado" == "1" ]] || selected[2]=0
     details[2]="nenhum detectado; marque para informar bases SQLite"
+  fi
+
+  if [[ -n "$VIRT_DETECTADA" ]]; then
+    [[ "$do_estado" == "1" ]] || selected[9]=1
+    details[9]="$(virt_rotulo "$VIRT_DETECTADA") detectado"
+  else
+    details[9]="marque para consultar hipervisores pela rede"
   fi
 
   # Marca do pai: segue os filhos.
@@ -2973,6 +3186,7 @@ resource_checklist() {
   ENABLE_INTERNET="${selected[6]}"
   ENABLE_VELOCIDADE="${selected[7]}"
   ENABLE_ACESSOS="${selected[8]}"
+  ENABLE_VIRT="${selected[9]}"
 
   EXPORTERS_MARCADOS=()
   for j in "${!filho_sel[@]}"; do
@@ -3271,6 +3485,8 @@ collect_inputs() {
   ENABLE_LINKS=0
   ENABLE_VELOCIDADE=0
   ENABLE_ACESSOS=0
+  ENABLE_VIRT=0
+  HIPERVISORES=()
   LINKS=()
   BLACKBOX_TARGETS=()
   SNMP_TARGETS=()
@@ -3296,6 +3512,7 @@ collect_inputs() {
   if [[ "$ENABLE_DATABASES" == "1" ]]; then
     collect_database_inputs
   fi
+  [[ "$ENABLE_VIRT" == "1" ]] && collect_virt_inputs
 
   [[ "$ENABLE_BLACKBOX" == "1" ]] && collect_blackbox_targets
   [[ "$ENABLE_SNMP" == "1" ]] && collect_snmp_targets
@@ -3351,6 +3568,13 @@ show_plan() {
   summary_row "Links de internet:" "$([[ "$ENABLE_LINKS" == 1 ]] && echo "sim (${#LINKS[@]})" || echo não)"
   summary_row "Teste de velocidade:" "$([[ "$ENABLE_VELOCIDADE" == 1 ]] && echo sim || echo não)"
   summary_row "Acessos (logins):" "$([[ "${ENABLE_ACESSOS:-0}" == 1 ]] && echo sim || echo não)"
+  local virt_resumo="não"
+  if [[ "${ENABLE_VIRT:-0}" == 1 ]]; then
+    virt_resumo="sim"
+    [[ "$(virt_local)" != "nao" ]] && virt_resumo+=" ($(virt_rotulo "$VIRT_DETECTADA") local)"
+    (( ${#HIPERVISORES[@]} > 0 )) && virt_resumo+=" + ${#HIPERVISORES[@]} pela rede"
+  fi
+  summary_row "Virtualização:" "$virt_resumo"
 
   echo
   [[ "$confirmacao" == "--resumo" ]] && return 0
@@ -3469,6 +3693,9 @@ salvar_estado_instalacao() {
     # Só o tipo do banco: a DSN fica em NEXTEC_DB_DSN_n, na mesma ordem.
     for item in "${DATABASE_TARGETS[@]}"; do echo "BANCO=${item%%|*}"; done
     echo "BANCOS_SQLITE=${BANCOS_SQLITE}"
+    echo "ENABLE_VIRT=${ENABLE_VIRT:-0}"
+    # Sem senha: o segredo de cada hipervisor fica em ${COLETA_SEGREDOS}.
+    for item in "${HIPERVISORES[@]}"; do echo "HIPERVISOR=${item}"; done
   } > "$tmp"
   install -m 0600 "$tmp" "$ESTADO_INSTALACAO"
   rm -f "$tmp"
@@ -3481,6 +3708,9 @@ carregar_estado_instalacao() {
   MODO_INSTALACAO="completo"
   # Recurso novo vem ligado em instalação antiga, que não tem a resposta gravada.
   ENABLE_ACESSOS=1
+  # Virtualização: sem resposta gravada, liga se este servidor é hipervisor.
+  ENABLE_VIRT=""
+  HIPERVISORES=()
   while IFS= read -r linha || [[ -n "$linha" ]]; do
     [[ -z "$linha" || "$linha" == \#* ]] && continue
     [[ "$linha" == *=* ]] || continue
@@ -3520,9 +3750,20 @@ carregar_estado_instalacao() {
       BANCOS_SQLITE)
         [[ -z "$valor" || "$valor" =~ ^/[^|\;]*$ ]] || { err "BANCOS_SQLITE inválido."; return 1; }
         BANCOS_SQLITE="$valor" ;;
+      ENABLE_VIRT)
+        [[ "$valor" =~ ^[01]$ ]] || { err "Valor inválido de ENABLE_VIRT."; return 1; }
+        ENABLE_VIRT="$valor" ;;
+      HIPERVISOR)
+        [[ "$valor" =~ ^[a-z0-9_.-]+\|(vmware|proxmox|xcpng)\|[A-Za-z0-9.:-]+\|[^|]+\|[01]$ ]] || { err "HIPERVISOR inválido."; return 1; }
+        HIPERVISORES+=("$valor") ;;
       *) ;;
     esac
   done < "$ESTADO_INSTALACAO"
+  detect_virtualizacao
+  if [[ -z "$ENABLE_VIRT" ]]; then
+    ENABLE_VIRT=0
+    [[ -n "$VIRT_DETECTADA" ]] && ENABLE_VIRT=1
+  fi
   RW_URL="https://${NOC_HOST}/api/v1/write"
   LOKI_URL="https://${NOC_HOST}/loki/api/v1/push"
   return 0
@@ -3724,7 +3965,10 @@ mostrar_status_instalacao() {
 descrever_item() {
   local a b
   IFS='|' read -r a b _ <<<"$1"
-  case "$b" in primario|failover|sdwan) b="$(papel_rotulo "$b")";; esac
+  case "$b" in
+    primario|failover|sdwan) b="$(papel_rotulo "$b")";;
+    vmware|proxmox|xcpng) b="$(virt_rotulo "$b")";;
+  esac
   printf '%s (%s)' "$a" "$b"
 }
 
@@ -3778,7 +4022,7 @@ editar_lista() {
 }
 
 editar_recursos() {
-  local db_antes="${ENABLE_DATABASES:-0}"
+  local db_antes="${ENABLE_DATABASES:-0}" virt_antes="${ENABLE_VIRT:-0}"
   CHECKLIST_DO_ESTADO=1
   resource_checklist
   CHECKLIST_DO_ESTADO=0
@@ -3789,6 +4033,10 @@ editar_recursos() {
     (( ${#DATABASE_TARGETS[@]} > 0 )) || [[ -n "$BANCOS_SQLITE" ]] || ENABLE_DATABASES=0
   fi
   [[ "$ENABLE_DATABASES" == "1" ]] || { DATABASE_TARGETS=(); BANCOS_SQLITE=""; }
+  if [[ "$ENABLE_VIRT" == "1" && "$virt_antes" != "1" ]]; then
+    collect_virt_inputs
+  fi
+  [[ "$ENABLE_VIRT" == "1" ]] || HIPERVISORES=()
 
   if [[ "$ENABLE_BLACKBOX" == "1" ]]; then
     (( ${#BLACKBOX_TARGETS[@]} > 0 )) || collect_blackbox_targets
@@ -3914,11 +4162,13 @@ aplicar_edicao() {
 menu_alterar() {
   detect_docker
   detect_databases
+  detect_virtualizacao
   local alterou=0 rotulo
   local opcoes=(
     "Identificação (cliente, host, ambiente, local, criticidade)"
     "Recursos (ligar e desligar coletas)"
     "Bancos de dados (credenciais)"
+    "Hipervisores (virtualização)"
     "Alvos de conectividade (Blackbox)"
     "Equipamentos SNMP"
     "Exporters adicionais"
@@ -3931,12 +4181,13 @@ menu_alterar() {
   )
   while true; do
     step "Alterar a configuração"
-    choose_padrao "O que deseja alterar?" 11 "${opcoes[@]}"
+    choose_padrao "O que deseja alterar?" 12 "${opcoes[@]}"
     rotulo="${opcoes[$((CHOOSE_RESULT-1))]}"
     case "$rotulo" in
       Identificação*) collect_identification; alterou=1 ;;
       Recursos*) editar_recursos; alterou=1 ;;
       Bancos*) editar_bancos; alterou=1 ;;
+      Hipervisores*) editar_virt; alterou=1 ;;
       Alvos*)
         editar_lista BLACKBOX_TARGETS "Alvos de conectividade (Blackbox)" collect_blackbox_targets ENABLE_BLACKBOX
         [[ "$ENABLE_BLACKBOX" == "1" ]] && COLLECTOR=1
@@ -4110,7 +4361,9 @@ main_somente_coleta() {
     info "Respostas atuais carregadas: ENTER mantém cada uma."
   fi
   sn() { [[ "$tem_estado" == "1" ]] && { [[ "${1:-0}" == "1" ]] && echo s || echo n; } || echo "$2"; }
-  local p_internet p_velocidade p_docker p_acessos
+  local p_internet p_velocidade p_docker p_acessos p_virt
+  detect_virtualizacao
+  p_virt="$(sn "${ENABLE_VIRT:-0}" "$([[ -n "$VIRT_DETECTADA" ]] && echo s || echo n)")"
   p_internet="$(sn "${ENABLE_INTERNET:-0}" s)"
   p_velocidade="$(sn "${ENABLE_VELOCIDADE:-0}" s)"
   p_docker="$(sn "${ENABLE_DOCKER:-0}" s)"
@@ -4130,6 +4383,7 @@ main_somente_coleta() {
   ENABLE_VELOCIDADE=0
   ENABLE_DOCKER=0
   ENABLE_ACESSOS=0
+  ENABLE_VIRT=0
 
   ask_yes_no "Medir a internet e os links (status, DNS e IP público)?" "$p_internet" && ENABLE_INTERNET=1
   dica "Recomendado: a cada 30 min. Cada teste satura o link por alguns segundos."
@@ -4138,6 +4392,16 @@ main_somente_coleta() {
     ask_yes_no "Coletar Docker (estado, consumo, health e eventos)?" "$p_docker" && ENABLE_DOCKER=1
   fi
   ask_yes_no "Registrar acessos ao servidor (logins com origem)?" "$p_acessos" && ENABLE_ACESSOS=1
+  if ask_yes_no "Monitorar virtualização (VMs e armazenamento: Proxmox, KVM, VMware, XCP-ng)?" "$p_virt"; then
+    ENABLE_VIRT=1
+    if [[ "$tem_estado" == "1" ]] && (( ${#HIPERVISORES[@]} > 0 )); then
+      editar_virt
+    else
+      collect_virt_inputs
+    fi
+  else
+    ENABLE_VIRT=0
+  fi
 
   if ! coleta_enabled; then
     warn "Nenhum módulo escolhido. Nada a fazer."
@@ -4169,6 +4433,7 @@ main() {
   detect_os
   detect_docker
   detect_databases
+  detect_virtualizacao
   show_detection
   collect_inputs
   show_plan
