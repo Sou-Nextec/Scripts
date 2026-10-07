@@ -10,8 +10,8 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.14.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.24.0 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.15.0 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.25.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.5.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
@@ -21,6 +21,14 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 - **SD-WAN no painel Nextec | Firewall.** O módulo `fortigate` passa a ler a tabela de testes de saúde do SD-WAN (`fgVWLHealthCheckLinkTable`): estado, latência, jitter e perda de cada link, com o nome do teste e a interface. Alimenta os painéis "Saúde dos links e testes", "Latência por link" e "Perda de pacotes por link", que antes ficavam vazios em FortiGate. Exige teste de saúde (Performance SLA) configurado no equipamento.
 - Latência, jitter e perda vêm em texto do FortiGate e são convertidos em número no próprio módulo. Os servidores recebem o módulo novo na próxima atualização ou ao rodar o instalador.
+
+### Instaladores Windows 2.25.0 e Linux 2.15.0, syslog dos equipamentos
+
+- **Syslog dos equipamentos SNMP.** Todo servidor com equipamento SNMP cadastrado passa a receber o syslog deles: 5514/udp no formato BSD (RFC3164: pfSense, OPNsense, MikroTik, SonicWall e a maioria dos switches) e 5515/udp no RFC5424 (FortiGate, com `set format rfc5424`). Liga sozinho na próxima atualização, sem pergunta nova.
+- **Só quem está cadastrado.** O IP de quem envia define `host`, `tipo`, `os` e `servico`, iguais aos do SNMP. Mensagem de IP fora do cadastro é descartada, porque o nome que vem na mensagem não é confiável. No Windows, a regra "Nextec: syslog dos equipamentos" do Firewall libera as duas portas só para esses IPs; no Linux, o mesmo vale para ufw ou firewalld ativos.
+- **Eventos prontos para o painel e os alertas.** Cada linha vira JSON com o texto original em `_entry` e, quando reconhecida, `evento`, `usuario`, `ip_origem`, `via` e `detalhe`: login, logout e falha de login de administrador, alteração de configuração, VPN de usuário (conectou, desconectou, falha), túnel IPsec (subiu, caiu), link (caiu, voltou) e ameaça bloqueada. O rótulo `nivel` sai da severidade do syslog. Alimenta a auditoria do painel Nextec | Firewall e os alertas de login e de alteração de configuração.
+- **Sem tráfego por regra.** O `filterlog` do pfSense e o `type="traffic"` do FortiGate são descartados: o volume é alto e o painel não usa.
+- **Credencial do Loki.** Servidor que passa a enviar logs só por causa do syslog usa a credencial do remote_write, como no modo silencioso.
 
 ### Instaladores Windows 2.24.0 e Linux 2.14.0
 
