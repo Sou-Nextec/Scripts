@@ -11,11 +11,18 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
 | Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.15.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.25.0 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.26.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.5.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
 ## 2026-10-07
+
+### Instalador Windows 2.26.0, coletor textfile por padrão
+
+- **Métricas próprias do servidor.** O exporter `system` passa a ter o coletor `textfile`, lendo `C:\Program Files\GrafanaLabs\Alloy\textfile_inputs` (pasta criada pelo instalador). Qualquer monitoramento novo do servidor é um processo gravando um `.prom` nessa pasta; `cliente`, `host` e os demais rótulos vêm do Alloy. Pasta vazia não gera métrica.
+- **Formato.** UTF-8 sem BOM, quebra de linha no fim, gravado em `.tmp` e renomeado para `.prom`. Arquivo inválido aparece em `windows_textfile_scrape_error = 1` e não derruba os outros coletores.
+- **Servidor já instalado.** Recebe na próxima atualização ou ao rodar o instalador. À mão: incluir `"textfile"` em `enabled_collectors` do exporter `system`, o bloco `textfile { text_file_directory = ... }`, criar a pasta e reiniciar o serviço Alloy.
+- O textfile no exporter `system` deixa de indicar o Speedtest antigo na leitura da configuração; isso só vale quando a pasta configurada é a do Speedtest.
 
 ### Módulo SNMP FortiGate, saúde dos links do SD-WAN
 

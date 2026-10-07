@@ -47,6 +47,10 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.26.0 Coletor textfile ligado por padrão no exporter "system", lendo
+           C:\Program Files\GrafanaLabs\Alloy\textfile_inputs: qualquer
+           métrica nova do servidor passa a ser um processo gravando .prom
+           nessa pasta (ex.: nextec_backup_* de rotinas próprias).
     2.25.0 Syslog dos equipamentos SNMP: receptor em 5514/udp (BSD) e
            5515/udp (RFC5424), só dos IPs cadastrados, com regra no Firewall
            do Windows e eventos normalizados para o painel de firewall.
@@ -346,7 +350,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.25.0"
+$InstallerVersion = "2.26.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -817,6 +821,13 @@ $ColetaConfig = Join-Path $ColetaDir "coleta-complementar.ini"
 # Senhas e tokens dos hipervisores consultados pela rede (só SYSTEM e Administradores).
 $ColetaSegredos = Join-Path $ColetaDir "segredos.ini"
 $ColetaTextfileDir = Join-Path $ColetaDir "textfile"
+# Pasta padrão do coletor textfile do exporter "system" (a mesma que o Alloy
+# usa quando o bloco textfile não informa pasta). Rotinas do servidor que não
+# são da Nextec (compactação, backup próprio, scripts do cliente) publicam
+# métricas gravando um .prom aqui; pasta vazia não gera métrica nenhuma.
+# Fica separada da pasta da Coleta Complementar porque aquela é limpa e
+# reescrita pela Coleta e tem exporter com honor_labels.
+$TextfileInputsDir = Join-Path $AlloyDir "textfile_inputs"
 $ColetaEventos = Join-Path $ColetaDir "eventos.jsonl"
 $ColetaTaskName = "NextecColetaComplementar"
 # Versão pinada do Ookla Speedtest CLI. Checar a versão mais recente em
@@ -2635,10 +2646,12 @@ function Read-CurrentAlloyConfiguration {
     }
 
     # Speedtest ligado: seção [velocidade] da Coleta ou, em instalação
-    # anterior à 2.21, o coletor textfile no exporter "system", a tarefa
-    # NextecSpeedtest ou o serviço antigo. O intervalo vem do .ini ou do
-    # gatilho da tarefa.
-    $enableInternet = ($collectors -contains "textfile") -or (Test-NextecSpeedtestLegado)
+    # anterior à 2.21, o coletor textfile no exporter "system" apontado para a
+    # pasta do Speedtest, a tarefa NextecSpeedtest ou o serviço antigo. Desde
+    # a 2.26 o textfile do "system" é padrão (textfile_inputs) e não indica
+    # Speedtest. O intervalo vem do .ini ou do gatilho da tarefa.
+    $speedtestNoSystem = ($collectors -contains "textfile") -and ($exporter -match '(?i)nextec-speedtest')
+    $enableInternet = $speedtestNoSystem -or (Test-NextecSpeedtestLegado)
     $internetIntervalMinutes = 30
 
     # A Coleta pode rodar só pelos bancos: a internet conta como ligada quando
@@ -7423,14 +7436,17 @@ function Get-WindowsCollectors {
 
         Coletores a avaliar antes de incluir, por custo:
           process           uma série por processo
-          textfile          depende de arquivo externo, falha em silêncio
           netframework*     volumoso e raramente consultado
           terminal_services séries por sessão de usuário, com rotatividade
                             diária
     #>
     $collectors = New-Object System.Collections.Generic.List[string]
 
-    foreach ($collector in @("cpu","logical_disk","memory","net","os","service","system","time")) {
+    # "textfile" entra sempre: lê $TextfileInputsDir e, com a pasta vazia,
+    # só gera as métricas de controle do próprio coletor. Arquivo .prom
+    # inválido não derruba os outros coletores: aparece em
+    # windows_textfile_scrape_error = 1.
+    foreach ($collector in @("cpu","logical_disk","memory","net","os","service","system","textfile","time")) {
         if (-not $collectors.Contains($collector)) {
             $collectors.Add($collector)
         }
@@ -7469,6 +7485,8 @@ function New-AlloyConfiguration {
 
     New-Item -ItemType Directory -Path $AlloyDir -Force | Out-Null
     New-Item -ItemType Directory -Path $StorageDir -Force | Out-Null
+    # Herda a ACL de Program Files: só Administradores e SYSTEM gravam.
+    New-Item -ItemType Directory -Path $TextfileInputsDir -Force | Out-Null
 
     $builder = New-Object Text.StringBuilder
 
@@ -7597,6 +7615,15 @@ function New-AlloyConfiguration {
             [void]$builder.AppendLine("  // Apenas volumes com letra de unidade.")
             [void]$builder.AppendLine("  logical_disk {")
             [void]$builder.AppendLine('    include = "^[A-Za-z]:$"')
+            [void]$builder.AppendLine("  }")
+            [void]$builder.AppendLine("")
+
+            # Pasta explícita, igual ao padrão do Alloy, para a configuração
+            # dizer onde gravar. text_file_directory (e não directories) porque
+            # é aceito por todas as versões do Alloy em uso nos clientes.
+            [void]$builder.AppendLine("  // Métricas próprias do servidor: arquivos .prom gravados nesta pasta.")
+            [void]$builder.AppendLine("  textfile {")
+            [void]$builder.AppendLine(('    text_file_directory = "{0}"' -f (ConvertTo-AlloyEscapedString $TextfileInputsDir)))
             [void]$builder.AppendLine("  }")
 
             $processosBanco = @()
