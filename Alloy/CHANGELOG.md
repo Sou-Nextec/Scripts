@@ -10,10 +10,19 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.12.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.22.0 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.13.0 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.23.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.5.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
+
+## 2026-10-07
+
+### Instaladores Windows 2.23.0 e Linux 2.13.0, módulos SNMP de NAS e iDRAC
+
+- **NAS.** Módulos SNMP novos: `qnap` (QTS e QuTS hero), `synology` (DSM), `truenas` (CORE e SCALE) e `nas`, genérico para Asustor, TerraMaster, WD e outros com net-snmp. Coletam discos (estado, SMART e temperatura), RAID e pools, volumes (tamanho e livre), ventoinhas, fontes, temperatura, CPU e memória. As métricas levam o prefixo do fabricante (`qnap*`, `syno*`, `truenas*`).
+- **Dell iDRAC.** Módulo `dell` (iDRAC 7 a 10): estado geral e por componente, temperaturas, ventoinhas, fontes, consumo em watts, memória, controladora RAID, discos físicos e virtuais e bateria da controladora (`idrac*`).
+- **iDRAC automático.** Em servidor Dell físico, o instalador lê o IP do iDRAC sem senha (Windows: driver IPMI ou racadm; Linux: ipmitool), sugere o modo Servidor + Collector, marca SNMP e já traz o iDRAC na lista de equipamentos. O técnico só informa a credencial SNMP do iDRAC. No modo silencioso o iDRAC continua dependendo de `-SnmpTarget`.
+- **Tipo sugerido.** Escolher o fabricante já sugere o tipo do equipamento (`storage` para NAS, `servidor` para iDRAC, `firewall` e `switch` onde se aplica). `servidor` entrou na lista de tipos SNMP.
 
 ## 2026-10-06
 

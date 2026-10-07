@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.12.0"
+INSTALLER_VERSION="2.13.0"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -695,6 +695,26 @@ detect_virtualizacao() {
   return 0
 }
 
+# Servidor físico Dell (PowerEdge): o iDRAC é monitorado por SNMP junto com o
+# host. O IP vem do ipmitool (canal 1, o da rede do iDRAC), sem credencial;
+# sem ipmitool, o técnico digita. VM em hipervisor Dell não entra.
+detect_idrac() {
+  IDRAC_DETECTADO=0
+  IDRAC_ENDERECO=""
+  local fabricante=""
+  [[ -r /sys/class/dmi/id/sys_vendor ]] && fabricante="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null)"
+  [[ "$fabricante" == Dell* ]] || return 0
+  if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --quiet --vm 2>/dev/null; then
+    return 0
+  fi
+  IDRAC_DETECTADO=1
+  if command -v ipmitool >/dev/null 2>&1; then
+    IDRAC_ENDERECO="$(timeout 15 ipmitool lan print 1 2>/dev/null | awk -F': *' '/^IP Address[[:space:]]*:/ {print $2; exit}')"
+    [[ "$IDRAC_ENDERECO" =~ ^[0-9]+(\.[0-9]+){3}$ && "$IDRAC_ENDERECO" != "0.0.0.0" ]] || IDRAC_ENDERECO=""
+  fi
+  return 0
+}
+
 virt_rotulo() {
   case "$1" in
     proxmox) echo "Proxmox VE" ;;
@@ -732,6 +752,13 @@ show_detection() {
   fi
   if [[ -n "$VIRT_DETECTADA" ]]; then
     ok "Hipervisor detectado: $(virt_rotulo "$VIRT_DETECTADA") (VMs, armazenamento e snapshots sem senha)."
+  fi
+  if [[ "${IDRAC_DETECTADO:-0}" == "1" ]]; then
+    if [[ -n "$IDRAC_ENDERECO" ]]; then
+      ok "Servidor Dell: iDRAC em ${IDRAC_ENDERECO}. Entra no cadastro SNMP."
+    else
+      warn "Servidor Dell: IP do iDRAC não lido (instale o ipmitool ou informe o IP no cadastro SNMP)."
+    fi
   fi
 }
 
@@ -2327,8 +2354,12 @@ EOF
 # neste servidor, em snmp-auth.yml. O Alloy junta os dois em memória. É o mesmo
 # desenho do instalador Windows.
 # Em ordem alfabética, como aparece para o técnico; "Outro" fica por último.
-SNMP_FABRICANTES=(cisco fortigate hp intelbras mikrotik pfsense sonicwall tplink ubiquiti)
-SNMP_FABRICANTES_ROTULOS=("Cisco" "FortiGate" "HP / Aruba" "Intelbras" "MikroTik" "pfSense" "SonicWall" "TP-Link" "Ubiquiti")
+SNMP_FABRICANTES=(cisco dell fortigate hp intelbras mikrotik nas pfsense qnap sonicwall synology tplink truenas ubiquiti)
+SNMP_FABRICANTES_ROTULOS=("Cisco" "Dell iDRAC (servidor)" "FortiGate" "HP / Aruba" "Intelbras" "MikroTik" "NAS genérico (Asustor, TerraMaster, WD)" "pfSense" "QNAP (NAS)" "SonicWall" "Synology (NAS)" "TP-Link" "TrueNAS (NAS)" "Ubiquiti")
+# Tipo sugerido por fabricante (catálogo do documento 02); vazio deixa o
+# técnico escolher a partir de "firewall".
+SNMP_FABRICANTES_TIPOS=("" "servidor" "firewall" "switch" "" "" "storage" "firewall" "storage" "firewall" "storage" "" "storage" "")
+SNMP_TIPOS=(firewall switch storage servidor ap ups)
 SNMP_AUTH_BLOCKS=()
 SNMP_FONTES=()
 SNMP_TMPDIR=""
@@ -2505,8 +2536,29 @@ collect_snmp_targets() {
   snmp_ler_auths "$SNMP_AUTH_FILE" manter
   snmp_ler_auths "$SNMP_FILE" manter
 
+  # Servidor Dell: o iDRAC entra primeiro, com o módulo dell e o IP lido pelo
+  # ipmitool. O técnico só informa a credencial SNMP do iDRAC.
+  local tem_idrac=0 alvo_existente nome_idrac end_idrac
+  for alvo_existente in "${SNMP_TARGETS[@]}"; do
+    [[ "${alvo_existente##*|}" == "dell" ]] && tem_idrac=1
+  done
+  if [[ "${IDRAC_DETECTADO:-0}" == "1" && "$tem_idrac" == "0" ]] && ask_yes_no "Servidor Dell detectado. Monitorar o iDRAC por SNMP?" s; then
+    snmp_obter_fabricante dell
+    if [[ -n "$SNMP_FONTE" ]]; then
+      info "Habilite o SNMP no iDRAC: iDRAC Settings > Services > SNMP Agent."
+      nome_idrac="idrac_${HOST_LABEL:-$(hostname -s)}"
+      nome_idrac="${nome_idrac//[-.]/_}"
+      end_idrac="$(ask_address "IP do iDRAC" "$IDRAC_ENDERECO" host)"
+      snmp_ler_credencial "$nome_idrac"
+      printf '%s\n' "${SNMP_FONTES[@]}" | grep -qxF "$SNMP_FONTE" || SNMP_FONTES+=("$SNMP_FONTE")
+      SNMP_TARGETS+=("${nome_idrac}|${end_idrac}|dell_${SNMP_VERSAO}|${SNMP_AUTH_NOME}|servidor|dell")
+      ok "iDRAC adicionado: ${nome_idrac} (${end_idrac}, dell_${SNMP_VERSAO})"
+      ask_yes_no "Cadastrar outros equipamentos SNMP?" n || return 0
+    fi
+  fi
+
   while true; do
-    local sn sa fab sm st sos rotulo_fab caminho
+    local sn sa fab sm st sos rotulo_fab caminho tipo_sugerido="" i padrao_tipo=1
     local -a modulos=()
     while true; do
       sn="$(ask_slug "Nome do equipamento" "" host)"
@@ -2524,6 +2576,7 @@ collect_snmp_targets() {
     if (( choice <= ${#SNMP_FABRICANTES[@]} )); then
       fab="${SNMP_FABRICANTES[$((choice-1))]}"
       rotulo_fab="${SNMP_FABRICANTES_ROTULOS[$((choice-1))]}"
+      tipo_sugerido="${SNMP_FABRICANTES_TIPOS[$((choice-1))]}"
       snmp_obter_fabricante "$fab"
       if [[ -z "$SNMP_FONTE" ]]; then
         warn "Equipamento não cadastrado."
@@ -2559,9 +2612,11 @@ collect_snmp_targets() {
     fi
     info "Módulo aplicado: ${sm}"
 
-    choose_padrao "Tipo do equipamento" 1 "firewall" "switch" "storage" "ap" "ups"
-    choice="$CHOOSE_RESULT"
-    case "$choice" in 1) st=firewall;; 2) st=switch;; 3) st=storage;; 4) st=ap;; 5) st=ups;; esac
+    for i in "${!SNMP_TIPOS[@]}"; do
+      [[ "${SNMP_TIPOS[$i]}" == "$tipo_sugerido" ]] && padrao_tipo=$((i+1))
+    done
+    choose_padrao "Tipo do equipamento" "$padrao_tipo" "${SNMP_TIPOS[@]}"
+    st="${SNMP_TIPOS[$((CHOOSE_RESULT-1))]}"
 
     if [[ -n "$fab" ]]; then
       sos="$fab"
@@ -2872,7 +2927,7 @@ resource_checklist() {
     "Docker / containers"
     "Logs do sistema, warning/error/critical"
     "Banco de dados"
-    "SNMP, firewalls/switches/UPS/APs"
+    "SNMP, firewalls/switches/UPS/APs/NAS/iDRAC"
     "Conectividade e disponibilidade (Blackbox), ping/TCP/DNS/HTTP"
     "Exporters adicionais"
     "Internet e links (status, DNS, IP público, cadastro dos links)"
@@ -2881,6 +2936,10 @@ resource_checklist() {
     "Virtualização (VMs, armazenamento, snapshots: Proxmox, KVM, VMware, XCP-ng)"
   )
   local -a details=("" "" "" "" "" "" "recomendado" "recomendado" "recomendado" "")
+  if [[ "${IDRAC_DETECTADO:-0}" == "1" ]]; then
+    selected[3]=1
+    details[3]="iDRAC deste servidor Dell"
+  fi
 
   # "Exporters adicionais" é uma categoria em árvore, igual ao Windows: abre
   # e mostra o catálogo como itens filhos. O item pai não é marcado direto;
@@ -3465,7 +3524,13 @@ collect_inputs() {
   local choice
 
   step "Função deste Alloy"
-  choose_padrao "Selecione o modo" 1 "Servidor monitorado" "Collector de rede" "Servidor + Collector de rede"
+  # Servidor Dell: o iDRAC é coletado por SNMP, que exige o collector.
+  local modo_padrao=1
+  if [[ "${IDRAC_DETECTADO:-0}" == "1" ]]; then
+    info "Servidor Dell detectado: o padrão é Servidor + Collector, para monitorar o iDRAC."
+    modo_padrao=3
+  fi
+  choose_padrao "Selecione o modo" "$modo_padrao" "Servidor monitorado" "Collector de rede" "Servidor + Collector de rede"
   choice="$CHOOSE_RESULT"
   MONITOR_SERVER=0
   COLLECTOR=0
@@ -3760,6 +3825,7 @@ carregar_estado_instalacao() {
     esac
   done < "$ESTADO_INSTALACAO"
   detect_virtualizacao
+  detect_idrac
   if [[ -z "$ENABLE_VIRT" ]]; then
     ENABLE_VIRT=0
     [[ -n "$VIRT_DETECTADA" ]] && ENABLE_VIRT=1
@@ -4163,6 +4229,7 @@ menu_alterar() {
   detect_docker
   detect_databases
   detect_virtualizacao
+  detect_idrac
   local alterou=0 rotulo
   local opcoes=(
     "Identificação (cliente, host, ambiente, local, criticidade)"
@@ -4363,6 +4430,7 @@ main_somente_coleta() {
   sn() { [[ "$tem_estado" == "1" ]] && { [[ "${1:-0}" == "1" ]] && echo s || echo n; } || echo "$2"; }
   local p_internet p_velocidade p_docker p_acessos p_virt
   detect_virtualizacao
+  detect_idrac
   p_virt="$(sn "${ENABLE_VIRT:-0}" "$([[ -n "$VIRT_DETECTADA" ]] && echo s || echo n)")"
   p_internet="$(sn "${ENABLE_INTERNET:-0}" s)"
   p_velocidade="$(sn "${ENABLE_VELOCIDADE:-0}" s)"
@@ -4434,6 +4502,7 @@ main() {
   detect_docker
   detect_databases
   detect_virtualizacao
+  detect_idrac
   show_detection
   collect_inputs
   show_plan
