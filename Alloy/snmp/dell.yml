@@ -3,7 +3,7 @@
 # Gerado por gerar_modulos.py. Não edite à mão: altere o gerador e rode de novo.
 #
 # Fontes: SNMPv2-MIB, IF-MIB, IF-X-MIB e IDRAC-MIB-SMIv2.
-# Os nomes das métricas são os usados pelo painel Nextec | Servidores (iDRAC).
+# Os nomes das métricas são os usados pelo painel Nextec | Hardware.
 #
 # Segurança: este arquivo NÃO contém community, usuário ou senha. As
 # credenciais ficam no snmp-auth.yml de cada cliente, gravado pelo instalador.

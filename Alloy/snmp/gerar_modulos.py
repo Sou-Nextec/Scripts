@@ -12,7 +12,7 @@ O pfsense.yml não sai daqui: ele é gerado pelo generator oficial do
 snmp_exporter, a partir das MIBs do pfSense.
 
 Os nomes das métricas são os que os painéis do NOC consultam (Nextec |
-Firewall, Nextec | NAS e Nextec | Servidores (iDRAC)). Trocar um nome aqui
+Firewall, Nextec | NAS e Nextec | Hardware). Trocar um nome aqui
 sem trocar no painel apaga o gráfico.
 
 Uso: python3 gerar_modulos.py   (grava os .yml nesta pasta)
@@ -507,7 +507,7 @@ FABRICANTES = {
     "dell": {
         "titulo": "Dell PowerEdge (iDRAC)",
         "mib": "IDRAC-MIB-SMIv2",
-        "painel": "Nextec | Servidores (iDRAC)",
+        "painel": "Nextec | Hardware",
         "host_resources": False,
         "escalares": [
             ("idracGlobalSystemStatus", "1.3.6.1.4.1.674.10892.5.2.1", "gauge", "Estado geral do servidor (3=ok 4=nonCritical 5=critical 6=nonRecoverable)"),
