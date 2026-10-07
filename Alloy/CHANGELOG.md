@@ -17,6 +17,11 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 ## 2026-10-07
 
+### Módulo SNMP FortiGate, saúde dos links do SD-WAN
+
+- **SD-WAN no painel Nextec | Firewall.** O módulo `fortigate` passa a ler a tabela de testes de saúde do SD-WAN (`fgVWLHealthCheckLinkTable`): estado, latência, jitter e perda de cada link, com o nome do teste e a interface. Alimenta os painéis "Saúde dos links e testes", "Latência por link" e "Perda de pacotes por link", que antes ficavam vazios em FortiGate. Exige teste de saúde (Performance SLA) configurado no equipamento.
+- Latência, jitter e perda vêm em texto do FortiGate e são convertidos em número no próprio módulo. Os servidores recebem o módulo novo na próxima atualização ou ao rodar o instalador.
+
 ### Instaladores Windows 2.25.0 e Linux 2.15.0, syslog dos equipamentos
 
 - **Syslog dos equipamentos SNMP.** Todo servidor com equipamento SNMP cadastrado passa a receber o syslog deles: 5514/udp no formato BSD (RFC3164: pfSense, OPNsense, MikroTik, SonicWall e a maioria dos switches) e 5515/udp no RFC5424 (FortiGate, com `set format rfc5424`). Liga sozinho na próxima atualização, sem pergunta nova.
