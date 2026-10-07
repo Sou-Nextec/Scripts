@@ -10,12 +10,16 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.13.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.23.0 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.14.0 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.24.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.5.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
 ## 2026-10-07
+
+### Instaladores Windows 2.24.0 e Linux 2.14.0
+
+- **iDRAC no painel do servidor.** O alvo SNMP do iDRAC ganha o rótulo `servidor` com o host dono dele. O painel Nextec | Servidor mostra a seção "Hardware (iDRAC)" só quando o servidor escolhido é Dell com iDRAC cadastrado. Instalações da 2.23.0 passam a gravar o rótulo na próxima atualização.
 
 ### Instaladores Windows 2.23.0 e Linux 2.13.0, módulos SNMP de NAS e iDRAC
 
