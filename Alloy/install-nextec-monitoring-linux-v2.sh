@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.13.0"
+INSTALLER_VERSION="2.14.0"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -2182,9 +2182,20 @@ prometheus.exporter.snmp "network" {
   config_file = "${SNMP_FILE}"
 EOF
       fi
-      local item sn_name sn_addr sn_module sn_auth sn_type sn_os
+      local item sn_name sn_addr sn_module sn_auth sn_type sn_os sn_extra
       for item in "${SNMP_TARGETS[@]}"; do
         IFS='|' read -r sn_name sn_addr sn_module sn_auth sn_type sn_os <<<"$item"
+        # iDRAC: o rótulo "servidor" liga o hardware ao host no painel Nextec |
+        # Servidor. O cadastrado sozinho (idrac_<este host>) é deste servidor;
+        # os cadastrados à mão no collector levam o nome sem o prefixo idrac_.
+        sn_extra=""
+        if [[ "$sn_os" == "dell" ]]; then
+          if [[ "$sn_name" == "idrac_${HOST_LABEL//[-.]/_}" ]]; then
+            sn_extra=" servidor=\"$(alloy_escape "$HOST_LABEL")\","
+          else
+            sn_extra=" servidor=\"$(alloy_escape "${sn_name#idrac_}")\","
+          fi
+        fi
         cat <<EOF
   target "${sn_name//[^A-Za-z0-9_]/_}" {
     address = "$(alloy_escape "$sn_addr")"
@@ -2192,7 +2203,7 @@ EOF
     auth    = "$(alloy_escape "$sn_auth")"
     labels = {
       cliente="$(alloy_escape "$CLIENTE")", host="$(alloy_escape "$sn_name")", servico="snmp",
-      tipo="$(alloy_escape "$sn_type")", ambiente="$(alloy_escape "$AMBIENTE")", os="$(alloy_escape "$sn_os")",
+      tipo="$(alloy_escape "$sn_type")", ambiente="$(alloy_escape "$AMBIENTE")", os="$(alloy_escape "$sn_os")",${sn_extra}
       origem="snmp", criticidade="$(alloy_escape "$CRITICIDADE")", local="$(alloy_escape "$LOCAL")",
     }
   }

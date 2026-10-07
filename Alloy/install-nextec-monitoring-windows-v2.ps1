@@ -343,7 +343,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.23.0"
+$InstallerVersion = "2.24.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -3350,6 +3350,23 @@ function Get-WindowsInventory {
         Model        = [string]$computer.Model
         Idrac        = $script:IdracDetectado
     }
+}
+
+function Get-NextecIdracServidor {
+    <#
+        Servidor dono do iDRAC, gravado no rótulo "servidor" do alvo SNMP.
+        O painel Nextec | Servidor usa esse rótulo para mostrar o hardware do
+        iDRAC junto do host. O iDRAC cadastrado sozinho (idrac_<este host>)
+        pertence a este servidor; os cadastrados à mão no collector levam o
+        nome sem o prefixo idrac_.
+    #>
+    param([Parameter(Mandatory=$true)][string]$Nome)
+    $proprios = @(
+        ("idrac_{0}" -f ([string]$script:HostLabel -replace "[-.]", "_")),
+        ((ConvertTo-Slug ("idrac_{0}" -f $env:COMPUTERNAME)) -replace "[-.]", "_")
+    )
+    if ($script:HostLabel -and $proprios -contains $Nome) { return [string]$script:HostLabel }
+    return ($Nome -replace "^idrac_", "")
 }
 
 function Get-NextecIdracEndereco {
@@ -7400,6 +7417,9 @@ function New-AlloyConfiguration {
             [void]$builder.AppendLine(('      tipo        = "{0}",' -f (ConvertTo-AlloyEscapedString $target.Type)))
             [void]$builder.AppendLine(('      ambiente    = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Ambiente)))
             [void]$builder.AppendLine(('      os          = "{0}",' -f (ConvertTo-AlloyEscapedString $target.Os)))
+            if ([string]$target.Os -eq "dell") {
+                [void]$builder.AppendLine(('      servidor    = "{0}",' -f (ConvertTo-AlloyEscapedString (Get-NextecIdracServidor -Nome ([string]$target.Name)))))
+            }
             [void]$builder.AppendLine('      origem      = "snmp",')
             [void]$builder.AppendLine(('      criticidade = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Criticidade)))
             [void]$builder.AppendLine(('      local       = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Local)))
