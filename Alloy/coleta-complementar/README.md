@@ -10,7 +10,7 @@ Completa o que o Grafana Alloy não coleta sozinho. É um arquivo único por sis
 | Execução | serviço `coleta-complementar` (systemd) | tarefa agendada `NextecColetaComplementar` (SYSTEM) |
 | Métricas | `/var/lib/coleta-complementar/textfile/*.prom` | `...\coleta-complementar\textfile\*.prom` |
 | Eventos | `/var/log/coleta-complementar/eventos.jsonl` | `...\coleta-complementar\eventos.jsonl` |
-| Módulos | internet, links, docker, velocidade, acessos, bancos | internet, links, acessos, bancos (velocidade fica com a tarefa NextecSpeedtest do instalador) |
+| Módulos | internet, links, docker, velocidade, acessos, bancos | internet, links, acessos, bancos, velocidade |
 
 Quem instala e liga é o instalador do Alloy (`install-nextec-monitoring-linux-v2.sh` 2.1.0+ e `install-nextec-monitoring-windows-v2.ps1` 2.12.0+; módulo acessos a partir de 2.4.0 e 2.14.0, que também instalam o [atualizador automático](../atualizador/README.md)): ao marcar Docker, Internet, Links, Velocidade ou um banco sem exportador próprio (Firebird, Oracle, SQL Anywhere, SQLite e, no Linux, SQL Server), ele baixa o arquivo deste diretório, grava a configuração, cria o serviço ou a tarefa e acrescenta no `config.alloy` a leitura dos arquivos. Modelo comentado da configuração: `coleta-complementar.ini.example`.
 
@@ -25,7 +25,7 @@ Quem instala e liga é o instalador do Alloy (`install-nextec-monitoring-linux-v
 | Docker: estado, health, saída, consumo, configuração, espaço, eventos | | Sim (API do Docker). O cAdvisor do Alloy não enxerga containers no Docker com armazenamento de imagens do containerd |
 | Internet: status, DNS, IP público, diagnóstico | | Sim |
 | Links: status, qualidade, link em uso, gateway da operadora, causa das quedas | | Sim |
-| Velocidade no Linux | | Sim (Ookla Speedtest CLI) |
+| Velocidade | | Sim (Ookla Speedtest CLI; no Windows a partir da 1.4.0, no lugar da tarefa NextecSpeedtest) |
 | Acessos: logins com IP de origem, acesso privilegiado, origem nova, fora do horário | | Sim (journal no Linux; evento 4624 no Windows) |
 | Bancos SQL Server (Windows), MySQL, MariaDB, PostgreSQL | Sim (coletores e exportadores do Alloy) | |
 | Bancos Firebird, Oracle, SQL Anywhere, SQLite e SQL Server no Linux: no ar, conexões, memória, tempo ligado, tamanho das bases | | Sim (processo, portas e arquivos, sem driver nem login no banco) |
@@ -61,6 +61,7 @@ Rótulos `cliente`, `host`, `ambiente`, `local` etc. são acrescentados pelo All
 | `nextec_internet_latencia_ms`, `_perda_percentual`, `_jitter_ms` | | Qualidade da saída padrão (perda do melhor destino) |
 | `nextec_internet_alvo_latencia_ms`, `_alvo_perda_percentual` | alvo | Por destino |
 | `nextec_internet_diagnostico` | diagnostico | Texto do diagnóstico atual |
+| `nextec_internet_estado_desde_segundos` | | Início do estado atual da saída padrão (epoch) |
 | `nextec_internet_rodadas_total`, `_rodadas_fora_total`, `_rodadas_degradado_total`, `_segundos_fora_total` | | Contadores de disponibilidade |
 | `nextec_internet_ip_publico_info`, `nextec_internet_ip_publico_sucesso` | ip | IP público atual |
 | `nextec_internet_link_ativo_info` | link | Link em uso |
@@ -100,7 +101,7 @@ Causas de queda: `rede local: firewall sem resposta`, `operadora: gateway sem re
 
 `stack` é o projeto do compose (`com.docker.compose.project`) ou do Swarm; `avulso` quando não há.
 
-**Velocidade** (Linux; mesmos nomes do instalador Windows): `nextec_speedtest_up`, `_download_bits_per_second`, `_upload_bits_per_second`, `_ping_latency_milliseconds`, `_ping_jitter_milliseconds`, `_packet_loss_percent`, `_last_run_timestamp_seconds`, `_server_info`.
+**Velocidade** (Linux e Windows): `nextec_speedtest_up`, `_download_bits_per_second`, `_upload_bits_per_second`, `_ping_latency_milliseconds`, `_ping_jitter_milliseconds`, `_packet_loss_percent`, `_last_run_timestamp_seconds`, `_server_info`.
 
 **Acessos** (Linux): `nextec_acessos_total{privilegiado, alerta}` e `nextec_acessos_coletor_ultima_execucao_segundos`.
 
@@ -182,4 +183,5 @@ $env:NEXTEC_COLETA_URL = "https://raw.githubusercontent.com/Sou-Nextec/Scripts/<
 | 1.0.0 | 03/10/2026 | Primeira versão: internet, links, Docker e velocidade (Linux); internet e links (Windows). |
 | 1.1.0 | 03/10/2026 | Módulo acessos (Linux e Windows) com origem e classificação para os alertas de acesso privilegiado; origem (usuário e IP da sessão SSH) no evento de terminal aberto em container. |
 | 1.2.0 | 03/10/2026 | IP público de cada link aprendido sozinho (quando só ele está no ar), sem precisar informar na instalação; velocidade contratada por link (`nextec_link_velocidade_contratada_mbps`). |
+| 1.4.0 | 05/10/2026 | Módulo velocidade no Windows (Speedtest CLI em segundo plano, sem atrasar os links), no lugar da tarefa NextecSpeedtest; `nextec_internet_estado_desde_segundos` (Linux e Windows), usado no painel NOC. |
 | 1.3.0 | 05/10/2026 | Módulo bancos (Linux e Windows): Firebird, Oracle, SQL Anywhere, SQLite e SQL Server no Linux, com `nextec_banco_*`. No Windows, `[internet] ativo = nao` desliga a rodada de internet quando a coleta é instalada só para bancos. |

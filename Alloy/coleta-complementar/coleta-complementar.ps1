@@ -19,9 +19,9 @@
                 Anywhere e arquivos SQLite): no ar, conexões, memória,
                 tempo ligado e tamanho das bases, no padrão nextec_banco_*.
                 O SQL Server segue com o coletor mssql do Alloy.
-
-    O teste de velocidade no Windows continua com o instalador (tarefa
-    NextecSpeedtest), que grava as mesmas métricas nextec_speedtest_*.
+      velocidade  teste de velocidade com o Speedtest CLI da Ookla, nas
+                métricas nextec_speedtest_* (mesmos nomes do Linux). O
+                teste roda em segundo plano para não atrasar os links.
 
 .PARAMETER Acao
     executar   roda em laço (usado pela tarefa agendada)
@@ -43,7 +43,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
-$Versao = "1.3.0"
+$Versao = "1.4.0"
 $PastaBase = Join-Path $env:ProgramData "GrafanaLabs\Alloy\coleta-complementar"
 if ([string]::IsNullOrWhiteSpace($Config)) {
     $Config = Join-Path $PastaBase "coleta-complementar.ini"
@@ -545,6 +545,7 @@ function Invoke-RodadaLinks {
     Add-Metrica $metricas "nextec_internet_perda_percentual" $internet.perda
     Add-Metrica $metricas "nextec_internet_jitter_ms" $internet.jitter
     Add-Metrica $metricas "nextec_internet_diagnostico" 1 @{ diagnostico = $diagnosticoInternet }
+    Add-Metrica $metricas "nextec_internet_estado_desde_segundos" ([math]::Round([double]$contagem.memoria.desde))
     Add-Metrica $metricas "nextec_internet_rodadas_total" $contagem.memoria.rodadas -Tipo counter
     Add-Metrica $metricas "nextec_internet_rodadas_fora_total" $contagem.memoria.fora -Tipo counter
     Add-Metrica $metricas "nextec_internet_rodadas_degradado_total" $contagem.memoria.degradado -Tipo counter
@@ -1046,13 +1047,96 @@ function Invoke-RodadaBancos {
     Save-Metricas $metricas (Join-Path $script:PastaTextfile "coleta_complementar_bancos.prom")
 }
 
+# -----------------------------------------------------------------------------
+# Módulo velocidade
+# -----------------------------------------------------------------------------
+# O teste leva de 20 a 60 segundos. Ele roda como processo à parte e o laço
+# principal só confere se terminou, para que os links continuem medidos a
+# cada rodada. O cmd.exe grava a saída em arquivo sem conversão de página de
+# código, o que preserva os acentos do nome do servidor Ookla.
+
+function Start-TesteVelocidade {
+    $saida = Join-Path $script:PastaDados "velocidade-saida.json"
+    Remove-Item -LiteralPath $saida -Force -ErrorAction SilentlyContinue
+    $comando = '/d /c ""{0}" --accept-license --accept-gdpr --format=json --progress=no > "{1}" 2>nul"' -f $script:SpeedtestExe, $saida
+    $processo = Start-Process -FilePath (Join-Path $env:SystemRoot "System32\cmd.exe") -ArgumentList $comando -WindowStyle Hidden -PassThru
+    $script:TesteVelocidade = [pscustomobject]@{ Processo = $processo; Saida = $saida; Inicio = (Get-Agora) }
+}
+
+function Save-ResultadoVelocidade {
+    param([double]$Inicio, $Dados, [string]$Erro)
+    $metricas = New-Metricas
+    $quando = [math]::Floor($Inicio)
+    if ($Erro) {
+        Add-Metrica $metricas "nextec_speedtest_up" 0
+        Add-Metrica $metricas "nextec_speedtest_last_run_timestamp_seconds" $quando
+        Save-Metricas $metricas (Join-Path $script:PastaTextfile "coleta_complementar_velocidade.prom")
+        Write-Log "erro" "teste de velocidade falhou: $Erro"
+        Write-Evento "velocidade" "teste_velocidade" "aviso" @{ detalhe = "teste falhou: $Erro" }
+        return
+    }
+    $download = [double]$Dados.download.bandwidth * 8
+    $upload = [double]$Dados.upload.bandwidth * 8
+    $latencia = [double]$Dados.ping.latency
+    $jitter = if ($null -ne $Dados.ping.jitter) { [double]$Dados.ping.jitter } else { $null }
+    $perda = if ($Dados.PSObject.Properties.Name -contains "packetLoss" -and $null -ne $Dados.packetLoss) { [double]$Dados.packetLoss } else { 0 }
+    $servidor = $Dados.server
+    Add-Metrica $metricas "nextec_speedtest_up" 1
+    Add-Metrica $metricas "nextec_speedtest_download_bits_per_second" $download
+    Add-Metrica $metricas "nextec_speedtest_upload_bits_per_second" $upload
+    Add-Metrica $metricas "nextec_speedtest_ping_latency_milliseconds" $latencia
+    Add-Metrica $metricas "nextec_speedtest_ping_jitter_milliseconds" $jitter
+    Add-Metrica $metricas "nextec_speedtest_packet_loss_percent" $perda
+    Add-Metrica $metricas "nextec_speedtest_last_run_timestamp_seconds" $quando
+    Add-Metrica $metricas "nextec_speedtest_server_info" 1 ([ordered]@{
+        server_id = [string]$servidor.id; server_name = [string]$servidor.name; server_location = [string]$servidor.location })
+    Save-Metricas $metricas (Join-Path $script:PastaTextfile "coleta_complementar_velocidade.prom")
+    Write-Evento "velocidade" "teste_velocidade" "info" @{
+        download_mbps = [math]::Round($download / 1e6, 1); upload_mbps = [math]::Round($upload / 1e6, 1)
+        latencia_ms = [math]::Round($latencia, 1); detalhe = [string]$servidor.name }
+}
+
+function Invoke-RodadaVelocidade {
+    $teste = $script:TesteVelocidade
+    if ($null -ne $teste) {
+        $decorrido = (Get-Agora) - $teste.Inicio
+        if (-not $teste.Processo.HasExited) {
+            if ($decorrido -lt 180) { return }
+            # taskkill /T encerra também o speedtest.exe filho do cmd.exe.
+            & (Join-Path $env:SystemRoot "System32\taskkill.exe") /PID $teste.Processo.Id /T /F 2>&1 | Out-Null
+            $script:TesteVelocidade = $null
+            Save-ResultadoVelocidade $teste.Inicio $null "sem resposta em 180 s"
+            return
+        }
+        $script:TesteVelocidade = $null
+        try {
+            $texto = if (Test-Path -LiteralPath $teste.Saida) { [IO.File]::ReadAllText($teste.Saida, $script:Utf8SemBom) } else { "" }
+            $linha = @($texto -split "`r?`n" | Where-Object { $_ -match '"type"\s*:\s*"result"' } | Select-Object -Last 1)
+            if ($linha.Count -eq 0) { throw "saída do Speedtest CLI sem resultado" }
+            $dados = $linha[0] | ConvertFrom-Json
+            Save-ResultadoVelocidade $teste.Inicio $dados $null
+        }
+        catch { Save-ResultadoVelocidade $teste.Inicio $null $_.Exception.Message }
+        finally { Remove-Item -LiteralPath $teste.Saida -Force -ErrorAction SilentlyContinue }
+        return
+    }
+    if (((Get-Agora) - $script:UltimoTesteVelocidade) -lt $script:IntervaloVelocidade) { return }
+    $script:UltimoTesteVelocidade = Get-Agora
+    if (-not (Test-Path -LiteralPath $script:SpeedtestExe)) {
+        Save-ResultadoVelocidade (Get-Agora) $null "Speedtest CLI não encontrado em $($script:SpeedtestExe)"
+        return
+    }
+    Start-TesteVelocidade
+}
+
 function Save-Saude {
-    param([bool]$Ok, [bool]$AcessosOk = $true, [bool]$BancosOk = $true)
+    param([bool]$Ok, [bool]$AcessosOk = $true, [bool]$BancosOk = $true, [bool]$VelocidadeOk = $true)
     $metricas = New-Metricas
     $lista = @()
     if ($script:InternetAtivo) { $lista += "internet" }
     if ($script:AcessosAtivo) { $lista += "acessos" }
     if ($script:BancosAtivo) { $lista += "bancos" }
+    if ($script:VelocidadeAtivo) { $lista += "velocidade" }
     Add-Metrica $metricas "nextec_coleta_complementar_info" 1 ([ordered]@{ versao = $script:Versao; modulos = ($lista -join ",") })
     if ($script:InternetAtivo) {
         Add-Metrica $metricas "nextec_coleta_complementar_modulo_ok" ([int]$Ok) @{ modulo = "internet" }
@@ -1062,6 +1146,9 @@ function Save-Saude {
     }
     if ($script:BancosAtivo) {
         Add-Metrica $metricas "nextec_coleta_complementar_modulo_ok" ([int]$BancosOk) @{ modulo = "bancos" }
+    }
+    if ($script:VelocidadeAtivo) {
+        Add-Metrica $metricas "nextec_coleta_complementar_modulo_ok" ([int]$VelocidadeOk) @{ modulo = "velocidade" }
     }
     Save-Metricas $metricas (Join-Path $script:PastaTextfile "coleta_complementar.prom")
 }
@@ -1116,6 +1203,14 @@ function Initialize-Configuracao {
         if ($script:MotoresBanco.Contains($motor) -and $caminho) { $script:BancosArquivos += [pscustomobject]@{ Motor = $motor; Caminho = $caminho } }
     }
 
+    $velocidade = if ($ini.Contains("velocidade")) { $ini["velocidade"] } else { @{} }
+    $script:VelocidadeAtivo = @("sim", "s", "1", "true", "ligado") -contains (Get-Valor $velocidade "ativo" "nao").ToLowerInvariant()
+    # Mínimo de 5 minutos, o mesmo que o instalador aceita com confirmação.
+    $script:IntervaloVelocidade = [math]::Max(5, [int](Get-Valor $velocidade "intervalo_minutos" "30")) * 60
+    $script:SpeedtestExe = Get-Valor $velocidade "speedtest" (Join-Path $env:ProgramData "GrafanaLabs\Alloy\nextec-speedtest\speedtest.exe")
+    $script:UltimoTesteVelocidade = 0.0
+    $script:TesteVelocidade = $null
+
     $script:Links = @()
     foreach ($nomeSecao in $ini.Keys) {
         if ($nomeSecao -match '^link:(.+)$') {
@@ -1149,7 +1244,7 @@ function Invoke-Executar {
     Initialize-Configuracao
     $script:BancosOk = $true
     Write-Log "info" "Coleta Complementar $script:Versao iniciada; links configurados: $($script:Links.Count)"
-    $ligados = @(); if ($script:InternetAtivo) { $ligados += "internet" }; if ($script:AcessosAtivo) { $ligados += "acessos" }; if ($script:BancosAtivo) { $ligados += "bancos" }
+    $ligados = @(); if ($script:InternetAtivo) { $ligados += "internet" }; if ($script:AcessosAtivo) { $ligados += "acessos" }; if ($script:BancosAtivo) { $ligados += "bancos" }; if ($script:VelocidadeAtivo) { $ligados += "velocidade" }
     Write-Evento "sistema" "coletor_iniciado" "info" @{ detalhe = "Coleta Complementar $script:Versao (Windows): $($ligados -join ', ')" }
     while ($true) {
         $inicio = Get-Agora
@@ -1170,13 +1265,21 @@ function Invoke-Executar {
                 Write-Log "erro" ("rodada de bancos falhou: {0}" -f $_.Exception.Message)
             }
         }
+        $velocidadeOk = $true
+        if ($script:VelocidadeAtivo) {
+            try { Invoke-RodadaVelocidade }
+            catch {
+                $velocidadeOk = $false
+                Write-Log "erro" ("rodada de velocidade falhou: {0}" -f $_.Exception.Message)
+            }
+        }
         try {
             if ($script:InternetAtivo) { Invoke-RodadaLinks }
-            Save-Saude $true $acessosOk $script:BancosOk
+            Save-Saude $true $acessosOk $script:BancosOk $velocidadeOk
         }
         catch {
             Write-Log "erro" ("rodada falhou: {0} | {1}" -f $_.Exception.Message, ($_.ScriptStackTrace -replace "`r?`n", " <- "))
-            try { Save-Saude $false $acessosOk $script:BancosOk } catch { }
+            try { Save-Saude $false $acessosOk $script:BancosOk $velocidadeOk } catch { }
         }
         $espera = $script:Intervalo - ((Get-Agora) - $inicio)
         if ($espera -gt 0) { Start-Sleep -Milliseconds ([int]($espera * 1000)) }
@@ -1187,6 +1290,14 @@ function Invoke-UmaVez {
     Initialize-Configuracao
     if ($script:InternetAtivo) { Invoke-RodadaLinks }
     if ($script:BancosAtivo) { Invoke-RodadaBancos }
+    if ($script:VelocidadeAtivo) {
+        # Uma rodada mostra o teste completo: espera o resultado.
+        Invoke-RodadaVelocidade
+        if ($null -ne $script:TesteVelocidade) {
+            [void]$script:TesteVelocidade.Processo.WaitForExit(185000)
+            Invoke-RodadaVelocidade
+        }
+    }
     Save-Saude $true
     Get-ChildItem -LiteralPath $script:PastaTextfile -Filter "coleta_complementar*.prom" | ForEach-Object {
         Write-Host "--- $($_.Name)"
@@ -1201,6 +1312,10 @@ function Invoke-Verificar {
     Write-Host "Links configurados: $($script:Links.Count)"
     Write-Host ("Acessos (logins com origem): {0}" -f $(if ($script:AcessosAtivo) { "ligado" } else { "desligado" }))
     Write-Host ("Bancos: {0}" -f $(if ($script:BancosAtivo) { "ligado ({0})" -f (@($script:BancosEsperados) -join ", ") } else { "desligado" }))
+    Write-Host ("Velocidade: {0}" -f $(if ($script:VelocidadeAtivo) { "ligado (a cada {0} min)" -f ($script:IntervaloVelocidade / 60) } else { "desligado" }))
+    if ($script:VelocidadeAtivo -and -not (Test-Path -LiteralPath $script:SpeedtestExe)) {
+        $problemas += "Speedtest CLI não encontrado em $($script:SpeedtestExe)"
+    }
     if ($script:AcessosAtivo) {
         try { [void](Get-WinEvent -LogName Security -MaxEvents 1) }
         catch { $problemas += "log Security ilegível: o módulo acessos não registra logins ($($_.Exception.Message))" }

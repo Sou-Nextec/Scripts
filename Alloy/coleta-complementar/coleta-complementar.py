@@ -52,7 +52,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-VERSAO = "1.3.0"
+VERSAO = "1.4.0"
 
 CONFIG_PADRAO = "/etc/coleta-complementar/coleta-complementar.ini"
 DIR_DADOS_PADRAO = "/var/lib/coleta-complementar"
@@ -510,6 +510,7 @@ class ModuloLinks:
         metricas.add("nextec_internet_perda_percentual", perda)
         metricas.add("nextec_internet_jitter_ms", jitter)
         metricas.add("nextec_internet_diagnostico", 1, {"diagnostico": diagnostico_internet})
+        metricas.add("nextec_internet_estado_desde_segundos", round(memoria["desde"]))
         metricas.add("nextec_internet_rodadas_total", memoria["rodadas"], tipo="counter")
         metricas.add("nextec_internet_rodadas_fora_total", memoria["fora"], tipo="counter")
         metricas.add("nextec_internet_rodadas_degradado_total", memoria["degradado"], tipo="counter")
