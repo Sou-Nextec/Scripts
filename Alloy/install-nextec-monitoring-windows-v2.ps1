@@ -47,6 +47,9 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.25.0 Syslog dos equipamentos SNMP: receptor em 5514/udp (BSD) e
+           5515/udp (RFC5424), só dos IPs cadastrados, com regra no Firewall
+           do Windows e eventos normalizados para o painel de firewall.
     2.22.0 Virtualização: Hyper-V do próprio servidor (VMs, checkpoints,
            replicação, armazenamento) e hipervisores pela rede (VMware ESXi ou
            vCenter, Proxmox VE e XCP-ng), com senha ou token protegido.
@@ -343,7 +346,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.24.0"
+$InstallerVersion = "2.25.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -387,6 +390,395 @@ $NextecSnmpVendors = [ordered]@{
 }
 # Tipos de equipamento SNMP oferecidos ao técnico (catálogo do documento 02).
 $NextecSnmpTipos = @("firewall", "switch", "storage", "servidor", "ap", "ups")
+
+# Syslog dos equipamentos SNMP. 5514/udp recebe o formato BSD (RFC3164, pfSense,
+# MikroTik, SonicWall e a maioria dos switches); 5515/udp recebe o RFC5424
+# (FortiGate e equipamentos que não mandam o cabeçalho BSD).
+$NextecSyslogPortaBsd = 5514
+$NextecSyslogPorta5424 = 5515
+$NextecSyslogRegraFirewall = "Nextec-Alloy-Syslog"
+
+# Normalização igual nos instaladores Windows e Linux e na central.
+$NextecSyslogProcesso = @'
+// Normaliza o syslog dos equipamentos para os eventos do painel Nextec | Firewall
+// e das regras de alerta. Cada linha vira JSON com o texto original em _entry e,
+// quando reconhecida, os campos evento, usuario, ip_origem, via e detalhe.
+// O rótulo nivel sai da severidade do syslog. Tráfego por regra (filterlog do
+// pfSense e type="traffic" do FortiGate) é descartado: o volume é alto e o
+// painel não usa.
+loki.process "syslog_equipamentos" {
+  forward_to = [loki.write.nextec.receiver]
+
+  // Mensagem de IP fora do cadastro chega sem host: descarta. O hostname que
+  // vem na mensagem não é confiável para identificar o equipamento.
+  stage.match {
+    selector            = "{origem=\"syslog\", host=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "origem_desconhecida"
+  }
+
+  stage.drop {
+    source              = "programa"
+    expression          = "^filterlog$"
+    drop_counter_reason = "trafego_por_regra"
+  }
+  stage.drop {
+    expression          = "type=\"?traffic\"?\\s"
+    drop_counter_reason = "trafego_por_regra"
+  }
+
+  stage.template {
+    source   = "nivel"
+    template = "{{ if or (eq .severidade \"emergency\") (eq .severidade \"alert\") (eq .severidade \"critical\") }}critico{{ else if eq .severidade \"error\" }}erro{{ else if eq .severidade \"warning\" }}aviso{{ else }}info{{ end }}"
+  }
+  stage.labels {
+    values = { nivel = "" }
+  }
+
+  // ---------------------------------------------------------------- FortiGate
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"logid=\\\"?[0-9]{10}\""
+
+    stage.logfmt {
+      mapping = { usuario_fg = "user", ip_fg = "srcip", remip_fg = "remip", via_fg = "method", msg_fg = "msg", cfgpath_fg = "cfgpath", tunel_fg = "vpntunnel", ui_fg = "ui" }
+    }
+    // ui="GUI(10.0.0.5)": canal e IP de quem alterou a configuração.
+    stage.regex {
+      source     = "ui_fg"
+      expression = "^(?P<ui_via_fg>[A-Za-z]+)\\((?P<ui_ip_fg>[0-9a-fA-F.:]+)\\)"
+    }
+    stage.template {
+      source   = "usuario"
+      template = "{{ if .usuario_fg }}{{ .usuario_fg }}{{ end }}"
+    }
+    stage.template {
+      source   = "ip_origem"
+      template = "{{ if .remip_fg }}{{ .remip_fg }}{{ else if .ip_fg }}{{ .ip_fg }}{{ else if .ui_ip_fg }}{{ .ui_ip_fg }}{{ end }}"
+    }
+    stage.template {
+      source   = "via"
+      template = "{{ if .via_fg }}{{ .via_fg }}{{ else if .ui_via_fg }}{{ ToLower .ui_via_fg }}{{ end }}"
+    }
+    stage.template {
+      source   = "detalhe"
+      template = "{{ if .cfgpath_fg }}{{ .cfgpath_fg }}{{ else if .tunel_fg }}{{ .tunel_fg }}: {{ .msg_fg }}{{ else if .msg_fg }}{{ .msg_fg }}{{ end }}"
+    }
+
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"logid=\\\"?0100032001\""
+      stage.template {
+      source   = "evento"
+      template = "admin_login"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"logid=\\\"?0100032003\""
+      stage.template {
+      source   = "evento"
+      template = "admin_logout"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"logid=\\\"?0100032002\""
+      stage.template {
+      source   = "evento"
+      template = "admin_login_falha"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"logdesc=\\\"(Object attribute configured|Object added|Object deleted|Attribute configured|Path configured)\""
+      stage.template {
+      source   = "evento"
+      template = "config_alterada"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"tunneltype=\\\"?ssl\" |~ \"action=\\\"?tunnel-up\""
+      stage.template {
+      source   = "evento"
+      template = "vpn_conectou"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"tunneltype=\\\"?ssl\" |~ \"action=\\\"?tunnel-down\""
+      stage.template {
+      source   = "evento"
+      template = "vpn_desconectou"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"action=\\\"?ssl-login-fail\""
+      stage.template {
+      source   = "evento"
+      template = "vpn_login_falha"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} !~ \"tunneltype=\\\"?ssl\" |~ \"action=\\\"?tunnel-up\""
+      stage.template {
+      source   = "evento"
+      template = "tunel_subiu"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} !~ \"tunneltype=\\\"?ssl\" |~ \"action=\\\"?tunnel-down\""
+      stage.template {
+      source   = "evento"
+      template = "tunel_caiu"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"(?i)(member\\\\(\\\\d+\\\\) dead|status=\\\"?dead|was turned down|interface status changed.*status=\\\"?down)\""
+      stage.template {
+      source   = "evento"
+      template = "link_caiu"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"(?i)(member\\\\(\\\\d+\\\\) alive|status=\\\"?alive|was turned up|interface status changed.*status=\\\"?up)\""
+      stage.template {
+      source   = "evento"
+      template = "link_voltou"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"type=\\\"?utm\" |~ \"action=\\\"?(blocked|dropped|deny|reset)\""
+      stage.template {
+      source   = "evento"
+      template = "ameaca_bloqueada"
+    }
+    }
+  }
+
+  // ------------------------------------------------- pfSense, OPNsense e Linux
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"Successful login for user\""
+    stage.regex { expression = "Successful login for user '(?P<usuario>[^']*)' from: (?P<ip_origem>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_login"
+    }
+stage.template {
+      source   = "via"
+      template = "web"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"authentication error for user\""
+    stage.regex { expression = "authentication error for user '(?P<usuario>[^']*)' from: (?P<ip_origem>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_login_falha"
+    }
+stage.template {
+      source   = "via"
+      template = "web"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"User logged out for user\""
+    stage.regex { expression = "User logged out for user '(?P<usuario>[^']*)' from: (?P<ip_origem>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_logout"
+    }
+stage.template {
+      source   = "via"
+      template = "web"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"Configuration Change: \""
+    stage.regex { expression = "Configuration Change: (?P<usuario>[^@]+)@(?P<ip_origem>[^ ]+)[^:]*: (?P<detalhe>.*)" }
+    stage.template {
+      source   = "evento"
+      template = "config_alterada"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\", programa=\"sshd\"} |~ \"Accepted [a-z-]+ for \""
+    stage.regex { expression = "Accepted [a-z-]+ for (?P<usuario>[^ ]+) from (?P<ip_origem>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_login"
+    }
+stage.template {
+      source   = "via"
+      template = "ssh"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\", programa=\"sshd\"} |~ \"Failed [a-z-]+ for \""
+    stage.regex { expression = "Failed [a-z-]+ for (invalid user )?(?P<usuario>[^ ]+) from (?P<ip_origem>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_login_falha"
+    }
+stage.template {
+      source   = "via"
+      template = "ssh"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"Gateway alarm: .*Alarm:1\""
+    stage.regex { expression = "Gateway alarm: (?P<detalhe>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "link_caiu"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"Gateway alarm: .*Alarm:0\""
+    stage.regex { expression = "Gateway alarm: (?P<detalhe>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "link_voltou"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\", programa=~\"openvpn.*\"} |~ \"user '[^']+' authenticated\""
+    stage.regex { expression = "(?P<ip_origem>[0-9.]+):[0-9]+ .*user '(?P<usuario>[^']+)' authenticated" }
+    stage.template {
+      source   = "evento"
+      template = "vpn_conectou"
+    }
+stage.template {
+      source   = "via"
+      template = "openvpn"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\", programa=~\"openvpn.*\"} |~ \"could not authenticate|AUTH_FAILED\""
+    stage.regex { expression = "user '(?P<usuario>[^']+)'" }
+    stage.template {
+      source   = "evento"
+      template = "vpn_login_falha"
+    }
+stage.template {
+      source   = "via"
+      template = "openvpn"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\", programa=~\"openvpn.*\"} |~ \"client-instance exiting|Inactivity timeout\""
+    stage.regex { expression = "^(?P<usuario>[^/ ]+)/(?P<ip_origem>[0-9.]+)" }
+    stage.template {
+      source   = "evento"
+      template = "vpn_desconectou"
+    }
+stage.template {
+      source   = "via"
+      template = "openvpn"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\", programa=\"charon\"} |~ \"IKE_SA .* established\""
+    stage.regex { expression = "IKE_SA (?P<detalhe>[^\\[ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "tunel_subiu"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\", programa=\"charon\"} |~ \"deleting IKE_SA\""
+    stage.regex { expression = "deleting IKE_SA (?P<detalhe>[^\\[ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "tunel_caiu"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\", programa=~\"suricata|snort\"} |~ \"\\\\[(Drop|wDrop|Block)\\\\]|\\\\[\\\\*\\\\*\\\\]\""
+    stage.template {
+      source   = "evento"
+      template = "ameaca_bloqueada"
+    }
+  }
+
+  // ----------------------------------------------------------------- MikroTik
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"user [^ ]+ logged in from \""
+    stage.regex { expression = "user (?P<usuario>[^ ]+) logged in from (?P<ip_origem>[^ ]+) via (?P<via>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_login"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"user [^ ]+ logged out from \""
+    stage.regex { expression = "user (?P<usuario>[^ ]+) logged out from (?P<ip_origem>[^ ]+) via (?P<via>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_logout"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"login failure for user \""
+    stage.regex { expression = "login failure for user (?P<usuario>[^ ]+) from (?P<ip_origem>[^ ]+) via (?P<via>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_login_falha"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \" (changed|added|removed) by \" !~ \"Configuration Change: \""
+    stage.regex { expression = "^([a-z]+(,[a-z]+)* )?(?P<detalhe>.+?) (changed|added|removed) by (.*[(:])?(?P<usuario>[A-Za-z0-9_.-]+)(@(?P<ip_origem>[0-9.]+))?" }
+    stage.template {
+      source   = "evento"
+      template = "config_alterada"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \" link down$\""
+    stage.regex { expression = "(?P<detalhe>[^ ]+) link down$" }
+    stage.template {
+      source   = "evento"
+      template = "link_caiu"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \" link up$\""
+    stage.regex { expression = "(?P<detalhe>[^ ]+) link up$" }
+    stage.template {
+      source   = "evento"
+      template = "link_voltou"
+    }
+  }
+
+  // ---------------------------------------------------------------- SonicWall
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"msg=\\\"(Administrator|User) login allowed\""
+    stage.regex { expression = "usr=\"(?P<usuario>[^\"]*)\".*src=(?P<ip_origem>[0-9.]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_login"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"msg=\\\"(Administrator|User) logged out\""
+    stage.regex { expression = "usr=\"(?P<usuario>[^\"]*)\".*src=(?P<ip_origem>[0-9.]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_logout"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"msg=\\\"(Administrator|User) login denied\""
+    stage.regex { expression = "usr=\"(?P<usuario>[^\"]*)\".*src=(?P<ip_origem>[0-9.]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_login_falha"
+    }
+  }
+
+  stage.pack {
+    labels = ["evento", "usuario", "ip_origem", "via", "detalhe", "programa"]
+  }
+  stage.label_drop {
+    values = ["severidade"]
+  }
+}
+'@
 
 # Servidor Dell: o iDRAC entra sozinho na lista de equipamentos SNMP
 # (Get-WindowsInventory preenche; $null quando o host não é Dell).
@@ -2601,6 +2993,7 @@ function Save-ReconfiguredAlloy {
     Install-ColetaComplementar
     New-AlloyConfiguration -Inventory $Inventory
     Format-AndValidateAlloyConfiguration
+    Set-NextecSyslogFirewall
     Restart-AlloyService
     Test-AlloyReadiness
     Remove-NextecSpeedtestLegado
@@ -2811,6 +3204,12 @@ function Edit-SnmpTargets {
 
     $script:EnableSnmpResolved = ($script:SnmpTargets.Count -gt 0)
     $script:Collector = ($script:EnableBlackboxResolved -or $script:EnableSnmpResolved -or $script:EnableInternetResolved)
+
+    # O syslog dos equipamentos vai para o Loki: pede a credencial se o host
+    # ainda não envia logs.
+    if ((Test-NextecNeedsLoki) -and [string]::IsNullOrWhiteSpace($script:LokiUsername)) {
+        Read-LokiCredentials
+    }
 }
 
 function Add-CustomExporterEntries {
@@ -5760,6 +6159,13 @@ function Set-AlloyServiceEnvironment {
     $environment.Add(("NEXTEC_RW_PASSWORD={0}" -f $script:RwPassword))
 
     if (Test-NextecNeedsLoki) {
+        # Host que passou a precisar do Loki numa atualização sem perguntas
+        # (ex.: syslog dos equipamentos) usa a credencial do remote_write, como
+        # no modo silencioso.
+        if ([string]::IsNullOrWhiteSpace($script:LokiUsername)) {
+            $script:LokiUsername = $script:RwUsername
+            $script:LokiPassword = $script:RwPassword
+        }
         $environment.Add(("NEXTEC_LOKI_USERNAME={0}" -f $script:LokiUsername))
         $environment.Add(("NEXTEC_LOKI_PASSWORD={0}" -f $script:LokiPassword))
     }
@@ -6137,7 +6543,138 @@ function Install-InternetMonitoring {
 # lê dali, e ajustes feitos à mão em [geral] e [internet] são preservados.
 
 function Test-NextecNeedsLoki {
-    return ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved -or $script:EnableColetaResolved)
+    return ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved -or $script:EnableColetaResolved -or (Test-NextecSyslogAtivo))
+}
+
+function Get-NextecSyslogOrigens {
+    <#
+        Equipamentos SNMP com IPv4 conhecido. Cada um vira uma origem aceita
+        pelo receptor de syslog, com host, tipo e os iguais aos do SNMP; IP
+        fora da lista é descartado. Endereço por nome é resolvido agora e fica
+        de fora se não resolver.
+    #>
+    $origens = New-Object System.Collections.Generic.List[object]
+    if (-not $script:EnableSnmpResolved) { return $origens.ToArray() }
+
+    $vistos = @{}
+    foreach ($alvo in @($script:SnmpTargets)) {
+        $endereco = (([string]$alvo.Address).Trim() -replace '^(udp|tcp)6?://', '') -replace ':\d+$', ''
+        $ip = $null
+        $convertido = $null
+        if ([Net.IPAddress]::TryParse($endereco, [ref]$convertido)) {
+            if ($convertido.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) { $ip = $convertido.ToString() }
+        }
+        elseif ($endereco) {
+            try {
+                $resolvido = @([Net.Dns]::GetHostAddresses($endereco) | Where-Object { $_.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork })
+                if ($resolvido.Count -gt 0) { $ip = $resolvido[0].ToString() }
+            }
+            catch { $ip = $null }
+        }
+        if ([string]::IsNullOrWhiteSpace($ip) -or $vistos.ContainsKey($ip)) { continue }
+        $vistos[$ip] = $true
+        $origens.Add([pscustomobject]@{ Nome = [string]$alvo.Name; Ip = $ip; Tipo = [string]$alvo.Type; Os = [string]$alvo.Os })
+    }
+    return $origens.ToArray()
+}
+
+function Test-NextecSyslogAtivo {
+    return (@(Get-NextecSyslogOrigens).Count -gt 0)
+}
+
+function Get-NextecSyslogEnderecoLocal {
+    <#
+        IP deste servidor na rede dos equipamentos, para o técnico apontar o
+        syslog. Usa a rota até o primeiro equipamento cadastrado.
+    #>
+    $origens = @(Get-NextecSyslogOrigens)
+    if ($origens.Count -eq 0) { return "" }
+    try {
+        $rota = @(Find-NetRoute -RemoteIPAddress $origens[0].Ip -ErrorAction Stop | Where-Object { $_.IPAddress })
+        if ($rota.Count -gt 0) { return [string]$rota[0].IPAddress }
+    }
+    catch { }
+    return ""
+}
+
+function Set-NextecSyslogFirewall {
+    <#
+        Libera as portas do syslog no Firewall do Windows só para os IPs dos
+        equipamentos cadastrados. A regra é refeita a cada configuração, e sai
+        quando não há mais equipamento.
+    #>
+    try {
+        Get-NetFirewallRule -Name $NextecSyslogRegraFirewall -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+        $origens = @(Get-NextecSyslogOrigens)
+        if ($origens.Count -eq 0) { return }
+        $ips = @($origens | ForEach-Object { $_.Ip })
+        New-NetFirewallRule -Name $NextecSyslogRegraFirewall -DisplayName "Nextec: syslog dos equipamentos" `
+            -Description "Syslog dos equipamentos monitorados pela Nextec, recebido pelo Grafana Alloy." `
+            -Direction Inbound -Protocol UDP -LocalPort @($NextecSyslogPortaBsd, $NextecSyslogPorta5424) `
+            -RemoteAddress $ips -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+        Write-Ok ("Syslog liberado no Firewall do Windows para {0} equipamento(s)." -f $ips.Count)
+    }
+    catch {
+        Write-Warn ("Não foi possível liberar o syslog no Firewall do Windows: {0}" -f $_.Exception.Message)
+    }
+}
+
+function Add-NextecSyslogConfig {
+    <#
+        Receptor de syslog dos equipamentos SNMP. O IP de quem envia define
+        host, tipo, os e servico; mensagem de IP desconhecido fica sem host e
+        é descartada no loki.process, porque o hostname que vem na mensagem
+        não é confiável.
+    #>
+    param([Parameter(Mandatory=$true)][Text.StringBuilder]$Builder)
+
+    $origens = @(Get-NextecSyslogOrigens)
+    if ($origens.Count -eq 0) { return }
+
+    [void]$Builder.AppendLine("// Syslog dos equipamentos SNMP: só os IPs cadastrados entram.")
+    [void]$Builder.AppendLine('loki.relabel "syslog_equipamentos" {')
+    [void]$Builder.AppendLine("  forward_to = []")
+    foreach ($origem in $origens) {
+        $regexIp = $origem.Ip -replace '\.', '\\.'
+        $valores = [ordered]@{ host = $origem.Nome; tipo = $origem.Tipo; servico = $origem.Tipo; os = $origem.Os }
+        foreach ($rotulo in $valores.Keys) {
+            [void]$Builder.AppendLine("  rule {")
+            [void]$Builder.AppendLine('    source_labels = ["__syslog_connection_ip_address"]')
+            [void]$Builder.AppendLine(('    regex         = "{0}"' -f $regexIp))
+            [void]$Builder.AppendLine(('    target_label  = "{0}"' -f $rotulo))
+            [void]$Builder.AppendLine(('    replacement   = "{0}"' -f (ConvertTo-AlloyEscapedString ([string]$valores[$rotulo]))))
+            [void]$Builder.AppendLine("  }")
+        }
+    }
+    [void]$Builder.AppendLine("  rule {")
+    [void]$Builder.AppendLine('    source_labels = ["__syslog_message_severity"]')
+    [void]$Builder.AppendLine('    target_label  = "severidade"')
+    [void]$Builder.AppendLine("  }")
+    [void]$Builder.AppendLine("  rule {")
+    [void]$Builder.AppendLine('    source_labels = ["__syslog_message_app_name"]')
+    [void]$Builder.AppendLine('    target_label  = "programa"')
+    [void]$Builder.AppendLine("  }")
+    [void]$Builder.AppendLine("}")
+    [void]$Builder.AppendLine("")
+
+    $rotulos = ('cliente = "{0}", ambiente = "{1}", origem = "syslog", criticidade = "{2}", local = "{3}"' -f
+        (ConvertTo-AlloyEscapedString $script:Cliente), (ConvertTo-AlloyEscapedString $script:Ambiente),
+        (ConvertTo-AlloyEscapedString $script:Criticidade), (ConvertTo-AlloyEscapedString $script:Local))
+    [void]$Builder.AppendLine('loki.source.syslog "equipamentos" {')
+    foreach ($ouvinte in @(@($NextecSyslogPortaBsd, "rfc3164"), @($NextecSyslogPorta5424, "rfc5424"))) {
+        [void]$Builder.AppendLine("  listener {")
+        [void]$Builder.AppendLine(('    address       = "0.0.0.0:{0}"' -f $ouvinte[0]))
+        [void]$Builder.AppendLine('    protocol      = "udp"')
+        [void]$Builder.AppendLine(('    syslog_format = "{0}"' -f $ouvinte[1]))
+        [void]$Builder.AppendLine(("    labels        = {{ {0} }}" -f $rotulos))
+        [void]$Builder.AppendLine("  }")
+    }
+    [void]$Builder.AppendLine("  relabel_rules = loki.relabel.syslog_equipamentos.rules")
+    [void]$Builder.AppendLine("  forward_to    = [loki.process.syslog_equipamentos.receiver]")
+    [void]$Builder.AppendLine("}")
+    [void]$Builder.AppendLine("")
+    [void]$Builder.AppendLine($NextecSyslogProcesso)
+    [void]$Builder.AppendLine("")
 }
 
 function Read-ColetaIniFile {
@@ -7172,7 +7709,7 @@ function New-AlloyConfiguration {
         [void]$builder.AppendLine("")
     }
 
-    if (($script:MonitorHost -and ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved)) -or $script:EnableColetaResolved) {
+    if (($script:MonitorHost -and ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved)) -or $script:EnableColetaResolved -or (Test-NextecSyslogAtivo)) {
         [void]$builder.AppendLine("// Logs Windows e eventos da Coleta Complementar")
         [void]$builder.AppendLine('loki.write "nextec" {')
         [void]$builder.AppendLine("  endpoint {")
@@ -7441,6 +7978,8 @@ function New-AlloyConfiguration {
         [void]$builder.AppendLine('  scrape_timeout  = "60s"')
         [void]$builder.AppendLine("}")
         [void]$builder.AppendLine("")
+
+        Add-NextecSyslogConfig -Builder $builder
     }
 
     if ($script:CustomExporters.Count -gt 0) {
@@ -7892,6 +8431,11 @@ function Show-FinalSummary {
     }
     if ($script:EnableSnmpResolved) {
         Write-Field -Label "SNMP" -Value ("{0} equipamento(s)" -f $script:SnmpTargets.Count) -ValueColor Green -Width 20
+    }
+    if (Test-NextecSyslogAtivo) {
+        $enderecoSyslog = Get-NextecSyslogEnderecoLocal
+        if (-not $enderecoSyslog) { $enderecoSyslog = "<IP deste servidor>" }
+        Write-Field -Label "Syslog" -Value ("{0}:{1}/udp (BSD) ou {0}:{2}/udp (RFC5424, FortiGate)" -f $enderecoSyslog, $NextecSyslogPortaBsd, $NextecSyslogPorta5424) -ValueColor Green -Width 20
     }
     if ($script:EnableInternetResolved) {
         Write-Field -Label "Velocidade" -Value ("Speedtest a cada {0} min" -f $script:InternetIntervalMinutesResolved) -ValueColor Green -Width 20
@@ -9945,6 +10489,7 @@ function Get-GuiResumo {
     if (& $gg.Marcado "snmp") {
         [void]$linhas.Add(("SNMP ............... {0} equipamento(s)" -f $gg.Snmp.Rows.Count))
         foreach ($r in $gg.Snmp.Rows) { [void]$linhas.Add(("    {0}  {1}  {2}  {3}" -f ((Get-GuiSlug (Get-GuiCelula $r "nome")) -replace "[-.]", "_"), (Get-GuiCelula $r "endereco"), (Get-GuiCelula $r "fabricante"), (Get-GuiCelula $r "credencial"))) }
+        [void]$linhas.Add(("Syslog ............. {0}/udp (BSD) e {1}/udp (RFC5424), só dos IPs acima" -f $NextecSyslogPortaBsd, $NextecSyslogPorta5424))
     }
     if (& $gg.Marcado "exporter") {
         [void]$linhas.Add(("Exporters .......... {0}" -f $gg.Exporters.Rows.Count))
@@ -10297,6 +10842,7 @@ function Invoke-NextecInstaller {
 
         New-AlloyConfiguration -Inventory $inventory
         Format-AndValidateAlloyConfiguration
+        Set-NextecSyslogFirewall
         Restart-AlloyService
 
         # Verificação não reverte nada: a configuração já está válida no disco
