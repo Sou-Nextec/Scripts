@@ -95,6 +95,21 @@ FABRICANTES = {
                     ("fgVpnTunEntStatus", "1.3.6.1.4.1.12356.101.12.2.2.1.20", "gauge", "Estado do túnel (1=down 2=up)"),
                 ],
             },
+            # Saúde dos links do SD-WAN (fgVWLHealthCheckLinkTable): uma linha
+            # por teste de saúde (SLA) e membro. Estado 0=vivo 1=morto. Latência,
+            # jitter e perda vêm em texto ("12.345") e viram número no regex.
+            {
+                "indice": "fgVWLHealthCheckLinkID",
+                "walk": "1.3.6.1.4.1.12356.101.4.9.2.1",
+                "lookups": [("fgVWLHealthCheckLinkName", "1.3.6.1.4.1.12356.101.4.9.2.1.2"),
+                            ("fgVWLHealthCheckLinkIfName", "1.3.6.1.4.1.12356.101.4.9.2.1.14")],
+                "metricas": [
+                    ("fgVWLHealthCheckLinkState", "1.3.6.1.4.1.12356.101.4.9.2.1.4", "gauge", "Estado do link no teste de saúde (0=vivo 1=morto)"),
+                    ("fgVWLHealthCheckLinkLatency", "1.3.6.1.4.1.12356.101.4.9.2.1.5", "numero_em_texto", "Latência do link no teste de saúde, em ms"),
+                    ("fgVWLHealthCheckLinkJitter", "1.3.6.1.4.1.12356.101.4.9.2.1.6", "numero_em_texto", "Jitter do link no teste de saúde, em ms"),
+                    ("fgVWLHealthCheckLinkPacketLoss", "1.3.6.1.4.1.12356.101.4.9.2.1.9", "numero_em_texto", "Perda de pacotes do link no teste de saúde, em porcentagem"),
+                ],
+            },
             {
                 "indice": "fgVpnSslStatsIndex",
                 "walk": "1.3.6.1.4.1.12356.101.12.2.3.1",
@@ -632,9 +647,12 @@ FABRICANTES = {
 def bloco_metrica(linhas, nome, oid, tipo, ajuda, indices=None, lookups=None):
     # O help sai sem aspas no YAML: ": " ou "#" no texto quebram o arquivo.
     assert ": " not in ajuda and " #" not in ajuda, f"help de {nome} não pode ter ': ' nem ' #'"
+    # "numero_em_texto": o equipamento devolve o número como texto; o
+    # regex_extracts com chave vazia mantém o nome e converte o valor.
+    numero_em_texto = tipo == "numero_em_texto"
     linhas.append(f"    - name: {nome}")
     linhas.append(f"      oid: {oid}")
-    linhas.append(f"      type: {tipo}")
+    linhas.append(f"      type: {'DisplayString' if numero_em_texto else tipo}")
     linhas.append(f"      help: {ajuda}")
     if indices:
         linhas.append("      indexes:")
@@ -649,6 +667,11 @@ def bloco_metrica(linhas, nome, oid, tipo, ajuda, indices=None, lookups=None):
             linhas.append(f"        labelname: {rotulo}")
             linhas.append(f"        oid: {oid_lookup}")
             linhas.append("        type: DisplayString")
+    if numero_em_texto:
+        linhas.append("      regex_extracts:")
+        linhas.append("        '':")
+        linhas.append("        - regex: '^\\s*([0-9.]+)'")
+        linhas.append("          value: '$1'")
 
 
 def modulo(nome_modulo, fab):

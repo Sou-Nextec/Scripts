@@ -17,6 +17,11 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 ## 2026-10-07
 
+### Módulo SNMP FortiGate, saúde dos links do SD-WAN
+
+- **SD-WAN no painel Nextec | Firewall.** O módulo `fortigate` passa a ler a tabela de testes de saúde do SD-WAN (`fgVWLHealthCheckLinkTable`): estado, latência, jitter e perda de cada link, com o nome do teste e a interface. Alimenta os painéis "Saúde dos links e testes", "Latência por link" e "Perda de pacotes por link", que antes ficavam vazios em FortiGate. Exige teste de saúde (Performance SLA) configurado no equipamento.
+- Latência, jitter e perda vêm em texto do FortiGate e são convertidos em número no próprio módulo. Os servidores recebem o módulo novo na próxima atualização ou ao rodar o instalador.
+
 ### Instaladores Windows 2.24.0 e Linux 2.14.0
 
 - **iDRAC no painel do servidor.** O alvo SNMP do iDRAC ganha o rótulo `servidor` com o host dono dele. O painel Nextec | Servidor mostra a seção "Hardware (iDRAC)" só quando o servidor escolhido é Dell com iDRAC cadastrado. Instalações da 2.23.0 passam a gravar o rótulo na próxima atualização.

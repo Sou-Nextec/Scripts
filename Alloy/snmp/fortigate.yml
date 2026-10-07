@@ -15,6 +15,7 @@ modules:
     - 1.3.6.1.2.1.2.2
     - 1.3.6.1.2.1.31.1.1
     - 1.3.6.1.4.1.12356.101.12.2.2.1
+    - 1.3.6.1.4.1.12356.101.4.9.2.1
     - 1.3.6.1.4.1.12356.101.12.2.3.1
     get:
     - 1.3.6.1.4.1.12356.101.4.1.1.0
@@ -322,6 +323,90 @@ modules:
         labelname: fgVpnTunEntPhase2Name
         oid: 1.3.6.1.4.1.12356.101.12.2.2.1.3
         type: DisplayString
+    - name: fgVWLHealthCheckLinkState
+      oid: 1.3.6.1.4.1.12356.101.4.9.2.1.4
+      type: gauge
+      help: Estado do link no teste de saúde (0=vivo 1=morto)
+      indexes:
+      - labelname: fgVWLHealthCheckLinkID
+        type: gauge
+      lookups:
+      - labels:
+        - fgVWLHealthCheckLinkID
+        labelname: fgVWLHealthCheckLinkName
+        oid: 1.3.6.1.4.1.12356.101.4.9.2.1.2
+        type: DisplayString
+      - labels:
+        - fgVWLHealthCheckLinkID
+        labelname: fgVWLHealthCheckLinkIfName
+        oid: 1.3.6.1.4.1.12356.101.4.9.2.1.14
+        type: DisplayString
+    - name: fgVWLHealthCheckLinkLatency
+      oid: 1.3.6.1.4.1.12356.101.4.9.2.1.5
+      type: DisplayString
+      help: Latência do link no teste de saúde, em ms
+      indexes:
+      - labelname: fgVWLHealthCheckLinkID
+        type: gauge
+      lookups:
+      - labels:
+        - fgVWLHealthCheckLinkID
+        labelname: fgVWLHealthCheckLinkName
+        oid: 1.3.6.1.4.1.12356.101.4.9.2.1.2
+        type: DisplayString
+      - labels:
+        - fgVWLHealthCheckLinkID
+        labelname: fgVWLHealthCheckLinkIfName
+        oid: 1.3.6.1.4.1.12356.101.4.9.2.1.14
+        type: DisplayString
+      regex_extracts:
+        '':
+        - regex: '^\s*([0-9.]+)'
+          value: '$1'
+    - name: fgVWLHealthCheckLinkJitter
+      oid: 1.3.6.1.4.1.12356.101.4.9.2.1.6
+      type: DisplayString
+      help: Jitter do link no teste de saúde, em ms
+      indexes:
+      - labelname: fgVWLHealthCheckLinkID
+        type: gauge
+      lookups:
+      - labels:
+        - fgVWLHealthCheckLinkID
+        labelname: fgVWLHealthCheckLinkName
+        oid: 1.3.6.1.4.1.12356.101.4.9.2.1.2
+        type: DisplayString
+      - labels:
+        - fgVWLHealthCheckLinkID
+        labelname: fgVWLHealthCheckLinkIfName
+        oid: 1.3.6.1.4.1.12356.101.4.9.2.1.14
+        type: DisplayString
+      regex_extracts:
+        '':
+        - regex: '^\s*([0-9.]+)'
+          value: '$1'
+    - name: fgVWLHealthCheckLinkPacketLoss
+      oid: 1.3.6.1.4.1.12356.101.4.9.2.1.9
+      type: DisplayString
+      help: Perda de pacotes do link no teste de saúde, em porcentagem
+      indexes:
+      - labelname: fgVWLHealthCheckLinkID
+        type: gauge
+      lookups:
+      - labels:
+        - fgVWLHealthCheckLinkID
+        labelname: fgVWLHealthCheckLinkName
+        oid: 1.3.6.1.4.1.12356.101.4.9.2.1.2
+        type: DisplayString
+      - labels:
+        - fgVWLHealthCheckLinkID
+        labelname: fgVWLHealthCheckLinkIfName
+        oid: 1.3.6.1.4.1.12356.101.4.9.2.1.14
+        type: DisplayString
+      regex_extracts:
+        '':
+        - regex: '^\s*([0-9.]+)'
+          value: '$1'
     - name: fgVpnSslStatsLoginUsers
       oid: 1.3.6.1.4.1.12356.101.12.2.3.1.2
       type: gauge
@@ -335,6 +420,7 @@ modules:
     - 1.3.6.1.2.1.2.2
     - 1.3.6.1.2.1.31.1.1
     - 1.3.6.1.4.1.12356.101.12.2.2.1
+    - 1.3.6.1.4.1.12356.101.4.9.2.1
     - 1.3.6.1.4.1.12356.101.12.2.3.1
     get:
     - 1.3.6.1.4.1.12356.101.4.1.1.0
@@ -642,6 +728,90 @@ modules:
         labelname: fgVpnTunEntPhase2Name
         oid: 1.3.6.1.4.1.12356.101.12.2.2.1.3
         type: DisplayString
+    - name: fgVWLHealthCheckLinkState
+      oid: 1.3.6.1.4.1.12356.101.4.9.2.1.4
+      type: gauge
+      help: Estado do link no teste de saúde (0=vivo 1=morto)
+      indexes:
+      - labelname: fgVWLHealthCheckLinkID
+        type: gauge
+      lookups:
+      - labels:
+        - fgVWLHealthCheckLinkID
+        labelname: fgVWLHealthCheckLinkName
+        oid: 1.3.6.1.4.1.12356.101.4.9.2.1.2
+        type: DisplayString
+      - labels:
+        - fgVWLHealthCheckLinkID
+        labelname: fgVWLHealthCheckLinkIfName
+        oid: 1.3.6.1.4.1.12356.101.4.9.2.1.14
+        type: DisplayString
+    - name: fgVWLHealthCheckLinkLatency
+      oid: 1.3.6.1.4.1.12356.101.4.9.2.1.5
+      type: DisplayString
+      help: Latência do link no teste de saúde, em ms
+      indexes:
+      - labelname: fgVWLHealthCheckLinkID
+        type: gauge
+      lookups:
+      - labels:
+        - fgVWLHealthCheckLinkID
+        labelname: fgVWLHealthCheckLinkName
+        oid: 1.3.6.1.4.1.12356.101.4.9.2.1.2
+        type: DisplayString
+      - labels:
+        - fgVWLHealthCheckLinkID
+        labelname: fgVWLHealthCheckLinkIfName
+        oid: 1.3.6.1.4.1.12356.101.4.9.2.1.14
+        type: DisplayString
+      regex_extracts:
+        '':
+        - regex: '^\s*([0-9.]+)'
+          value: '$1'
+    - name: fgVWLHealthCheckLinkJitter
+      oid: 1.3.6.1.4.1.12356.101.4.9.2.1.6
+      type: DisplayString
+      help: Jitter do link no teste de saúde, em ms
+      indexes:
+      - labelname: fgVWLHealthCheckLinkID
+        type: gauge
+      lookups:
+      - labels:
+        - fgVWLHealthCheckLinkID
+        labelname: fgVWLHealthCheckLinkName
+        oid: 1.3.6.1.4.1.12356.101.4.9.2.1.2
+        type: DisplayString
+      - labels:
+        - fgVWLHealthCheckLinkID
+        labelname: fgVWLHealthCheckLinkIfName
+        oid: 1.3.6.1.4.1.12356.101.4.9.2.1.14
+        type: DisplayString
+      regex_extracts:
+        '':
+        - regex: '^\s*([0-9.]+)'
+          value: '$1'
+    - name: fgVWLHealthCheckLinkPacketLoss
+      oid: 1.3.6.1.4.1.12356.101.4.9.2.1.9
+      type: DisplayString
+      help: Perda de pacotes do link no teste de saúde, em porcentagem
+      indexes:
+      - labelname: fgVWLHealthCheckLinkID
+        type: gauge
+      lookups:
+      - labels:
+        - fgVWLHealthCheckLinkID
+        labelname: fgVWLHealthCheckLinkName
+        oid: 1.3.6.1.4.1.12356.101.4.9.2.1.2
+        type: DisplayString
+      - labels:
+        - fgVWLHealthCheckLinkID
+        labelname: fgVWLHealthCheckLinkIfName
+        oid: 1.3.6.1.4.1.12356.101.4.9.2.1.14
+        type: DisplayString
+      regex_extracts:
+        '':
+        - regex: '^\s*([0-9.]+)'
+          value: '$1'
     - name: fgVpnSslStatsLoginUsers
       oid: 1.3.6.1.4.1.12356.101.12.2.3.1.2
       type: gauge
