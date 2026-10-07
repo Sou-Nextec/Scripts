@@ -20,6 +20,10 @@ Módulos:
   bancos      bancos sem exportador próprio (Firebird, Oracle, SQL Anywhere,
               SQL Server e arquivos SQLite): no ar, conexões, memória,
               tempo ligado e tamanho das bases, no padrão nextec_banco_*
+  virtualizacao  hipervisores (Proxmox VE e KVM/libvirt no próprio
+              servidor; VMware, Proxmox e XCP-ng pela rede): hosts, VMs,
+              armazenamento, snapshots e cluster, no padrão
+              nextec_hipervisor_* e nextec_vm_*
 
 Uso:
   coleta-complementar.py executar            roda os módulos ligados (serviço)
@@ -48,11 +52,16 @@ import subprocess
 import sys
 import threading
 import time
+import ssl
+import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
+import xmlrpc.client
+from xml.sax.saxutils import escape as xml_escape
 from datetime import datetime, timedelta, timezone
 
-VERSAO = "1.4.0"
+VERSAO = "1.5.0"
 
 CONFIG_PADRAO = "/etc/coleta-complementar/coleta-complementar.ini"
 DIR_DADOS_PADRAO = "/var/lib/coleta-complementar"
@@ -1780,8 +1789,678 @@ class ModuloBancos:
 
 
 
+# ---------------------------------------------------------------------------
+# Módulo virtualização
+# ---------------------------------------------------------------------------
+# Hipervisores no padrão nextec_hipervisor_* (host, armazenamento, cluster) e
+# nextec_vm_* (cada VM ou contêiner). Fontes:
+#   local     Proxmox VE (pvesh, como root, sem senha) ou KVM/libvirt (virsh)
+#             no próprio servidor
+#   [hipervisor:<nome>]  consulta pela rede: VMware ESXi ou vCenter (SOAP),
+#             Proxmox VE (API com token) e XCP-ng (XAPI). Senha e token ficam
+#             no arquivo de segredos (permissão 600), nunca no .ini.
+# Snapshots e discos mudam pouco e custam uma chamada por VM: são lidos a cada
+# 30 minutos e repetidos nas rodadas do meio.
+
+ARQ_SEGREDOS_PADRAO = "/etc/coleta-complementar/segredos.ini"
+PLATAFORMAS = {
+    "proxmox": "Proxmox VE",
+    "libvirt": "KVM/libvirt",
+    "vmware": "VMware",
+    "xcpng": "XCP-ng",
+}
+VM_LIGADA, VM_DESLIGADA, VM_PAUSADA = 1, 0, 2
+INTERVALO_DETALHES = 1800
+
+
+def contexto_tls(verificar):
+    contexto = ssl.create_default_context()
+    if not verificar:
+        # Hipervisor com certificado próprio (padrão do ESXi, Proxmox e
+        # XCP-ng): a conexão segue cifrada, só sem conferir quem assinou.
+        contexto.check_hostname = False
+        contexto.verify_mode = ssl.CERT_NONE
+    return contexto
+
+
+def epoch_iso(texto):
+    """Data ISO 8601 (com ou sem fuso) para epoch; None se não der para ler."""
+    if not texto:
+        return None
+    texto = str(texto).strip().replace("Z", "+00:00")
+    texto = re.sub(r"(\.\d{6})\d+", r"\1", texto)
+    try:
+        data = datetime.fromisoformat(texto)
+    except ValueError:
+        # Formato básico da XAPI (20261001T10:00:00Z), sempre em UTC.
+        achado = re.match(r"(\d{4})-?(\d{2})-?(\d{2})T(\d{2}):?(\d{2}):?(\d{2})", texto)
+        if not achado:
+            return None
+        data = datetime(*(int(g) for g in achado.groups()))
+    if data.tzinfo is None:
+        data = data.replace(tzinfo=timezone.utc)
+    return data.timestamp()
+
+
+def novo_inventario():
+    return {"hosts": [], "vms": [], "armazenamentos": [], "clusters": []}
+
+
+def resumo_snapshots(datas):
+    datas = [d for d in datas if d]
+    return len(datas), (min(datas) if datas else None)
+
+
+class LeitorHostLocal:
+    """CPU, memória e tempo ligado do próprio servidor, para o libvirt."""
+
+    def __init__(self):
+        self._cpu_anterior = None
+
+    def cpu_percentual(self):
+        with open("/proc/stat", encoding="ascii") as arquivo:
+            campos = [int(v) for v in arquivo.readline().split()[1:]]
+        ocioso, total = campos[3] + (campos[4] if len(campos) > 4 else 0), sum(campos)
+        anterior, self._cpu_anterior = self._cpu_anterior, (ocioso, total)
+        if anterior is None or total == anterior[1]:
+            return None
+        return round(100.0 * (1 - (ocioso - anterior[0]) / (total - anterior[1])), 2)
+
+    @staticmethod
+    def memoria():
+        valores = {}
+        with open("/proc/meminfo", encoding="ascii") as arquivo:
+            for linha in arquivo:
+                chave, _, resto = linha.partition(":")
+                valores[chave] = int(resto.split()[0]) * 1024
+        total = valores.get("MemTotal", 0)
+        return total - valores.get("MemAvailable", 0), total
+
+    @staticmethod
+    def ligado():
+        with open("/proc/uptime", encoding="ascii") as arquivo:
+            return int(float(arquivo.read().split()[0]))
+
+
+class FonteProxmox:
+    """Proxmox VE pelo pvesh (local, como root) ou pela API com token."""
+
+    plataforma = "proxmox"
+
+    def __init__(self, nome, endereco="", usuario="", token="", verificar=False):
+        self.nome = nome
+        self.local = not endereco
+        self.endereco = endereco if ":" in endereco or not endereco else f"{endereco}:8006"
+        self.usuario = usuario
+        self.token = token
+        self.contexto = contexto_tls(verificar)
+        self._detalhes = {}
+        self._ultimo_detalhe = 0.0
+
+    def get(self, caminho):
+        if self.local:
+            saida = subprocess.run(["pvesh", "get", caminho, "--output-format", "json"],
+                                   capture_output=True, text=True, timeout=60)
+            if saida.returncode != 0:
+                raise RuntimeError(f"pvesh {caminho}: {saida.stderr.strip()[:200]}")
+            return json.loads(saida.stdout or "null")
+        pedido = urllib.request.Request(f"https://{self.endereco}/api2/json{caminho}", headers={
+            "Authorization": f"PVEAPIToken={self.usuario}={self.token}"})
+        with urllib.request.urlopen(pedido, timeout=30, context=self.contexto) as resposta:
+            return json.loads(resposta.read().decode("utf-8")).get("data")
+
+    def coletar(self):
+        inv = novo_inventario()
+        versao = (self.get("/version") or {}).get("version", "")
+        status = self.get("/cluster/status") or []
+        local = next((s.get("name") for s in status if s.get("type") == "node" and s.get("local")), None)
+        cluster = next((s for s in status if s.get("type") == "cluster"), None)
+        if cluster:
+            nos = [s for s in status if s.get("type") == "node"]
+            inv["clusters"].append({"cluster": cluster.get("name", ""), "quorum": int(bool(cluster.get("quorate"))),
+                                    "nos_online": sum(1 for n in nos if n.get("online")), "nos": len(nos)})
+        nome_cluster = cluster.get("name", "") if cluster else ""
+        recursos = self.get("/cluster/resources") or []
+        # Com o agente em cada nó do cluster, cada um informa só o que é dele.
+        def deste(r):
+            return not self.local or local is None or r.get("node") == local
+
+        for r in recursos:
+            if not deste(r):
+                continue
+            tipo = r.get("type")
+            if tipo == "node":
+                online = r.get("status") == "online"
+                inv["hosts"].append({
+                    "no": r.get("node", ""), "versao": versao, "cluster": nome_cluster, "up": int(online),
+                    "cpu_percentual": round(float(r.get("cpu", 0)) * 100, 2) if online else None,
+                    "cpus": r.get("maxcpu"), "memoria_usada": r.get("mem"), "memoria_total": r.get("maxmem"),
+                    "ligado_segundos": r.get("uptime") if online else None})
+            elif tipo == "storage":
+                inv["armazenamentos"].append({
+                    "no": r.get("node", ""), "nome": r.get("storage", ""), "tipo": r.get("plugintype", ""),
+                    "usado": r.get("disk"), "total": r.get("maxdisk"),
+                    "saude": 1 if r.get("status") == "available" else 0})
+            elif tipo in ("qemu", "lxc") and not r.get("template"):
+                ligada = r.get("status") == "running"
+                inv["vms"].append({
+                    "no": r.get("node", ""), "vm": r.get("name", str(r.get("vmid"))), "id": str(r.get("vmid", "")),
+                    "tipo": "VM" if tipo == "qemu" else "Contêiner", "so": "",
+                    "estado": VM_LIGADA if ligada else VM_DESLIGADA,
+                    "cpus": r.get("maxcpu"),
+                    "cpu_percentual": round(float(r.get("cpu", 0)) * 100, 2) if ligada else None,
+                    "memoria_usada": r.get("mem") if ligada else None, "memoria_total": r.get("maxmem"),
+                    "disco_usado": r.get("disk") or None, "disco_total": r.get("maxdisk"),
+                    "ligado_segundos": r.get("uptime") if ligada else None, "_tipo": tipo})
+
+        if agora() - self._ultimo_detalhe >= INTERVALO_DETALHES:
+            self._detalhes = self.ler_detalhes(inv)
+            self._ultimo_detalhe = agora()
+        for vm in inv["vms"]:
+            vm["snapshots"], vm["snapshot_mais_antigo"] = self._detalhes.get(("vm", vm["id"]), (None, None))
+        inv["armazenamentos"].extend(self._detalhes.get("zfs", []))
+        return inv
+
+    def ler_detalhes(self, inv):
+        detalhes = {"zfs": []}
+        online = {h["no"] for h in inv["hosts"] if h["up"]}
+        for vm in inv["vms"]:
+            if vm["no"] not in online:
+                continue
+            try:
+                lista_snap = self.get(f"/nodes/{vm['no']}/{vm['_tipo']}/{vm['id']}/snapshot") or []
+                detalhes[("vm", vm["id"])] = resumo_snapshots(
+                    [s.get("snaptime") for s in lista_snap if s.get("name") != "current"])
+            except (OSError, RuntimeError, ValueError) as erro:
+                log("aviso", "snapshots não lidos", vm=vm["vm"], erro=erro)
+        for host in inv["hosts"]:
+            if not host["up"]:
+                continue
+            try:
+                for pool in self.get(f"/nodes/{host['no']}/disks/zfs") or []:
+                    detalhes["zfs"].append({
+                        "no": host["no"], "nome": f"zfs:{pool.get('name')}", "tipo": "zfs",
+                        "usado": pool.get("alloc"), "total": pool.get("size"),
+                        "saude": 1 if pool.get("health") == "ONLINE" else 0})
+            except (OSError, RuntimeError, ValueError):
+                pass  # nó sem ZFS
+        return detalhes
+
+
+class FonteLibvirt:
+    """KVM/libvirt local pelo virsh."""
+
+    plataforma = "libvirt"
+    ESTADOS = {1: VM_LIGADA, 2: VM_LIGADA, 3: VM_PAUSADA, 7: VM_PAUSADA}
+
+    def __init__(self, nome, uri="qemu:///system"):
+        self.nome = nome
+        self.uri = uri
+        self.host = LeitorHostLocal()
+        self._cpu_anterior = {}
+        self._detalhes = {}
+        self._ultimo_detalhe = 0.0
+
+    def virsh(self, *args):
+        saida = subprocess.run(["virsh", "-c", self.uri, *args], capture_output=True, text=True, timeout=60)
+        if saida.returncode != 0:
+            raise RuntimeError(f"virsh {args[0]}: {saida.stderr.strip()[:200]}")
+        return saida.stdout
+
+    @staticmethod
+    def ler_domstats(texto):
+        dominios, atual = [], None
+        for linha in texto.splitlines():
+            linha = linha.strip()
+            if linha.startswith("Domain:"):
+                atual = {"_nome": linha.split(":", 1)[1].strip().strip("'")}
+                dominios.append(atual)
+            elif "=" in linha and atual is not None:
+                chave, _, valor = linha.partition("=")
+                atual[chave] = valor
+        return dominios
+
+    def coletar(self):
+        inv = novo_inventario()
+        no = socket.gethostname()
+        versao = ""
+        for linha in self.virsh("version").splitlines():
+            if "hypervisor" in linha.lower() or "hipervisor" in linha.lower():
+                versao = linha.split(":", 1)[-1].strip()
+        usada, total = self.host.memoria()
+        inv["hosts"].append({"no": no, "versao": versao, "cluster": "", "up": 1,
+                             "cpu_percentual": self.host.cpu_percentual(), "cpus": os.cpu_count(),
+                             "memoria_usada": usada, "memoria_total": total,
+                             "ligado_segundos": self.host.ligado()})
+        momento = time.monotonic()
+        for d in self.ler_domstats(self.virsh("domstats", "--raw")):
+            estado = self.ESTADOS.get(int(d.get("state.state", 5)), VM_DESLIGADA)
+            vcpus = int(d.get("vcpu.maximum", d.get("vcpu.current", 0)) or 0)
+            cpu_percentual = None
+            if estado == VM_LIGADA and "cpu.time" in d:
+                tempo = int(d["cpu.time"])
+                anterior = self._cpu_anterior.get(d["_nome"])
+                self._cpu_anterior[d["_nome"]] = (tempo, momento)
+                if anterior and momento > anterior[1] and vcpus:
+                    cpu_percentual = round(100.0 * (tempo - anterior[0]) / ((momento - anterior[1]) * 1e9 * vcpus), 2)
+            blocos = range(int(d.get("block.count", 0)))
+            inv["vms"].append({
+                "no": no, "vm": d["_nome"], "id": d["_nome"], "tipo": "VM", "so": "", "estado": estado,
+                "cpus": vcpus or None, "cpu_percentual": cpu_percentual,
+                "memoria_usada": int(d["balloon.rss"]) * 1024 if estado == VM_LIGADA and "balloon.rss" in d else None,
+                "memoria_total": int(d["balloon.maximum"]) * 1024 if "balloon.maximum" in d else None,
+                "disco_usado": sum(int(d.get(f"block.{i}.physical", 0)) for i in blocos) or None,
+                "disco_total": sum(int(d.get(f"block.{i}.capacity", 0)) for i in blocos) or None,
+                "ligado_segundos": None})
+        if agora() - self._ultimo_detalhe >= INTERVALO_DETALHES:
+            self._detalhes = self.ler_detalhes(inv)
+            self._ultimo_detalhe = agora()
+        for vm in inv["vms"]:
+            vm["snapshots"], vm["snapshot_mais_antigo"] = self._detalhes.get(vm["vm"], (None, None))
+        inv["armazenamentos"] = self._detalhes.get("_pools", [])
+        return inv
+
+    def ler_detalhes(self, inv):
+        detalhes = {"_pools": []}
+        for vm in inv["vms"]:
+            try:
+                datas = []
+                for linha in self.virsh("snapshot-list", vm["vm"]).splitlines()[2:]:
+                    achado = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ?([+-]\d{4})?", linha)
+                    if achado:
+                        fuso = achado.group(2) or "+0000"
+                        datas.append(datetime.strptime(f"{achado.group(1)} {fuso}", "%Y-%m-%d %H:%M:%S %z").timestamp())
+                detalhes[vm["vm"]] = resumo_snapshots(datas)
+            except (OSError, RuntimeError, ValueError) as erro:
+                log("aviso", "snapshots não lidos", vm=vm["vm"], erro=erro)
+        no = inv["hosts"][0]["no"]
+        for pool in [p for p in self.virsh("pool-list", "--all", "--name").splitlines() if p.strip()]:
+            try:
+                info = {}
+                for linha in self.virsh("pool-info", pool.strip(), "--bytes").splitlines():
+                    chave, _, valor = linha.partition(":")
+                    info[chave.strip().lower()] = valor.strip()
+                detalhes["_pools"].append({
+                    "no": no, "nome": pool.strip(), "tipo": "libvirt",
+                    "usado": int(info.get("allocation", "0").split()[0]),
+                    "total": int(info.get("capacity", "0").split()[0]),
+                    "saude": 1 if info.get("state") == "running" else 0})
+            except (OSError, RuntimeError, ValueError):
+                pass
+        return detalhes
+
+
+class FonteVMware:
+    """VMware ESXi ou vCenter pela API SOAP (vim25), com usuário só leitura."""
+
+    plataforma = "vmware"
+    NS = {"s": "http://schemas.xmlsoap.org/soap/envelope/", "v": "urn:vim25"}
+    PROPRIEDADES = {
+        "HostSystem": ["name", "runtime.connectionState", "summary.quickStats.overallCpuUsage",
+                       "summary.quickStats.overallMemoryUsage", "summary.quickStats.uptime",
+                       "summary.hardware.cpuMhz", "summary.hardware.numCpuCores", "summary.hardware.numCpuThreads",
+                       "summary.hardware.memorySize", "summary.config.product.fullName", "parent"],
+        "VirtualMachine": ["name", "config.template", "config.uuid", "runtime.powerState", "runtime.host",
+                           "summary.config.numCpu", "summary.config.memorySizeMB", "summary.config.guestFullName",
+                           "summary.quickStats.overallCpuUsage", "summary.runtime.maxCpuUsage",
+                           "summary.quickStats.guestMemoryUsage", "summary.quickStats.uptimeSeconds",
+                           "summary.storage.committed", "summary.storage.uncommitted", "snapshot"],
+        "Datastore": ["summary.name", "summary.type", "summary.capacity", "summary.freeSpace",
+                      "summary.accessible", "host"],
+        "ClusterComputeResource": ["name"],
+    }
+
+    def __init__(self, nome, endereco, usuario, senha, verificar=False):
+        self.nome = nome
+        self.url = f"https://{endereco}/sdk"
+        self.usuario = usuario
+        self.senha = senha
+        self.contexto = contexto_tls(verificar)
+        self.cookie = None
+        self.versao_api = ""
+
+    def chamar(self, corpo):
+        envelope = ('<?xml version="1.0" encoding="UTF-8"?><soapenv:Envelope '
+                    'xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
+                    'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:urn="urn:vim25">'
+                    f'<soapenv:Body>{corpo}</soapenv:Body></soapenv:Envelope>')
+        cabecalhos = {"Content-Type": "text/xml; charset=utf-8",
+                      "SOAPAction": f"urn:vim25/{self.versao_api}" if self.versao_api else "urn:vim25"}
+        if self.cookie:
+            cabecalhos["Cookie"] = self.cookie
+        pedido = urllib.request.Request(self.url, data=envelope.encode("utf-8"), headers=cabecalhos)
+        try:
+            with urllib.request.urlopen(pedido, timeout=60, context=self.contexto) as resposta:
+                cookie = resposta.headers.get("Set-Cookie")
+                if cookie:
+                    self.cookie = cookie.split(";", 1)[0]
+                return ET.fromstring(resposta.read())
+        except urllib.error.HTTPError as erro:
+            texto = erro.read().decode("utf-8", "replace")
+            achado = re.search(r"<faultstring>(.*?)</faultstring>", texto, re.S)
+            raise RuntimeError(f"VMware: {achado.group(1).strip() if achado else erro}") from None
+
+    def coletar(self):
+        self.cookie = None
+        self.versao_api = ""
+        conteudo = self.chamar('<urn:RetrieveServiceContent><urn:_this type="ServiceInstance">ServiceInstance'
+                               '</urn:_this></urn:RetrieveServiceContent>').find(".//v:returnval", self.NS)
+        texto = lambda caminho: (conteudo.findtext(caminho, "", self.NS) or "").strip()
+        self.versao_api = texto("v:about/v:apiVersion")
+        produto = texto("v:about/v:fullName")
+        self.chamar(f'<urn:Login><urn:_this type="SessionManager">{texto("v:sessionManager")}</urn:_this>'
+                    f'<urn:userName>{xml_escape(self.usuario)}</urn:userName>'
+                    f'<urn:password>{xml_escape(self.senha)}</urn:password></urn:Login>')
+        try:
+            vista = self.chamar(
+                f'<urn:CreateContainerView><urn:_this type="ViewManager">{texto("v:viewManager")}</urn:_this>'
+                f'<urn:container type="Folder">{texto("v:rootFolder")}</urn:container>'
+                + "".join(f"<urn:type>{t}</urn:type>" for t in self.PROPRIEDADES)
+                + '<urn:recursive>true</urn:recursive></urn:CreateContainerView>').findtext(".//v:returnval", "", self.NS)
+            objetos = self.ler_objetos(texto("v:propertyCollector"), vista)
+            return self.montar(objetos, produto)
+        finally:
+            try:
+                self.chamar(f'<urn:Logout><urn:_this type="SessionManager">{texto("v:sessionManager")}'
+                            '</urn:_this></urn:Logout>')
+            except (OSError, RuntimeError):
+                pass
+
+    def ler_objetos(self, coletor, vista):
+        conjuntos = "".join(f"<urn:propSet><urn:type>{t}</urn:type>"
+                            + "".join(f"<urn:pathSet>{p}</urn:pathSet>" for p in props) + "</urn:propSet>"
+                            for t, props in self.PROPRIEDADES.items())
+        corpo = (f'<urn:RetrievePropertiesEx><urn:_this type="PropertyCollector">{coletor}</urn:_this>'
+                 f'<urn:specSet>{conjuntos}<urn:objectSet><urn:obj type="ContainerView">{vista}</urn:obj>'
+                 '<urn:skip>true</urn:skip><urn:selectSet xsi:type="urn:TraversalSpec"><urn:name>vista</urn:name>'
+                 '<urn:type>ContainerView</urn:type><urn:path>view</urn:path><urn:skip>false</urn:skip>'
+                 '</urn:selectSet></urn:objectSet></urn:specSet><urn:options><urn:maxObjects>500</urn:maxObjects>'
+                 '</urn:options></urn:RetrievePropertiesEx>')
+        objetos = []
+        resposta = self.chamar(corpo)
+        while True:
+            retorno = resposta.find(".//v:returnval", self.NS)
+            if retorno is None:
+                break
+            for obj in retorno.findall("v:objects", self.NS):
+                ref = obj.find("v:obj", self.NS)
+                item = {"_tipo": ref.get("type"), "_id": (ref.text or "").strip()}
+                for prop in obj.findall("v:propSet", self.NS):
+                    item[prop.findtext("v:name", "", self.NS)] = prop.find("v:val", self.NS)
+                objetos.append(item)
+            ficha = retorno.findtext("v:token", "", self.NS)
+            if not ficha:
+                break
+            resposta = self.chamar(f'<urn:ContinueRetrievePropertiesEx><urn:_this type="PropertyCollector">'
+                                   f'{coletor}</urn:_this><urn:token>{ficha}</urn:token></urn:ContinueRetrievePropertiesEx>')
+        return objetos
+
+    @staticmethod
+    def valor(item, chave, conversor=str):
+        elemento = item.get(chave)
+        if elemento is None or elemento.text is None:
+            return None
+        try:
+            return conversor(elemento.text.strip())
+        except ValueError:
+            return None
+
+    def montar(self, objetos, produto):
+        inv = novo_inventario()
+        hosts = {o["_id"]: o for o in objetos if o["_tipo"] == "HostSystem"}
+        clusters = {o["_id"]: self.valor(o, "name") for o in objetos if o["_tipo"] == "ClusterComputeResource"}
+        nomes_host = {i: self.valor(h, "name") or i for i, h in hosts.items()}
+        for i, h in hosts.items():
+            conectado = self.valor(h, "runtime.connectionState") == "connected"
+            mhz, nucleos = self.valor(h, "summary.hardware.cpuMhz", int), self.valor(h, "summary.hardware.numCpuCores", int)
+            uso = self.valor(h, "summary.quickStats.overallCpuUsage", int)
+            memoria_mb = self.valor(h, "summary.quickStats.overallMemoryUsage", int)
+            inv["hosts"].append({
+                "no": nomes_host[i], "versao": self.valor(h, "summary.config.product.fullName") or produto,
+                "cluster": clusters.get(self.valor(h, "parent") or "", "") or "", "up": int(conectado),
+                "cpu_percentual": round(100.0 * uso / (mhz * nucleos), 2) if conectado and uso is not None and mhz and nucleos else None,
+                "cpus": self.valor(h, "summary.hardware.numCpuThreads", int),
+                "memoria_usada": memoria_mb * 1024 * 1024 if conectado and memoria_mb is not None else None,
+                "memoria_total": self.valor(h, "summary.hardware.memorySize", int),
+                "ligado_segundos": self.valor(h, "summary.quickStats.uptime", int) if conectado else None})
+        unico = next(iter(nomes_host.values())) if len(nomes_host) == 1 else ""
+        for o in objetos:
+            if o["_tipo"] == "Datastore":
+                total, livre = self.valor(o, "summary.capacity", int), self.valor(o, "summary.freeSpace", int)
+                inv["armazenamentos"].append({
+                    "no": unico, "nome": self.valor(o, "summary.name") or o["_id"], "tipo": self.valor(o, "summary.type") or "",
+                    "usado": total - livre if total is not None and livre is not None else None, "total": total,
+                    "saude": 1 if self.valor(o, "summary.accessible") == "true" else 0})
+            elif o["_tipo"] == "VirtualMachine" and self.valor(o, "config.template") != "true":
+                estado = {"poweredOn": VM_LIGADA, "suspended": VM_PAUSADA}.get(self.valor(o, "runtime.powerState"), VM_DESLIGADA)
+                ligada = estado == VM_LIGADA
+                uso, maximo = self.valor(o, "summary.quickStats.overallCpuUsage", int), self.valor(o, "summary.runtime.maxCpuUsage", int)
+                memoria_mb = self.valor(o, "summary.config.memorySizeMB", int)
+                convidado_mb = self.valor(o, "summary.quickStats.guestMemoryUsage", int)
+                usado = self.valor(o, "summary.storage.committed", int)
+                livre = self.valor(o, "summary.storage.uncommitted", int)
+                snapshot = o.get("snapshot")
+                datas = [epoch_iso(e.text) for e in snapshot.iter("{urn:vim25}createTime")] if snapshot is not None else []
+                quantidade, antigo = resumo_snapshots(datas)
+                inv["vms"].append({
+                    "no": nomes_host.get(self.valor(o, "runtime.host") or "", ""), "vm": self.valor(o, "name") or o["_id"],
+                    "id": o["_id"], "tipo": "VM", "so": self.valor(o, "summary.config.guestFullName") or "", "estado": estado,
+                    "cpus": self.valor(o, "summary.config.numCpu", int),
+                    "cpu_percentual": round(100.0 * uso / maximo, 2) if ligada and uso is not None and maximo else None,
+                    "memoria_usada": convidado_mb * 1024 * 1024 if ligada and convidado_mb is not None else None,
+                    "memoria_total": memoria_mb * 1024 * 1024 if memoria_mb is not None else None,
+                    "disco_usado": usado, "disco_total": (usado or 0) + (livre or 0) or None,
+                    "ligado_segundos": self.valor(o, "summary.quickStats.uptimeSeconds", int) if ligada else None,
+                    "snapshots": quantidade, "snapshot_mais_antigo": antigo})
+        return inv
+
+
+class FonteXcp:
+    """XCP-ng (e Citrix Hypervisor) pela XAPI, em XML-RPC."""
+
+    plataforma = "xcpng"
+
+    def __init__(self, nome, endereco, usuario, senha, verificar=False):
+        self.nome = nome
+        self.servidor = xmlrpc.client.ServerProxy(f"https://{endereco}", context=contexto_tls(verificar),
+                                                  allow_none=True)
+        self.usuario = usuario
+        self.senha = senha
+
+    @staticmethod
+    def valor(resposta):
+        if resposta.get("Status") != "Success":
+            raise RuntimeError(f"XAPI: {resposta.get('ErrorDescription')}")
+        return resposta["Value"]
+
+    def coletar(self):
+        x = self.servidor
+        sessao = self.valor(x.session.login_with_password(self.usuario, self.senha, "1.0", "nextec-coleta"))
+        try:
+            return self.montar(sessao)
+        finally:
+            try:
+                x.session.logout(sessao)
+            except (OSError, xmlrpc.client.Error):
+                pass
+
+    def montar(self, s):
+        x = self.servidor
+        todos = lambda classe: self.valor(getattr(x, classe).get_all_records(s))
+        inv = novo_inventario()
+        pools = todos("pool")
+        nome_pool = next(iter(pools.values()), {}).get("name_label", "") if pools else ""
+        metricas_host, cpus_host = todos("host_metrics"), todos("host_cpu")
+        hosts = todos("host")
+        nomes = {ref: h.get("name_label", ref) for ref, h in hosts.items()}
+        for ref, h in hosts.items():
+            m = metricas_host.get(h.get("metrics"), {})
+            vivo = bool(m.get("live", True))
+            uso = [float(c.get("utilisation", 0)) for c in cpus_host.values() if c.get("host") == ref]
+            total = int(m.get("memory_total", 0) or 0)
+            inv["hosts"].append({
+                "no": nomes[ref], "versao": "XCP-ng " + h.get("software_version", {}).get("product_version", ""),
+                "cluster": nome_pool, "up": int(vivo),
+                "cpu_percentual": round(100.0 * sum(uso) / len(uso), 2) if uso and vivo else None,
+                "cpus": len(uso) or None, "memoria_usada": total - int(m.get("memory_free", 0) or 0) if total else None,
+                "memoria_total": total or None, "ligado_segundos": None})
+        vdis, vbds = todos("VDI"), todos("VBD")
+        metricas_vm, convidado = todos("VM_metrics"), todos("VM_guest_metrics")
+        vms = todos("VM")
+        snapshots = {}
+        for v in vms.values():
+            if v.get("is_a_snapshot"):
+                snapshots.setdefault(v.get("snapshot_of"), []).append(epoch_iso(str(v.get("snapshot_time"))))
+        for ref, v in vms.items():
+            if v.get("is_a_template") or v.get("is_control_domain") or v.get("is_a_snapshot"):
+                continue
+            estado = {"Running": VM_LIGADA, "Paused": VM_PAUSADA, "Suspended": VM_PAUSADA}.get(v.get("power_state"), VM_DESLIGADA)
+            ligada = estado == VM_LIGADA
+            m = metricas_vm.get(v.get("metrics"), {})
+            discos = [vdis.get(vbds[b].get("VDI"), {}) for b in v.get("VBDs", []) if b in vbds and vbds[b].get("type") == "Disk"]
+            inicio = epoch_iso(str(m.get("start_time", ""))) if ligada else None
+            quantidade, antigo = resumo_snapshots(snapshots.get(ref, []))
+            inv["vms"].append({
+                "no": nomes.get(v.get("resident_on"), "") if ligada else "", "vm": v.get("name_label", ref),
+                "id": v.get("uuid", ref), "tipo": "VM",
+                "so": convidado.get(v.get("guest_metrics"), {}).get("os_version", {}).get("name", "").split("|")[0],
+                "estado": estado, "cpus": int(v.get("VCPUs_at_startup", 0) or 0) or None, "cpu_percentual": None,
+                "memoria_usada": (int(m.get("memory_actual", 0) or 0) or None) if ligada else None,
+                "memoria_total": int(v.get("memory_static_max", 0) or 0) or None,
+                "disco_usado": sum(int(d.get("physical_utilisation", 0) or 0) for d in discos) or None,
+                "disco_total": sum(int(d.get("virtual_size", 0) or 0) for d in discos) or None,
+                "ligado_segundos": round(agora() - inicio) if inicio and inicio > 0 else None,
+                "snapshots": quantidade, "snapshot_mais_antigo": antigo})
+        for sr in todos("SR").values():
+            if sr.get("type") in ("iso", "udev") or not int(sr.get("physical_size", 0) or 0):
+                continue
+            inv["armazenamentos"].append({
+                "no": "", "nome": sr.get("name_label", ""), "tipo": sr.get("type", ""),
+                "usado": int(sr.get("physical_utilisation", 0) or 0), "total": int(sr.get("physical_size", 0) or 0),
+                "saude": None})
+        return inv
+
+
+def gravar_inventario(metricas, fonte, inv):
+    base = {"plataforma": PLATAFORMAS[fonte.plataforma], "hipervisor": fonte.nome}
+    for c in inv["clusters"]:
+        rotulos = {**base, "cluster": c["cluster"]}
+        metricas.add("nextec_hipervisor_cluster_quorum", c["quorum"], rotulos, ajuda="1 com quórum")
+        metricas.add("nextec_hipervisor_cluster_nos_online", c["nos_online"], rotulos)
+        metricas.add("nextec_hipervisor_cluster_nos", c["nos"], rotulos)
+    for h in inv["hosts"]:
+        rotulos = {**base, "no": h["no"]}
+        metricas.add("nextec_hipervisor_info", 1, {**rotulos, "versao": h["versao"], "cluster": h["cluster"]})
+        metricas.add("nextec_hipervisor_host_up", h["up"], rotulos, ajuda="1 com o host conectado")
+        metricas.add("nextec_hipervisor_cpu_percentual", h["cpu_percentual"], rotulos)
+        metricas.add("nextec_hipervisor_cpus", h["cpus"], rotulos)
+        metricas.add("nextec_hipervisor_memoria_usada_bytes", h["memoria_usada"], rotulos)
+        metricas.add("nextec_hipervisor_memoria_total_bytes", h["memoria_total"], rotulos)
+        metricas.add("nextec_hipervisor_ligado_segundos", h["ligado_segundos"], rotulos)
+    for a in inv["armazenamentos"]:
+        rotulos = {**base, "no": a["no"], "armazenamento": a["nome"], "tipo": a["tipo"]}
+        metricas.add("nextec_hipervisor_armazenamento_usado_bytes", a["usado"], rotulos)
+        metricas.add("nextec_hipervisor_armazenamento_total_bytes", a["total"], rotulos)
+        metricas.add("nextec_hipervisor_armazenamento_saude", a["saude"], rotulos, ajuda="1 normal, 0 com falha")
+    for v in inv["vms"]:
+        rotulos = {**base, "no": v["no"], "vm": v["vm"], "vmid": v["id"]}
+        metricas.add("nextec_vm_info", 1, {**rotulos, "tipo": v["tipo"], "so": v["so"]})
+        metricas.add("nextec_vm_estado", v["estado"], rotulos, ajuda="1 ligada, 0 desligada, 2 pausada ou suspensa")
+        metricas.add("nextec_vm_cpus", v["cpus"], rotulos)
+        metricas.add("nextec_vm_cpu_percentual", v["cpu_percentual"], rotulos)
+        metricas.add("nextec_vm_memoria_usada_bytes", v["memoria_usada"], rotulos)
+        metricas.add("nextec_vm_memoria_total_bytes", v["memoria_total"], rotulos)
+        metricas.add("nextec_vm_disco_usado_bytes", v["disco_usado"], rotulos)
+        metricas.add("nextec_vm_disco_total_bytes", v["disco_total"], rotulos)
+        metricas.add("nextec_vm_ligado_segundos", v["ligado_segundos"], rotulos)
+        metricas.add("nextec_vm_snapshots", v.get("snapshots"), rotulos)
+        if v.get("snapshot_mais_antigo"):
+            metricas.add("nextec_vm_snapshot_mais_antigo_segundos", round(v["snapshot_mais_antigo"]), rotulos)
+
+
+def detectar_virtualizacao_local():
+    """proxmox, libvirt ou vazio, conforme o que roda neste servidor."""
+    if os.path.isdir("/etc/pve") and shutil.which("pvesh"):
+        return "proxmox"
+    if shutil.which("virsh") and os.path.exists("/var/run/libvirt/libvirt-sock"):
+        return "libvirt"
+    return ""
+
+
+def ler_segredos(config):
+    geral = config["geral"] if config.has_section("geral") else {}
+    caminho = geral.get("arquivo_segredos", ARQ_SEGREDOS_PADRAO)
+    segredos = configparser.ConfigParser(interpolation=None)
+    segredos.optionxform = str
+    if os.path.exists(caminho):
+        segredos.read(caminho, encoding="utf-8")
+    return segredos
+
+
+def fontes_virtualizacao(config):
+    secao = config["virtualizacao"] if config.has_section("virtualizacao") else {}
+    fontes = []
+    local = (secao.get("local", "auto") or "").strip().lower()
+    if local == "auto":
+        local = detectar_virtualizacao_local()
+    nome_local = socket.gethostname()
+    if local == "proxmox":
+        fontes.append(FonteProxmox(nome_local))
+    elif local == "libvirt":
+        fontes.append(FonteLibvirt(nome_local, secao.get("libvirt_uri", "qemu:///system")))
+    segredos = ler_segredos(config)
+    for nome_secao in config.sections():
+        if not nome_secao.lower().startswith("hipervisor:"):
+            continue
+        dados = config[nome_secao]
+        nome = nome_secao.split(":", 1)[1].strip()
+        segredo = segredos[nome_secao] if segredos.has_section(nome_secao) else {}
+        tipo = dados.get("tipo", "").strip().lower()
+        endereco, usuario = dados.get("endereco", "").strip(), dados.get("usuario", "").strip()
+        verificar = sim(dados.get("verificar_certificado"), False)
+        if tipo == "vmware":
+            fontes.append(FonteVMware(nome, endereco, usuario, segredo.get("senha", ""), verificar))
+        elif tipo == "proxmox":
+            fontes.append(FonteProxmox(nome, endereco, usuario, segredo.get("token", ""), verificar))
+        elif tipo in ("xcpng", "xcp-ng", "xenserver"):
+            fontes.append(FonteXcp(nome, endereco, usuario, segredo.get("senha", ""), verificar))
+        else:
+            log("aviso", "hipervisor com tipo desconhecido", secao=nome_secao, tipo=tipo)
+    return fontes
+
+
+class ModuloVirtualizacao:
+    nome = "virtualizacao"
+
+    def __init__(self, config, eventos, estado, dir_textfile):
+        secao = config["virtualizacao"] if config.has_section("virtualizacao") else {}
+        self.intervalo = max(60, int(secao.get("intervalo_segundos", "120")))
+        self.fontes = fontes_virtualizacao(config)
+        self.arquivo = os.path.join(dir_textfile, "coleta_complementar_virtualizacao.prom")
+
+    def rodada(self):
+        metricas = Metricas()
+        falhas = 0
+        for fonte in self.fontes:
+            rotulos = {"plataforma": PLATAFORMAS[fonte.plataforma], "hipervisor": fonte.nome}
+            inicio = agora()
+            try:
+                inv = fonte.coletar()
+                gravar_inventario(metricas, fonte, inv)
+                metricas.add("nextec_hipervisor_up", 1, rotulos, ajuda="1 com a consulta ao hipervisor funcionando")
+            except Exception as erro:  # uma fonte fora não apaga as outras
+                falhas += 1
+                metricas.add("nextec_hipervisor_up", 0, rotulos)
+                log("erro", "consulta ao hipervisor falhou", hipervisor=fonte.nome, erro=str(erro)[:300])
+            metricas.add("nextec_hipervisor_coleta_duracao_segundos", round(agora() - inicio, 2), rotulos)
+        metricas.add("nextec_hipervisor_coletor_ultima_execucao_segundos", round(agora()))
+        gravar_atomico(self.arquivo, metricas.texto())
+        if self.fontes and falhas == len(self.fontes):
+            raise RuntimeError("nenhum hipervisor respondeu")
+
+
 MODULOS = {"internet": ModuloLinks, "docker": ModuloDocker, "velocidade": ModuloVelocidade,
-           "acessos": ModuloAcessos, "bancos": ModuloBancos}
+           "acessos": ModuloAcessos, "bancos": ModuloBancos, "virtualizacao": ModuloVirtualizacao}
 
 
 def carregar_config():
@@ -1805,6 +2484,8 @@ def modulos_ligados(config):
         ligados.append("acessos")
     if config.has_section("bancos") and sim(config["bancos"].get("ativo"), False):
         ligados.append("bancos")
+    if config.has_section("virtualizacao") and sim(config["virtualizacao"].get("ativo"), False):
+        ligados.append("virtualizacao")
     return ligados
 
 
@@ -1924,6 +2605,14 @@ def verificar():
         modulo = ModuloVelocidade(config, None, None, "/tmp")
         if not os.path.exists(modulo.binario):
             problemas.append(f"Speedtest CLI não encontrado em {modulo.binario}")
+    if "virtualizacao" in ligados:
+        for fonte in fontes_virtualizacao(config):
+            try:
+                inv = fonte.coletar()
+                print(f"Hipervisor {fonte.nome} ({PLATAFORMAS[fonte.plataforma]}): "
+                      f"{len(inv['hosts'])} host(s), {len(inv['vms'])} VM(s), {len(inv['armazenamentos'])} armazenamento(s)")
+            except Exception as erro:  # noqa: BLE001 - o motivo vai para o técnico
+                problemas.append(f"hipervisor {fonte.nome} ({PLATAFORMAS[fonte.plataforma]}) sem resposta: {erro}")
     for problema in problemas:
         print(f"PROBLEMA: {problema}")
     if not problemas:

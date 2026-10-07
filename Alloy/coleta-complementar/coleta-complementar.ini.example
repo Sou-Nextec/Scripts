@@ -53,6 +53,30 @@ intervalo_segundos = 60
 motores = firebird, sqlite
 arquivos = sqlite:/opt/sistema/dados/*.db
 
+; Virtualização: hosts, VMs, armazenamento, snapshots e cluster.
+; local: auto (detecta), proxmox, libvirt, hyperv ou nao. Local não usa senha.
+; intervalo_segundos: VMs e hosts (mínimo 60); snapshots e discos a cada 30 min.
+[virtualizacao]
+ativo = nao
+local = auto
+intervalo_segundos = 120
+
+; Hipervisores consultados pela rede, um bloco por hipervisor, com usuário só leitura.
+; tipo: vmware (ESXi ou vCenter), proxmox ou xcpng. endereco: host[:porta].
+; proxmox: usuario é o ID do token (monitor@pve!nextec), papel PVEAuditor em /.
+; A senha (vmware, xcpng) ou o token (proxmox) vai em segredos.ini, nunca aqui:
+;   Linux /etc/coleta-complementar/segredos.ini (0600 root), Windows na pasta da coleta.
+;   [hipervisor:vcenter01]
+;   senha = ...
+;   [hipervisor:pve01]
+;   token = ...
+; verificar_certificado: nao aceita o certificado de fábrica (a conexão continua cifrada).
+[hipervisor:vcenter01]
+tipo = vmware
+endereco = 192.168.0.20
+usuario = monitor@vsphere.local
+verificar_certificado = nao
+
 ; Um bloco por link. O nome depois de "link:" é o que aparece no painel.
 ; Cada link precisa de pelo menos um destino que saia SOMENTE por ele:
 ;   a) rota por link no firewall (ex.: 8.8.8.8 pelo link 1, 1.1.1.1 pelo link 2), ou

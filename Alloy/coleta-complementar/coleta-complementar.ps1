@@ -19,6 +19,10 @@
                 Anywhere e arquivos SQLite): no ar, conexões, memória,
                 tempo ligado e tamanho das bases, no padrão nextec_banco_*.
                 O SQL Server segue com o coletor mssql do Alloy.
+      virtualizacao  hipervisores (Hyper-V no próprio servidor; VMware,
+                Proxmox e XCP-ng pela rede): hosts, VMs, armazenamento,
+                snapshots e replicação, no padrão nextec_hipervisor_* e
+                nextec_vm_* (mesmos nomes do Linux)
       velocidade  teste de velocidade com o Speedtest CLI da Ookla, nas
                 métricas nextec_speedtest_* (mesmos nomes do Linux). O
                 teste roda em segundo plano para não atrasar os links.
@@ -43,7 +47,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
-$Versao = "1.4.0"
+$Versao = "1.5.0"
 $PastaBase = Join-Path $env:ProgramData "GrafanaLabs\Alloy\coleta-complementar"
 if ([string]::IsNullOrWhiteSpace($Config)) {
     $Config = Join-Path $PastaBase "coleta-complementar.ini"
@@ -81,14 +85,15 @@ function Write-Log {
 }
 
 function Read-Ini {
-    param([string]$Caminho)
+    # -Bruto: só linha inteira vira comentário (senha pode ter ; e #).
+    param([string]$Caminho, [switch]$Bruto)
     if (-not (Test-Path -LiteralPath $Caminho)) {
         throw "Configuração não encontrada: $Caminho"
     }
     $secoes = [ordered]@{}
     $atual = $null
     foreach ($linhaBruta in [IO.File]::ReadAllLines($Caminho, $script:Utf8SemBom)) {
-        $linha = ($linhaBruta -replace '\s[;#].*$', '').Trim()
+        $linha = $(if ($Bruto) { $linhaBruta.Trim() } else { ($linhaBruta -replace '\s[;#].*$', '').Trim() })
         if ($linha -eq "" -or $linha.StartsWith(";") -or $linha.StartsWith("#")) { continue }
         if ($linha -match '^\[(.+)\]$') {
             $atual = $Matches[1].Trim()
@@ -1129,14 +1134,575 @@ function Invoke-RodadaVelocidade {
     Start-TesteVelocidade
 }
 
+# -----------------------------------------------------------------------------
+# Módulo virtualização
+# -----------------------------------------------------------------------------
+# Hipervisores no padrão nextec_hipervisor_* (host, armazenamento, cluster) e
+# nextec_vm_* (cada VM), os mesmos nomes do Linux. Fontes:
+#   local      Hyper-V do próprio servidor (Get-VM), sem senha
+#   [hipervisor:<nome>]  consulta pela rede: VMware ESXi ou vCenter (SOAP),
+#              Proxmox VE (API com token) e XCP-ng (XAPI). Senha e token ficam
+#              no arquivo de segredos, com acesso só de SYSTEM e Administradores.
+# Snapshots e discos mudam pouco e custam uma chamada por VM: são lidos a cada
+# 30 minutos e repetidos nas rodadas do meio.
+
+$PlataformasVirt = [ordered]@{ hyperv = "Hyper-V"; proxmox = "Proxmox VE"; vmware = "VMware"; xcpng = "XCP-ng" }
+$IntervaloDetalhesVirt = 1800
+
+function Get-Campo {
+    # Lê campo de hashtable ou de objeto do ConvertFrom-Json sem quebrar no
+    # modo estrito quando o campo não existe.
+    param($Objeto, [string]$Nome)
+    if ($null -eq $Objeto) { return $null }
+    if ($Objeto -is [System.Collections.IDictionary]) { return $Objeto[$Nome] }
+    $propriedade = $Objeto.PSObject.Properties[$Nome]
+    if ($null -eq $propriedade) { return $null }
+    return $propriedade.Value
+}
+
+function ConvertTo-Epoch {
+    # Data ISO 8601, formato básico da XAPI (20261001T10:00:00Z) ou DateTime.
+    param($Valor)
+    if ($null -eq $Valor -or [string]$Valor -eq "") { return $null }
+    if ($Valor -is [datetime]) { return [double]([DateTimeOffset]$Valor.ToUniversalTime()).ToUnixTimeSeconds() }
+    $texto = [string]$Valor
+    $formato = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
+    $data = [datetime]::MinValue
+    foreach ($padrao in @("yyyyMMdd'T'HH:mm:ss'Z'", "yyyyMMdd'T'HH:mm:ss")) {
+        if ([datetime]::TryParseExact($texto, $padrao, $script:Cultura, $formato, [ref]$data)) {
+            return [double]([DateTimeOffset]::new($data, [TimeSpan]::Zero)).ToUnixTimeSeconds()
+        }
+    }
+    $offset = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse($texto, $script:Cultura, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$offset)) {
+        return [double]$offset.ToUnixTimeSeconds()
+    }
+    return $null
+}
+
+function New-InventarioVirt {
+    return @{ Hosts = New-Object System.Collections.ArrayList; Vms = New-Object System.Collections.ArrayList
+              Armazenamentos = New-Object System.Collections.ArrayList; Clusters = New-Object System.Collections.ArrayList }
+}
+
+function Get-ResumoSnapshots {
+    param($Datas)
+    $validas = @($Datas | Where-Object { $null -ne $_ })
+    if ($validas.Count -eq 0) { return @(0, $null) }
+    return @($validas.Count, ($validas | Measure-Object -Minimum).Minimum)
+}
+
+function Initialize-TlsNextec {
+    # Hipervisor com certificado próprio (padrão do ESXi, Proxmox e XCP-ng):
+    # a conexão segue cifrada, só sem conferir quem assinou. A validação é
+    # desligada por requisição, nunca no processo inteiro.
+    if (-not ("NextecTls" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public static class NextecTls {
+    public static bool Aceitar(object s, X509Certificate c, X509Chain ch, SslPolicyErrors e) { return true; }
+    public static RemoteCertificateValidationCallback SemVerificar = new RemoteCertificateValidationCallback(Aceitar);
+}
+"@
+    }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
+
+function Invoke-NextecHttp {
+    param([string]$Url, [string]$Metodo = "GET", [string]$Corpo = "", [hashtable]$Cabecalhos = @{}, [bool]$Verificar = $false,
+          [string]$TipoConteudo = "application/json")
+    Initialize-TlsNextec
+    $pedido = [Net.HttpWebRequest]::Create($Url)
+    $pedido.Method = $Metodo
+    $pedido.Timeout = 60000
+    $pedido.ReadWriteTimeout = 60000
+    if (-not $Verificar) { $pedido.ServerCertificateValidationCallback = [NextecTls]::SemVerificar }
+    foreach ($chave in $Cabecalhos.Keys) { $pedido.Headers[$chave] = [string]$Cabecalhos[$chave] }
+    if ($Corpo) {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($Corpo)
+        $pedido.ContentType = $TipoConteudo
+        $pedido.ContentLength = $bytes.Length
+        $fluxo = $pedido.GetRequestStream(); $fluxo.Write($bytes, 0, $bytes.Length); $fluxo.Close()
+    }
+    try { $resposta = $pedido.GetResponse() }
+    catch [Net.WebException] {
+        if ($null -eq $_.Exception.Response) { throw }
+        $resposta = $_.Exception.Response
+    }
+    try {
+        $leitor = New-Object IO.StreamReader($resposta.GetResponseStream(), [Text.Encoding]::UTF8)
+        return [pscustomobject]@{ Status = [int]$resposta.StatusCode; Corpo = $leitor.ReadToEnd(); Cookie = $resposta.Headers["Set-Cookie"] }
+    }
+    finally { $resposta.Close() }
+}
+
+function Get-HyperVInventario {
+    param($Fonte)
+    $inv = New-InventarioVirt
+    $no = $env:COMPUTERNAME.ToLowerInvariant()
+    $so = Get-CimInstance Win32_OperatingSystem
+    $cpu = $null
+    try {
+        $hv = Get-CimInstance -ClassName Win32_PerfFormattedData_HvStats_HyperVHypervisorLogicalProcessor -Filter "Name = '_Total'" -ErrorAction Stop
+        $cpu = [double]$hv.PercentTotalRunTime
+    }
+    catch { $cpu = [double](@(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average) }
+    $vmHost = Get-VMHost
+    [void]$inv.Hosts.Add(@{
+        no = $no; versao = ("Hyper-V em {0}" -f $so.Caption); cluster = ""; up = 1; cpu_percentual = $cpu
+        cpus = [int]$vmHost.LogicalProcessorCount
+        memoria_usada = ([double]$so.TotalVisibleMemorySize - [double]$so.FreePhysicalMemory) * 1024
+        memoria_total = [double]$so.TotalVisibleMemorySize * 1024
+        ligado_segundos = [math]::Round(((Get-Date) - $so.LastBootUpTime).TotalSeconds) })
+
+    $vms = @(Get-VM)
+    if (((Get-Agora) - $Fonte.UltimoDetalhe) -ge $script:IntervaloDetalhesVirt) {
+        $detalhes = @{}
+        $pastas = New-Object System.Collections.Generic.List[string]
+        if ($vmHost.VirtualHardDiskPath) { $pastas.Add([string]$vmHost.VirtualHardDiskPath) }
+        foreach ($vm in $vms) {
+            $datas = @(Get-VMSnapshot -VM $vm -ErrorAction SilentlyContinue | ForEach-Object { ConvertTo-Epoch $_.CreationTime })
+            $usado = 0.0; $total = 0.0
+            foreach ($disco in @(Get-VMHardDiskDrive -VM $vm -ErrorAction SilentlyContinue | Where-Object { $_.Path })) {
+                $pastas.Add([string]$disco.Path)
+                try { $vhd = Get-VHD -Path $disco.Path -ErrorAction Stop; $usado += [double]$vhd.FileSize; $total += [double]$vhd.Size } catch { }
+            }
+            $detalhes[[string]$vm.Id] = @{ Snapshots = (Get-ResumoSnapshots $datas); Usado = $usado; Total = $total }
+        }
+        $volumes = New-Object System.Collections.ArrayList
+        foreach ($letra in @($pastas | Where-Object { $_ -match '^[A-Za-z]:' } | ForEach-Object { $_.Substring(0, 1).ToUpperInvariant() } | Select-Object -Unique)) {
+            $volume = Get-Volume -DriveLetter $letra -ErrorAction SilentlyContinue
+            if ($null -eq $volume) { continue }
+            [void]$volumes.Add(@{ no = $no; nome = "${letra}:"; tipo = [string]$volume.FileSystem
+                                  usado = [double]$volume.Size - [double]$volume.SizeRemaining; total = [double]$volume.Size
+                                  saude = [int]([string]$volume.HealthStatus -eq "Healthy") })
+        }
+        $Fonte.Detalhes = @{ Vms = $detalhes; Volumes = $volumes }
+        $Fonte.UltimoDetalhe = Get-Agora
+    }
+    foreach ($volume in @($Fonte.Detalhes.Volumes)) { if ($volume) { [void]$inv.Armazenamentos.Add($volume) } }
+
+    foreach ($vm in $vms) {
+        $estadoTexto = [string]$vm.State
+        $estado = if (@("Running", "Starting") -contains $estadoTexto) { 1 } elseif (@("Paused", "Saved", "Pausing", "Saving") -contains $estadoTexto) { 2 } else { 0 }
+        $ligada = $estado -eq 1
+        $detalhe = $Fonte.Detalhes.Vms[[string]$vm.Id]
+        $memoriaTotal = if ($vm.DynamicMemoryEnabled) { [double]$vm.MemoryMaximum } else { [double]$vm.MemoryStartup }
+        $replicacao = switch ([string]$vm.ReplicationHealth) { "Normal" { 1 } "Warning" { 2 } "Critical" { 0 } default { $null } }
+        [void]$inv.Vms.Add(@{
+            no = $no; vm = [string]$vm.Name; id = [string]$vm.Id; tipo = "VM"; so = ""; estado = $estado
+            cpus = [int]$vm.ProcessorCount; cpu_percentual = $(if ($ligada) { [double]$vm.CPUUsage } else { $null })
+            memoria_usada = $(if ($ligada) { [double]$vm.MemoryAssigned } else { $null }); memoria_total = $memoriaTotal
+            disco_usado = $(if ($detalhe -and $detalhe.Usado) { $detalhe.Usado } else { $null })
+            disco_total = $(if ($detalhe -and $detalhe.Total) { $detalhe.Total } else { $null })
+            ligado_segundos = $(if ($ligada) { [math]::Round($vm.Uptime.TotalSeconds) } else { $null })
+            snapshots = $(if ($detalhe) { $detalhe.Snapshots[0] } else { $null })
+            snapshot_mais_antigo = $(if ($detalhe) { $detalhe.Snapshots[1] } else { $null })
+            replicacao = $replicacao })
+    }
+    return $inv
+}
+
+function Get-ProxmoxInventario {
+    param($Fonte)
+    $endereco = if ($Fonte.Endereco -match ':\d+$') { $Fonte.Endereco } else { "$($Fonte.Endereco):8006" }
+    $obter = {
+        param([string]$Caminho)
+        $r = Invoke-NextecHttp -Url ("https://{0}/api2/json{1}" -f $endereco, $Caminho) -Verificar $Fonte.Verificar `
+            -Cabecalhos @{ Authorization = ("PVEAPIToken={0}={1}" -f $Fonte.Usuario, $Fonte.Segredo) }
+        if ($r.Status -ne 200) { throw ("Proxmox {0}: HTTP {1}" -f $Caminho, $r.Status) }
+        return (Get-Campo ($r.Corpo | ConvertFrom-Json) "data")
+    }
+    $inv = New-InventarioVirt
+    $versao = [string](Get-Campo (& $obter "/version") "version")
+    $status = @(& $obter "/cluster/status")
+    $cluster = @($status | Where-Object { (Get-Campo $_ "type") -eq "cluster" }) | Select-Object -First 1
+    $nomeCluster = if ($cluster) { [string](Get-Campo $cluster "name") } else { "" }
+    if ($cluster) {
+        $nos = @($status | Where-Object { (Get-Campo $_ "type") -eq "node" })
+        [void]$inv.Clusters.Add(@{ cluster = $nomeCluster; quorum = [int][bool](Get-Campo $cluster "quorate")
+                                   nos_online = @($nos | Where-Object { Get-Campo $_ "online" }).Count; nos = $nos.Count })
+    }
+    foreach ($r in @(& $obter "/cluster/resources")) {
+        $tipo = [string](Get-Campo $r "type")
+        if ($tipo -eq "node") {
+            $online = (Get-Campo $r "status") -eq "online"
+            [void]$inv.Hosts.Add(@{ no = [string](Get-Campo $r "node"); versao = $versao; cluster = $nomeCluster; up = [int]$online
+                cpu_percentual = $(if ($online) { [math]::Round([double](Get-Campo $r "cpu") * 100, 2) } else { $null })
+                cpus = Get-Campo $r "maxcpu"; memoria_usada = Get-Campo $r "mem"; memoria_total = Get-Campo $r "maxmem"
+                ligado_segundos = $(if ($online) { Get-Campo $r "uptime" } else { $null }) })
+        }
+        elseif ($tipo -eq "storage") {
+            [void]$inv.Armazenamentos.Add(@{ no = [string](Get-Campo $r "node"); nome = [string](Get-Campo $r "storage")
+                tipo = [string](Get-Campo $r "plugintype"); usado = Get-Campo $r "disk"; total = Get-Campo $r "maxdisk"
+                saude = [int]((Get-Campo $r "status") -eq "available") })
+        }
+        elseif (@("qemu", "lxc") -contains $tipo -and -not (Get-Campo $r "template")) {
+            $ligada = (Get-Campo $r "status") -eq "running"
+            [void]$inv.Vms.Add(@{ no = [string](Get-Campo $r "node"); vm = [string](Get-Campo $r "name"); id = [string](Get-Campo $r "vmid")
+                tipo = $(if ($tipo -eq "qemu") { "VM" } else { "Contêiner" }); so = ""; estado = [int]$ligada; cpus = Get-Campo $r "maxcpu"
+                cpu_percentual = $(if ($ligada) { [math]::Round([double](Get-Campo $r "cpu") * 100, 2) } else { $null })
+                memoria_usada = $(if ($ligada) { Get-Campo $r "mem" } else { $null }); memoria_total = Get-Campo $r "maxmem"
+                disco_usado = $(if (Get-Campo $r "disk") { Get-Campo $r "disk" } else { $null }); disco_total = Get-Campo $r "maxdisk"
+                ligado_segundos = $(if ($ligada) { Get-Campo $r "uptime" } else { $null }); _tipo = $tipo })
+        }
+    }
+    if (((Get-Agora) - $Fonte.UltimoDetalhe) -ge $script:IntervaloDetalhesVirt) {
+        $detalhes = @{ zfs = New-Object System.Collections.ArrayList }
+        $online = @($inv.Hosts | Where-Object { $_.up } | ForEach-Object { $_.no })
+        foreach ($vm in $inv.Vms) {
+            if ($online -notcontains $vm.no) { continue }
+            try {
+                $datas = @(& $obter ("/nodes/{0}/{1}/{2}/snapshot" -f $vm.no, $vm._tipo, $vm.id) |
+                    Where-Object { (Get-Campo $_ "name") -ne "current" } | ForEach-Object { Get-Campo $_ "snaptime" })
+                $detalhes["vm:" + $vm.id] = Get-ResumoSnapshots $datas
+            }
+            catch { Write-Log "aviso" ("snapshots não lidos de {0}: {1}" -f $vm.vm, $_.Exception.Message) }
+        }
+        foreach ($h in @($inv.Hosts | Where-Object { $_.up })) {
+            try {
+                foreach ($pool in @(& $obter ("/nodes/{0}/disks/zfs" -f $h.no))) {
+                    [void]$detalhes.zfs.Add(@{ no = $h.no; nome = "zfs:" + (Get-Campo $pool "name"); tipo = "zfs"
+                        usado = Get-Campo $pool "alloc"; total = Get-Campo $pool "size"; saude = [int]((Get-Campo $pool "health") -eq "ONLINE") })
+                }
+            }
+            catch { }
+        }
+        $Fonte.Detalhes = $detalhes
+        $Fonte.UltimoDetalhe = Get-Agora
+    }
+    foreach ($vm in $inv.Vms) {
+        $resumo = $Fonte.Detalhes["vm:" + $vm.id]
+        if ($resumo) { $vm.snapshots = $resumo[0]; $vm.snapshot_mais_antigo = $resumo[1] }
+    }
+    foreach ($z in @($Fonte.Detalhes.zfs)) { if ($z) { [void]$inv.Armazenamentos.Add($z) } }
+    return $inv
+}
+
+function Invoke-VMwareSoap {
+    param($Fonte, [string]$Corpo)
+    $envelope = '<?xml version="1.0" encoding="UTF-8"?><soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" ' +
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:urn="urn:vim25"><soapenv:Body>' + $Corpo + '</soapenv:Body></soapenv:Envelope>'
+    $cabecalhos = @{ SOAPAction = $(if ($Fonte.VersaoApi) { "urn:vim25/" + $Fonte.VersaoApi } else { "urn:vim25" }) }
+    if ($Fonte.Cookie) { $cabecalhos["Cookie"] = $Fonte.Cookie }
+    $r = Invoke-NextecHttp -Url ("https://{0}/sdk" -f $Fonte.Endereco) -Metodo POST -Corpo $envelope -Cabecalhos $cabecalhos `
+        -Verificar $Fonte.Verificar -TipoConteudo "text/xml; charset=utf-8"
+    if ($r.Cookie) { $Fonte.Cookie = ($r.Cookie -split ";")[0] }
+    $xml = [xml]$r.Corpo
+    if ($r.Status -ne 200) {
+        $falha = $xml.SelectSingleNode("//*[local-name()='faultstring']")
+        throw ("VMware: {0}" -f $(if ($falha) { $falha.InnerText.Trim() } else { "HTTP $($r.Status)" }))
+    }
+    return $xml
+}
+
+function Get-VMwareInventario {
+    param($Fonte)
+    $Fonte.Cookie = $null; $Fonte.VersaoApi = ""
+    $nos = { param($x, [string]$nome) @($x.SelectNodes(".//*[local-name()='$nome']")) }
+    $texto = { param($x, [string]$nome) $n = $x.SelectSingleNode(".//*[local-name()='$nome']"); if ($n) { $n.InnerText.Trim() } else { "" } }
+    $conteudo = (Invoke-VMwareSoap $Fonte '<urn:RetrieveServiceContent><urn:_this type="ServiceInstance">ServiceInstance</urn:_this></urn:RetrieveServiceContent>').SelectSingleNode("//*[local-name()='returnval']")
+    $Fonte.VersaoApi = & $texto $conteudo "apiVersion"
+    $produto = & $texto $conteudo "fullName"
+    $sessao = & $texto $conteudo "sessionManager"
+    $esc = { param([string]$t) [Security.SecurityElement]::Escape($t) }
+    [void](Invoke-VMwareSoap $Fonte ('<urn:Login><urn:_this type="SessionManager">{0}</urn:_this><urn:userName>{1}</urn:userName><urn:password>{2}</urn:password></urn:Login>' -f $sessao, (& $esc $Fonte.Usuario), (& $esc $Fonte.Segredo)))
+    try {
+        $tipos = [ordered]@{
+            HostSystem = @("name", "runtime.connectionState", "summary.quickStats.overallCpuUsage", "summary.quickStats.overallMemoryUsage",
+                           "summary.quickStats.uptime", "summary.hardware.cpuMhz", "summary.hardware.numCpuCores", "summary.hardware.numCpuThreads",
+                           "summary.hardware.memorySize", "summary.config.product.fullName", "parent")
+            VirtualMachine = @("name", "config.template", "runtime.powerState", "runtime.host", "summary.config.numCpu", "summary.config.memorySizeMB",
+                               "summary.config.guestFullName", "summary.quickStats.overallCpuUsage", "summary.runtime.maxCpuUsage",
+                               "summary.quickStats.guestMemoryUsage", "summary.quickStats.uptimeSeconds", "summary.storage.committed",
+                               "summary.storage.uncommitted", "snapshot")
+            Datastore = @("summary.name", "summary.type", "summary.capacity", "summary.freeSpace", "summary.accessible")
+            ClusterComputeResource = @("name")
+        }
+        $vista = & $texto (Invoke-VMwareSoap $Fonte ('<urn:CreateContainerView><urn:_this type="ViewManager">{0}</urn:_this><urn:container type="Folder">{1}</urn:container>{2}<urn:recursive>true</urn:recursive></urn:CreateContainerView>' -f (& $texto $conteudo "viewManager"), (& $texto $conteudo "rootFolder"), (($tipos.Keys | ForEach-Object { "<urn:type>$_</urn:type>" }) -join ""))) "returnval"
+        $conjuntos = ($tipos.Keys | ForEach-Object { "<urn:propSet><urn:type>$_</urn:type>" + (($tipos[$_] | ForEach-Object { "<urn:pathSet>$_</urn:pathSet>" }) -join "") + "</urn:propSet>" }) -join ""
+        $coletor = & $texto $conteudo "propertyCollector"
+        $corpo = ('<urn:RetrievePropertiesEx><urn:_this type="PropertyCollector">{0}</urn:_this><urn:specSet>{1}<urn:objectSet><urn:obj type="ContainerView">{2}</urn:obj>' +
+                  '<urn:skip>true</urn:skip><urn:selectSet xsi:type="urn:TraversalSpec"><urn:name>vista</urn:name><urn:type>ContainerView</urn:type><urn:path>view</urn:path>' +
+                  '<urn:skip>false</urn:skip></urn:selectSet></urn:objectSet></urn:specSet><urn:options><urn:maxObjects>500</urn:maxObjects></urn:options></urn:RetrievePropertiesEx>') -f $coletor, $conjuntos, $vista
+        $objetos = New-Object System.Collections.ArrayList
+        $resposta = Invoke-VMwareSoap $Fonte $corpo
+        while ($true) {
+            $retorno = $resposta.SelectSingleNode("//*[local-name()='returnval']")
+            if ($null -eq $retorno) { break }
+            foreach ($o in @($retorno.SelectNodes("./*[local-name()='objects']"))) {
+                $ref = $o.SelectSingleNode("./*[local-name()='obj']")
+                $item = @{ _tipo = $ref.GetAttribute("type"); _id = $ref.InnerText.Trim() }
+                foreach ($p in @($o.SelectNodes("./*[local-name()='propSet']"))) {
+                    $item[$p.SelectSingleNode("./*[local-name()='name']").InnerText] = $p.SelectSingleNode("./*[local-name()='val']")
+                }
+                [void]$objetos.Add($item)
+            }
+            $ficha = $retorno.SelectSingleNode("./*[local-name()='token']")
+            if ($null -eq $ficha) { break }
+            $resposta = Invoke-VMwareSoap $Fonte ('<urn:ContinueRetrievePropertiesEx><urn:_this type="PropertyCollector">{0}</urn:_this><urn:token>{1}</urn:token></urn:ContinueRetrievePropertiesEx>' -f $coletor, $ficha.InnerText)
+        }
+    }
+    finally {
+        try { [void](Invoke-VMwareSoap $Fonte ('<urn:Logout><urn:_this type="SessionManager">{0}</urn:_this></urn:Logout>' -f $sessao)) } catch { }
+    }
+
+    $v = { param($item, [string]$chave) $n = $item[$chave]; if ($null -eq $n) { $null } else { $n.InnerText.Trim() } }
+    $num = { param($item, [string]$chave) $t = & $v $item $chave; if ($t -match '^-?\d+(\.\d+)?$') { [double]$t } else { $null } }
+    $inv = New-InventarioVirt
+    $hosts = @($objetos | Where-Object { $_._tipo -eq "HostSystem" })
+    $clusters = @{}; foreach ($c in @($objetos | Where-Object { $_._tipo -eq "ClusterComputeResource" })) { $clusters[$c._id] = & $v $c "name" }
+    $nomes = @{}; foreach ($h in $hosts) { $nomes[$h._id] = $(if (& $v $h "name") { & $v $h "name" } else { $h._id }) }
+    foreach ($h in $hosts) {
+        $conectado = (& $v $h "runtime.connectionState") -eq "connected"
+        $mhz = & $num $h "summary.hardware.cpuMhz"; $nucleos = & $num $h "summary.hardware.numCpuCores"; $uso = & $num $h "summary.quickStats.overallCpuUsage"
+        $memoria = & $num $h "summary.quickStats.overallMemoryUsage"
+        $pai = & $v $h "parent"
+        [void]$inv.Hosts.Add(@{ no = $nomes[$h._id]; versao = $(if (& $v $h "summary.config.product.fullName") { & $v $h "summary.config.product.fullName" } else { $produto })
+            cluster = $(if ($pai -and $clusters.ContainsKey($pai)) { $clusters[$pai] } else { "" }); up = [int]$conectado
+            cpu_percentual = $(if ($conectado -and $null -ne $uso -and $mhz -and $nucleos) { [math]::Round(100 * $uso / ($mhz * $nucleos), 2) } else { $null })
+            cpus = & $num $h "summary.hardware.numCpuThreads"
+            memoria_usada = $(if ($conectado -and $null -ne $memoria) { $memoria * 1MB } else { $null }); memoria_total = & $num $h "summary.hardware.memorySize"
+            ligado_segundos = $(if ($conectado) { & $num $h "summary.quickStats.uptime" } else { $null }) })
+    }
+    $unico = if ($nomes.Count -eq 1) { @($nomes.Values)[0] } else { "" }
+    foreach ($o in $objetos) {
+        if ($o._tipo -eq "Datastore") {
+            $total = & $num $o "summary.capacity"; $livre = & $num $o "summary.freeSpace"
+            [void]$inv.Armazenamentos.Add(@{ no = $unico; nome = $(if (& $v $o "summary.name") { & $v $o "summary.name" } else { $o._id }); tipo = [string](& $v $o "summary.type")
+                usado = $(if ($null -ne $total -and $null -ne $livre) { $total - $livre } else { $null }); total = $total
+                saude = [int]((& $v $o "summary.accessible") -eq "true") })
+        }
+        elseif ($o._tipo -eq "VirtualMachine" -and (& $v $o "config.template") -ne "true") {
+            $estado = switch (& $v $o "runtime.powerState") { "poweredOn" { 1 } "suspended" { 2 } default { 0 } }
+            $ligada = $estado -eq 1
+            $uso = & $num $o "summary.quickStats.overallCpuUsage"; $maximo = & $num $o "summary.runtime.maxCpuUsage"
+            $memoria = & $num $o "summary.config.memorySizeMB"; $convidado = & $num $o "summary.quickStats.guestMemoryUsage"
+            $usado = & $num $o "summary.storage.committed"; $livre = & $num $o "summary.storage.uncommitted"
+            $datas = @()
+            if ($o["snapshot"]) { $datas = @(& $nos $o["snapshot"] "createTime" | ForEach-Object { ConvertTo-Epoch $_.InnerText.Trim() }) }
+            $resumo = Get-ResumoSnapshots $datas
+            $hostVm = & $v $o "runtime.host"
+            [void]$inv.Vms.Add(@{ no = $(if ($hostVm -and $nomes.ContainsKey($hostVm)) { $nomes[$hostVm] } else { "" }); vm = [string](& $v $o "name"); id = $o._id
+                tipo = "VM"; so = [string](& $v $o "summary.config.guestFullName"); estado = $estado; cpus = & $num $o "summary.config.numCpu"
+                cpu_percentual = $(if ($ligada -and $null -ne $uso -and $maximo) { [math]::Round(100 * $uso / $maximo, 2) } else { $null })
+                memoria_usada = $(if ($ligada -and $null -ne $convidado) { $convidado * 1MB } else { $null })
+                memoria_total = $(if ($null -ne $memoria) { $memoria * 1MB } else { $null })
+                disco_usado = $usado; disco_total = $(if ($null -ne $usado -or $null -ne $livre) { [double]$usado + [double]$livre } else { $null })
+                ligado_segundos = $(if ($ligada) { & $num $o "summary.quickStats.uptimeSeconds" } else { $null })
+                snapshots = $resumo[0]; snapshot_mais_antigo = $resumo[1] })
+        }
+    }
+    return $inv
+}
+
+function ConvertFrom-XmlRpcValor {
+    param([System.Xml.XmlNode]$No)
+    $filho = @($No.ChildNodes | Where-Object { $_.NodeType -eq [System.Xml.XmlNodeType]::Element }) | Select-Object -First 1
+    if ($null -eq $filho) { return $No.InnerText }
+    switch ($filho.LocalName) {
+        "struct" {
+            $tabela = @{}
+            foreach ($membro in @($filho.SelectNodes("./member"))) {
+                $tabela[$membro.SelectSingleNode("./name").InnerText] = ConvertFrom-XmlRpcValor $membro.SelectSingleNode("./value")
+            }
+            return $tabela
+        }
+        "array" { return , @($filho.SelectNodes("./data/value") | ForEach-Object { ConvertFrom-XmlRpcValor $_ }) }
+        "boolean" { return $filho.InnerText -eq "1" }
+        { @("int", "i4", "i8") -contains $_ } { return [int64]$filho.InnerText }
+        "double" { return [double]::Parse($filho.InnerText, $script:Cultura) }
+        default { return $filho.InnerText }
+    }
+}
+
+function Invoke-XmlRpc {
+    param($Fonte, [string]$Metodo, [string[]]$Parametros)
+    $params = ($Parametros | ForEach-Object { "<param><value><string>{0}</string></value></param>" -f [Security.SecurityElement]::Escape($_) }) -join ""
+    $corpo = "<?xml version=`"1.0`"?><methodCall><methodName>$Metodo</methodName><params>$params</params></methodCall>"
+    $r = Invoke-NextecHttp -Url ("https://{0}/" -f $Fonte.Endereco) -Metodo POST -Corpo $corpo -Verificar $Fonte.Verificar -TipoConteudo "text/xml"
+    if ($r.Status -ne 200) { throw ("XAPI {0}: HTTP {1}" -f $Metodo, $r.Status) }
+    $resposta = ConvertFrom-XmlRpcValor ([xml]$r.Corpo).SelectSingleNode("//params/param/value")
+    if ($resposta["Status"] -ne "Success") { throw ("XAPI {0}: {1}" -f $Metodo, (@($resposta["ErrorDescription"]) -join " ")) }
+    return $resposta["Value"]
+}
+
+function Get-XcpInventario {
+    param($Fonte)
+    $sessao = Invoke-XmlRpc $Fonte "session.login_with_password" @($Fonte.Usuario, $Fonte.Segredo, "1.0", "nextec-coleta")
+    try {
+        $todos = @{}
+        foreach ($classe in @("pool", "host", "host_metrics", "host_cpu", "VM", "VM_metrics", "VM_guest_metrics", "VBD", "VDI", "SR")) {
+            $todos[$classe] = Invoke-XmlRpc $Fonte "$classe.get_all_records" @($sessao)
+        }
+    }
+    finally { try { [void](Invoke-XmlRpc $Fonte "session.logout" @($sessao)) } catch { } }
+    $inv = New-InventarioVirt
+    $nomePool = ""; foreach ($p in $todos.pool.Values) { $nomePool = [string]$p["name_label"]; break }
+    $nomes = @{}; foreach ($ref in $todos.host.Keys) { $nomes[$ref] = [string]$todos.host[$ref]["name_label"] }
+    foreach ($ref in $todos.host.Keys) {
+        $h = $todos.host[$ref]; $m = $todos.host_metrics[[string]$h["metrics"]]
+        $vivo = if ($m -and $m.ContainsKey("live")) { [bool]$m["live"] } else { $true }
+        $uso = @($todos.host_cpu.Values | Where-Object { $_["host"] -eq $ref } | ForEach-Object { [double]$_["utilisation"] })
+        $total = if ($m) { [double]$m["memory_total"] } else { 0 }
+        $versaoXcp = if ($h["software_version"]) { [string]$h["software_version"]["product_version"] } else { "" }
+        [void]$inv.Hosts.Add(@{ no = $nomes[$ref]; versao = "XCP-ng $versaoXcp"; cluster = $nomePool; up = [int]$vivo
+            cpu_percentual = $(if ($uso.Count -and $vivo) { [math]::Round(100 * ($uso | Measure-Object -Sum).Sum / $uso.Count, 2) } else { $null })
+            cpus = $(if ($uso.Count) { $uso.Count } else { $null }); memoria_usada = $(if ($total) { $total - [double]$m["memory_free"] } else { $null })
+            memoria_total = $(if ($total) { $total } else { $null }); ligado_segundos = $null })
+    }
+    $snapshots = @{}
+    foreach ($vm in $todos.VM.Values) {
+        if ($vm["is_a_snapshot"]) {
+            $origem = [string]$vm["snapshot_of"]
+            if (-not $snapshots.ContainsKey($origem)) { $snapshots[$origem] = New-Object System.Collections.ArrayList }
+            [void]$snapshots[$origem].Add((ConvertTo-Epoch $vm["snapshot_time"]))
+        }
+    }
+    foreach ($ref in $todos.VM.Keys) {
+        $vm = $todos.VM[$ref]
+        if ($vm["is_a_template"] -or $vm["is_control_domain"] -or $vm["is_a_snapshot"]) { continue }
+        $estado = switch ([string]$vm["power_state"]) { "Running" { 1 } "Paused" { 2 } "Suspended" { 2 } default { 0 } }
+        $ligada = $estado -eq 1
+        $m = $todos.VM_metrics[[string]$vm["metrics"]]
+        $g = $todos.VM_guest_metrics[[string]$vm["guest_metrics"]]
+        $discos = @(@($vm["VBDs"]) | Where-Object { $_ -and $todos.VBD.ContainsKey($_) -and $todos.VBD[$_]["type"] -eq "Disk" } |
+                    ForEach-Object { $todos.VDI[[string]$todos.VBD[$_]["VDI"]] } | Where-Object { $_ })
+        $inicio = if ($ligada -and $m) { ConvertTo-Epoch $m["start_time"] } else { $null }
+        $resumo = Get-ResumoSnapshots $(if ($snapshots.ContainsKey($ref)) { $snapshots[$ref] } else { @() })
+        $usado = ($discos | ForEach-Object { [double]$_["physical_utilisation"] } | Measure-Object -Sum).Sum
+        $total = ($discos | ForEach-Object { [double]$_["virtual_size"] } | Measure-Object -Sum).Sum
+        [void]$inv.Vms.Add(@{ no = $(if ($ligada -and $nomes.ContainsKey([string]$vm["resident_on"])) { $nomes[[string]$vm["resident_on"]] } else { "" })
+            vm = [string]$vm["name_label"]; id = [string]$vm["uuid"]; tipo = "VM"
+            so = $(if ($g -and $g["os_version"]) { ([string]$g["os_version"]["name"] -split '\|')[0] } else { "" })
+            estado = $estado; cpus = $(if ($vm["VCPUs_at_startup"]) { [double]$vm["VCPUs_at_startup"] } else { $null }); cpu_percentual = $null
+            memoria_usada = $(if ($ligada -and $m -and $m["memory_actual"]) { [double]$m["memory_actual"] } else { $null })
+            memoria_total = $(if ($vm["memory_static_max"]) { [double]$vm["memory_static_max"] } else { $null })
+            disco_usado = $(if ($usado) { $usado } else { $null }); disco_total = $(if ($total) { $total } else { $null })
+            ligado_segundos = $(if ($inicio -and $inicio -gt 0) { [math]::Round((Get-Agora) - $inicio) } else { $null })
+            snapshots = $resumo[0]; snapshot_mais_antigo = $resumo[1] })
+    }
+    foreach ($sr in $todos.SR.Values) {
+        if (@("iso", "udev") -contains [string]$sr["type"] -or -not [double]$sr["physical_size"]) { continue }
+        [void]$inv.Armazenamentos.Add(@{ no = ""; nome = [string]$sr["name_label"]; tipo = [string]$sr["type"]
+            usado = [double]$sr["physical_utilisation"]; total = [double]$sr["physical_size"]; saude = $null })
+    }
+    return $inv
+}
+
+function Add-InventarioVirt {
+    param($Metricas, $Fonte, $Inv)
+    $base = [ordered]@{ plataforma = $script:PlataformasVirt[$Fonte.Plataforma]; hipervisor = $Fonte.Nome }
+    $com = { param([System.Collections.IDictionary]$extra) $r = [ordered]@{}; foreach ($k in $base.Keys) { $r[$k] = $base[$k] }; foreach ($k in $extra.Keys) { $r[$k] = $extra[$k] }; $r }
+    foreach ($c in $Inv.Clusters) {
+        $r = & $com ([ordered]@{ cluster = $c.cluster })
+        Add-Metrica $Metricas "nextec_hipervisor_cluster_quorum" $c.quorum $r
+        Add-Metrica $Metricas "nextec_hipervisor_cluster_nos_online" $c.nos_online $r
+        Add-Metrica $Metricas "nextec_hipervisor_cluster_nos" $c.nos $r
+    }
+    foreach ($h in $Inv.Hosts) {
+        $r = & $com ([ordered]@{ no = $h.no })
+        Add-Metrica $Metricas "nextec_hipervisor_info" 1 (& $com ([ordered]@{ no = $h.no; versao = $h.versao; cluster = $h.cluster }))
+        Add-Metrica $Metricas "nextec_hipervisor_host_up" $h.up $r
+        foreach ($par in @(@("cpu_percentual", "nextec_hipervisor_cpu_percentual"), @("cpus", "nextec_hipervisor_cpus"),
+                           @("memoria_usada", "nextec_hipervisor_memoria_usada_bytes"), @("memoria_total", "nextec_hipervisor_memoria_total_bytes"),
+                           @("ligado_segundos", "nextec_hipervisor_ligado_segundos"))) {
+            Add-Metrica $Metricas $par[1] $h[$par[0]] $r
+        }
+    }
+    foreach ($a in $Inv.Armazenamentos) {
+        $r = & $com ([ordered]@{ no = $a.no; armazenamento = $a.nome; tipo = $a.tipo })
+        Add-Metrica $Metricas "nextec_hipervisor_armazenamento_usado_bytes" $a.usado $r
+        Add-Metrica $Metricas "nextec_hipervisor_armazenamento_total_bytes" $a.total $r
+        Add-Metrica $Metricas "nextec_hipervisor_armazenamento_saude" $a.saude $r
+    }
+    foreach ($vm in $Inv.Vms) {
+        $r = & $com ([ordered]@{ no = $vm.no; vm = $vm.vm; vmid = $vm.id })
+        Add-Metrica $Metricas "nextec_vm_info" 1 (& $com ([ordered]@{ no = $vm.no; vm = $vm.vm; vmid = $vm.id; tipo = $vm.tipo; so = $vm.so }))
+        Add-Metrica $Metricas "nextec_vm_estado" $vm.estado $r
+        foreach ($par in @(@("cpus", "nextec_vm_cpus"), @("cpu_percentual", "nextec_vm_cpu_percentual"), @("memoria_usada", "nextec_vm_memoria_usada_bytes"),
+                           @("memoria_total", "nextec_vm_memoria_total_bytes"), @("disco_usado", "nextec_vm_disco_usado_bytes"),
+                           @("disco_total", "nextec_vm_disco_total_bytes"), @("ligado_segundos", "nextec_vm_ligado_segundos"),
+                           @("snapshots", "nextec_vm_snapshots"), @("replicacao", "nextec_vm_replicacao_saude"))) {
+            Add-Metrica $Metricas $par[1] $vm[$par[0]] $r
+        }
+        if ($vm["snapshot_mais_antigo"]) { Add-Metrica $Metricas "nextec_vm_snapshot_mais_antigo_segundos" ([math]::Round($vm["snapshot_mais_antigo"])) $r }
+    }
+}
+
+function Get-FontesVirtualizacao {
+    param($Ini)
+    $secao = if ($Ini.Contains("virtualizacao")) { $Ini["virtualizacao"] } else { @{} }
+    $fontes = New-Object System.Collections.ArrayList
+    $local = (Get-Valor $secao "local" "auto").ToLowerInvariant()
+    if ($local -eq "auto") { $local = $(if (Get-Command Get-VM -ErrorAction SilentlyContinue) { "hyperv" } else { "" }) }
+    if ($local -eq "hyperv") {
+        [void]$fontes.Add([pscustomobject]@{ Nome = $env:COMPUTERNAME.ToLowerInvariant(); Plataforma = "hyperv"; Detalhes = @{ Vms = @{}; Volumes = @() }; UltimoDetalhe = 0.0 })
+    }
+    $segredos = @{}
+    if (Test-Path -LiteralPath $script:ArquivoSegredos) { $segredos = Read-Ini $script:ArquivoSegredos -Bruto }
+    foreach ($nomeSecao in $Ini.Keys) {
+        if ($nomeSecao -notmatch '^hipervisor:(.+)$') { continue }
+        $nome = $Matches[1].Trim()
+        $dados = $Ini[$nomeSecao]
+        $segredo = if ($segredos.Contains($nomeSecao)) { $segredos[$nomeSecao] } else { @{} }
+        $tipo = (Get-Valor $dados "tipo").ToLowerInvariant() -replace '^(xcp-ng|xenserver)$', 'xcpng'
+        if (-not $script:PlataformasVirt.Contains($tipo) -or $tipo -eq "hyperv") {
+            Write-Log "aviso" "hipervisor [$nomeSecao] com tipo desconhecido: $tipo"
+            continue
+        }
+        [void]$fontes.Add([pscustomobject]@{
+            Nome = $nome; Plataforma = $tipo; Endereco = Get-Valor $dados "endereco"; Usuario = Get-Valor $dados "usuario"
+            Segredo = $(if ($tipo -eq "proxmox") { Get-Valor $segredo "token" } else { Get-Valor $segredo "senha" })
+            Verificar = @("sim", "s", "1", "true") -contains (Get-Valor $dados "verificar_certificado" "nao").ToLowerInvariant()
+            Detalhes = @{}; UltimoDetalhe = 0.0; Cookie = $null; VersaoApi = "" })
+    }
+    return $fontes
+}
+
+function Get-InventarioFonte {
+    param($Fonte)
+    switch ($Fonte.Plataforma) {
+        "hyperv" { return Get-HyperVInventario $Fonte }
+        "proxmox" { return Get-ProxmoxInventario $Fonte }
+        "vmware" { return Get-VMwareInventario $Fonte }
+        "xcpng" { return Get-XcpInventario $Fonte }
+    }
+}
+
+function Invoke-RodadaVirtualizacao {
+    $metricas = New-Metricas
+    $falhas = 0
+    foreach ($fonte in $script:FontesVirt) {
+        $rotulos = [ordered]@{ plataforma = $script:PlataformasVirt[$fonte.Plataforma]; hipervisor = $fonte.Nome }
+        $inicio = Get-Agora
+        try {
+            $inv = Get-InventarioFonte $fonte
+            Add-InventarioVirt $metricas $fonte $inv
+            Add-Metrica $metricas "nextec_hipervisor_up" 1 $rotulos
+        }
+        catch {
+            $falhas++
+            Add-Metrica $metricas "nextec_hipervisor_up" 0 $rotulos
+            Write-Log "erro" ("consulta ao hipervisor {0} falhou: {1}" -f $fonte.Nome, $_.Exception.Message)
+        }
+        Add-Metrica $metricas "nextec_hipervisor_coleta_duracao_segundos" ([math]::Round((Get-Agora) - $inicio, 2)) $rotulos
+    }
+    Add-Metrica $metricas "nextec_hipervisor_coletor_ultima_execucao_segundos" ([math]::Floor((Get-Agora)))
+    Save-Metricas $metricas (Join-Path $script:PastaTextfile "coleta_complementar_virtualizacao.prom")
+    if ($script:FontesVirt.Count -gt 0 -and $falhas -eq $script:FontesVirt.Count) { throw "nenhum hipervisor respondeu" }
+}
+
 function Save-Saude {
-    param([bool]$Ok, [bool]$AcessosOk = $true, [bool]$BancosOk = $true, [bool]$VelocidadeOk = $true)
+    param([bool]$Ok, [bool]$AcessosOk = $true, [bool]$BancosOk = $true, [bool]$VelocidadeOk = $true, [bool]$VirtOk = $true)
     $metricas = New-Metricas
     $lista = @()
     if ($script:InternetAtivo) { $lista += "internet" }
     if ($script:AcessosAtivo) { $lista += "acessos" }
     if ($script:BancosAtivo) { $lista += "bancos" }
     if ($script:VelocidadeAtivo) { $lista += "velocidade" }
+    if ($script:VirtAtivo) { $lista += "virtualizacao" }
     Add-Metrica $metricas "nextec_coleta_complementar_info" 1 ([ordered]@{ versao = $script:Versao; modulos = ($lista -join ",") })
     if ($script:InternetAtivo) {
         Add-Metrica $metricas "nextec_coleta_complementar_modulo_ok" ([int]$Ok) @{ modulo = "internet" }
@@ -1149,6 +1715,9 @@ function Save-Saude {
     }
     if ($script:VelocidadeAtivo) {
         Add-Metrica $metricas "nextec_coleta_complementar_modulo_ok" ([int]$VelocidadeOk) @{ modulo = "velocidade" }
+    }
+    if ($script:VirtAtivo) {
+        Add-Metrica $metricas "nextec_coleta_complementar_modulo_ok" ([int]$VirtOk) @{ modulo = "virtualizacao" }
     }
     Save-Metricas $metricas (Join-Path $script:PastaTextfile "coleta_complementar.prom")
 }
@@ -1165,6 +1734,7 @@ function Initialize-Configuracao {
     $script:PastaDados = Get-Valor $geral "pasta_dados" $script:PastaBase
     $script:PastaTextfile = Get-Valor $geral "pasta_textfile" (Join-Path $script:PastaDados "textfile")
     $script:ArquivoEventos = Get-Valor $geral "arquivo_eventos" (Join-Path $script:PastaDados "eventos.jsonl")
+    $script:ArquivoSegredos = Get-Valor $geral "arquivo_segredos" (Join-Path $script:PastaBase "segredos.ini")
     foreach ($pasta in @($script:PastaDados, $script:PastaTextfile)) {
         if (-not (Test-Path -LiteralPath $pasta)) { New-Item -ItemType Directory -Path $pasta -Force | Out-Null }
     }
@@ -1211,6 +1781,13 @@ function Initialize-Configuracao {
     $script:UltimoTesteVelocidade = 0.0
     $script:TesteVelocidade = $null
 
+    $virt = if ($ini.Contains("virtualizacao")) { $ini["virtualizacao"] } else { @{} }
+    $script:VirtAtivo = @("sim", "s", "1", "true", "ligado") -contains (Get-Valor $virt "ativo" "nao").ToLowerInvariant()
+    $script:IntervaloVirt = [math]::Max(60, [int](Get-Valor $virt "intervalo_segundos" "120"))
+    $script:UltimaRodadaVirt = 0.0
+    $script:FontesVirt = @()
+    if ($script:VirtAtivo) { $script:FontesVirt = @(Get-FontesVirtualizacao $ini) }
+
     $script:Links = @()
     foreach ($nomeSecao in $ini.Keys) {
         if ($nomeSecao -match '^link:(.+)$') {
@@ -1243,8 +1820,9 @@ function Initialize-Configuracao {
 function Invoke-Executar {
     Initialize-Configuracao
     $script:BancosOk = $true
+    $script:VirtOk = $true
     Write-Log "info" "Coleta Complementar $script:Versao iniciada; links configurados: $($script:Links.Count)"
-    $ligados = @(); if ($script:InternetAtivo) { $ligados += "internet" }; if ($script:AcessosAtivo) { $ligados += "acessos" }; if ($script:BancosAtivo) { $ligados += "bancos" }; if ($script:VelocidadeAtivo) { $ligados += "velocidade" }
+    $ligados = @(); if ($script:InternetAtivo) { $ligados += "internet" }; if ($script:AcessosAtivo) { $ligados += "acessos" }; if ($script:BancosAtivo) { $ligados += "bancos" }; if ($script:VelocidadeAtivo) { $ligados += "velocidade" }; if ($script:VirtAtivo) { $ligados += "virtualizacao" }
     Write-Evento "sistema" "coletor_iniciado" "info" @{ detalhe = "Coleta Complementar $script:Versao (Windows): $($ligados -join ', ')" }
     while ($true) {
         $inicio = Get-Agora
@@ -1265,6 +1843,14 @@ function Invoke-Executar {
                 Write-Log "erro" ("rodada de bancos falhou: {0}" -f $_.Exception.Message)
             }
         }
+        if ($script:VirtAtivo -and ($inicio - $script:UltimaRodadaVirt) -ge $script:IntervaloVirt) {
+            $script:UltimaRodadaVirt = $inicio
+            try { Invoke-RodadaVirtualizacao; $script:VirtOk = $true }
+            catch {
+                $script:VirtOk = $false
+                Write-Log "erro" ("rodada de virtualização falhou: {0}" -f $_.Exception.Message)
+            }
+        }
         $velocidadeOk = $true
         if ($script:VelocidadeAtivo) {
             try { Invoke-RodadaVelocidade }
@@ -1275,11 +1861,11 @@ function Invoke-Executar {
         }
         try {
             if ($script:InternetAtivo) { Invoke-RodadaLinks }
-            Save-Saude $true $acessosOk $script:BancosOk $velocidadeOk
+            Save-Saude $true $acessosOk $script:BancosOk $velocidadeOk $script:VirtOk
         }
         catch {
             Write-Log "erro" ("rodada falhou: {0} | {1}" -f $_.Exception.Message, ($_.ScriptStackTrace -replace "`r?`n", " <- "))
-            try { Save-Saude $false $acessosOk $script:BancosOk $velocidadeOk } catch { }
+            try { Save-Saude $false $acessosOk $script:BancosOk $velocidadeOk $script:VirtOk } catch { }
         }
         $espera = $script:Intervalo - ((Get-Agora) - $inicio)
         if ($espera -gt 0) { Start-Sleep -Milliseconds ([int]($espera * 1000)) }
@@ -1290,6 +1876,7 @@ function Invoke-UmaVez {
     Initialize-Configuracao
     if ($script:InternetAtivo) { Invoke-RodadaLinks }
     if ($script:BancosAtivo) { Invoke-RodadaBancos }
+    if ($script:VirtAtivo) { Invoke-RodadaVirtualizacao }
     if ($script:VelocidadeAtivo) {
         # Uma rodada mostra o teste completo: espera o resultado.
         Invoke-RodadaVelocidade
@@ -1315,6 +1902,13 @@ function Invoke-Verificar {
     Write-Host ("Velocidade: {0}" -f $(if ($script:VelocidadeAtivo) { "ligado (a cada {0} min)" -f ($script:IntervaloVelocidade / 60) } else { "desligado" }))
     if ($script:VelocidadeAtivo -and -not (Test-Path -LiteralPath $script:SpeedtestExe)) {
         $problemas += "Speedtest CLI não encontrado em $($script:SpeedtestExe)"
+    }
+    foreach ($fonte in $script:FontesVirt) {
+        try {
+            $inv = Get-InventarioFonte $fonte
+            Write-Host ("Hipervisor {0} ({1}): {2} host(s), {3} VM(s), {4} armazenamento(s)" -f $fonte.Nome, $script:PlataformasVirt[$fonte.Plataforma], $inv.Hosts.Count, $inv.Vms.Count, $inv.Armazenamentos.Count)
+        }
+        catch { $problemas += ("hipervisor {0} ({1}) sem resposta: {2}" -f $fonte.Nome, $script:PlataformasVirt[$fonte.Plataforma], $_.Exception.Message) }
     }
     if ($script:AcessosAtivo) {
         try { [void](Get-WinEvent -LogName Security -MaxEvents 1) }
