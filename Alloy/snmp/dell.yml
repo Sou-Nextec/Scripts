@@ -1,0 +1,1251 @@
+# ============================================================================
+# Nextec, módulo SNMP para Dell PowerEdge (iDRAC)
+# Gerado por gerar_modulos.py. Não edite à mão: altere o gerador e rode de novo.
+#
+# Fontes: SNMPv2-MIB, IF-MIB, IF-X-MIB e IDRAC-MIB-SMIv2.
+# Os nomes das métricas são os usados pelo painel Nextec | Hardware.
+#
+# Segurança: este arquivo NÃO contém community, usuário ou senha. As
+# credenciais ficam no snmp-auth.yml de cada cliente, gravado pelo instalador.
+# ============================================================================
+modules:
+  dell_v2c:
+    walk:
+    - 1.3.6.1.2.1.1
+    - 1.3.6.1.2.1.2.2
+    - 1.3.6.1.2.1.31.1.1
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.9
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.12
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.15
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.21
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.24
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.27
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.30
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.50
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.52
+    - 1.3.6.1.4.1.674.10892.5.4.700.20.1.5
+    - 1.3.6.1.4.1.674.10892.5.4.700.20.1.6
+    - 1.3.6.1.4.1.674.10892.5.4.700.20.1.8
+    - 1.3.6.1.4.1.674.10892.5.4.700.12.1.5
+    - 1.3.6.1.4.1.674.10892.5.4.700.12.1.6
+    - 1.3.6.1.4.1.674.10892.5.4.700.12.1.8
+    - 1.3.6.1.4.1.674.10892.5.4.600.12.1.5
+    - 1.3.6.1.4.1.674.10892.5.4.600.12.1.6
+    - 1.3.6.1.4.1.674.10892.5.4.600.12.1.8
+    - 1.3.6.1.4.1.674.10892.5.4.600.30.1.5
+    - 1.3.6.1.4.1.674.10892.5.4.600.30.1.6
+    - 1.3.6.1.4.1.674.10892.5.4.600.30.1.7
+    - 1.3.6.1.4.1.674.10892.5.4.600.30.1.8
+    - 1.3.6.1.4.1.674.10892.5.4.1100.50.1.5
+    - 1.3.6.1.4.1.674.10892.5.4.1100.50.1.8
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.1.1.38
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.1.1.79
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.4
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.11
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.24
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.31
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.55
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.140.1.1.4
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.140.1.1.20
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.140.1.1.36
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.15.1.6
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.15.1.21
+    get:
+    - 1.3.6.1.4.1.674.10892.5.2.1.0
+    - 1.3.6.1.4.1.674.10892.5.2.2.0
+    - 1.3.6.1.4.1.674.10892.5.2.3.0
+    - 1.3.6.1.4.1.674.10892.5.2.4.0
+    - 1.3.6.1.4.1.674.10892.5.1.1.8.0
+    - 1.3.6.1.4.1.674.10892.5.1.3.2.0
+    - 1.3.6.1.4.1.674.10892.5.1.3.12.0
+    metrics:
+    - name: sysDescr
+      oid: 1.3.6.1.2.1.1.1
+      type: DisplayString
+      help: Descrição do equipamento e firmware
+    - name: sysUpTime
+      oid: 1.3.6.1.2.1.1.3
+      type: gauge
+      help: Tempo ligado, em centésimos de segundo
+    - name: idracGlobalSystemStatus
+      oid: 1.3.6.1.4.1.674.10892.5.2.1
+      type: gauge
+      help: Estado geral do servidor (3=ok 4=nonCritical 5=critical 6=nonRecoverable)
+    - name: idracSystemLCDStatus
+      oid: 1.3.6.1.4.1.674.10892.5.2.2
+      type: gauge
+      help: Estado mostrado no painel frontal (3=ok 4=nonCritical 5=critical 6=nonRecoverable)
+    - name: idracGlobalStorageStatus
+      oid: 1.3.6.1.4.1.674.10892.5.2.3
+      type: gauge
+      help: Estado geral do armazenamento (3=ok 4=nonCritical 5=critical 6=nonRecoverable)
+    - name: idracSystemPowerState
+      oid: 1.3.6.1.4.1.674.10892.5.2.4
+      type: gauge
+      help: Energia do servidor (3=off 4=on)
+    - name: idracFirmwareVersion
+      oid: 1.3.6.1.4.1.674.10892.5.1.1.8
+      type: DisplayString
+      help: Versão do firmware do iDRAC
+    - name: idracSystemServiceTag
+      oid: 1.3.6.1.4.1.674.10892.5.1.3.2
+      type: DisplayString
+      help: Service tag do servidor
+    - name: idracSystemModelName
+      oid: 1.3.6.1.4.1.674.10892.5.1.3.12
+      type: DisplayString
+      help: Modelo do servidor
+    - name: ifAdminStatus
+      oid: 1.3.6.1.2.1.2.2.1.7
+      type: gauge
+      help: Estado configurado da interface (1=up 2=down 3=testing)
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifOperStatus
+      oid: 1.3.6.1.2.1.2.2.1.8
+      type: gauge
+      help: Estado operacional da interface (1=up 2=down)
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifInDiscards
+      oid: 1.3.6.1.2.1.2.2.1.13
+      type: counter
+      help: Pacotes recebidos descartados
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifInErrors
+      oid: 1.3.6.1.2.1.2.2.1.14
+      type: counter
+      help: Pacotes recebidos com erro
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifOutDiscards
+      oid: 1.3.6.1.2.1.2.2.1.19
+      type: counter
+      help: Pacotes enviados descartados
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifOutErrors
+      oid: 1.3.6.1.2.1.2.2.1.20
+      type: counter
+      help: Pacotes enviados com erro
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifHCInOctets
+      oid: 1.3.6.1.2.1.31.1.1.1.6
+      type: counter
+      help: Bytes recebidos (64 bits)
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifHCOutOctets
+      oid: 1.3.6.1.2.1.31.1.1.1.10
+      type: counter
+      help: Bytes enviados (64 bits)
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifHighSpeed
+      oid: 1.3.6.1.2.1.31.1.1.1.15
+      type: gauge
+      help: Velocidade da interface em Mbps
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: idracPowerSupplyStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.9
+      type: gauge
+      help: Estado consolidado das fontes (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracVoltageStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.12
+      type: gauge
+      help: Estado consolidado das tensões (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracAmperageStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.15
+      type: gauge
+      help: Estado consolidado das correntes (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracCoolingDeviceStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.21
+      type: gauge
+      help: Estado consolidado das ventoinhas (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracTemperatureStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.24
+      type: gauge
+      help: Estado consolidado das temperaturas (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracMemoryDeviceStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.27
+      type: gauge
+      help: Estado consolidado da memória (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracChassisIntrusionStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.30
+      type: gauge
+      help: Estado do sensor de abertura do gabinete (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracProcessorDeviceStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.50
+      type: gauge
+      help: Estado consolidado dos processadores (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracBatteryStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.52
+      type: gauge
+      help: Estado consolidado das baterias (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracTemperatureProbeStatus
+      oid: 1.3.6.1.4.1.674.10892.5.4.700.20.1.5
+      type: gauge
+      help: Estado do sensor de temperatura (3=ok 4-9=limite ultrapassado 10=failed)
+      indexes:
+      - labelname: temperatureProbechassisIndex
+        type: gauge
+      - labelname: temperatureProbeIndex
+        type: gauge
+      lookups:
+      - labels:
+        - temperatureProbechassisIndex
+        - temperatureProbeIndex
+        labelname: temperatureProbeLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.700.20.1.8
+        type: DisplayString
+    - name: idracTemperatureProbeReading
+      oid: 1.3.6.1.4.1.674.10892.5.4.700.20.1.6
+      type: gauge
+      help: Temperatura em décimos de grau Celsius
+      indexes:
+      - labelname: temperatureProbechassisIndex
+        type: gauge
+      - labelname: temperatureProbeIndex
+        type: gauge
+      lookups:
+      - labels:
+        - temperatureProbechassisIndex
+        - temperatureProbeIndex
+        labelname: temperatureProbeLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.700.20.1.8
+        type: DisplayString
+    - name: idracCoolingDeviceStatus
+      oid: 1.3.6.1.4.1.674.10892.5.4.700.12.1.5
+      type: gauge
+      help: Estado da ventoinha (3=ok 4-9=limite ultrapassado 10=failed)
+      indexes:
+      - labelname: coolingDevicechassisIndex
+        type: gauge
+      - labelname: coolingDeviceIndex
+        type: gauge
+      lookups:
+      - labels:
+        - coolingDevicechassisIndex
+        - coolingDeviceIndex
+        labelname: coolingDeviceLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.700.12.1.8
+        type: DisplayString
+    - name: idracCoolingDeviceReading
+      oid: 1.3.6.1.4.1.674.10892.5.4.700.12.1.6
+      type: gauge
+      help: Velocidade da ventoinha em RPM
+      indexes:
+      - labelname: coolingDevicechassisIndex
+        type: gauge
+      - labelname: coolingDeviceIndex
+        type: gauge
+      lookups:
+      - labels:
+        - coolingDevicechassisIndex
+        - coolingDeviceIndex
+        labelname: coolingDeviceLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.700.12.1.8
+        type: DisplayString
+    - name: idracPowerSupplyStatus
+      oid: 1.3.6.1.4.1.674.10892.5.4.600.12.1.5
+      type: gauge
+      help: Estado da fonte (3=ok 4=nonCritical 5=critical 6=nonRecoverable)
+      indexes:
+      - labelname: powerSupplychassisIndex
+        type: gauge
+      - labelname: powerSupplyIndex
+        type: gauge
+      lookups:
+      - labels:
+        - powerSupplychassisIndex
+        - powerSupplyIndex
+        labelname: powerSupplyLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.600.12.1.8
+        type: DisplayString
+    - name: idracPowerSupplyOutputWatts
+      oid: 1.3.6.1.4.1.674.10892.5.4.600.12.1.6
+      type: gauge
+      help: Potência máxima da fonte em décimos de watt
+      indexes:
+      - labelname: powerSupplychassisIndex
+        type: gauge
+      - labelname: powerSupplyIndex
+        type: gauge
+      lookups:
+      - labels:
+        - powerSupplychassisIndex
+        - powerSupplyIndex
+        labelname: powerSupplyLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.600.12.1.8
+        type: DisplayString
+    - name: idracAmperageProbeStatus
+      oid: 1.3.6.1.4.1.674.10892.5.4.600.30.1.5
+      type: gauge
+      help: Estado do sensor de corrente ou consumo (3=ok)
+      indexes:
+      - labelname: amperageProbechassisIndex
+        type: gauge
+      - labelname: amperageProbeIndex
+        type: gauge
+      lookups:
+      - labels:
+        - amperageProbechassisIndex
+        - amperageProbeIndex
+        labelname: amperageProbeLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.600.30.1.8
+        type: DisplayString
+    - name: idracAmperageProbeReading
+      oid: 1.3.6.1.4.1.674.10892.5.4.600.30.1.6
+      type: gauge
+      help: Leitura em watts no tipo 26 e em décimos de ampère no tipo 23
+      indexes:
+      - labelname: amperageProbechassisIndex
+        type: gauge
+      - labelname: amperageProbeIndex
+        type: gauge
+      lookups:
+      - labels:
+        - amperageProbechassisIndex
+        - amperageProbeIndex
+        labelname: amperageProbeLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.600.30.1.8
+        type: DisplayString
+    - name: idracAmperageProbeType
+      oid: 1.3.6.1.4.1.674.10892.5.4.600.30.1.7
+      type: gauge
+      help: Tipo do sensor (23=corrente da fonte 24=watts da fonte 26=consumo do sistema)
+      indexes:
+      - labelname: amperageProbechassisIndex
+        type: gauge
+      - labelname: amperageProbeIndex
+        type: gauge
+      lookups:
+      - labels:
+        - amperageProbechassisIndex
+        - amperageProbeIndex
+        labelname: amperageProbeLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.600.30.1.8
+        type: DisplayString
+    - name: idracMemoryDeviceStatus
+      oid: 1.3.6.1.4.1.674.10892.5.4.1100.50.1.5
+      type: gauge
+      help: Estado do pente de memória (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: memoryDevicechassisIndex
+        type: gauge
+      - labelname: memoryDeviceIndex
+        type: gauge
+      lookups:
+      - labels:
+        - memoryDevicechassisIndex
+        - memoryDeviceIndex
+        labelname: memoryDeviceLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.1100.50.1.8
+        type: DisplayString
+    - name: idracControllerComponentStatus
+      oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.1.1.38
+      type: gauge
+      help: Estado da controladora (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: controllerNumber
+        type: gauge
+      lookups:
+      - labels:
+        - controllerNumber
+        labelname: controllerDisplayName
+        oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.1.1.79
+        type: DisplayString
+    - name: idracPhysicalDiskState
+      oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.4
+      type: gauge
+      help: Estado do disco físico (3=online 7=failed 5=offline 9=removed)
+      indexes:
+      - labelname: physicalDiskNumber
+        type: gauge
+      lookups:
+      - labels:
+        - physicalDiskNumber
+        labelname: physicalDiskDisplayName
+        oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.55
+        type: DisplayString
+    - name: idracPhysicalDiskCapacityInMB
+      oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.11
+      type: gauge
+      help: Capacidade do disco físico em MB
+      indexes:
+      - labelname: physicalDiskNumber
+        type: gauge
+      lookups:
+      - labels:
+        - physicalDiskNumber
+        labelname: physicalDiskDisplayName
+        oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.55
+        type: DisplayString
+    - name: idracPhysicalDiskComponentStatus
+      oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.24
+      type: gauge
+      help: Estado do disco físico (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: physicalDiskNumber
+        type: gauge
+      lookups:
+      - labels:
+        - physicalDiskNumber
+        labelname: physicalDiskDisplayName
+        oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.55
+        type: DisplayString
+    - name: idracPhysicalDiskSmartAlert
+      oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.31
+      type: gauge
+      help: Falha prevista pelo SMART (0=não 1=sim)
+      indexes:
+      - labelname: physicalDiskNumber
+        type: gauge
+      lookups:
+      - labels:
+        - physicalDiskNumber
+        labelname: physicalDiskDisplayName
+        oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.55
+        type: DisplayString
+    - name: idracVirtualDiskState
+      oid: 1.3.6.1.4.1.674.10892.5.5.1.20.140.1.1.4
+      type: gauge
+      help: Estado do disco virtual (2=online 3=failed 4=degraded)
+      indexes:
+      - labelname: virtualDiskNumber
+        type: gauge
+      lookups:
+      - labels:
+        - virtualDiskNumber
+        labelname: virtualDiskDisplayName
+        oid: 1.3.6.1.4.1.674.10892.5.5.1.20.140.1.1.36
+        type: DisplayString
+    - name: idracVirtualDiskComponentStatus
+      oid: 1.3.6.1.4.1.674.10892.5.5.1.20.140.1.1.20
+      type: gauge
+      help: Estado do disco virtual (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: virtualDiskNumber
+        type: gauge
+      lookups:
+      - labels:
+        - virtualDiskNumber
+        labelname: virtualDiskDisplayName
+        oid: 1.3.6.1.4.1.674.10892.5.5.1.20.140.1.1.36
+        type: DisplayString
+    - name: idracBatteryComponentStatus
+      oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.15.1.6
+      type: gauge
+      help: Estado da bateria da controladora (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: batteryNumber
+        type: gauge
+      lookups:
+      - labels:
+        - batteryNumber
+        labelname: batteryDisplayName
+        oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.15.1.21
+        type: DisplayString
+  dell_v3:
+    walk:
+    - 1.3.6.1.2.1.1
+    - 1.3.6.1.2.1.2.2
+    - 1.3.6.1.2.1.31.1.1
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.9
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.12
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.15
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.21
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.24
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.27
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.30
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.50
+    - 1.3.6.1.4.1.674.10892.5.4.200.10.1.52
+    - 1.3.6.1.4.1.674.10892.5.4.700.20.1.5
+    - 1.3.6.1.4.1.674.10892.5.4.700.20.1.6
+    - 1.3.6.1.4.1.674.10892.5.4.700.20.1.8
+    - 1.3.6.1.4.1.674.10892.5.4.700.12.1.5
+    - 1.3.6.1.4.1.674.10892.5.4.700.12.1.6
+    - 1.3.6.1.4.1.674.10892.5.4.700.12.1.8
+    - 1.3.6.1.4.1.674.10892.5.4.600.12.1.5
+    - 1.3.6.1.4.1.674.10892.5.4.600.12.1.6
+    - 1.3.6.1.4.1.674.10892.5.4.600.12.1.8
+    - 1.3.6.1.4.1.674.10892.5.4.600.30.1.5
+    - 1.3.6.1.4.1.674.10892.5.4.600.30.1.6
+    - 1.3.6.1.4.1.674.10892.5.4.600.30.1.7
+    - 1.3.6.1.4.1.674.10892.5.4.600.30.1.8
+    - 1.3.6.1.4.1.674.10892.5.4.1100.50.1.5
+    - 1.3.6.1.4.1.674.10892.5.4.1100.50.1.8
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.1.1.38
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.1.1.79
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.4
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.11
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.24
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.31
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.55
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.140.1.1.4
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.140.1.1.20
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.140.1.1.36
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.15.1.6
+    - 1.3.6.1.4.1.674.10892.5.5.1.20.130.15.1.21
+    get:
+    - 1.3.6.1.4.1.674.10892.5.2.1.0
+    - 1.3.6.1.4.1.674.10892.5.2.2.0
+    - 1.3.6.1.4.1.674.10892.5.2.3.0
+    - 1.3.6.1.4.1.674.10892.5.2.4.0
+    - 1.3.6.1.4.1.674.10892.5.1.1.8.0
+    - 1.3.6.1.4.1.674.10892.5.1.3.2.0
+    - 1.3.6.1.4.1.674.10892.5.1.3.12.0
+    metrics:
+    - name: sysDescr
+      oid: 1.3.6.1.2.1.1.1
+      type: DisplayString
+      help: Descrição do equipamento e firmware
+    - name: sysUpTime
+      oid: 1.3.6.1.2.1.1.3
+      type: gauge
+      help: Tempo ligado, em centésimos de segundo
+    - name: idracGlobalSystemStatus
+      oid: 1.3.6.1.4.1.674.10892.5.2.1
+      type: gauge
+      help: Estado geral do servidor (3=ok 4=nonCritical 5=critical 6=nonRecoverable)
+    - name: idracSystemLCDStatus
+      oid: 1.3.6.1.4.1.674.10892.5.2.2
+      type: gauge
+      help: Estado mostrado no painel frontal (3=ok 4=nonCritical 5=critical 6=nonRecoverable)
+    - name: idracGlobalStorageStatus
+      oid: 1.3.6.1.4.1.674.10892.5.2.3
+      type: gauge
+      help: Estado geral do armazenamento (3=ok 4=nonCritical 5=critical 6=nonRecoverable)
+    - name: idracSystemPowerState
+      oid: 1.3.6.1.4.1.674.10892.5.2.4
+      type: gauge
+      help: Energia do servidor (3=off 4=on)
+    - name: idracFirmwareVersion
+      oid: 1.3.6.1.4.1.674.10892.5.1.1.8
+      type: DisplayString
+      help: Versão do firmware do iDRAC
+    - name: idracSystemServiceTag
+      oid: 1.3.6.1.4.1.674.10892.5.1.3.2
+      type: DisplayString
+      help: Service tag do servidor
+    - name: idracSystemModelName
+      oid: 1.3.6.1.4.1.674.10892.5.1.3.12
+      type: DisplayString
+      help: Modelo do servidor
+    - name: ifAdminStatus
+      oid: 1.3.6.1.2.1.2.2.1.7
+      type: gauge
+      help: Estado configurado da interface (1=up 2=down 3=testing)
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifOperStatus
+      oid: 1.3.6.1.2.1.2.2.1.8
+      type: gauge
+      help: Estado operacional da interface (1=up 2=down)
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifInDiscards
+      oid: 1.3.6.1.2.1.2.2.1.13
+      type: counter
+      help: Pacotes recebidos descartados
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifInErrors
+      oid: 1.3.6.1.2.1.2.2.1.14
+      type: counter
+      help: Pacotes recebidos com erro
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifOutDiscards
+      oid: 1.3.6.1.2.1.2.2.1.19
+      type: counter
+      help: Pacotes enviados descartados
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifOutErrors
+      oid: 1.3.6.1.2.1.2.2.1.20
+      type: counter
+      help: Pacotes enviados com erro
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifHCInOctets
+      oid: 1.3.6.1.2.1.31.1.1.1.6
+      type: counter
+      help: Bytes recebidos (64 bits)
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifHCOutOctets
+      oid: 1.3.6.1.2.1.31.1.1.1.10
+      type: counter
+      help: Bytes enviados (64 bits)
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: ifHighSpeed
+      oid: 1.3.6.1.2.1.31.1.1.1.15
+      type: gauge
+      help: Velocidade da interface em Mbps
+      indexes:
+      - labelname: ifIndex
+        type: gauge
+      lookups:
+      - labels:
+        - ifIndex
+        labelname: ifName
+        oid: 1.3.6.1.2.1.31.1.1.1.1
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifAlias
+        oid: 1.3.6.1.2.1.31.1.1.1.18
+        type: DisplayString
+      - labels:
+        - ifIndex
+        labelname: ifDescr
+        oid: 1.3.6.1.2.1.2.2.1.2
+        type: DisplayString
+    - name: idracPowerSupplyStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.9
+      type: gauge
+      help: Estado consolidado das fontes (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracVoltageStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.12
+      type: gauge
+      help: Estado consolidado das tensões (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracAmperageStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.15
+      type: gauge
+      help: Estado consolidado das correntes (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracCoolingDeviceStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.21
+      type: gauge
+      help: Estado consolidado das ventoinhas (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracTemperatureStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.24
+      type: gauge
+      help: Estado consolidado das temperaturas (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracMemoryDeviceStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.27
+      type: gauge
+      help: Estado consolidado da memória (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracChassisIntrusionStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.30
+      type: gauge
+      help: Estado do sensor de abertura do gabinete (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracProcessorDeviceStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.50
+      type: gauge
+      help: Estado consolidado dos processadores (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracBatteryStatusCombined
+      oid: 1.3.6.1.4.1.674.10892.5.4.200.10.1.52
+      type: gauge
+      help: Estado consolidado das baterias (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: systemStatechassisIndex
+        type: gauge
+    - name: idracTemperatureProbeStatus
+      oid: 1.3.6.1.4.1.674.10892.5.4.700.20.1.5
+      type: gauge
+      help: Estado do sensor de temperatura (3=ok 4-9=limite ultrapassado 10=failed)
+      indexes:
+      - labelname: temperatureProbechassisIndex
+        type: gauge
+      - labelname: temperatureProbeIndex
+        type: gauge
+      lookups:
+      - labels:
+        - temperatureProbechassisIndex
+        - temperatureProbeIndex
+        labelname: temperatureProbeLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.700.20.1.8
+        type: DisplayString
+    - name: idracTemperatureProbeReading
+      oid: 1.3.6.1.4.1.674.10892.5.4.700.20.1.6
+      type: gauge
+      help: Temperatura em décimos de grau Celsius
+      indexes:
+      - labelname: temperatureProbechassisIndex
+        type: gauge
+      - labelname: temperatureProbeIndex
+        type: gauge
+      lookups:
+      - labels:
+        - temperatureProbechassisIndex
+        - temperatureProbeIndex
+        labelname: temperatureProbeLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.700.20.1.8
+        type: DisplayString
+    - name: idracCoolingDeviceStatus
+      oid: 1.3.6.1.4.1.674.10892.5.4.700.12.1.5
+      type: gauge
+      help: Estado da ventoinha (3=ok 4-9=limite ultrapassado 10=failed)
+      indexes:
+      - labelname: coolingDevicechassisIndex
+        type: gauge
+      - labelname: coolingDeviceIndex
+        type: gauge
+      lookups:
+      - labels:
+        - coolingDevicechassisIndex
+        - coolingDeviceIndex
+        labelname: coolingDeviceLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.700.12.1.8
+        type: DisplayString
+    - name: idracCoolingDeviceReading
+      oid: 1.3.6.1.4.1.674.10892.5.4.700.12.1.6
+      type: gauge
+      help: Velocidade da ventoinha em RPM
+      indexes:
+      - labelname: coolingDevicechassisIndex
+        type: gauge
+      - labelname: coolingDeviceIndex
+        type: gauge
+      lookups:
+      - labels:
+        - coolingDevicechassisIndex
+        - coolingDeviceIndex
+        labelname: coolingDeviceLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.700.12.1.8
+        type: DisplayString
+    - name: idracPowerSupplyStatus
+      oid: 1.3.6.1.4.1.674.10892.5.4.600.12.1.5
+      type: gauge
+      help: Estado da fonte (3=ok 4=nonCritical 5=critical 6=nonRecoverable)
+      indexes:
+      - labelname: powerSupplychassisIndex
+        type: gauge
+      - labelname: powerSupplyIndex
+        type: gauge
+      lookups:
+      - labels:
+        - powerSupplychassisIndex
+        - powerSupplyIndex
+        labelname: powerSupplyLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.600.12.1.8
+        type: DisplayString
+    - name: idracPowerSupplyOutputWatts
+      oid: 1.3.6.1.4.1.674.10892.5.4.600.12.1.6
+      type: gauge
+      help: Potência máxima da fonte em décimos de watt
+      indexes:
+      - labelname: powerSupplychassisIndex
+        type: gauge
+      - labelname: powerSupplyIndex
+        type: gauge
+      lookups:
+      - labels:
+        - powerSupplychassisIndex
+        - powerSupplyIndex
+        labelname: powerSupplyLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.600.12.1.8
+        type: DisplayString
+    - name: idracAmperageProbeStatus
+      oid: 1.3.6.1.4.1.674.10892.5.4.600.30.1.5
+      type: gauge
+      help: Estado do sensor de corrente ou consumo (3=ok)
+      indexes:
+      - labelname: amperageProbechassisIndex
+        type: gauge
+      - labelname: amperageProbeIndex
+        type: gauge
+      lookups:
+      - labels:
+        - amperageProbechassisIndex
+        - amperageProbeIndex
+        labelname: amperageProbeLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.600.30.1.8
+        type: DisplayString
+    - name: idracAmperageProbeReading
+      oid: 1.3.6.1.4.1.674.10892.5.4.600.30.1.6
+      type: gauge
+      help: Leitura em watts no tipo 26 e em décimos de ampère no tipo 23
+      indexes:
+      - labelname: amperageProbechassisIndex
+        type: gauge
+      - labelname: amperageProbeIndex
+        type: gauge
+      lookups:
+      - labels:
+        - amperageProbechassisIndex
+        - amperageProbeIndex
+        labelname: amperageProbeLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.600.30.1.8
+        type: DisplayString
+    - name: idracAmperageProbeType
+      oid: 1.3.6.1.4.1.674.10892.5.4.600.30.1.7
+      type: gauge
+      help: Tipo do sensor (23=corrente da fonte 24=watts da fonte 26=consumo do sistema)
+      indexes:
+      - labelname: amperageProbechassisIndex
+        type: gauge
+      - labelname: amperageProbeIndex
+        type: gauge
+      lookups:
+      - labels:
+        - amperageProbechassisIndex
+        - amperageProbeIndex
+        labelname: amperageProbeLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.600.30.1.8
+        type: DisplayString
+    - name: idracMemoryDeviceStatus
+      oid: 1.3.6.1.4.1.674.10892.5.4.1100.50.1.5
+      type: gauge
+      help: Estado do pente de memória (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: memoryDevicechassisIndex
+        type: gauge
+      - labelname: memoryDeviceIndex
+        type: gauge
+      lookups:
+      - labels:
+        - memoryDevicechassisIndex
+        - memoryDeviceIndex
+        labelname: memoryDeviceLocationName
+        oid: 1.3.6.1.4.1.674.10892.5.4.1100.50.1.8
+        type: DisplayString
+    - name: idracControllerComponentStatus
+      oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.1.1.38
+      type: gauge
+      help: Estado da controladora (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: controllerNumber
+        type: gauge
+      lookups:
+      - labels:
+        - controllerNumber
+        labelname: controllerDisplayName
+        oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.1.1.79
+        type: DisplayString
+    - name: idracPhysicalDiskState
+      oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.4
+      type: gauge
+      help: Estado do disco físico (3=online 7=failed 5=offline 9=removed)
+      indexes:
+      - labelname: physicalDiskNumber
+        type: gauge
+      lookups:
+      - labels:
+        - physicalDiskNumber
+        labelname: physicalDiskDisplayName
+        oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.55
+        type: DisplayString
+    - name: idracPhysicalDiskCapacityInMB
+      oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.11
+      type: gauge
+      help: Capacidade do disco físico em MB
+      indexes:
+      - labelname: physicalDiskNumber
+        type: gauge
+      lookups:
+      - labels:
+        - physicalDiskNumber
+        labelname: physicalDiskDisplayName
+        oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.55
+        type: DisplayString
+    - name: idracPhysicalDiskComponentStatus
+      oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.24
+      type: gauge
+      help: Estado do disco físico (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: physicalDiskNumber
+        type: gauge
+      lookups:
+      - labels:
+        - physicalDiskNumber
+        labelname: physicalDiskDisplayName
+        oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.55
+        type: DisplayString
+    - name: idracPhysicalDiskSmartAlert
+      oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.31
+      type: gauge
+      help: Falha prevista pelo SMART (0=não 1=sim)
+      indexes:
+      - labelname: physicalDiskNumber
+        type: gauge
+      lookups:
+      - labels:
+        - physicalDiskNumber
+        labelname: physicalDiskDisplayName
+        oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.4.1.55
+        type: DisplayString
+    - name: idracVirtualDiskState
+      oid: 1.3.6.1.4.1.674.10892.5.5.1.20.140.1.1.4
+      type: gauge
+      help: Estado do disco virtual (2=online 3=failed 4=degraded)
+      indexes:
+      - labelname: virtualDiskNumber
+        type: gauge
+      lookups:
+      - labels:
+        - virtualDiskNumber
+        labelname: virtualDiskDisplayName
+        oid: 1.3.6.1.4.1.674.10892.5.5.1.20.140.1.1.36
+        type: DisplayString
+    - name: idracVirtualDiskComponentStatus
+      oid: 1.3.6.1.4.1.674.10892.5.5.1.20.140.1.1.20
+      type: gauge
+      help: Estado do disco virtual (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: virtualDiskNumber
+        type: gauge
+      lookups:
+      - labels:
+        - virtualDiskNumber
+        labelname: virtualDiskDisplayName
+        oid: 1.3.6.1.4.1.674.10892.5.5.1.20.140.1.1.36
+        type: DisplayString
+    - name: idracBatteryComponentStatus
+      oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.15.1.6
+      type: gauge
+      help: Estado da bateria da controladora (3=ok 4=nonCritical 5=critical)
+      indexes:
+      - labelname: batteryNumber
+        type: gauge
+      lookups:
+      - labels:
+        - batteryNumber
+        labelname: batteryDisplayName
+        oid: 1.3.6.1.4.1.674.10892.5.5.1.20.130.15.1.21
+        type: DisplayString

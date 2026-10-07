@@ -343,7 +343,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.22.0"
+$InstallerVersion = "2.23.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -367,18 +367,30 @@ $SnmpAuthFile = Join-Path $AlloyDir "snmp-auth.yml"
 # Repositório Nextec com os snmp.yml homologados por fabricante. Usado para
 # baixar o arquivo certo sem depender de o operador já ter uma cópia local.
 $NextecSnmpRepoBaseUrl = "https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Alloy/snmp"
-# Em ordem alfabética, como aparece para o técnico.
+# Em ordem alfabética, como aparece para o técnico. Tipo é o "tipo" sugerido
+# quando o técnico escolhe o fabricante (catálogo do documento 02).
 $NextecSnmpVendors = [ordered]@{
     "1" = @{ Label = "Cisco"; File = "cisco.yml" }
-    "2" = @{ Label = "FortiGate"; File = "fortigate.yml" }
-    "3" = @{ Label = "HP / Aruba"; File = "hp.yml" }
-    "4" = @{ Label = "Intelbras"; File = "intelbras.yml" }
-    "5" = @{ Label = "MikroTik"; File = "mikrotik.yml" }
-    "6" = @{ Label = "pfSense"; File = "pfsense.yml" }
-    "7" = @{ Label = "SonicWall"; File = "sonicwall.yml" }
-    "8" = @{ Label = "TP-Link"; File = "tplink.yml" }
-    "9" = @{ Label = "Ubiquiti"; File = "ubiquiti.yml" }
+    "2" = @{ Label = "Dell iDRAC (servidor)"; File = "dell.yml"; Tipo = "servidor" }
+    "3" = @{ Label = "FortiGate"; File = "fortigate.yml"; Tipo = "firewall" }
+    "4" = @{ Label = "HP / Aruba"; File = "hp.yml"; Tipo = "switch" }
+    "5" = @{ Label = "Intelbras"; File = "intelbras.yml" }
+    "6" = @{ Label = "MikroTik"; File = "mikrotik.yml" }
+    "7" = @{ Label = "NAS genérico (Asustor, TerraMaster, WD)"; File = "nas.yml"; Tipo = "storage" }
+    "8" = @{ Label = "pfSense"; File = "pfsense.yml"; Tipo = "firewall" }
+    "9" = @{ Label = "QNAP (NAS)"; File = "qnap.yml"; Tipo = "storage" }
+    "10" = @{ Label = "SonicWall"; File = "sonicwall.yml"; Tipo = "firewall" }
+    "11" = @{ Label = "Synology (NAS)"; File = "synology.yml"; Tipo = "storage" }
+    "12" = @{ Label = "TP-Link"; File = "tplink.yml" }
+    "13" = @{ Label = "TrueNAS (NAS)"; File = "truenas.yml"; Tipo = "storage" }
+    "14" = @{ Label = "Ubiquiti"; File = "ubiquiti.yml" }
 }
+# Tipos de equipamento SNMP oferecidos ao técnico (catálogo do documento 02).
+$NextecSnmpTipos = @("firewall", "switch", "storage", "servidor", "ap", "ups")
+
+# Servidor Dell: o iDRAC entra sozinho na lista de equipamentos SNMP
+# (Get-WindowsInventory preenche; $null quando o host não é Dell).
+$script:IdracDetectado = $null
 
 # Nome do serviço Windows. Resolve-AlloyInstallation substitui pelo nome real
 # quando o serviço existe com outro nome.
@@ -3272,6 +3284,18 @@ function Get-WindowsInventory {
 
     $productType = [int]$os.ProductType
 
+    # Servidor físico Dell (PowerEdge): o iDRAC é monitorado por SNMP junto
+    # com o host. VM em hipervisor Dell aparece como VMware/Microsoft e não
+    # entra aqui. A leitura do IP só roda uma vez por execução.
+    if ([string]$computer.Manufacturer -match "^Dell" -and $productType -ne 1) {
+        if ($null -eq $script:IdracDetectado) {
+            $script:IdracDetectado = [pscustomobject]@{ Endereco = (Get-NextecIdracEndereco) }
+        }
+    }
+    else {
+        $script:IdracDetectado = $null
+    }
+
     switch ($productType) {
         1 { $role = "workstation" }
         2 { $role = "domain_controller" }
@@ -3324,7 +3348,45 @@ function Get-WindowsInventory {
         Domain       = [string]$computer.Domain
         Manufacturer = [string]$computer.Manufacturer
         Model        = [string]$computer.Model
+        Idrac        = $script:IdracDetectado
     }
+}
+
+function Get-NextecIdracEndereco {
+    <#
+        IP do iDRAC lido de dentro do próprio servidor Dell, sem credencial.
+        1) Driver IPMI do Windows (classe Microsoft_IPMI, presente em todo
+           Windows Server com BMC): comando "Get LAN Configuration
+           Parameters" (NetFn 0x0C, Cmd 0x02), parâmetro 3 (IP), canal 1.
+           Resposta: código de conclusão, revisão e os 4 octetos.
+        2) racadm local (iDRAC Service Module ou OpenManage), se instalado.
+        Devolve "" quando nenhum dos dois responde; o técnico digita o IP.
+    #>
+    try {
+        $ipmi = Get-CimInstance -Namespace root\wmi -ClassName Microsoft_IPMI -ErrorAction Stop | Select-Object -First 1
+        if ($null -ne $ipmi) {
+            $r = Invoke-CimMethod -InputObject $ipmi -MethodName RequestResponse -ErrorAction Stop -Arguments @{
+                Command = [byte]0x02; Lun = [byte]0; NetworkFunction = [byte]0x0C; ResponderAddress = [byte]0x20
+                RequestData = [byte[]](1, 3, 0, 0); RequestDataSize = [uint32]4
+            }
+            $d = @($r.ResponseData)
+            if ([int]$r.CompletionCode -eq 0 -and $d.Count -ge 6 -and [int]$d[0] -eq 0) {
+                $ip = "{0}.{1}.{2}.{3}" -f $d[2], $d[3], $d[4], $d[5]
+                if ($ip -ne "0.0.0.0") { return $ip }
+            }
+        }
+    }
+    catch { }
+
+    $racadm = Get-Command racadm -ErrorAction SilentlyContinue
+    if ($null -ne $racadm) {
+        try {
+            $saida = & $racadm.Source getniccfg 2>$null | Out-String
+            if ($saida -match "IP Address\s*=\s*(\d{1,3}(\.\d{1,3}){3})" -and $Matches[1] -ne "0.0.0.0") { return $Matches[1] }
+        }
+        catch { }
+    }
+    return ""
 }
 
 function Get-WindowsServerRoles {
@@ -3676,6 +3738,18 @@ function Show-DetectionSummary {
     if ($DetectedFeatures.Count -gt 0) {
         Write-Ok ("Recursos detectados: {0}" -f (($DetectedFeatures | ForEach-Object { $_.Label }) -join ", "))
     }
+
+    if ($null -ne $script:IdracDetectado) {
+        if ($script:IdracDetectado.Endereco) {
+            Write-Ok ("Servidor Dell: iDRAC em {0}. Entra na lista de equipamentos SNMP." -f $script:IdracDetectado.Endereco)
+        }
+        else {
+            Write-Warn "Servidor Dell: IP do iDRAC não lido (driver IPMI ou racadm ausente). Informe o IP no cadastro SNMP."
+        }
+        if ($Silent) {
+            Write-Warn "Modo silencioso: o iDRAC só é cadastrado se vier em -SnmpTarget (módulo dell_v2c ou dell_v3)."
+        }
+    }
 }
 
 # ==============================================================================
@@ -3978,7 +4052,7 @@ function Read-ResourceChecklist {
     }
 
     if ($Collector) {
-        $items.Add((New-NextecChecklistItem -Key "snmp" -Label "SNMP, firewalls/switches/UPS/APs" -Selected $script:EnableSnmpResolved))
+        $items.Add((New-NextecChecklistItem -Key "snmp" -Label "SNMP, firewalls/switches/UPS/APs/NAS/iDRAC" -Selected ($script:EnableSnmpResolved -or (-not $Silent -and $null -ne $script:IdracDetectado))))
         $items.Add((New-NextecChecklistItem -Key "blackbox" -Label "Conectividade e disponibilidade, ping/HTTP/TCP" -Selected $script:EnableBlackboxResolved))
         # Instala e configura sozinho: baixa o Speedtest CLI, grava o wrapper
         # e registra a tarefa agendada. Não pede nada além de marcar aqui.
@@ -4736,6 +4810,35 @@ function Read-SnmpTargets {
 
     Write-Step "SNMP"
 
+    # Servidor Dell: cadastra o iDRAC primeiro, com o módulo dell e o IP lido
+    # pelo IPMI. O dell.yml é somado ao snmp.yml escolhido mais abaixo.
+    $arquivoIdrac = $null
+    $jaTemIdrac = (@($script:SnmpTargets | Where-Object { [string]$_.Os -eq "dell" }).Count -gt 0)
+    if ($null -ne $script:IdracDetectado -and -not $jaTemIdrac -and (Read-YesNo -Prompt "Servidor Dell detectado. Monitorar o iDRAC por SNMP?" -Default $true)) {
+        try {
+            $arquivoIdrac = Get-NextecSnmpVendorFiles -Arquivos @("dell.yml")
+        }
+        catch {
+            Write-Warn ("Falha ao baixar o módulo do iDRAC: {0}" -f $_.Exception.Message)
+        }
+        if ($null -ne $arquivoIdrac) {
+            Write-Info "Habilite o SNMP no iDRAC: iDRAC Settings > Services > SNMP Agent."
+            $nomeIdrac = (ConvertTo-Slug ("idrac_{0}" -f $env:COMPUTERNAME)) -replace "[-.]", "_"
+            $enderecoIdrac = Read-NextecAddress -Prompt "IP do iDRAC" -Default ([string]$script:IdracDetectado.Endereco) -Kind host
+            $authIdrac = Read-SnmpAuthDefinition -EquipmentName $nomeIdrac
+            $script:SnmpAuthBlocks += $authIdrac.Yaml
+            $script:SnmpTargets += [pscustomobject]@{
+                Name = $nomeIdrac; Address = $enderecoIdrac; Module = ("dell_{0}" -f $authIdrac.Version)
+                Auth = $authIdrac.Name; Type = "servidor"; Os = "dell"
+            }
+            Write-Ok ("iDRAC adicionado: {0} ({1})" -f $nomeIdrac, $enderecoIdrac)
+            if (-not (Read-YesNo -Prompt "Cadastrar outros equipamentos SNMP?" -Default $false)) {
+                $script:SnmpSourceFile = $arquivoIdrac
+                return
+            }
+        }
+    }
+
     $temArquivoInstalado = Test-Path -LiteralPath $SnmpFile -PathType Leaf
     $opcoesOrigem = @("Baixar do repositório Nextec (GitHub)","Informar caminho local")
 
@@ -4776,6 +4879,15 @@ function Read-SnmpTargets {
     # Só os módulos do arquivo escolhido: os do snmp.yml instalado continuam
     # lá para os equipamentos que já usam, mas não entram no novo.
     $availableModules = @(Get-SnmpConfigSectionKeys -Path $script:SnmpSourceFile -Section "modules")
+
+    # iDRAC já cadastrado acima: o dell.yml vai junto do arquivo escolhido.
+    if ($null -ne $arquivoIdrac) {
+        $junto = Join-Path $env:TEMP ("nextec-snmp-console-{0}.yml" -f $PID)
+        if (Test-Path -LiteralPath $junto) { Remove-Item -LiteralPath $junto -Force }
+        Merge-SnmpModuleFile -NewFile $arquivoIdrac -Destination $junto
+        Merge-SnmpModuleFile -NewFile $script:SnmpSourceFile -Destination $junto
+        $script:SnmpSourceFile = $junto
+    }
 
     if ($availableModules.Count -eq 0) {
         throw ("Nenhum módulo encontrado na seção 'modules' de {0}." -f $script:SnmpSourceFile)
@@ -4818,7 +4930,7 @@ function Read-SnmpTargets {
 
         Write-Info ("Módulo aplicado: {0}" -f $module)
 
-        $typeOptions = @("firewall","switch","storage","ap","ups")
+        $typeOptions = $NextecSnmpTipos
         $typeChoice = Read-Choice -Prompt "Tipo do equipamento" -Options $typeOptions -Default 1
         $assetType = $typeOptions[$typeChoice - 1]
 
@@ -4998,7 +5110,13 @@ function Get-NextecConfiguration {
             $modeOptions = @("Servidor monitorado", "Collector de rede", "Servidor + Collector de rede")
         }
 
-        $modeChoice = Read-Choice -Prompt "Selecione o modo" -Options $modeOptions -Default 1
+        # Servidor Dell: o iDRAC é coletado por SNMP, que exige o collector.
+        $modoPadrao = 1
+        if ($null -ne $script:IdracDetectado) {
+            Write-Info "Servidor Dell detectado: o padrão é Servidor + Collector, para monitorar o iDRAC."
+            $modoPadrao = 3
+        }
+        $modeChoice = Read-Choice -Prompt "Selecione o modo" -Options $modeOptions -Default $modoPadrao
 
         switch ($modeChoice) {
             1 { $script:MonitorHost = $true;  $script:Collector = $false }
@@ -8321,9 +8439,14 @@ function Show-GuiEquipamentoSnmp {
     $f.Controls[$f.Controls.Count - 1].Height = 34
 
     [void](Add-GuiRotulo $f "Tipo" 20 204 160)
-    $tipos = @("firewall", "switch", "storage", "ap", "ups")
-    $tipo = New-GuiCombo 200 201 180 $tipos
+    $tipo = New-GuiCombo 200 201 180 $NextecSnmpTipos
     $f.Controls.Add($tipo)
+    # Fabricante com tipo conhecido (NAS, iDRAC, firewall) já sugere o tipo.
+    $fabricante.Add_SelectedIndexChanged({
+        foreach ($k in $NextecSnmpVendors.Keys) {
+            if ($NextecSnmpVendors[$k].Label -eq [string]$fabricante.SelectedItem -and $NextecSnmpVendors[$k].Tipo) { $tipo.SelectedItem = $NextecSnmpVendors[$k].Tipo }
+        }
+    })
 
     $f.Controls.Add((New-GuiLabel "Credencial SNMP" 20 244 300 -Titulo))
     [void](Add-GuiRotulo $f "Versão" 20 284 160)
@@ -9032,6 +9155,8 @@ function Show-NextecInstallerGui {
         "servidor_collector" { $indiceModo = 2 }
         "estacao_collector" { $indiceModo = 2 }
     }
+    # Servidor Dell: o iDRAC é coletado por SNMP, que exige o collector.
+    if ($Modo -eq "auto" -and $null -ne $script:IdracDetectado) { $indiceModo = 2 }
     if ($Edicao) { $indiceModo = $(if (-not $script:MonitorHost) { 1 } elseif ($script:Collector) { 2 } else { 0 }) }
     $p.Controls.Add((New-GuiLabel "Função deste Alloy" 24 277 200))
     $g.Modo = New-GuiCombo 230 274 420 $modos $indiceModo
@@ -9218,7 +9343,7 @@ function Show-NextecInstallerGui {
     # ---------------- SNMP ----------------
     $p = New-Object Windows.Forms.TabPage; $p.Text = "SNMP"; $p.BackColor = [Drawing.Color]::White
     $g.PaginaSnmp = $p
-    $p.Controls.Add((New-GuiLabel "Equipamentos de rede (firewall, switch, nobreak, AP)" 24 16 640 -Titulo))
+    $p.Controls.Add((New-GuiLabel "Equipamentos SNMP (firewall, switch, nobreak, AP, NAS, iDRAC)" 24 16 640 -Titulo))
     Add-GuiLegendaObrigatorio $p
     $p.Controls.Add((New-GuiLabel "Use Adicionar equipamento: nome, endereço, fabricante e credencial ficam na mesma janela. Duplo clique numa linha edita." 24 46 820 -Dica))
     $g.Snmp = New-GuiGrid 24 72 820 290
@@ -9302,6 +9427,24 @@ function Show-NextecInstallerGui {
             else { $r.Cells["credencial"].Value = $(if ($cred.Versao -eq "v2c") { "v2c (community)" } else { "v3, {0}" -f $cred.Nivel }) }
             $r.Tag = $cred
         }
+    }
+    # Servidor Dell: o iDRAC entra na lista com nome, IP e fabricante. Sem
+    # credencial a página não avança: o técnico edita a linha e informa a
+    # community ou o usuário SNMPv3 do iDRAC (ou remove a linha).
+    if ($null -ne $script:IdracDetectado) {
+        $rotuloIdrac = $NextecSnmpVendors["2"].Label
+        $temIdrac = $false
+        foreach ($r in $g.Snmp.Rows) { if ((Get-GuiCelula $r "fabricante") -eq $rotuloIdrac) { $temIdrac = $true } }
+        if (-not $temIdrac) {
+            $r = $g.Snmp.Rows[$g.Snmp.Rows.Add()]
+            $r.Cells["nome"].Value = ((Get-GuiSlug ("idrac_{0}" -f $env:COMPUTERNAME)) -replace "[-.]", "_")
+            $r.Cells["endereco"].Value = [string]$script:IdracDetectado.Endereco
+            $r.Cells["fabricante"].Value = $rotuloIdrac
+            $r.Cells["tipo"].Value = "servidor"
+            $r.Cells["credencial"].Value = "falta (editar)"
+            $r.Tag = $null
+        }
+        $p.Controls.Add((New-GuiLabel "Servidor Dell: o iDRAC já está na lista. Edite a linha e informe a credencial SNMP do iDRAC (iDRAC Settings > Services > SNMP Agent)." 24 440 820 -Dica))
     }
 
     # ---------------- Exporters ----------------
@@ -9497,7 +9640,7 @@ function Show-NextecInstallerGui {
             }
         }
         if ($coleta) {
-            [void](& $novo $null "snmp" "SNMP: firewall, switch, nobreak, AP" ([bool]$EnableSnmp.IsPresent))
+            [void](& $novo $null "snmp" "SNMP: firewall, switch, nobreak, AP, NAS, iDRAC" ([bool]$EnableSnmp.IsPresent -or $null -ne $script:IdracDetectado))
             [void](& $novo $null "blackbox" "Conectividade: ping, HTTP, TCP, DNS" ([bool]$EnableBlackbox.IsPresent))
             [void](& $novo $null "internet" "Teste de velocidade (Speedtest)" ([bool]$EnableInternet.IsPresent))
         }
