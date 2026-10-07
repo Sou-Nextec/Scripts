@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.14.0"
+INSTALLER_VERSION="2.15.0"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -1128,7 +1128,502 @@ bancos_arquivos() {
 }
 
 needs_loki() {
-  [[ "${ENABLE_LOGS:-0}" == "1" ]] || coleta_enabled
+  [[ "${ENABLE_LOGS:-0}" == "1" ]] || coleta_enabled || [[ -n "$(syslog_origens)" ]]
+}
+
+# Syslog dos equipamentos SNMP. 5514/udp recebe o formato BSD (RFC3164, pfSense,
+# MikroTik, SonicWall e a maioria dos switches); 5515/udp recebe o RFC5424
+# (FortiGate e equipamentos que não mandam o cabeçalho BSD).
+SYSLOG_PORTA_BSD=5514
+SYSLOG_PORTA_5424=5515
+
+# Uma linha "nome|ip|tipo|os" por equipamento SNMP com IPv4 conhecido. Endereço
+# por nome é resolvido agora e fica de fora se não resolver.
+syslog_origens() {
+  [[ "${ENABLE_SNMP:-0}" == "1" ]] || return 0
+  local item sn_name sn_addr sn_module sn_auth sn_type sn_os ip vistos=" "
+  for item in "${SNMP_TARGETS[@]}"; do
+    IFS='|' read -r sn_name sn_addr sn_module sn_auth sn_type sn_os <<<"$item"
+    sn_addr="${sn_addr#udp://}"; sn_addr="${sn_addr#tcp://}"; sn_addr="${sn_addr%:*}"
+    if [[ "$sn_addr" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      ip="$sn_addr"
+    else
+      ip="$(getent ahostsv4 "$sn_addr" 2>/dev/null | awk 'NR==1 {print $1}')" || ip=""
+    fi
+    [[ -n "$ip" && "$vistos" != *" $ip "* ]] || continue
+    vistos+="$ip "
+    printf '%s|%s|%s|%s\n' "$sn_name" "$ip" "$sn_type" "$sn_os"
+  done
+}
+
+# IP deste servidor na rede dos equipamentos, para o técnico apontar o syslog.
+syslog_endereco_local() {
+  local primeiro
+  primeiro="$(syslog_origens | awk -F'|' 'NR==1 {print $2}')"
+  [[ -n "$primeiro" ]] || return 0
+  ip -4 route get "$primeiro" 2>/dev/null | awk '{for (i=1; i<NF; i++) if ($i == "src") {print $(i+1); exit}}'
+}
+
+# Libera as portas do syslog no firewall local (ufw ou firewalld), só para os IPs
+# dos equipamentos cadastrados. Sem firewall local ativo, não há o que fazer.
+liberar_syslog_firewall() {
+  local origens ip
+  origens="$(syslog_origens)"
+  [[ -n "$origens" ]] || return 0
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"; then
+    while IFS='|' read -r _ ip _ _; do
+      ufw allow proto udp from "$ip" to any port "${SYSLOG_PORTA_BSD},${SYSLOG_PORTA_5424}" comment "Nextec syslog" >/dev/null || true
+    done <<<"$origens"
+    ok "Syslog liberado no ufw para os equipamentos cadastrados."
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    while IFS='|' read -r _ ip _ _; do
+      firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=${ip} port port=${SYSLOG_PORTA_BSD}-${SYSLOG_PORTA_5424} protocol=udp accept" >/dev/null || true
+    done <<<"$origens"
+    firewall-cmd --reload >/dev/null || true
+    ok "Syslog liberado no firewalld para os equipamentos cadastrados."
+  fi
+}
+
+# Normalização igual nos instaladores Windows e Linux e na central.
+syslog_processo() {
+  cat <<'NEXTEC_SYSLOG_EOF'
+// Normaliza o syslog dos equipamentos para os eventos do painel Nextec | Firewall
+// e das regras de alerta. Cada linha vira JSON com o texto original em _entry e,
+// quando reconhecida, os campos evento, usuario, ip_origem, via e detalhe.
+// O rótulo nivel sai da severidade do syslog. Tráfego por regra (filterlog do
+// pfSense e type="traffic" do FortiGate) é descartado: o volume é alto e o
+// painel não usa.
+loki.process "syslog_equipamentos" {
+  forward_to = [loki.write.nextec.receiver]
+
+  // Mensagem de IP fora do cadastro chega sem host: descarta. O hostname que
+  // vem na mensagem não é confiável para identificar o equipamento.
+  stage.match {
+    selector            = "{origem=\"syslog\", host=\"\"}"
+    action              = "drop"
+    drop_counter_reason = "origem_desconhecida"
+  }
+
+  stage.drop {
+    source              = "programa"
+    expression          = "^filterlog$"
+    drop_counter_reason = "trafego_por_regra"
+  }
+  stage.drop {
+    expression          = "type=\"?traffic\"?\\s"
+    drop_counter_reason = "trafego_por_regra"
+  }
+
+  stage.template {
+    source   = "nivel"
+    template = "{{ if or (eq .severidade \"emergency\") (eq .severidade \"alert\") (eq .severidade \"critical\") }}critico{{ else if eq .severidade \"error\" }}erro{{ else if eq .severidade \"warning\" }}aviso{{ else }}info{{ end }}"
+  }
+  stage.labels {
+    values = { nivel = "" }
+  }
+
+  // ---------------------------------------------------------------- FortiGate
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"logid=\\\"?[0-9]{10}\""
+
+    stage.logfmt {
+      mapping = { usuario_fg = "user", ip_fg = "srcip", remip_fg = "remip", via_fg = "method", msg_fg = "msg", cfgpath_fg = "cfgpath", tunel_fg = "vpntunnel", ui_fg = "ui" }
+    }
+    // ui="GUI(10.0.0.5)": canal e IP de quem alterou a configuração.
+    stage.regex {
+      source     = "ui_fg"
+      expression = "^(?P<ui_via_fg>[A-Za-z]+)\\((?P<ui_ip_fg>[0-9a-fA-F.:]+)\\)"
+    }
+    stage.template {
+      source   = "usuario"
+      template = "{{ if .usuario_fg }}{{ .usuario_fg }}{{ end }}"
+    }
+    stage.template {
+      source   = "ip_origem"
+      template = "{{ if .remip_fg }}{{ .remip_fg }}{{ else if .ip_fg }}{{ .ip_fg }}{{ else if .ui_ip_fg }}{{ .ui_ip_fg }}{{ end }}"
+    }
+    stage.template {
+      source   = "via"
+      template = "{{ if .via_fg }}{{ .via_fg }}{{ else if .ui_via_fg }}{{ ToLower .ui_via_fg }}{{ end }}"
+    }
+    stage.template {
+      source   = "detalhe"
+      template = "{{ if .cfgpath_fg }}{{ .cfgpath_fg }}{{ else if .tunel_fg }}{{ .tunel_fg }}: {{ .msg_fg }}{{ else if .msg_fg }}{{ .msg_fg }}{{ end }}"
+    }
+
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"logid=\\\"?0100032001\""
+      stage.template {
+      source   = "evento"
+      template = "admin_login"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"logid=\\\"?0100032003\""
+      stage.template {
+      source   = "evento"
+      template = "admin_logout"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"logid=\\\"?0100032002\""
+      stage.template {
+      source   = "evento"
+      template = "admin_login_falha"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"logdesc=\\\"(Object attribute configured|Object added|Object deleted|Attribute configured|Path configured)\""
+      stage.template {
+      source   = "evento"
+      template = "config_alterada"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"tunneltype=\\\"?ssl\" |~ \"action=\\\"?tunnel-up\""
+      stage.template {
+      source   = "evento"
+      template = "vpn_conectou"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"tunneltype=\\\"?ssl\" |~ \"action=\\\"?tunnel-down\""
+      stage.template {
+      source   = "evento"
+      template = "vpn_desconectou"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"action=\\\"?ssl-login-fail\""
+      stage.template {
+      source   = "evento"
+      template = "vpn_login_falha"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} !~ \"tunneltype=\\\"?ssl\" |~ \"action=\\\"?tunnel-up\""
+      stage.template {
+      source   = "evento"
+      template = "tunel_subiu"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} !~ \"tunneltype=\\\"?ssl\" |~ \"action=\\\"?tunnel-down\""
+      stage.template {
+      source   = "evento"
+      template = "tunel_caiu"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"(?i)(member\\\\(\\\\d+\\\\) dead|status=\\\"?dead|was turned down|interface status changed.*status=\\\"?down)\""
+      stage.template {
+      source   = "evento"
+      template = "link_caiu"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"(?i)(member\\\\(\\\\d+\\\\) alive|status=\\\"?alive|was turned up|interface status changed.*status=\\\"?up)\""
+      stage.template {
+      source   = "evento"
+      template = "link_voltou"
+    }
+    }
+    stage.match {
+      selector = "{origem=\"syslog\"} |~ \"type=\\\"?utm\" |~ \"action=\\\"?(blocked|dropped|deny|reset)\""
+      stage.template {
+      source   = "evento"
+      template = "ameaca_bloqueada"
+    }
+    }
+  }
+
+  // ------------------------------------------------- pfSense, OPNsense e Linux
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"Successful login for user\""
+    stage.regex { expression = "Successful login for user '(?P<usuario>[^']*)' from: (?P<ip_origem>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_login"
+    }
+stage.template {
+      source   = "via"
+      template = "web"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"authentication error for user\""
+    stage.regex { expression = "authentication error for user '(?P<usuario>[^']*)' from: (?P<ip_origem>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_login_falha"
+    }
+stage.template {
+      source   = "via"
+      template = "web"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"User logged out for user\""
+    stage.regex { expression = "User logged out for user '(?P<usuario>[^']*)' from: (?P<ip_origem>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_logout"
+    }
+stage.template {
+      source   = "via"
+      template = "web"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"Configuration Change: \""
+    stage.regex { expression = "Configuration Change: (?P<usuario>[^@]+)@(?P<ip_origem>[^ ]+)[^:]*: (?P<detalhe>.*)" }
+    stage.template {
+      source   = "evento"
+      template = "config_alterada"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\", programa=\"sshd\"} |~ \"Accepted [a-z-]+ for \""
+    stage.regex { expression = "Accepted [a-z-]+ for (?P<usuario>[^ ]+) from (?P<ip_origem>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_login"
+    }
+stage.template {
+      source   = "via"
+      template = "ssh"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\", programa=\"sshd\"} |~ \"Failed [a-z-]+ for \""
+    stage.regex { expression = "Failed [a-z-]+ for (invalid user )?(?P<usuario>[^ ]+) from (?P<ip_origem>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_login_falha"
+    }
+stage.template {
+      source   = "via"
+      template = "ssh"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"Gateway alarm: .*Alarm:1\""
+    stage.regex { expression = "Gateway alarm: (?P<detalhe>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "link_caiu"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"Gateway alarm: .*Alarm:0\""
+    stage.regex { expression = "Gateway alarm: (?P<detalhe>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "link_voltou"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\", programa=~\"openvpn.*\"} |~ \"user '[^']+' authenticated\""
+    stage.regex { expression = "(?P<ip_origem>[0-9.]+):[0-9]+ .*user '(?P<usuario>[^']+)' authenticated" }
+    stage.template {
+      source   = "evento"
+      template = "vpn_conectou"
+    }
+stage.template {
+      source   = "via"
+      template = "openvpn"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\", programa=~\"openvpn.*\"} |~ \"could not authenticate|AUTH_FAILED\""
+    stage.regex { expression = "user '(?P<usuario>[^']+)'" }
+    stage.template {
+      source   = "evento"
+      template = "vpn_login_falha"
+    }
+stage.template {
+      source   = "via"
+      template = "openvpn"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\", programa=~\"openvpn.*\"} |~ \"client-instance exiting|Inactivity timeout\""
+    stage.regex { expression = "^(?P<usuario>[^/ ]+)/(?P<ip_origem>[0-9.]+)" }
+    stage.template {
+      source   = "evento"
+      template = "vpn_desconectou"
+    }
+stage.template {
+      source   = "via"
+      template = "openvpn"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\", programa=\"charon\"} |~ \"IKE_SA .* established\""
+    stage.regex { expression = "IKE_SA (?P<detalhe>[^\\[ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "tunel_subiu"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\", programa=\"charon\"} |~ \"deleting IKE_SA\""
+    stage.regex { expression = "deleting IKE_SA (?P<detalhe>[^\\[ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "tunel_caiu"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\", programa=~\"suricata|snort\"} |~ \"\\\\[(Drop|wDrop|Block)\\\\]|\\\\[\\\\*\\\\*\\\\]\""
+    stage.template {
+      source   = "evento"
+      template = "ameaca_bloqueada"
+    }
+  }
+
+  // ----------------------------------------------------------------- MikroTik
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"user [^ ]+ logged in from \""
+    stage.regex { expression = "user (?P<usuario>[^ ]+) logged in from (?P<ip_origem>[^ ]+) via (?P<via>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_login"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"user [^ ]+ logged out from \""
+    stage.regex { expression = "user (?P<usuario>[^ ]+) logged out from (?P<ip_origem>[^ ]+) via (?P<via>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_logout"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"login failure for user \""
+    stage.regex { expression = "login failure for user (?P<usuario>[^ ]+) from (?P<ip_origem>[^ ]+) via (?P<via>[^ ]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_login_falha"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \" (changed|added|removed) by \" !~ \"Configuration Change: \""
+    stage.regex { expression = "^([a-z]+(,[a-z]+)* )?(?P<detalhe>.+?) (changed|added|removed) by (.*[(:])?(?P<usuario>[A-Za-z0-9_.-]+)(@(?P<ip_origem>[0-9.]+))?" }
+    stage.template {
+      source   = "evento"
+      template = "config_alterada"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \" link down$\""
+    stage.regex { expression = "(?P<detalhe>[^ ]+) link down$" }
+    stage.template {
+      source   = "evento"
+      template = "link_caiu"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \" link up$\""
+    stage.regex { expression = "(?P<detalhe>[^ ]+) link up$" }
+    stage.template {
+      source   = "evento"
+      template = "link_voltou"
+    }
+  }
+
+  // ---------------------------------------------------------------- SonicWall
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"msg=\\\"(Administrator|User) login allowed\""
+    stage.regex { expression = "usr=\"(?P<usuario>[^\"]*)\".*src=(?P<ip_origem>[0-9.]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_login"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"msg=\\\"(Administrator|User) logged out\""
+    stage.regex { expression = "usr=\"(?P<usuario>[^\"]*)\".*src=(?P<ip_origem>[0-9.]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_logout"
+    }
+  }
+  stage.match {
+    selector = "{origem=\"syslog\"} |~ \"msg=\\\"(Administrator|User) login denied\""
+    stage.regex { expression = "usr=\"(?P<usuario>[^\"]*)\".*src=(?P<ip_origem>[0-9.]+)" }
+    stage.template {
+      source   = "evento"
+      template = "admin_login_falha"
+    }
+  }
+
+  stage.pack {
+    labels = ["evento", "usuario", "ip_origem", "via", "detalhe", "programa"]
+  }
+  stage.label_drop {
+    values = ["severidade"]
+  }
+}
+NEXTEC_SYSLOG_EOF
+}
+
+# Receptor de syslog dos equipamentos SNMP. O IP de quem envia define host,
+# tipo, os e servico; mensagem de IP desconhecido fica sem host e é descartada
+# no loki.process, porque o hostname que vem na mensagem não é confiável.
+generate_syslog_config() {
+  local origens nome ip tipo os rotulo valor ip_regex rotulos porta formato
+  origens="$(syslog_origens)"
+  [[ -n "$origens" ]] || return 0
+
+  printf '\n// Syslog dos equipamentos SNMP: só os IPs cadastrados entram.\n'
+  printf 'loki.relabel "syslog_equipamentos" {\n  forward_to = []\n'
+  while IFS='|' read -r nome ip tipo os; do
+    ip_regex="${ip//./\\\\.}"
+    for rotulo in host tipo servico os; do
+      case "$rotulo" in host) valor="$nome" ;; tipo|servico) valor="$tipo" ;; os) valor="$os" ;; esac
+      cat <<EOF
+  rule {
+    source_labels = ["__syslog_connection_ip_address"]
+    regex         = "${ip_regex}"
+    target_label  = "${rotulo}"
+    replacement   = "$(alloy_escape "$valor")"
+  }
+EOF
+    done
+  done <<<"$origens"
+  cat <<'EOF'
+  rule {
+    source_labels = ["__syslog_message_severity"]
+    target_label  = "severidade"
+  }
+  rule {
+    source_labels = ["__syslog_message_app_name"]
+    target_label  = "programa"
+  }
+}
+
+EOF
+  rotulos="cliente = \"$(alloy_escape "$CLIENTE")\", ambiente = \"$(alloy_escape "$AMBIENTE")\", origem = \"syslog\", criticidade = \"$(alloy_escape "$CRITICIDADE")\", local = \"$(alloy_escape "$LOCAL")\""
+  printf 'loki.source.syslog "equipamentos" {\n'
+  for porta in "${SYSLOG_PORTA_BSD}:rfc3164" "${SYSLOG_PORTA_5424}:rfc5424"; do
+    formato="${porta#*:}"; porta="${porta%%:*}"
+    cat <<EOF
+  listener {
+    address       = "0.0.0.0:${porta}"
+    protocol      = "udp"
+    syslog_format = "${formato}"
+    labels        = { ${rotulos} }
+  }
+EOF
+  done
+  cat <<'EOF'
+  relabel_rules = loki.relabel.syslog_equipamentos.rules
+  forward_to    = [loki.process.syslog_equipamentos.receiver]
+}
+
+EOF
+  syslog_processo
 }
 
 ini_value() {
@@ -1594,6 +2089,11 @@ configure_service_env() {
 
   # Na atualização as credenciais já estão em ${ENV_FILE} e ficam como estão.
   if [[ "$MODO_ATUALIZACAO" == "1" ]]; then
+    # Host que passou a precisar do Loki (ex.: syslog dos equipamentos) usa a
+    # credencial do remote_write, como no modo silencioso.
+    if needs_loki && ! env_tem_chave NEXTEC_LOKI_USERNAME; then
+      copiar_credencial_rw_para_loki
+    fi
     configure_service_groups
     ok "Credenciais mantidas em ${ENV_FILE}."
     return 0
@@ -2221,6 +2721,7 @@ prometheus.scrape "snmp" {
   scrape_timeout  = "60s"
 }
 EOF
+      generate_syslog_config
     fi
 
     if (( ${#CUSTOM_EXPORTERS[@]} > 0 )); then
@@ -2741,6 +3242,8 @@ validate_and_start() {
 
   alloy validate "$CONFIG_FILE"
   ok "Sintaxe do Alloy válida."
+
+  liberar_syslog_firewall
 
   systemctl daemon-reload
   systemctl restart alloy
@@ -3698,6 +4201,11 @@ final_summary() {
   [[ "${ENABLE_ACESSOS:-0}" == 1 ]] && campo "Acessos" "logins com origem e alerta de privilegiado" "$GREEN"
   [[ "$ENABLE_BLACKBOX" == 1 ]] && campo "Conectividade" "${#BLACKBOX_TARGETS[@]} alvo(s)" "$GREEN"
   [[ "$ENABLE_SNMP" == 1 ]] && campo "SNMP" "${#SNMP_TARGETS[@]} equipamento(s)" "$GREEN"
+  if [[ -n "$(syslog_origens)" ]]; then
+    local end_syslog
+    end_syslog="$(syslog_endereco_local)"
+    campo "Syslog" "${end_syslog:-<IP deste servidor>}:${SYSLOG_PORTA_BSD}/udp (BSD) ou :${SYSLOG_PORTA_5424}/udp (RFC5424, FortiGate)" "$GREEN"
+  fi
   (( ${#DATABASE_TARGETS[@]} > 0 )) && campo "Banco(s) de dados" "${#DATABASE_TARGETS[@]}" "$GREEN"
 
   secao "Arquivos"
