@@ -102,7 +102,7 @@ if ($PSVersionTable.PSEdition -eq 'Desktop') {
     $caminhosModulo = @($env:PSModulePath -split ';' | Where-Object { $_ -match 'WindowsPowerShell' })
     if ($caminhosModulo.Count) { $env:PSModulePath = $caminhosModulo -join ';' }
 }
-$script:Versao         = '2.1'
+$script:Versao         = '2.1.1'
 $script:Rotulo         = @{ CRITICO = 'CRÍTICO'; ALTO = 'ALTO'; MEDIO = 'MÉDIO'; BAIXO = 'BAIXO'; INFO = 'INFO' }
 $script:Inicio         = Get-Date
 $script:DesdeData      = (Get-Date).AddDays(-$Dias)
@@ -296,6 +296,73 @@ function Test-Porta {
     } finally { $cli.Close() }
 }
 
+$script:CimFalhas = @{}
+
+function Get-CimSeguro {
+    <# Get-CimInstance que nao derruba a etapa quando o repositorio WMI esta corrompido
+       (HRESULT 0x80041010 "Classe inválida", provider ausente etc). Devolve $null e registra a lacuna uma vez por classe.
+       Com -ErrorAction Stop o erro e repassado (para quem ja trata com try/catch). #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0)][string]$ClassName,
+        [string]$Namespace = 'root\cimv2',
+        [string]$Filter,
+        [switch]$Silencioso
+    )
+    $param = @{ ClassName = $ClassName; Namespace = $Namespace; ErrorAction = 'Stop' }
+    if ($Filter) { $param.Filter = $Filter }
+    try { Get-CimInstance @param }
+    catch {
+        $chave = "$Namespace\$ClassName"
+        $msg = ($_.Exception.Message -replace '\s+', ' ').Trim()
+        $primeira = -not $script:CimFalhas.ContainsKey($chave)
+        if ($primeira) { $script:CimFalhas[$chave] = $msg }
+        if ("$($PSBoundParameters['ErrorAction'])" -eq 'Stop') { throw }
+        if ($primeira -and -not $Silencioso) { Add-Lacuna "WMI $chave" $msg }
+        return $null
+    }
+}
+
+function Get-MemoriaFallback {
+    <# Memoria fisica sem WMI (Microsoft.VisualBasic.Devices.ComputerInfo). Devolve TotalKB e LivreKB, ou $null. #>
+    try {
+        Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
+        $ci = New-Object Microsoft.VisualBasic.Devices.ComputerInfo
+        [pscustomobject]@{ TotalKB = [double]$ci.TotalPhysicalMemory / 1KB; LivreKB = [double]$ci.AvailablePhysicalMemory / 1KB }
+    } catch { $null }
+}
+
+function Get-DadosSistemaSemWmi {
+    <# Monta objetos equivalentes a Win32_OperatingSystem / ComputerSystem / BIOS lendo registro e .NET,
+       para o diagnostico continuar util quando o WMI esta quebrado. #>
+    $nt = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+    $bz = Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\BIOS' -ErrorAction SilentlyContinue
+    $ip = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -ErrorAction SilentlyContinue
+    $nl = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters' -ErrorAction SilentlyContinue
+    $instalado = $null
+    if ($nt.InstallDate) {
+        try { $instalado = ([datetime]::SpecifyKind([datetime]'1970-01-01', [DateTimeKind]::Utc)).AddSeconds([double]$nt.InstallDate).ToLocalTime() } catch { }
+    }
+    $boot = $null
+    try { $boot = (Get-Process -Id 4 -ErrorAction Stop).StartTime } catch { }
+    $mem = Get-MemoriaFallback
+    $dominio = $nl.DomainName
+    $versao = if ($nt.CurrentMajorVersionNumber) { '{0}.{1}.{2}' -f $nt.CurrentMajorVersionNumber, $nt.CurrentMinorVersionNumber, $nt.CurrentBuildNumber } else { '{0}.{1}' -f $nt.CurrentVersion, $nt.CurrentBuildNumber }
+    [pscustomobject]@{
+        OS = [pscustomobject]@{
+            Caption = $nt.ProductName; Version = $versao; BuildNumber = $nt.CurrentBuildNumber
+            OSArchitecture = $(if ([Environment]::Is64BitOperatingSystem) { '64 bits' } else { '32 bits' })
+            InstallDate = $instalado; LastBootUpTime = $boot
+        }
+        CS = [pscustomobject]@{
+            Domain = $(if ($dominio) { $dominio } else { $ip.Domain }); PartOfDomain = [bool]$dominio
+            Manufacturer = $bz.SystemManufacturer; Model = $bz.SystemProductName
+            TotalPhysicalMemory = $(if ($mem) { $mem.TotalKB * 1KB } else { 0 })
+        }
+        BIOS = [pscustomobject]@{ SerialNumber = '(indisponível sem WMI)'; SMBIOSBIOSVersion = $bz.BIOSVersion; ReleaseDate = $bz.BIOSReleaseDate }
+    }
+}
+
 function Get-UsuarioAlvo {
     <# Descobre o usuario que esta usando a maquina (quem abriu o explorer.exe), mesmo que o script
        tenha sido elevado com outra conta. Dados por usuario (registro HKCU, perfil) vem dele. #>
@@ -303,8 +370,8 @@ function Get-UsuarioAlvo {
     $res = [pscustomobject]@{ Nome = $atual.Name; SID = $atual.User.Value; Perfil = $env:USERPROFILE
         Origem = 'usuário do processo'; HKU = "Registry::HKEY_USERS\$($atual.User.Value)"; Outro = $false }
     try {
-        $console = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName
-        $cands = foreach ($p in (Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop)) {
+        $console = (Get-CimSeguro Win32_ComputerSystem -ErrorAction Stop).UserName
+        $cands = foreach ($p in (Get-CimSeguro Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop)) {
             $sid = (Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid -ErrorAction SilentlyContinue).Sid
             $own = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue
             if ($sid) { [pscustomobject]@{ SID = $sid; Nome = "$($own.Domain)\$($own.User)" } }
@@ -318,7 +385,20 @@ function Get-UsuarioAlvo {
                 Origem = 'usuário logado (explorer.exe)'; HKU = "Registry::HKEY_USERS\$($alvo.SID)"
                 Outro = ($alvo.SID -ne $atual.User.Value) }
         }
-    } catch { }
+    } catch {
+        # Sem WMI: tenta o dono do explorer.exe pelo proprio Get-Process (precisa de administrador)
+        try {
+            $exp = Get-Process -Name explorer -IncludeUserName -ErrorAction Stop | Select-Object -First 1
+            if ($exp -and $exp.UserName) {
+                $sid = (New-Object Security.Principal.NTAccount($exp.UserName)).Translate([Security.Principal.SecurityIdentifier]).Value
+                $perfil = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid" -ErrorAction SilentlyContinue).ProfileImagePath
+                if (-not $perfil) { $perfil = $env:USERPROFILE }
+                $res = [pscustomobject]@{ Nome = $exp.UserName; SID = $sid; Perfil = $perfil
+                    Origem = 'usuário logado (explorer.exe, sem WMI)'; HKU = "Registry::HKEY_USERS\$sid"
+                    Outro = ($sid -ne $atual.User.Value) }
+            }
+        } catch { }
+    }
     return $res
 }
 Write-Host ''
@@ -334,6 +414,18 @@ if (-not $script:IsAdmin) {
     Write-Log 'Script NÃO está rodando como Administrador. Várias coletas ficarão incompletas.' 'AVISO'
     Add-Achado -Severidade MEDIO -Categoria 'Execução' -Titulo 'Diagnóstico executado sem privilégios de administrador' `
         -Detalhe 'SMART, BitLocker, log de Segurança, DISM e alguns eventos não foram coletados. Rode novamente como Administrador.'
+}
+
+# Saude do WMI: varias coletas (hardware, servicos, desempenho) dependem dele. Se estiver quebrado, o script
+# usa fontes alternativas (registro, .NET, Get-Service) e registra o problema como achado.
+$null = Get-CimSeguro Win32_OperatingSystem -Silencioso -ErrorAction SilentlyContinue
+if ($script:CimFalhas.Count -gt 0) {
+    $classe = ($script:CimFalhas.Keys | Select-Object -First 1)
+    Write-Log "WMI com defeito: $classe ($($script:CimFalhas[$classe])). Usando fontes alternativas." 'AVISO'
+    Invoke-Externo '01_Sistema' 'wmi_verificacao.txt' 'winmgmt /verifyrepository' 90 | Out-Null
+    $detalheWmi = ('Falha ao consultar {0}: {1}. Coletas que dependem de WMI (hardware, serviços, contadores, drivers, segurança) ficaram incompletas ou usaram fontes alternativas. ' -f $classe, $script:CimFalhas[$classe]) +
+        'Correção (administrador): winmgmt /verifyrepository; se inconsistente, winmgmt /salvagerepository e reiniciar o serviço (net stop winmgmt && net start winmgmt). Se persistir, recompilar os MOFs ou, como último recurso, winmgmt /resetrepository (apaga o repositório: reinstalar aplicativos que registram WMI, como agentes de monitoramento e backup).'
+    Add-Achado ALTO 'Sistema' 'Repositório WMI corrompido ou inconsistente' $detalheWmi '01_Sistema\wmi_verificacao.txt'
 }
 
 $script:Alvo = Get-UsuarioAlvo
@@ -353,10 +445,19 @@ if ($SemDadosSensiveis) {
 # 01 SISTEMA
 # ---------------------------------------------------------------------------
 Invoke-Etapa 'Sistema operacional' {
-    $os   = Get-CimInstance Win32_OperatingSystem
-    $cs   = Get-CimInstance Win32_ComputerSystem
-    $bios = Get-CimInstance Win32_BIOS
-    $uptime = (Get-Date) - $os.LastBootUpTime
+    $os   = Get-CimSeguro Win32_OperatingSystem
+    $cs   = Get-CimSeguro Win32_ComputerSystem
+    $bios = Get-CimSeguro Win32_BIOS
+    if (-not $os -or -not $cs -or -not $bios) {
+        # WMI indisponivel: completa o que faltou lendo registro e .NET
+        $alt = Get-DadosSistemaSemWmi
+        if (-not $os)   { $os = $alt.OS }
+        if (-not $cs)   { $cs = $alt.CS }
+        if (-not $bios) { $bios = $alt.BIOS }
+        Save-Texto '01_Sistema' 'nota_sem_wmi.txt' 'Dados do sistema lidos do registro e do .NET porque o WMI não respondeu. Serial e alguns campos ficam indisponíveis.'
+    }
+    $uptime = $null
+    if ($os.LastBootUpTime) { $uptime = (Get-Date) - $os.LastBootUpTime }
 
     $info = [ordered]@{
         Computador      = $env:COMPUTERNAME
@@ -374,7 +475,7 @@ Invoke-Etapa 'Sistema operacional' {
         Arquitetura     = $os.OSArchitecture
         Instalado       = $os.InstallDate
         UltimoBoot      = $os.LastBootUpTime
-        Uptime          = '{0}d {1}h {2}m' -f $uptime.Days, $uptime.Hours, $uptime.Minutes
+        Uptime          = $(if ($uptime) { '{0}d {1}h {2}m' -f $uptime.Days, $uptime.Hours, $uptime.Minutes } else { 'indisponível' })
         FusoHorario     = (Get-TimeZone).DisplayName
         RAMTotal        = Format-Bytes $cs.TotalPhysicalMemory
         Admin           = $script:IsAdmin
@@ -383,7 +484,7 @@ Invoke-Etapa 'Sistema operacional' {
     Save-Texto '01_Sistema' 'resumo_sistema.txt' ([pscustomobject]$info | Format-List)
     $script:InfoSistema = $info
 
-    if ($uptime.TotalDays -gt 30) {
+    if ($uptime -and $uptime.TotalDays -gt 30) {
         Add-Achado ALTO 'Sistema' "Máquina ligada há $([int]$uptime.TotalDays) dias sem reiniciar" `
             'Uptime longo acumula vazamento de memória e impede a conclusão de updates.' '01_Sistema\resumo_sistema.txt'
     }
@@ -449,7 +550,7 @@ Invoke-Etapa 'Reinicialização pendente' {
 }
 
 Invoke-Etapa 'Ativação do Windows' {
-    $lic = Get-CimInstance SoftwareLicensingProduct -Filter "PartialProductKey IS NOT NULL AND Name LIKE 'Windows%'" -ErrorAction SilentlyContinue
+    $lic = Get-CimSeguro SoftwareLicensingProduct -Filter "PartialProductKey IS NOT NULL AND Name LIKE 'Windows%'" -ErrorAction SilentlyContinue
     $status = @{ 0 = 'Não licenciado'; 1 = 'Licenciado'; 2 = 'Período OOB'; 3 = 'Período OOT'; 4 = 'Não original'; 5 = 'Notificação'; 6 = 'Período estendido' }
     $dados = $lic | Select-Object Name, Description, @{n = 'Status'; e = { $status[[int]$_.LicenseStatus] } }, PartialProductKey
     Save-Texto '01_Sistema' 'ativacao.txt' ($dados | Format-List)
@@ -462,22 +563,38 @@ Invoke-Etapa 'Ativação do Windows' {
 # 02 HARDWARE
 # ---------------------------------------------------------------------------
 Invoke-Etapa 'CPU e memória' {
-    $cpu = Get-CimInstance Win32_Processor
-    Save-Texto '02_Hardware' 'cpu.txt' ($cpu | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors,
-        MaxClockSpeed, CurrentClockSpeed, LoadPercentage, L2CacheSize, L3CacheSize, VirtualizationFirmwareEnabled | Format-List)
+    $cpu = Get-CimSeguro Win32_Processor
+    if ($cpu) {
+        Save-Texto '02_Hardware' 'cpu.txt' ($cpu | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors,
+            MaxClockSpeed, CurrentClockSpeed, LoadPercentage, L2CacheSize, L3CacheSize, VirtualizationFirmwareEnabled | Format-List)
+    } else {
+        $rc = Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0' -ErrorAction SilentlyContinue
+        Save-Texto '02_Hardware' 'cpu.txt' ([pscustomobject]@{ Name = $rc.ProcessorNameString; NumberOfLogicalProcessors = [Environment]::ProcessorCount
+            MaxClockSpeed = $rc.'~MHz'; Fonte = 'registro (WMI indisponível)' } | Format-List)
+    }
 
-    $pentes = Get-CimInstance Win32_PhysicalMemory
+    $pentes = Get-CimSeguro Win32_PhysicalMemory
     Save-Csv '02_Hardware' 'memoria_pentes.csv' ($pentes | Select-Object BankLabel, DeviceLocator, Manufacturer, PartNumber,
         SerialNumber, @{n = 'Capacidade'; e = { Format-Bytes $_.Capacity } }, Speed, ConfiguredClockSpeed)
 
-    $os = Get-CimInstance Win32_OperatingSystem
-    $usoRam = [math]::Round((1 - $os.FreePhysicalMemory / $os.TotalVisibleMemorySize) * 100, 1)
-    if ($usoRam -ge 90) {
-        Add-Achado ALTO 'Hardware' "Memória RAM com $usoRam% de uso no momento da coleta" 'Verifique os processos em 05_Desempenho.'
+    $os = Get-CimSeguro Win32_OperatingSystem
+    $totalKB = 0; $livreKB = 0
+    if ($os) { $totalKB = [double]$os.TotalVisibleMemorySize; $livreKB = [double]$os.FreePhysicalMemory }
+    else {
+        $mf = Get-MemoriaFallback
+        if ($mf) { $totalKB = $mf.TotalKB; $livreKB = $mf.LivreKB }
     }
-    $totalGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
-    if ($totalGB -lt 7.5) {
-        Add-Achado MEDIO 'Hardware' "Pouca memória RAM instalada ($totalGB GB)" 'Para Windows 10/11 com uso corporativo o recomendado é 8 GB ou mais.'
+    if ($totalKB -gt 0) {
+        $usoRam = [math]::Round((1 - $livreKB / $totalKB) * 100, 1)
+        if ($usoRam -ge 90) {
+            Add-Achado ALTO 'Hardware' "Memória RAM com $usoRam% de uso no momento da coleta" 'Verifique os processos em 05_Desempenho.'
+        }
+        $totalGB = [math]::Round($totalKB / 1MB, 1)
+        if ($totalGB -lt 7.5) {
+            Add-Achado MEDIO 'Hardware' "Pouca memória RAM instalada ($totalGB GB)" 'Para Windows 10/11 com uso corporativo o recomendado é 8 GB ou mais.'
+        }
+    } else {
+        Add-Lacuna 'uso e total de memória RAM' 'WMI indisponível e a leitura alternativa falhou'
     }
     $velocidades = $pentes | Select-Object -ExpandProperty ConfiguredClockSpeed -Unique
     if (($velocidades | Measure-Object).Count -gt 1) {
@@ -535,14 +652,14 @@ Invoke-Etapa 'Discos e volumes' {
         }
     }
     # wmic foi removido do Windows 11 25H2: usar CIM
-    $dd = Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue
+    $dd = Get-CimSeguro Win32_DiskDrive -ErrorAction SilentlyContinue
     Save-Csv '02_Hardware' 'discos_cim.csv' ($dd | Select-Object Model, SerialNumber, Status, InterfaceType, MediaType, FirmwareRevision,
         Partitions, @{n = 'Tamanho'; e = { Format-Bytes $_.Size } }, PNPDeviceID)
     foreach ($x in $dd | Where-Object { $_.Status -and $_.Status -ne 'OK' }) {
         Add-Achado ALTO 'Hardware' "Disco '$($x.Model)' com status '$($x.Status)'" 'Status reportado pelo firmware/SMART (Pred Fail = falha prevista).' '02_Hardware\discos_cim.csv'
     }
     if ($script:IsAdmin) {
-        $pred = Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction SilentlyContinue
+        $pred = Get-CimSeguro -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction SilentlyContinue
         if ($pred) {
             Save-Texto '02_Hardware' 'smart_predicao.txt' ($pred | Select-Object InstanceName, PredictFailure, Reason, Active | Format-Table -AutoSize)
             foreach ($p in $pred | Where-Object PredictFailure) {
@@ -577,7 +694,7 @@ Invoke-Etapa 'Discos e volumes' {
     # Bit "dirty" do NTFS (chkdsk agendado por corrupção). Via CIM: o texto do fsutil muda com o idioma
     # ("esta sujo" e "NAO esta sujo" casavam na mesma busca).
     $sujos = New-Object System.Collections.Generic.List[string]
-    foreach ($v in Get-CimInstance Win32_Volume -Filter 'DriveType=3' -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -and $_.DirtyBitSet }) {
+    foreach ($v in Get-CimSeguro Win32_Volume -Filter 'DriveType=3' -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -and $_.DirtyBitSet }) {
         $sujos.Add($v.DriveLetter)
     }
     if ($sujos.Count) {
@@ -593,7 +710,7 @@ Invoke-Etapa 'Dispositivos com erro' {
         32 = 'Serviço do driver desabilitado'; 37 = 'Falha na inicialização do driver'; 39 = 'Driver corrompido ou ausente'
         43 = 'Dispositivo reportou problema'; 45 = 'Desconectado'; 52 = 'Assinatura do driver inválida'
     }
-    $todos = Get-CimInstance Win32_PnPEntity
+    $todos = Get-CimSeguro Win32_PnPEntity
     $comErro = $todos | Where-Object { $_.ConfigManagerErrorCode -ne 0 } |
         Select-Object Name, PNPClass, Manufacturer, ConfigManagerErrorCode,
             @{n = 'Significado'; e = { $codigos[[int]$_.ConfigManagerErrorCode] } }, DeviceID
@@ -604,7 +721,7 @@ Invoke-Etapa 'Dispositivos com erro' {
         Add-Achado ALTO 'Hardware' "Dispositivo com erro: $($d.Name)" "Código $($d.ConfigManagerErrorCode): $($d.Significado)" '02_Hardware\dispositivos_com_erro.csv'
     }
 
-    $drivers = Get-CimInstance Win32_PnPSignedDriver | Where-Object DeviceName |
+    $drivers = Get-CimSeguro Win32_PnPSignedDriver | Where-Object DeviceName |
         Select-Object DeviceName, DeviceClass, Manufacturer, DriverVersion, DriverDate, DriverProviderName, IsSigned, InfName
     Save-Csv '02_Hardware' 'drivers.csv' $drivers
     $naoAssinados = $drivers | Where-Object { $_.IsSigned -eq $false }
@@ -615,14 +732,14 @@ Invoke-Etapa 'Dispositivos com erro' {
 }
 
 Invoke-Etapa 'Vídeo, bateria e temperatura' {
-    Save-Texto '02_Hardware' 'video.txt' (Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, DriverDate,
+    Save-Texto '02_Hardware' 'video.txt' (Get-CimSeguro Win32_VideoController | Select-Object Name, DriverVersion, DriverDate,
         VideoModeDescription, @{n = 'VRAM'; e = { Format-Bytes $_.AdapterRAM } }, Status | Format-List)
 
-    $bat = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
+    $bat = Get-CimSeguro Win32_Battery -ErrorAction SilentlyContinue
     if ($bat) {
         Invoke-Externo '02_Hardware' 'powercfg_bateria_saida.txt' ("powercfg /batteryreport /output `"{0}`"" -f (Join-Path $script:Raiz '02_Hardware\relatorio_bateria.html')) 60 | Out-Null
-        $full   = (Get-CimInstance -Namespace root\wmi -ClassName BatteryFullChargedCapacity -ErrorAction SilentlyContinue | Select-Object -First 1).FullChargedCapacity
-        $design = (Get-CimInstance -Namespace root\wmi -ClassName BatteryStaticData -ErrorAction SilentlyContinue | Select-Object -First 1).DesignedCapacity
+        $full   = (Get-CimSeguro -Namespace root\wmi -ClassName BatteryFullChargedCapacity -ErrorAction SilentlyContinue | Select-Object -First 1).FullChargedCapacity
+        $design = (Get-CimSeguro -Namespace root\wmi -ClassName BatteryStaticData -ErrorAction SilentlyContinue | Select-Object -First 1).DesignedCapacity
         if ($full -and $design) {
             $saude = [math]::Round($full / $design * 100, 1)
             Save-Texto '02_Hardware' 'bateria.txt' "Capacidade projetada: $design mWh`r`nCapacidade atual: $full mWh`r`nSaúde: $saude%"
@@ -631,7 +748,7 @@ Invoke-Etapa 'Vídeo, bateria e temperatura' {
         }
     }
 
-    $temps = Get-CimInstance -Namespace root\wmi -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue
+    $temps = Get-CimSeguro -Namespace root\wmi -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue
     if ($temps) {
         $lista = $temps | Select-Object InstanceName, @{n = 'Celsius'; e = { [math]::Round($_.CurrentTemperature / 10 - 273.15, 1) } }
         Save-Texto '02_Hardware' 'temperatura_acpi.txt' ($lista | Format-Table -AutoSize)
@@ -1022,10 +1139,10 @@ Invoke-Etapa 'Relatórios WER' {
 }
 
 Invoke-Etapa 'Monitor de confiabilidade' {
-    $rel = Get-CimInstance Win32_ReliabilityRecords -ErrorAction SilentlyContinue | Where-Object TimeGenerated -ge $script:DesdeData
+    $rel = Get-CimSeguro Win32_ReliabilityRecords -ErrorAction SilentlyContinue | Where-Object TimeGenerated -ge $script:DesdeData
     Save-Csv '04_Falhas' 'confiabilidade_registros.csv' ($rel | Select-Object TimeGenerated, SourceName, EventIdentifier, ProductName,
         @{n = 'Mensagem'; e = { ($_.Message -replace '\s+', ' ').Trim() } })
-    $idx = Get-CimInstance Win32_ReliabilityStabilityMetrics -ErrorAction SilentlyContinue | Sort-Object TimeGenerated -Descending | Select-Object -First 30
+    $idx = Get-CimSeguro Win32_ReliabilityStabilityMetrics -ErrorAction SilentlyContinue | Sort-Object TimeGenerated -Descending | Select-Object -First 30
     Save-Csv '04_Falhas' 'confiabilidade_indice.csv' ($idx | Select-Object TimeGenerated, SystemStabilityIndex)
     $atual = $idx | Select-Object -First 1
     if ($atual -and $atual.SystemStabilityIndex -lt 5) {
@@ -1069,21 +1186,21 @@ Invoke-Etapa 'Processos e contadores' {
     # Contadores via CIM: Get-Counter usa nomes localizados e falha em Windows pt-BR.
     # Latência de disco é PERF_AVERAGE_TIMER: precisa de duas amostras brutas (delta / frequência / delta base).
     try {
-        $disco1 = Get-CimInstance Win32_PerfRawData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction Stop
+        $disco1 = Get-CimSeguro Win32_PerfRawData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction Stop
         $linhas = New-Object System.Collections.Generic.List[object]
         for ($i = 0; $i -lt 5; $i++) {
             Start-Sleep -Seconds 2
-            $cpu = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'" -ErrorAction Stop
-            $mem = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop
-            $dsk = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction Stop
-            $sis = Get-CimInstance Win32_PerfFormattedData_PerfOS_System -ErrorAction Stop
+            $cpu = Get-CimSeguro Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'" -ErrorAction Stop
+            $mem = Get-CimSeguro Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop
+            $dsk = Get-CimSeguro Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction Stop
+            $sis = Get-CimSeguro Win32_PerfFormattedData_PerfOS_System -ErrorAction Stop
             $linhas.Add([pscustomobject]@{
                 Hora = Get-Date -Format 'HH:mm:ss'; CPUPct = $cpu.PercentProcessorTime; MemDisponivelMB = $mem.AvailableMBytes
                 PaginasSeg = $mem.PagesPersec; MemComprometidaPct = $mem.PercentCommittedBytesInUse
                 DiscoOcupadoPct = $dsk.PercentDiskTime; FilaDisco = $dsk.CurrentDiskQueueLength; FilaCPU = $sis.ProcessorQueueLength
             })
         }
-        $disco2 = Get-CimInstance Win32_PerfRawData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction Stop
+        $disco2 = Get-CimSeguro Win32_PerfRawData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction Stop
         $lat = foreach ($tipo in 'Read', 'Write') {
             $dBase = [double]$disco2."AvgDisksecPer${tipo}_Base" - [double]$disco1."AvgDisksecPer${tipo}_Base"
             $dVal  = [double]$disco2."AvgDisksecPer$tipo" - [double]$disco1."AvgDisksecPer$tipo"
@@ -1111,7 +1228,7 @@ Invoke-Etapa 'Processos e contadores' {
 }
 
 Invoke-Etapa 'Processos detalhados e assinaturas' {
-    $cim = @(Get-CimInstance Win32_Process)
+    $cim = @(Get-CimSeguro Win32_Process)
     $porId = @{}
     foreach ($p in $cim) { $porId[[int]$p.ProcessId] = $p }
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -1167,11 +1284,13 @@ Invoke-Etapa 'Processos detalhados e assinaturas' {
 }
 
 Invoke-Etapa 'Arquivo de paginação' {
-    $pf = Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue
-    $cfg = Get-CimInstance Win32_ComputerSystem
+    $pf = Get-CimSeguro Win32_PageFileUsage -ErrorAction SilentlyContinue
+    $cfg = Get-CimSeguro Win32_ComputerSystem
+    $pagReg = @((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' -ErrorAction SilentlyContinue).PagingFiles) | Where-Object { $_ }
     Save-Texto '05_Desempenho' 'pagefile.txt' (("Gerenciado automaticamente: {0}" -f $cfg.AutomaticManagedPagefile),
-        ($pf | Select-Object Name, AllocatedBaseSize, CurrentUsage, PeakUsage | Format-Table -AutoSize | Out-String))
-    if (-not $pf) {
+        ($pf | Select-Object Name, AllocatedBaseSize, CurrentUsage, PeakUsage | Format-Table -AutoSize | Out-String),
+        ("Registro (PagingFiles): {0}" -f ($pagReg -join '; ')))
+    if (-not $pf -and -not $pagReg) {
         Add-Achado MEDIO 'Desempenho' 'Sem arquivo de paginação' 'Pode causar falta de memória e impede gravação de dumps de tela azul.'
     }
 }
@@ -1180,7 +1299,17 @@ Invoke-Etapa 'Arquivo de paginação' {
 # 06 SERVICOS
 # ---------------------------------------------------------------------------
 Invoke-Etapa 'Serviços' {
-    $svcs = Get-CimInstance Win32_Service
+    $svcs = Get-CimSeguro Win32_Service
+    if (-not $svcs) {
+        # Sem WMI: usa o gerenciador de servicos (nao traz conta, caminho nem codigo de saida)
+        $mapaInicio = @{ Automatic = 'Auto'; Manual = 'Manual'; Disabled = 'Disabled' }
+        $svcs = @(Get-Service -ErrorAction SilentlyContinue | ForEach-Object {
+            [pscustomobject]@{ Name = $_.Name; DisplayName = $_.DisplayName; State = "$($_.Status)"
+                StartMode = $(if ($mapaInicio.ContainsKey("$($_.StartType)")) { $mapaInicio["$($_.StartType)"] } else { "$($_.StartType)" })
+                StartName = ''; ExitCode = 0; PathName = '' }
+        })
+        if ($svcs.Count) { Save-Texto '06_Servicos' 'nota_sem_wmi.txt' 'Lista de serviços obtida via Get-Service porque o WMI não respondeu: sem conta de execução, caminho e código de saída.' }
+    }
     Save-Csv '06_Servicos' 'servicos_todos.csv' ($svcs | Select-Object Name, DisplayName, State, StartMode, StartName, ExitCode, PathName | Sort-Object Name)
 
     # Automáticos parados (ignorando os que normalmente param sozinhos)
@@ -1525,7 +1654,7 @@ if (-not $SemRede) {
 # 08 SEGURANCA
 # ---------------------------------------------------------------------------
 Invoke-Etapa 'Antivírus e Defender' {
-    $av = Get-CimInstance -Namespace root\SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction SilentlyContinue
+    $av = Get-CimSeguro -Namespace root\SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction SilentlyContinue
     $lista = foreach ($a in $av) {
         $hex = '{0:X6}' -f [int]$a.productState
         [pscustomobject]@{ Produto = $a.displayName; Ativo = ($hex.Substring(2, 2) -in '10', '11')
@@ -1592,7 +1721,7 @@ Invoke-Etapa 'Firewall, BitLocker, TPM, Secure Boot, UAC' {
     if ($rdp -eq 0 -and $nla -ne 1) { Add-Achado MEDIO 'Segurança' 'Área de Trabalho Remota habilitada sem NLA' }
 
     # Win32_OptionalFeature não exige elevação (Get-WindowsOptionalFeature exige)
-    $smb1 = Get-CimInstance Win32_OptionalFeature -Filter "Name='SMB1Protocol'" -ErrorAction SilentlyContinue
+    $smb1 = Get-CimSeguro Win32_OptionalFeature -Filter "Name='SMB1Protocol'" -ErrorAction SilentlyContinue
     if ($smb1 -and $smb1.InstallState -eq 1) { Add-Achado MEDIO 'Segurança' 'Protocolo SMBv1 habilitado' 'Protocolo obsoleto é explorado por ransomware (WannaCry).' }
 }
 
@@ -1606,7 +1735,7 @@ Invoke-Etapa 'Contas e logons' {
         $admins = Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | Select-Object Name, ObjectClass, PrincipalSource
     } catch {
         # Falha conhecida do Get-LocalGroupMember com SID orfao (Entra ID / dominio): usa CIM
-        $grp = Get-CimInstance Win32_Group -Filter "SID='S-1-5-32-544'" -ErrorAction SilentlyContinue
+        $grp = Get-CimSeguro Win32_Group -Filter "SID='S-1-5-32-544'" -ErrorAction SilentlyContinue
         if ($grp) {
             $admins = Get-CimAssociatedInstance -InputObject $grp -Association Win32_GroupUser -ErrorAction SilentlyContinue |
                 Select-Object @{n = 'Name'; e = { "$($_.Domain)\$($_.Name)" } }, @{n = 'ObjectClass'; e = { $_.CimClass.CimClassName } }, @{n = 'PrincipalSource'; e = { 'CIM' } }
@@ -2055,7 +2184,8 @@ Invoke-Etapa 'Políticas de grupo' {
         Invoke-Externo '13_Politicas' 'gpresult_resumo.txt' "gpresult /r $escopo" 120 | Out-Null
     }
 
-    $cs = Get-CimInstance Win32_ComputerSystem
+    $cs = Get-CimSeguro Win32_ComputerSystem
+    if (-not $cs) { $cs = (Get-DadosSistemaSemWmi).CS }
     if ($cs.PartOfDomain) {
         # Test-ComputerSecureChannel tambem falha quando o DC esta inacessivel (fora da rede/VPN): checar o DC antes
         $rc = Invoke-Externo '13_Politicas' 'nltest_dc.txt' "nltest /dsgetdc:$($cs.Domain)" 30

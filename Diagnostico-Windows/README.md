@@ -9,7 +9,7 @@ Funciona no Windows PowerShell 5.1 (já vem no Windows 10/11). Sem administrador
 Num PowerShell, troque a tag pela versão desejada:
 
 ```powershell
-[Net.ServicePointManager]::SecurityProtocol='Tls12'; $f="$env:TEMP\Diag.ps1"; iwr 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/diagnostico-windows-v2.1/Diagnostico-Windows/Diagnostico-Windows.ps1' -OutFile $f; powershell -NoProfile -ExecutionPolicy Bypass -File $f -Dias 30; ri $f
+[Net.ServicePointManager]::SecurityProtocol='Tls12'; $f="$env:TEMP\Diag.ps1"; iwr 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/diagnostico-windows-v2.1.1/Diagnostico-Windows/Diagnostico-Windows.ps1' -OutFile $f; powershell -NoProfile -ExecutionPolicy Bypass -File $f -Dias 30; ri $f
 ```
 
 - Depois do aviso do UAC, o script abre uma janela elevada e roda lá. Os parâmetros que você passar vão para ela.
@@ -52,10 +52,10 @@ O material pode conter nomes de usuário, programas instalados, redes e logs. Tr
 
 ## Verificação de integridade
 
-SHA-256 do `Diagnostico-Windows.ps1` desta versão (v2.1):
+SHA-256 do `Diagnostico-Windows.ps1` desta versão (v2.1.1):
 
 ```
-046DD3C18CF62F0F58F88B80DAA1E98F9BCB7AE6D2FA3FBDE24079D42EED04B2
+1F3CAF5F706354D44198B78E612B90500C47166837BA00C27467CA6BE0C0A022
 ```
 
 ```powershell
@@ -71,5 +71,6 @@ SHA-256 do `Diagnostico-Windows.ps1` desta versão (v2.1):
 
 ## Histórico
 
+- **v2.1.1**: não quebra mais quando o repositório WMI está corrompido (erro "Classe inválida", 0x80041010). Sistema, CPU, memória, serviços, arquivo de paginação e domínio passam a usar registro, .NET e `Get-Service` como alternativa, e o `RESUMO` traz o achado "Repositório WMI corrompido ou inconsistente" com a correção. Itens que só existem via WMI ficam listados como lacunas.
 - **v2.1**: textos e relatório acentuados; logo da Nextec no `RESUMO.html`; o relatório não abre mais sozinho (`-Abrir` para abrir).
 - **v2.0**: primeira versão publicada.
