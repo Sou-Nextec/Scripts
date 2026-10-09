@@ -11,9 +11,17 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
 | Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.15.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.26.0 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.27.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.5.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
+
+## 2026-10-09
+
+### Instalador Windows 2.27.0, sessões de usuário
+
+- **Últimos logins no painel Nextec | Servidor.** Com os logs de segurança ligados, o Alloy passa a enviar o canal `Microsoft-Windows-TerminalServices-LocalSessionManager/Operational` (eventos 21, 23, 24 e 25: entrada, saída, desconexão e reconexão por RDP ou console), com `canal="sessoes"`. Antes o painel ficava vazio em todos os servidores.
+- Volume baixo: o canal só registra sessão interativa, diferente do 4624, que continua fora. Logon por SSH no Windows não aparece aqui.
+- Servidor já instalado recebe na próxima atualização ou ao rodar o instalador.
 
 ## 2026-10-07
 
