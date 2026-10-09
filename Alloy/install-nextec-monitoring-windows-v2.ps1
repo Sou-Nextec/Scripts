@@ -47,6 +47,9 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.27.0 Sessões de usuário (entrada, saída, desconexão e reconexão por
+           RDP ou console) do canal TerminalServices-LocalSessionManager,
+           para o painel "Últimos logins" do Nextec | Servidor.
     2.26.0 Coletor textfile ligado por padrão no exporter "system", lendo
            C:\Program Files\GrafanaLabs\Alloy\textfile_inputs: qualquer
            métrica nova do servidor passa a ser um processo gravando .prom
@@ -350,7 +353,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.26.0"
+$InstallerVersion = "2.27.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -7802,6 +7805,21 @@ function New-AlloyConfiguration {
                 Nivel     = "alerta"
                 XPath     = "*[System[(EventID=4625 or EventID=4648 or EventID=4720 or EventID=4726 or EventID=4728 or EventID=4732 or EventID=4740 or EventID=4756 or EventID=4771 or EventID=1102)]]"
                 Rate      = 50
+            })
+
+            # Sessões de usuário (RDP e console) para o painel "Últimos
+            # logins" do Nextec | Servidor. O canal LocalSessionManager só
+            # registra sessão interativa, então o volume é baixo mesmo em
+            # servidor de terminal, ao contrário do 4624:
+            #   21 logon   23 logoff   24 desconexão   25 reconexão
+            # Logon por SSH (OpenSSH do Windows) não passa por este canal.
+            $logStreams.Add([pscustomobject]@{
+                Component = "sessoes"
+                EventLog  = "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"
+                Canal     = "sessoes"
+                Nivel     = "info"
+                XPath     = "*[System[(EventID=21 or EventID=23 or EventID=24 or EventID=25)]]"
+                Rate      = 20
             })
         }
 
