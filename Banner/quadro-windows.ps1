@@ -1,19 +1,33 @@
-﻿# Nextec | Quadro informativo no papel de parede dos servidores Windows
+﻿# Nextec | Quadro informativo sobre o papel de parede dos servidores Windows
 # Lê NEXTEC_NOME_SERVIDOR, NEXTEC_FUNCAO e NEXTEC_AMBIENTE das variáveis da máquina.
 # Roda a cada login pela tarefa agendada criada pelo aplicar-banner.ps1.
 #
+# O papel de parede de cada usuário é preservado: o quadro é desenhado por cima dele.
+# Na primeira execução o papel de parede original é copiado para %LOCALAPPDATA%\Nextec; se o usuário
+# trocar o papel de parede depois, o novo passa a ser o original no próximo login.
+#
 # Uso manual:
-#   .\quadro-windows.ps1                                 # aplica no papel de parede do usuário atual
+#   .\quadro-windows.ps1                                 # aplica sobre o papel de parede do usuário atual
 #   .\quadro-windows.ps1 -SalvarEm C:\Temp\quadro.png    # só gera a imagem, para conferir o resultado
+#   .\quadro-windows.ps1 -SalvarEm C:\Temp\quadro.png -Fundo C:\Windows\Web\Wallpaper\Windows\img0.jpg
+#
+# A variável de máquina NEXTEC_PAPEL_DE_PAREDE escolhe o fundo: Manter (padrão) desenha o quadro sobre o
+# papel de parede do usuário; Remover troca o papel de parede por um fundo azul escuro liso.
+# O parâmetro -PapelDeParede tem o mesmo efeito e vale mais que a variável (útil para conferir o resultado).
 #
 # Este arquivo deve ficar salvo em UTF-8 com BOM, para o Windows PowerShell 5.1 ler os acentos.
 [CmdletBinding()]
 param(
-    [string]$SalvarEm = ''
+    [string]$SalvarEm = '',
+    [string]$Fundo = '',     # Só com -SalvarEm: imagem usada como papel de parede, para conferir o resultado
+    [ValidateSet('', 'Manter', 'Remover')]
+    [string]$PapelDeParede = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $PastaUsuario = Join-Path $env:LOCALAPPDATA 'Nextec'
+$ArquivoQuadro = Join-Path $PastaUsuario 'quadro.bmp'
+$ArquivoEstado = Join-Path $PastaUsuario 'fundo-original.json'
 
 try {
     # ---------- Variáveis do servidor ----------
@@ -111,6 +125,52 @@ public static class NextecWin32 {
     Campo 'Processos' ('{0}  |  Usuários: {1}' -f $processos, $usuarios)
     Campo 'IP' $ip
 
+    # ---------- Papel de parede do usuário (o quadro vai por cima dele) ----------
+    $chaveDesktop = 'HKCU:\Control Panel\Desktop'
+
+    function LerFundoAtual {
+        $d = Get-ItemProperty -Path $chaveDesktop -ErrorAction SilentlyContinue
+        $c = Get-ItemProperty -Path 'HKCU:\Control Panel\Colors' -ErrorAction SilentlyContinue
+        [pscustomobject]@{ Caminho = "$($d.Wallpaper)"; Estilo = "$($d.WallpaperStyle)"; Tile = "$($d.TileWallpaper)"; Cor = "$($c.Background)" }
+    }
+
+    # Quando o papel de parede atual é o próprio quadro e o original se perdeu, procura no histórico do Windows
+    function BuscarNoHistorico {
+        $historico = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Wallpapers' -ErrorAction SilentlyContinue
+        foreach ($i in 0..4) {
+            $caminho = "$($historico."BackgroundHistoryPath$i")"
+            if ($caminho -and ($caminho -ine $ArquivoQuadro) -and (Test-Path -LiteralPath $caminho)) { return $caminho }
+        }
+        return ''
+    }
+
+    $fundoAtual = LerFundoAtual
+    $atualEhQuadro = [bool]($fundoAtual.Caminho -and ($fundoAtual.Caminho -ieq $ArquivoQuadro))
+    $fundoOriginal = $fundoAtual
+    if ($Fundo) {
+        $fundoOriginal = [pscustomobject]@{ Caminho = $Fundo; Estilo = '10'; Tile = '0'; Cor = $fundoAtual.Cor }
+    } elseif ($atualEhQuadro -and (Test-Path -LiteralPath $ArquivoEstado)) {
+        $fundoOriginal = Get-Content -LiteralPath $ArquivoEstado -Raw -Encoding UTF8 | ConvertFrom-Json
+    } else {
+        if ($atualEhQuadro) { $fundoOriginal.Caminho = BuscarNoHistorico; $fundoOriginal.Estilo = '10'; $fundoOriginal.Tile = '0' }
+        if (-not $SalvarEm) {
+            if ($fundoOriginal.Caminho -and (Test-Path -LiteralPath $fundoOriginal.Caminho)) {
+                New-Item -ItemType Directory -Path $PastaUsuario -Force | Out-Null
+                $copia = Join-Path $PastaUsuario ('fundo-original' + [IO.Path]::GetExtension($fundoOriginal.Caminho))
+                if ($fundoOriginal.Caminho -ine $copia) { Copy-Item -LiteralPath $fundoOriginal.Caminho -Destination $copia -Force }
+                $fundoOriginal.Caminho = $copia
+            }
+            $fundoOriginal | ConvertTo-Json | Set-Content -LiteralPath $ArquivoEstado -Encoding UTF8
+        }
+    }
+
+    function CorSolida([string]$texto) {
+        $partes = @($texto -split '\s+' | Where-Object { $_ })
+        if ($partes.Count -ne 3) { return $null }
+        try { return [System.Drawing.Color]::FromArgb([math]::Min(255, [int]$partes[0]), [math]::Min(255, [int]$partes[1]), [math]::Min(255, [int]$partes[2])) }
+        catch { return $null }
+    }
+
     $tela = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
     $largura = if ($tela.Width -ge 800) { $tela.Width } else { 1920 }
     $altura  = if ($tela.Height -ge 600) { $tela.Height } else { 1080 }
@@ -136,12 +196,42 @@ public static class NextecWin32 {
         $pincel.Dispose()
     }
 
-    # Fundo em degradê (azul acinzentado escuro)
-    $fundo = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
-        (New-Object System.Drawing.Point(0, 0)), (New-Object System.Drawing.Point(0, $altura)),
-        [System.Drawing.Color]::FromArgb(14, 26, 48), [System.Drawing.Color]::FromArgb(21, 35, 66))
-    $g.FillRectangle($fundo, 0, 0, $largura, $altura)
-    $fundo.Dispose()
+    # Fundo: o papel de parede do usuário (Manter); sem imagem, a cor sólida dele; sem nada disso, ou com Remover, degradê azul acinzentado escuro
+    $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $escolhaFundo = if ($PapelDeParede) { $PapelDeParede } else { Ler 'NEXTEC_PAPEL_DE_PAREDE' }
+    $removerFundo = [bool]($escolhaFundo -like 'remov*')
+    $imagemFundo = $null
+    if (-not $removerFundo -and $fundoOriginal.Caminho -and (Test-Path -LiteralPath $fundoOriginal.Caminho)) {
+        try { $imagemFundo = [System.Drawing.Image]::FromFile($fundoOriginal.Caminho) } catch { $imagemFundo = $null }
+    }
+    $corSolida = if ($removerFundo) { $null } else { CorSolida $fundoOriginal.Cor }
+    if ($corSolida) { $g.Clear($corSolida) }
+
+    if ($imagemFundo) {
+        $iw = [single]$imagemFundo.Width
+        $ih = [single]$imagemFundo.Height
+        if ($fundoOriginal.Tile -eq '1') {
+            $pincelFundo = New-Object System.Drawing.TextureBrush($imagemFundo)
+            $g.FillRectangle($pincelFundo, 0, 0, $largura, $altura)
+            $pincelFundo.Dispose()
+        } else {
+            switch ($fundoOriginal.Estilo) {
+                '0'     { $esc = 1 }                                                  # centralizado
+                '2'     { $esc = 0 }                                                  # esticado
+                '6'     { $esc = [math]::Min($largura / $iw, $altura / $ih) }         # ajustado
+                default { $esc = [math]::Max($largura / $iw, $altura / $ih) }         # preenchido ou estendido
+            }
+            if ($esc -eq 0) { $dw = [single]$largura; $dh = [single]$altura } else { $dw = [single]($iw * $esc); $dh = [single]($ih * $esc) }
+            $g.DrawImage($imagemFundo, [single](($largura - $dw) / 2), [single](($altura - $dh) / 2), $dw, $dh)
+        }
+        $imagemFundo.Dispose()
+    } elseif (-not $corSolida) {
+        $degrade = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+            (New-Object System.Drawing.Point(0, 0)), (New-Object System.Drawing.Point(0, $altura)),
+            [System.Drawing.Color]::FromArgb(14, 26, 48), [System.Drawing.Color]::FromArgb(21, 35, 66))
+        $g.FillRectangle($degrade, 0, 0, $largura, $altura)
+        $degrade.Dispose()
+    }
 
     # Medidas do bloco
     $larguraRotulo = ($rotulos | Where-Object { $_ } | ForEach-Object { Largura $_.Rotulo $fonte } | Measure-Object -Maximum).Maximum + ($px * 2)
@@ -157,6 +247,24 @@ public static class NextecWin32 {
     $larguraBloco = [math]::Max($larguraRotulo + $larguraValor, [math]::Max($larguraAviso, $larguraContato))
     $x0 = $largura - $margem - $larguraBloco
     $y  = $margem
+
+    # Painel translúcido atrás do quadro, para o texto continuar legível sobre qualquer papel de parede
+    $alturaBloco = [math]::Round($alturaLinha * 1.6) + $px
+    foreach ($linha in $rotulos) { $alturaBloco += $(if ($null -eq $linha) { [math]::Round($alturaLinha * 0.6) } else { $alturaLinha }) }
+    $folga = [math]::Round($px * 1.1)
+    $raio  = [math]::Round($px * 0.7)
+    $px0 = $x0 - $folga; $py0 = $y - $folga; $pw = $larguraBloco + 2 * $folga; $ph = $alturaBloco + 2 * $folga
+    $caminhoPainel = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $caminhoPainel.AddArc($px0, $py0, 2 * $raio, 2 * $raio, 180, 90)
+    $caminhoPainel.AddArc($px0 + $pw - 2 * $raio, $py0, 2 * $raio, 2 * $raio, 270, 90)
+    $caminhoPainel.AddArc($px0 + $pw - 2 * $raio, $py0 + $ph - 2 * $raio, 2 * $raio, 2 * $raio, 0, 90)
+    $caminhoPainel.AddArc($px0, $py0 + $ph - 2 * $raio, 2 * $raio, 2 * $raio, 90, 90)
+    $caminhoPainel.CloseFigure()
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $pincelPainel = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(150, 10, 18, 36))
+    $g.FillPath($pincelPainel, $caminhoPainel)
+    $pincelPainel.Dispose()
+    $caminhoPainel.Dispose()
 
     foreach ($linha in $rotulos) {
         if ($null -eq $linha) { $y += [math]::Round($alturaLinha * 0.6); continue }
@@ -186,15 +294,13 @@ public static class NextecWin32 {
     }
 
     New-Item -ItemType Directory -Path $PastaUsuario -Force | Out-Null
-    $arquivo = Join-Path $PastaUsuario 'quadro.bmp'
-    $imagem.Save($arquivo, [System.Drawing.Imaging.ImageFormat]::Bmp)
+    $imagem.Save($ArquivoQuadro, [System.Drawing.Imaging.ImageFormat]::Bmp)
     $imagem.Dispose()
 
-    $chave = 'HKCU:\Control Panel\Desktop'
-    Set-ItemProperty -Path $chave -Name 'WallpaperStyle' -Value '10'
-    Set-ItemProperty -Path $chave -Name 'TileWallpaper' -Value '0'
+    Set-ItemProperty -Path $chaveDesktop -Name 'WallpaperStyle' -Value '10'
+    Set-ItemProperty -Path $chaveDesktop -Name 'TileWallpaper' -Value '0'
     # 20 = SPI_SETDESKWALLPAPER; 3 = grava no perfil e avisa as janelas
-    if ([NextecWin32]::SystemParametersInfo(20, 0, $arquivo, 3) -eq 0) {
+    if ([NextecWin32]::SystemParametersInfo(20, 0, $ArquivoQuadro, 3) -eq 0) {
         throw 'o Windows recusou o papel de parede (uma GPO pode estar bloqueando a troca).'
     }
 } catch {

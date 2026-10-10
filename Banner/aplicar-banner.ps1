@@ -4,11 +4,12 @@
 #   $nome     = ''                   # Vazio = usa o nome real da máquina
 #   $funcao   = 'Servidor Escriba'
 #   $ambiente = 'Produção'           # Produção | Homologação | Testes
+#   $papel    = 'Manter'             # Manter = quadro sobre o papel de parede atual | Remover = fundo azul liso
 #   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 #   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 #   $s = Join-Path $env:TEMP 'aplicar-banner.ps1'
 #   Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Banner/aplicar-banner.ps1' -OutFile $s
-#   & $s -Nome $nome -Funcao $funcao -Ambiente $ambiente
+#   & $s -Nome $nome -Funcao $funcao -Ambiente $ambiente -PapelDeParede $papel
 #
 # Pode ser executado de novo a qualquer momento: baixa o quadro do repositório, faz backup do que mudar e regrava tudo.
 # Este arquivo deve ficar salvo em UTF-8 com BOM, para o Windows PowerShell 5.1 ler os acentos.
@@ -16,7 +17,9 @@
 param(
     [string]$Nome = '',
     [string]$Funcao = '',
-    [string]$Ambiente = ''
+    [string]$Ambiente = '',
+    [ValidateSet('Manter', 'Remover')]
+    [string]$PapelDeParede = 'Manter'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -96,6 +99,7 @@ $variaveis = [ordered]@{
     NEXTEC_NOME_SERVIDOR = $(if ($Nome) { $Nome } else { $null })
     NEXTEC_FUNCAO        = $Funcao
     NEXTEC_AMBIENTE      = $Ambiente
+    NEXTEC_PAPEL_DE_PAREDE = $PapelDeParede
     NEXTEC_SERVIDOR      = $null   # usada só pela versão antiga; removida
 }
 foreach ($chave in $variaveis.Keys) {
@@ -143,9 +147,9 @@ Write-Host 'Quadro aplicado na área de trabalho desta sessão.'
 # ---------- 7. Conferência ----------
 Write-Host ''
 Write-Host 'Variáveis gravadas:'
-foreach ($chave in 'NEXTEC_NOME_SERVIDOR', 'NEXTEC_FUNCAO', 'NEXTEC_AMBIENTE') {
+foreach ($chave in 'NEXTEC_NOME_SERVIDOR', 'NEXTEC_FUNCAO', 'NEXTEC_AMBIENTE', 'NEXTEC_PAPEL_DE_PAREDE') {
     $valor = [Environment]::GetEnvironmentVariable($chave, 'Machine')
-    if ($valor) { Write-Host ("  {0,-22} {1}" -f $chave, $valor) }
+    if ($valor) { Write-Host ("  {0,-24} {1}" -f $chave, $valor) }
 }
 $estado = (Get-ScheduledTask -TaskName $TarefaNome).State
 Write-Host "Tarefa agendada: $estado"
