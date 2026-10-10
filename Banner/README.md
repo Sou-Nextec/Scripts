@@ -1,4 +1,4 @@
-# Banner de login dos servidores
+﻿# Banner de login dos servidores
 
 Aviso de acesso antes da senha e quadro informativo depois do login, nos servidores Linux e Windows da Nextec e dos clientes. O passo a passo completo fica no Confluence, na página "Como configurar o aviso de acesso e o banner de login nos servidores" (espaço Documentação Interna).
 
@@ -34,7 +34,7 @@ O que editar:
 | `$nome` | Vazio usa o nome real da máquina |
 | `$funcao` | Texto livre, por exemplo `Servidor Escriba` |
 | `$ambiente` | `Produção` (vermelho), `Homologação` (amarelo) ou `Testes` (verde) |
-| `$papel` | `Manter` (quadro sobre o papel de parede atual), `Azul` (azul Nextec #0D0035 liso) ou `Preto` (preto liso) |
+| `$papel` | `Manter` (quadro sobre o papel de parede atual) ou `Preto` (preto liso) |
 
 O `aplicar-banner.ps1` baixa o `quadro-windows.ps1` desta pasta, grava as variáveis, aplica o aviso antes da senha, registra a tarefa agendada que redesenha o quadro a cada login e já aplica na sessão atual. Pode ser executado de novo a qualquer momento, e é assim que se muda nome, função, ambiente ou papel de parede depois. Para só conferir o visual, sem alterar nada: `.\quadro-windows.ps1 -SalvarEm C:\Temp\quadro.png`.
 
@@ -62,7 +62,7 @@ Gravadas pelo `aplicar-banner.sh` em `/etc/environment` (Linux) e pelo `aplicar-
 | `NEXTEC_NOME_SERVIDOR` | Nome do servidor como a Nextec o chama. Sai em caixa alta, com o hostname entre parênteses. Sem ela, aparece o hostname em caixa alta |
 | `NEXTEC_FUNCAO` | Para que o servidor serve |
 | `NEXTEC_AMBIENTE` | Produção (vermelho), Homologação (amarelo) ou outro valor, como Testes (verde) |
-| `NEXTEC_PAPEL_DE_PAREDE` | Só no Windows. `Manter` (padrão) desenha o quadro por cima do papel de parede de cada usuário; `Azul` troca o papel de parede pelo azul Nextec (#0D0035) liso; `Preto` troca por preto liso. `Remover` ainda é aceito e equivale a `Azul`. Para mudar depois, basta rodar o instalador de novo |
+| `NEXTEC_PAPEL_DE_PAREDE` | Só no Windows. `Manter` (padrão) desenha o quadro por cima do papel de parede de cada usuário; `Preto` troca o papel de parede por preto liso. `Remover` ainda é aceito e equivale a `Preto`. Para mudar depois, basta rodar o instalador de novo |
 | `NEXTEC_OPACIDADE` | Opcional, só no Windows. Opacidade do painel atrás do quadro, de 0 a 255 (padrão 215). Aumentar melhora o contraste sobre papéis de parede claros |
 
 Os valores são tratados só como texto: aspas, barras, quebras de linha e caracteres de controle são ignorados.
@@ -80,5 +80,6 @@ Os valores são tratados só como texto: aspas, barras, quebras de linha e carac
 | 2.1.1 | 2026-10-10 | Windows: o quadro é desenhado por cima do papel de parede do usuário (preservado e recuperado do histórico quando já foi sobrescrito), com painel translúcido para manter a leitura; novo parâmetro `-PapelDeParede` (Manter ou Remover) para escolher entre manter ou retirar o papel de parede |
 | 2.1.2 | 2026-10-10 | Windows: mais contraste no quadro (painel mais opaco com borda leve, rótulos e rodapé mais claros, rodapé maior); opacidade ajustável por `NEXTEC_OPACIDADE` ou `-Opacidade` |
 | 2.1.3 | 2026-10-10 | Windows: novas opções de fundo `Azul` (#0D0035) e `Preto` no `-PapelDeParede` (`Remover` segue valendo como `Azul`); comando de uma linha com os quatro valores editáveis no início |
+| 2.1.4 | 2026-10-10 | Windows: fundo liso passa a ser só preto (`Preto`; `Remover` equivale a `Preto`; `Azul` retirado); sem papel de parede nem cor sólida, o quadro também usa preto |
 | 2.0.0 | 2026-10-07 | Instalador único `aplicar-banner.sh`; aviso no padrão NIST AC-8, também no console; resumo do sistema no quadro; cor do ambiente; logotipo centralizado com separador; identificação no `10-nextec-info`; limpeza dos scripts de MOTD do Ubuntu |
 | 1.0.0 | 2026-10-04 | Primeira versão: `05-nextec` (logotipo Nextec, nome real e nome Nextec do servidor) e `05-servidor` (quadro neutro para clientes, com contato noc@nex.tec.br) |

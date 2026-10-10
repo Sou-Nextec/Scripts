@@ -5,7 +5,7 @@
 #
 #   $nome     Vazio = usa o nome real da máquina
 #   $ambiente Produção | Homologação | Testes
-#   $papel    Manter = quadro sobre o papel de parede atual | Azul = azul Nextec liso | Preto = preto liso
+#   $papel    Manter = quadro sobre o papel de parede atual | Preto = preto liso
 #
 # Pode ser executado de novo a qualquer momento: baixa o quadro do repositório, faz backup do que mudar e regrava tudo.
 # Este arquivo deve ficar salvo em UTF-8 com BOM, para o Windows PowerShell 5.1 ler os acentos.
@@ -14,7 +14,7 @@ param(
     [string]$Nome = '',
     [string]$Funcao = '',
     [string]$Ambiente = '',
-    [ValidateSet('Manter', 'Azul', 'Preto', 'Remover')]
+    [ValidateSet('Manter', 'Preto', 'Remover')]
     [string]$PapelDeParede = 'Manter'
 )
 
