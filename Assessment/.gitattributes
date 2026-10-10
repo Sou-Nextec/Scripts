@@ -1,0 +1,4 @@
+# Preserva exatamente o BOM UTF-8 e as quebras de linha. Sem BOM os acentos quebram o parse
+# no Windows PowerShell 5.1. Nao deixar o Git converter.
+*.ps1 -text
+*.cmd -text
