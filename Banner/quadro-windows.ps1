@@ -15,13 +15,18 @@
 # papel de parede do usuário; Remover troca o papel de parede por um fundo azul escuro liso.
 # O parâmetro -PapelDeParede tem o mesmo efeito e vale mais que a variável (útil para conferir o resultado).
 #
+# O painel atrás do texto tem opacidade 215 (de 255) por padrão, para dar contraste sobre qualquer papel de
+# parede. A variável de máquina NEXTEC_OPACIDADE ou o parâmetro -Opacidade (0 a 255) ajustam esse valor.
+#
 # Este arquivo deve ficar salvo em UTF-8 com BOM, para o Windows PowerShell 5.1 ler os acentos.
 [CmdletBinding()]
 param(
     [string]$SalvarEm = '',
     [string]$Fundo = '',     # Só com -SalvarEm: imagem usada como papel de parede, para conferir o resultado
     [ValidateSet('', 'Manter', 'Remover')]
-    [string]$PapelDeParede = ''
+    [string]$PapelDeParede = '',
+    [ValidateRange(0, 255)]
+    [int]$Opacidade = -1     # Opacidade do painel (0 a 255); sem valor usa NEXTEC_OPACIDADE ou 215
 )
 
 $ErrorActionPreference = 'Stop'
@@ -105,7 +110,7 @@ public static class NextecWin32 {
     }
     [void][NextecWin32]::SetProcessDPIAware()
 
-    $corRotulo = [System.Drawing.Color]::FromArgb(154, 150, 184)
+    $corRotulo = [System.Drawing.Color]::FromArgb(205, 210, 232)
     $corValor  = [System.Drawing.Color]::FromArgb(244, 244, 244)
     $corAmbiente = switch -Wildcard ($ambiente.ToLower()) {
         'produ*'   { [System.Drawing.Color]::FromArgb(239, 83, 80) }
@@ -178,8 +183,8 @@ public static class NextecWin32 {
     $px = [math]::Max(15, [math]::Round($altura / 62))
     $fonte      = New-Object System.Drawing.Font('Segoe UI', $px, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
     $fonteBold  = New-Object System.Drawing.Font('Segoe UI', $px, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
-    $fontePeq   = New-Object System.Drawing.Font('Segoe UI', [math]::Round($px * 0.85), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
-    $fontePeqB  = New-Object System.Drawing.Font('Segoe UI', [math]::Round($px * 0.85), [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+    $fontePeq   = New-Object System.Drawing.Font('Segoe UI', [math]::Round($px * 0.92), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+    $fontePeqB  = New-Object System.Drawing.Font('Segoe UI', [math]::Round($px * 0.92), [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
     $alturaLinha = [math]::Round($px * 1.7)
     $margem = [math]::Round($px * 2.4)
 
@@ -261,9 +266,17 @@ public static class NextecWin32 {
     $caminhoPainel.AddArc($px0, $py0 + $ph - 2 * $raio, 2 * $raio, 2 * $raio, 90, 90)
     $caminhoPainel.CloseFigure()
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $pincelPainel = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(150, 10, 18, 36))
+    $opacidadePainel = $Opacidade
+    if ($opacidadePainel -lt 0) {
+        $lida = 0
+        $opacidadePainel = if ([int]::TryParse((Ler 'NEXTEC_OPACIDADE'), [ref]$lida) -and $lida -ge 0 -and $lida -le 255) { $lida } else { 215 }
+    }
+    $pincelPainel = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb($opacidadePainel, 8, 14, 30))
     $g.FillPath($pincelPainel, $caminhoPainel)
     $pincelPainel.Dispose()
+    $canetaBorda = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(90, 255, 255, 255), 1)
+    $g.DrawPath($canetaBorda, $caminhoPainel)
+    $canetaBorda.Dispose()
     $caminhoPainel.Dispose()
 
     foreach ($linha in $rotulos) {
