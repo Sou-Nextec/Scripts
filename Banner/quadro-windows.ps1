@@ -11,11 +11,17 @@
 #   .\quadro-windows.ps1 -SalvarEm C:\Temp\quadro.png    # só gera a imagem, para conferir o resultado
 #   .\quadro-windows.ps1 -SalvarEm C:\Temp\quadro.png -Fundo C:\Windows\Web\Wallpaper\Windows\img0.jpg
 #
+# A variável de máquina NEXTEC_PAPEL_DE_PAREDE escolhe o fundo: Manter (padrão) desenha o quadro sobre o
+# papel de parede do usuário; Remover troca o papel de parede por um fundo azul escuro liso.
+# O parâmetro -PapelDeParede tem o mesmo efeito e vale mais que a variável (útil para conferir o resultado).
+#
 # Este arquivo deve ficar salvo em UTF-8 com BOM, para o Windows PowerShell 5.1 ler os acentos.
 [CmdletBinding()]
 param(
     [string]$SalvarEm = '',
-    [string]$Fundo = ''      # Só com -SalvarEm: imagem usada como papel de parede, para conferir o resultado
+    [string]$Fundo = '',     # Só com -SalvarEm: imagem usada como papel de parede, para conferir o resultado
+    [ValidateSet('', 'Manter', 'Remover')]
+    [string]$PapelDeParede = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -190,13 +196,15 @@ public static class NextecWin32 {
         $pincel.Dispose()
     }
 
-    # Fundo: o papel de parede do usuário; sem imagem, a cor sólida dele; sem nada disso, degradê azul acinzentado escuro
+    # Fundo: o papel de parede do usuário (Manter); sem imagem, a cor sólida dele; sem nada disso, ou com Remover, degradê azul acinzentado escuro
     $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $escolhaFundo = if ($PapelDeParede) { $PapelDeParede } else { Ler 'NEXTEC_PAPEL_DE_PAREDE' }
+    $removerFundo = [bool]($escolhaFundo -like 'remov*')
     $imagemFundo = $null
-    if ($fundoOriginal.Caminho -and (Test-Path -LiteralPath $fundoOriginal.Caminho)) {
+    if (-not $removerFundo -and $fundoOriginal.Caminho -and (Test-Path -LiteralPath $fundoOriginal.Caminho)) {
         try { $imagemFundo = [System.Drawing.Image]::FromFile($fundoOriginal.Caminho) } catch { $imagemFundo = $null }
     }
-    $corSolida = CorSolida $fundoOriginal.Cor
+    $corSolida = if ($removerFundo) { $null } else { CorSolida $fundoOriginal.Cor }
     if ($corSolida) { $g.Clear($corSolida) }
 
     if ($imagemFundo) {
