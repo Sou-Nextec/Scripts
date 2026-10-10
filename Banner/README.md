@@ -62,6 +62,7 @@ Gravadas pelo `aplicar-banner.sh` em `/etc/environment` (Linux) e pelo `aplicar-
 | `NEXTEC_FUNCAO` | Para que o servidor serve |
 | `NEXTEC_AMBIENTE` | Produção (vermelho), Homologação (amarelo) ou outro valor, como Testes (verde) |
 | `NEXTEC_PAPEL_DE_PAREDE` | Só no Windows. `Manter` (padrão) desenha o quadro por cima do papel de parede de cada usuário; `Remover` troca o papel de parede por um fundo azul escuro liso. Para mudar depois, basta rodar o instalador de novo |
+| `NEXTEC_OPACIDADE` | Opcional, só no Windows. Opacidade do painel atrás do quadro, de 0 a 255 (padrão 215). Aumentar melhora o contraste sobre papéis de parede claros |
 
 Os valores são tratados só como texto: aspas, barras, quebras de linha e caracteres de controle são ignorados.
 
@@ -76,5 +77,6 @@ Os valores são tratados só como texto: aspas, barras, quebras de linha e carac
 | --- | --- | --- |
 | 2.1.0 | 2026-10-09 | Windows: instalador único `aplicar-banner.ps1` e `quadro-windows.ps1`, que desenha o quadro no papel de parede com as mesmas informações do Linux (cor do ambiente, carga, disco, memória, paginação, uptime, processos, usuários e IP), sem BGInfo e sem modelo binário; grupo Users resolvido pelo SID, que funciona em Windows em português |
 | 2.1.1 | 2026-10-10 | Windows: o quadro é desenhado por cima do papel de parede do usuário (preservado e recuperado do histórico quando já foi sobrescrito), com painel translúcido para manter a leitura; novo parâmetro `-PapelDeParede` (Manter ou Remover) para escolher entre manter ou retirar o papel de parede |
+| 2.1.2 | 2026-10-10 | Windows: mais contraste no quadro (painel mais opaco com borda leve, rótulos e rodapé mais claros, rodapé maior); opacidade ajustável por `NEXTEC_OPACIDADE` ou `-Opacidade` |
 | 2.0.0 | 2026-10-07 | Instalador único `aplicar-banner.sh`; aviso no padrão NIST AC-8, também no console; resumo do sistema no quadro; cor do ambiente; logotipo centralizado com separador; identificação no `10-nextec-info`; limpeza dos scripts de MOTD do Ubuntu |
 | 1.0.0 | 2026-10-04 | Primeira versão: `05-nextec` (logotipo Nextec, nome real e nome Nextec do servidor) e `05-servidor` (quadro neutro para clientes, com contato noc@nex.tec.br) |
