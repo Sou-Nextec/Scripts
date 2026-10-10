@@ -48,7 +48,7 @@ Os dois arquivos `.ps1` ficam salvos em UTF-8 com BOM, para o Windows PowerShell
 | `05-nextec` | `/etc/update-motd.d/05-nextec` | Logotipo e boas-vindas, só para servidores da Nextec |
 | `10-nextec-info` | `/etc/update-motd.d/10-nextec-info` | Identificação e resumo do sistema dos servidores da Nextec |
 | `aplicar-banner.ps1` | Executado uma vez | Windows: instala tudo (quadro, variáveis, aviso antes da senha e tarefa agendada) |
-| `quadro-windows.ps1` | `C:\ProgramData\Nextec\Banner\` | Windows: desenha o quadro no papel de parede a cada login, com as mesmas informações do quadro Linux |
+| `quadro-windows.ps1` | `C:\ProgramData\Nextec\Banner\` | Windows: desenha o quadro por cima do papel de parede do usuário a cada login, com as mesmas informações do quadro Linux |
 | `exemplos/` | | Telas da versão 1.0 |
 
 ## Variáveis
@@ -73,5 +73,6 @@ Os valores são tratados só como texto: aspas, barras, quebras de linha e carac
 | Versão | Data | Mudanças |
 | --- | --- | --- |
 | 2.1.0 | 2026-10-09 | Windows: instalador único `aplicar-banner.ps1` e `quadro-windows.ps1`, que desenha o quadro no papel de parede com as mesmas informações do Linux (cor do ambiente, carga, disco, memória, paginação, uptime, processos, usuários e IP), sem BGInfo e sem modelo binário; grupo Users resolvido pelo SID, que funciona em Windows em português |
+| 2.1.1 | 2026-10-10 | Windows: o quadro é desenhado por cima do papel de parede do usuário (preservado e recuperado do histórico quando já foi sobrescrito), com painel translúcido para manter a leitura |
 | 2.0.0 | 2026-10-07 | Instalador único `aplicar-banner.sh`; aviso no padrão NIST AC-8, também no console; resumo do sistema no quadro; cor do ambiente; logotipo centralizado com separador; identificação no `10-nextec-info`; limpeza dos scripts de MOTD do Ubuntu |
 | 1.0.0 | 2026-10-04 | Primeira versão: `05-nextec` (logotipo Nextec, nome real e nome Nextec do servidor) e `05-servidor` (quadro neutro para clientes, com contato noc@nex.tec.br) |
