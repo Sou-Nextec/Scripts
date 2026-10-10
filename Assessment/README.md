@@ -44,7 +44,7 @@ O material contém nomes de usuário, IPs, softwares e configurações do client
 SHA-256 do `Nextec-Assessment-v2.ps1` da tag `assessment-v2.1`:
 
 ```
-D6BA010BE9CAE0F1AC9F9D5A61386FA2EEA454FB2C09F7A7D0D7E8728C993F58
+D4BD945E3FE1740AB4810F16949C3AAB647C88AA7FFAC8A29C618484BF1A4723
 ```
 
 ```powershell

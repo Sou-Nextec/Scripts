@@ -1273,7 +1273,8 @@ Invoke-Etapa 'Internet, operadora e rota de saída' {
         } catch { Write-Log "Consulta do IP público falhou: $($_.Exception.Message)" 'AVISO' }
     }
     if (-not (Test-ComandoExiste 'Test-NetConnection')) { return }
-    $rota = Test-NetConnection -ComputerName 8.8.8.8 -TraceRoute -Hops 8 -WarningAction SilentlyContinue
+    $destinoRota = '8.8.8.8'   # DNS público do Google, só como alvo do traceroute
+    $rota = Test-NetConnection -ComputerName $destinoRota -TraceRoute -Hops 8 -WarningAction SilentlyContinue
     $n = 0
     $saltos = @(foreach ($ip in @($rota.TraceRoute)) {
         $n++
