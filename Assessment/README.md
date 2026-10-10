@@ -9,7 +9,7 @@ Funciona no Windows PowerShell 5.1. Executar no servidor principal do cliente, d
 Num PowerShell, no servidor do cliente (troque a tag pela versão desejada):
 
 ```powershell
-[Net.ServicePointManager]::SecurityProtocol='Tls12'; $f="$env:TEMP\Nextec-Assessment-v2.ps1"; iwr 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/assessment-v2.1/Assessment/Nextec-Assessment-v2.ps1' -OutFile $f -UseBasicParsing; powershell -NoProfile -ExecutionPolicy Bypass -File $f -Automatico
+[Net.ServicePointManager]::SecurityProtocol='Tls12'; $f="$env:TEMP\Nextec-Assessment-v2.ps1"; iwr 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/assessment-v2.2/Assessment/Nextec-Assessment-v2.ps1' -OutFile $f -UseBasicParsing; powershell -NoProfile -ExecutionPolicy Bypass -File $f -Automatico
 ```
 
 - O script se reabre como administrador sozinho (confirme o UAC) e valida o ambiente antes de coletar.
@@ -41,10 +41,10 @@ O material contém nomes de usuário, IPs, softwares e configurações do client
 
 ## Verificação de integridade
 
-SHA-256 do `Nextec-Assessment-v2.ps1` da tag `assessment-v2.1`:
+SHA-256 do `Nextec-Assessment-v2.ps1` da tag `assessment-v2.2`:
 
 ```
-D4BD945E3FE1740AB4810F16949C3AAB647C88AA7FFAC8A29C618484BF1A4723
+12D14F97281E93587D56329C2B031F510E35796E1839D8900544C0A7165B4E24
 ```
 
 ```powershell
@@ -58,5 +58,6 @@ D4BD945E3FE1740AB4810F16949C3AAB647C88AA7FFAC8A29C618484BF1A4723
 
 ## Histórico
 
+- **v2.2**: base de fabricantes embutida passou a carregar (antes ficava vazia e o fabricante saía em branco); textos de alerta e da pré-validação mais claros.
 - **v2.1**: modo sem intervenção (`-Automatico`), pré-validação, login único, relatório separa credencial recusada de máquina desligada.
 - **v2.0**: versão de 29/09/2026.
