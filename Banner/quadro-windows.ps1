@@ -12,7 +12,8 @@
 #   .\quadro-windows.ps1 -SalvarEm C:\Temp\quadro.png -Fundo C:\Windows\Web\Wallpaper\Windows\img0.jpg
 #
 # A variável de máquina NEXTEC_PAPEL_DE_PAREDE escolhe o fundo: Manter (padrão) desenha o quadro sobre o
-# papel de parede do usuário; Remover troca o papel de parede por um fundo azul escuro liso.
+# papel de parede do usuário; Azul troca o papel de parede pelo azul Nextec liso (0D0035); Preto troca por
+# preto liso. Remover é o nome antigo de Azul e continua valendo.
 # O parâmetro -PapelDeParede tem o mesmo efeito e vale mais que a variável (útil para conferir o resultado).
 #
 # O painel atrás do texto tem opacidade 215 (de 255) por padrão, para dar contraste sobre qualquer papel de
@@ -23,7 +24,7 @@
 param(
     [string]$SalvarEm = '',
     [string]$Fundo = '',     # Só com -SalvarEm: imagem usada como papel de parede, para conferir o resultado
-    [ValidateSet('', 'Manter', 'Remover')]
+    [ValidateSet('', 'Manter', 'Azul', 'Preto', 'Remover')]
     [string]$PapelDeParede = '',
     [ValidateRange(0, 255)]
     [int]$Opacidade = -1     # Opacidade do painel (0 a 255); sem valor usa NEXTEC_OPACIDADE ou 215
@@ -201,15 +202,21 @@ public static class NextecWin32 {
         $pincel.Dispose()
     }
 
-    # Fundo: o papel de parede do usuário (Manter); sem imagem, a cor sólida dele; sem nada disso, ou com Remover, degradê azul acinzentado escuro
+    # Fundo: o papel de parede do usuário (Manter); sem imagem, a cor sólida dele; sem nada disso, degradê azul acinzentado escuro; com Azul ou Preto, a cor lisa escolhida
     $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
     $escolhaFundo = if ($PapelDeParede) { $PapelDeParede } else { Ler 'NEXTEC_PAPEL_DE_PAREDE' }
-    $removerFundo = [bool]($escolhaFundo -like 'remov*')
+    $corForcada = switch -Wildcard ($escolhaFundo.ToLower()) {
+        'azul*'    { [System.Drawing.Color]::FromArgb(13, 0, 53) }
+        'remov*'   { [System.Drawing.Color]::FromArgb(13, 0, 53) }
+        'preto*'   { [System.Drawing.Color]::FromArgb(0, 0, 0) }
+        default    { $null }
+    }
+    $removerFundo = [bool]$corForcada
     $imagemFundo = $null
     if (-not $removerFundo -and $fundoOriginal.Caminho -and (Test-Path -LiteralPath $fundoOriginal.Caminho)) {
         try { $imagemFundo = [System.Drawing.Image]::FromFile($fundoOriginal.Caminho) } catch { $imagemFundo = $null }
     }
-    $corSolida = if ($removerFundo) { $null } else { CorSolida $fundoOriginal.Cor }
+    $corSolida = if ($removerFundo) { $corForcada } else { CorSolida $fundoOriginal.Cor }
     if ($corSolida) { $g.Clear($corSolida) }
 
     if ($imagemFundo) {

@@ -4,7 +4,7 @@
 #   $nome     = ''                   # Vazio = usa o nome real da máquina
 #   $funcao   = 'Servidor Escriba'
 #   $ambiente = 'Produção'           # Produção | Homologação | Testes
-#   $papel    = 'Manter'             # Manter = quadro sobre o papel de parede atual | Remover = fundo azul liso
+#   $papel    = 'Manter'             # Manter = quadro sobre o papel de parede atual | Azul = azul Nextec liso | Preto = preto liso
 #   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 #   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 #   $s = Join-Path $env:TEMP 'aplicar-banner.ps1'
@@ -18,7 +18,7 @@ param(
     [string]$Nome = '',
     [string]$Funcao = '',
     [string]$Ambiente = '',
-    [ValidateSet('Manter', 'Remover')]
+    [ValidateSet('Manter', 'Azul', 'Preto', 'Remover')]
     [string]$PapelDeParede = 'Manter'
 )
 
