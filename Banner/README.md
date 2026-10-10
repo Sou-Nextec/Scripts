@@ -21,21 +21,22 @@ O `aplicar-banner.sh` baixa os demais arquivos desta pasta, faz backup do que ex
 
 ### Windows
 
-No PowerShell como administrador, dentro do servidor, ajuste as variáveis e cole o bloco:
+No PowerShell como administrador, dentro do servidor, edite só os quatro valores no início da linha (entre aspas) e cole a linha inteira:
 
 ```powershell
-$nome     = ''                   # Vazio = usa o nome real da máquina
-$funcao   = 'Servidor Escriba'
-$ambiente = 'Produção'           # Produção | Homologação | Testes
-$papel    = 'Manter'             # Manter = quadro sobre o papel de parede atual | Remover = fundo azul liso
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$s = Join-Path $env:TEMP 'aplicar-banner.ps1'
-Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Banner/aplicar-banner.ps1' -OutFile $s
-& $s -Nome $nome -Funcao $funcao -Ambiente $ambiente -PapelDeParede $papel
+$nome=''; $funcao='Servidor Escriba'; $ambiente='Produção'; $papel='Manter'; Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Banner/aplicar-banner.ps1').Content.TrimStart([char]0xFEFF))) -Nome $nome -Funcao $funcao -Ambiente $ambiente -PapelDeParede $papel
 ```
 
-O `aplicar-banner.ps1` baixa o `quadro-windows.ps1` desta pasta, grava as variáveis, aplica o aviso antes da senha, registra a tarefa agendada que redesenha o quadro a cada login e já aplica na sessão atual. Pode ser executado de novo a qualquer momento. Para só conferir o visual, sem alterar nada: `.\quadro-windows.ps1 -SalvarEm C:\Temp\quadro.png`.
+O que editar:
+
+| Valor | Opções |
+| --- | --- |
+| `$nome` | Vazio usa o nome real da máquina |
+| `$funcao` | Texto livre, por exemplo `Servidor Escriba` |
+| `$ambiente` | `Produção` (vermelho), `Homologação` (amarelo) ou `Testes` (verde) |
+| `$papel` | `Manter` (quadro sobre o papel de parede atual), `Azul` (azul Nextec #0D0035 liso) ou `Preto` (preto liso) |
+
+O `aplicar-banner.ps1` baixa o `quadro-windows.ps1` desta pasta, grava as variáveis, aplica o aviso antes da senha, registra a tarefa agendada que redesenha o quadro a cada login e já aplica na sessão atual. Pode ser executado de novo a qualquer momento, e é assim que se muda nome, função, ambiente ou papel de parede depois. Para só conferir o visual, sem alterar nada: `.\quadro-windows.ps1 -SalvarEm C:\Temp\quadro.png`.
 
 Os dois arquivos `.ps1` ficam salvos em UTF-8 com BOM, para o Windows PowerShell 5.1 ler os acentos.
 
@@ -61,7 +62,7 @@ Gravadas pelo `aplicar-banner.sh` em `/etc/environment` (Linux) e pelo `aplicar-
 | `NEXTEC_NOME_SERVIDOR` | Nome do servidor como a Nextec o chama. Sai em caixa alta, com o hostname entre parênteses. Sem ela, aparece o hostname em caixa alta |
 | `NEXTEC_FUNCAO` | Para que o servidor serve |
 | `NEXTEC_AMBIENTE` | Produção (vermelho), Homologação (amarelo) ou outro valor, como Testes (verde) |
-| `NEXTEC_PAPEL_DE_PAREDE` | Só no Windows. `Manter` (padrão) desenha o quadro por cima do papel de parede de cada usuário; `Remover` troca o papel de parede por um fundo azul escuro liso. Para mudar depois, basta rodar o instalador de novo |
+| `NEXTEC_PAPEL_DE_PAREDE` | Só no Windows. `Manter` (padrão) desenha o quadro por cima do papel de parede de cada usuário; `Azul` troca o papel de parede pelo azul Nextec (#0D0035) liso; `Preto` troca por preto liso. `Remover` ainda é aceito e equivale a `Azul`. Para mudar depois, basta rodar o instalador de novo |
 | `NEXTEC_OPACIDADE` | Opcional, só no Windows. Opacidade do painel atrás do quadro, de 0 a 255 (padrão 215). Aumentar melhora o contraste sobre papéis de parede claros |
 
 Os valores são tratados só como texto: aspas, barras, quebras de linha e caracteres de controle são ignorados.
@@ -78,5 +79,6 @@ Os valores são tratados só como texto: aspas, barras, quebras de linha e carac
 | 2.1.0 | 2026-10-09 | Windows: instalador único `aplicar-banner.ps1` e `quadro-windows.ps1`, que desenha o quadro no papel de parede com as mesmas informações do Linux (cor do ambiente, carga, disco, memória, paginação, uptime, processos, usuários e IP), sem BGInfo e sem modelo binário; grupo Users resolvido pelo SID, que funciona em Windows em português |
 | 2.1.1 | 2026-10-10 | Windows: o quadro é desenhado por cima do papel de parede do usuário (preservado e recuperado do histórico quando já foi sobrescrito), com painel translúcido para manter a leitura; novo parâmetro `-PapelDeParede` (Manter ou Remover) para escolher entre manter ou retirar o papel de parede |
 | 2.1.2 | 2026-10-10 | Windows: mais contraste no quadro (painel mais opaco com borda leve, rótulos e rodapé mais claros, rodapé maior); opacidade ajustável por `NEXTEC_OPACIDADE` ou `-Opacidade` |
+| 2.1.3 | 2026-10-10 | Windows: novas opções de fundo `Azul` (#0D0035) e `Preto` no `-PapelDeParede` (`Remover` segue valendo como `Azul`); comando de uma linha com os quatro valores editáveis no início |
 | 2.0.0 | 2026-10-07 | Instalador único `aplicar-banner.sh`; aviso no padrão NIST AC-8, também no console; resumo do sistema no quadro; cor do ambiente; logotipo centralizado com separador; identificação no `10-nextec-info`; limpeza dos scripts de MOTD do Ubuntu |
 | 1.0.0 | 2026-10-04 | Primeira versão: `05-nextec` (logotipo Nextec, nome real e nome Nextec do servidor) e `05-servidor` (quadro neutro para clientes, com contato noc@nex.tec.br) |

@@ -1,15 +1,11 @@
 ﻿# Nextec | Aplica o aviso de acesso (antes da senha) e o quadro informativo (área de trabalho) no Windows Server
 #
-# Uso (PowerShell como administrador, dentro do servidor):
-#   $nome     = ''                   # Vazio = usa o nome real da máquina
-#   $funcao   = 'Servidor Escriba'
-#   $ambiente = 'Produção'           # Produção | Homologação | Testes
-#   $papel    = 'Manter'             # Manter = quadro sobre o papel de parede atual | Azul = azul Nextec liso | Preto = preto liso
-#   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-#   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-#   $s = Join-Path $env:TEMP 'aplicar-banner.ps1'
-#   Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Banner/aplicar-banner.ps1' -OutFile $s
-#   & $s -Nome $nome -Funcao $funcao -Ambiente $ambiente -PapelDeParede $papel
+# Uso (PowerShell como administrador, dentro do servidor), em uma linha só: edite os quatro valores do início e cole:
+#   $nome=''; $funcao='Servidor Escriba'; $ambiente='Produção'; $papel='Manter'; Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Banner/aplicar-banner.ps1').Content.TrimStart([char]0xFEFF))) -Nome $nome -Funcao $funcao -Ambiente $ambiente -PapelDeParede $papel
+#
+#   $nome     Vazio = usa o nome real da máquina
+#   $ambiente Produção | Homologação | Testes
+#   $papel    Manter = quadro sobre o papel de parede atual | Azul = azul Nextec liso | Preto = preto liso
 #
 # Pode ser executado de novo a qualquer momento: baixa o quadro do repositório, faz backup do que mudar e regrava tudo.
 # Este arquivo deve ficar salvo em UTF-8 com BOM, para o Windows PowerShell 5.1 ler os acentos.
