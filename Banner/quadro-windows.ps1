@@ -12,8 +12,8 @@
 #   .\quadro-windows.ps1 -SalvarEm C:\Temp\quadro.png -Fundo C:\Windows\Web\Wallpaper\Windows\img0.jpg
 #
 # A variável de máquina NEXTEC_PAPEL_DE_PAREDE escolhe o fundo: Manter (padrão) desenha o quadro sobre o
-# papel de parede do usuário; Azul troca o papel de parede pelo azul Nextec liso (0D0035); Preto troca por
-# preto liso. Remover é o nome antigo de Azul e continua valendo.
+# papel de parede do usuário; Preto troca o papel de parede por preto liso. Remover é o nome antigo de Preto e
+# continua valendo.
 # O parâmetro -PapelDeParede tem o mesmo efeito e vale mais que a variável (útil para conferir o resultado).
 #
 # O painel atrás do texto tem opacidade 215 (de 255) por padrão, para dar contraste sobre qualquer papel de
@@ -24,7 +24,7 @@
 param(
     [string]$SalvarEm = '',
     [string]$Fundo = '',     # Só com -SalvarEm: imagem usada como papel de parede, para conferir o resultado
-    [ValidateSet('', 'Manter', 'Azul', 'Preto', 'Remover')]
+    [ValidateSet('', 'Manter', 'Preto', 'Remover')]
     [string]$PapelDeParede = '',
     [ValidateRange(0, 255)]
     [int]$Opacidade = -1     # Opacidade do painel (0 a 255); sem valor usa NEXTEC_OPACIDADE ou 215
@@ -202,13 +202,12 @@ public static class NextecWin32 {
         $pincel.Dispose()
     }
 
-    # Fundo: o papel de parede do usuário (Manter); sem imagem, a cor sólida dele; sem nada disso, degradê azul acinzentado escuro; com Azul ou Preto, a cor lisa escolhida
+    # Fundo: o papel de parede do usuário (Manter); sem imagem, a cor sólida dele; sem nada disso, preto liso; com Preto, preto liso
     $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
     $escolhaFundo = if ($PapelDeParede) { $PapelDeParede } else { Ler 'NEXTEC_PAPEL_DE_PAREDE' }
     $corForcada = switch -Wildcard ($escolhaFundo.ToLower()) {
-        'azul*'    { [System.Drawing.Color]::FromArgb(13, 0, 53) }
-        'remov*'   { [System.Drawing.Color]::FromArgb(13, 0, 53) }
         'preto*'   { [System.Drawing.Color]::FromArgb(0, 0, 0) }
+        'remov*'   { [System.Drawing.Color]::FromArgb(0, 0, 0) }
         default    { $null }
     }
     $removerFundo = [bool]$corForcada
@@ -238,11 +237,7 @@ public static class NextecWin32 {
         }
         $imagemFundo.Dispose()
     } elseif (-not $corSolida) {
-        $degrade = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
-            (New-Object System.Drawing.Point(0, 0)), (New-Object System.Drawing.Point(0, $altura)),
-            [System.Drawing.Color]::FromArgb(14, 26, 48), [System.Drawing.Color]::FromArgb(21, 35, 66))
-        $g.FillRectangle($degrade, 0, 0, $largura, $altura)
-        $degrade.Dispose()
+        $g.Clear([System.Drawing.Color]::FromArgb(0, 0, 0))
     }
 
     # Medidas do bloco
