@@ -47,6 +47,9 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.28.0 Alvos de conectividade (blackbox) com o rótulo sonda_host, o
+           servidor que executa a sonda, para ligar o serviço testado ao
+           servidor no painel Nextec | Serviços.
     2.27.0 Sessões de usuário (entrada, saída, desconexão e reconexão por
            RDP ou console) do canal TerminalServices-LocalSessionManager,
            para o painel "Últimos logins" do Nextec | Servidor.
@@ -353,7 +356,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.27.0"
+$InstallerVersion = "2.28.0"
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -7928,6 +7931,7 @@ function New-AlloyConfiguration {
             [void]$builder.AppendLine("    labels = {")
             [void]$builder.AppendLine(('      cliente     = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Cliente)))
             [void]$builder.AppendLine(('      host        = "{0}",' -f (ConvertTo-AlloyEscapedString $target.Name)))
+            [void]$builder.AppendLine(('      sonda_host  = "{0}",' -f (ConvertTo-AlloyEscapedString $script:HostLabel)))
             [void]$builder.AppendLine('      servico     = "blackbox",')
             [void]$builder.AppendLine(('      tipo        = "{0}",' -f (ConvertTo-AlloyEscapedString $target.Type)))
             [void]$builder.AppendLine(('      ambiente    = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Ambiente)))
