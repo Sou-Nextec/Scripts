@@ -2501,7 +2501,7 @@ function Get-InventarioRemoto {
         }
     }
     if (-not $sessao) {
-        if ($Computador -ine $env:COMPUTERNAME) {
+        if (-not $Local) {
             $alternativa = Invoke-PsExecInventory -Computador $Computador
             if ($alternativa.Status -eq 'OK' -or $alternativa.Status -like 'Falha PsExec*') { return $alternativa }
             if ($negou) { $alternativa.Status = 'Credencial recusada (WinRM/DCOM e PsExec sem acesso)' }
@@ -2589,10 +2589,12 @@ function Get-InventarioRemoto {
                 }
                 $qtdSoftware = $lista.Count
             } catch {
-                # Usa PsExec como fallback somente para o componente de softwares.
-                $alternativaSoftware = Invoke-PsExecInventory -Computador $Computador
-                if ($alternativaSoftware.Status -eq 'OK') { $qtdSoftware = $alternativaSoftware.QtdSoftwares }
-                else { Write-Log "  Software de $Computador não coletado: $($alternativaSoftware.Status)" 'AVISO' }
+                if (-not $Local) {
+                    # Usa PsExec como fallback somente para o componente de softwares.
+                    $alternativaSoftware = Invoke-PsExecInventory -Computador $Computador
+                    if ($alternativaSoftware.Status -eq 'OK') { $qtdSoftware = $alternativaSoftware.QtdSoftwares }
+                    else { Write-Log "  Software de $Computador não coletado: $($alternativaSoftware.Status)" 'AVISO' }
+                } else { Write-Log "  Software local de $Computador não coletado: $($_.Exception.Message)" 'AVISO' }
             }
         }
 
