@@ -9,11 +9,13 @@ Funciona no Windows PowerShell 5.1. Executar no servidor principal do cliente, d
 Num PowerShell, no servidor do cliente (troque a tag pela versão desejada):
 
 ```powershell
-[Net.ServicePointManager]::SecurityProtocol='Tls12'; $f="$env:TEMP\Nextec-Assessment-v2.ps1"; iwr 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/assessment-v2.3/Assessment/Nextec-Assessment-v2.ps1' -OutFile $f -UseBasicParsing; powershell -NoProfile -ExecutionPolicy Bypass -File $f -Automatico
+[Net.ServicePointManager]::SecurityProtocol='Tls12'; $f="$env:TEMP\Nextec-Assessment-v2.ps1"; iwr 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/assessment-v2.3/Assessment/Nextec-Assessment-v2.ps1' -OutFile $f -UseBasicParsing; powershell -NoProfile -ExecutionPolicy Bypass -File $f
 ```
 
-- O script se reabre como administrador sozinho (confirme o UAC) e valida o ambiente antes de coletar.
-- Se a conta atual não alcançar as estações, abre **uma** janela de login e senha do domínio. A credencial vale só para a execução e não é gravada.
+- Sem parâmetros, o script inicia a coleta completa, se reabre como administrador (confirme o UAC) e valida o ambiente antes de coletar.
+- A coleta das estações tenta WinRM, DCOM e, como última alternativa, PsExec por SMB/445. Se a conta atual não alcançar as máquinas, abre **uma** janela de login e senha do domínio. A credencial vale só para a execução e não é gravada.
+- O inventário consulta todos os computadores habilitados no AD e os Windows prováveis encontrados nas sub-redes locais descobertas. Prefixos maiores que `/22` continuam limitados pelo modo seguro; informe redes roteadas com `-Subredes`.
+- A lista de softwares por estação está ligada por padrão; `-SemSoftwareEstacoes` desativa essa coleta.
 - O resultado fica em `C:\Assessment\<cliente>_<servidor>_<data>.zip`. A pasta de trabalho é removida assim que o `.zip` é gerado (se o zip falhar, a pasta é mantida). Ao terminar, o Explorer abre com o `.zip` selecionado.
 - Use sempre uma **tag**, nunca a `main`: assim uma alteração futura no repositório não passa a rodar como administrador nas máquinas dos clientes.
 
@@ -23,7 +25,7 @@ Alternativa por arquivo: baixe os dois arquivos desta pasta, na mesma pasta, e d
 
 | Parâmetro | Efeito |
 |---|---|
-| `-Automatico` | Sem perguntas (o `.cmd` já usa). |
+| `-Automatico` | Força o fluxo automático; também é o padrão sem parâmetros. |
 | `-SoValidar` | Só a pré-validação do ambiente, sem coletar. |
 | `-Cliente "Nome"` | Nome do cliente nos arquivos. Sem ele, usa o domínio. |
 | `-Subredes 192.168.0.0/24` | Sub-redes a varrer. Sem ele, detecta sozinho. |
@@ -32,12 +34,16 @@ Alternativa por arquivo: baixe os dois arquivos desta pasta, na mesma pasta, e d
 | `-SemAD` | Não coleta o Active Directory. |
 | `-SemConsultaInternet` | Nenhuma consulta pela internet. |
 | `-PedirCredencial` | Abre o login e senha do domínio logo no início. |
+| `-SemSoftwareEstacoes` | Não coleta o inventário de softwares nas estações. |
+| `-SemPsExec` | Desativa o fallback PsExec. |
+| `-PsExecPath` | Define o caminho de um PsExec local já assinado pela Microsoft. |
+| `-TimeoutPsExecSegundos` | Limite local de espera do PsExec (padrão: 120 segundos). |
 
 Todos os parâmetros e o que é coletado estão no próprio cabeçalho do script (`Get-Help .\Nextec-Assessment-v2.ps1 -Full`).
 
 ## Confidencialidade
 
-O material contém nomes de usuário, IPs, softwares e configurações do cliente. Trate a pasta e o `.zip` como confidenciais. O script não altera nada no cliente: grava apenas a pasta de saída e um cache de fabricantes em `%LOCALAPPDATA%\Nextec-Assessment`. As únicas consultas externas são a base de fabricantes da IEEE, o `api.macvendors.com` (só o prefixo do MAC) e o `ipinfo.io`; `-SemConsultaInternet` desliga todas.
+O material contém nomes de usuário, IPs, softwares e configurações do cliente. Trate a pasta e o `.zip` como confidenciais. A coleta é somente leitura. PsExec, quando necessário, cria um serviço temporário na estação e o remove ao encerrar normalmente; se houver timeout, o encerramento remoto não pode ser confirmado. O executável não é baixado: deve estar instalado localmente (por exemplo, `C:\Tools\PsExec64.exe`) e ter assinatura Microsoft válida. O script grava a pasta de saída e um cache de fabricantes em `%LOCALAPPDATA%\Nextec-Assessment`. As únicas consultas externas são a base de fabricantes da IEEE, o `api.macvendors.com` (só o prefixo do MAC) e o `ipinfo.io`; `-SemConsultaInternet` desliga todas.
 
 ## Verificação de integridade
 
