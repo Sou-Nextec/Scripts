@@ -25,7 +25,8 @@
         provável identificado nas sub-redes locais descobertas. PsExec é a última alternativa após WinRM e DCOM.
 
     Executar sem parâmetros (ou com -Automatico, usado pelo Executar-Assessment.cmd) inicia o fluxo completo.
-    A coleta de softwares está habilitada por padrão (-SemSoftwareEstacoes desativa essa parte).
+    A coleta de softwares está habilitada por padrão (-SemSoftwareEstacoes desativa essa parte; -SoftwareEstacoes
+    é aceito só por compatibilidade). O coletor do PsExec funciona em PowerShell 2.0 (Windows 7/2008 R2).
     Reabre elevado sozinho (o UAC é o único aviso), assume o nome do cliente pelo domínio, valida o ambiente
     antes de coletar e, só se a conta atual for negada nas estações, abre UMA janela de login e senha do domínio.
     Essa credencial vale apenas para esta execução, não é gravada e é descartada ao terminar.
@@ -70,6 +71,7 @@ param(
     [switch]$SemConsultaInternet,
     [switch]$PortasCompletas,
     [switch]$IncluirRedesVirtuais,
+    # Obsoleto: a coleta de softwares já é o padrão. Mantido só para não quebrar linhas de comando antigas.
     [switch]$SoftwareEstacoes,
     [switch]$SemSoftwareEstacoes,
     [switch]$SemPsExec,
@@ -89,7 +91,8 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 # Sem parâmetros, executa o fluxo completo sem perguntas de configuração.
-if ($PSBoundParameters.Count -eq 0 -and $args.Count -eq 0) { $Automatico = $true }
+if ($PSBoundParameters.Count -eq 0) { $Automatico = $true }
+# -SoftwareEstacoes não tem mais efeito: só -SemSoftwareEstacoes muda o padrão.
 $SoftwareEstacoes = -not $SemSoftwareEstacoes
 
 # Executado por duplo clique (.cmd) ou "Executar com o PowerShell", a janela fecha sozinha em erro fatal
@@ -130,6 +133,7 @@ $script:UpnSuffixesForest = @()
 $script:SoftwaresEstacoes = New-Object System.Collections.Generic.List[object]
 $script:CredencialRemota = $null
 $script:PsExecPath = ''
+$script:PsExecMotivo = 'PsExec desativado'
 $script:SemaforoPsExec = New-Object System.Threading.SemaphoreSlim(2, 2)
 
 # Ritmo da varredura. O padrão é suave de propósito: rajada grande de conexões TCP esgota a tabela
@@ -199,6 +203,15 @@ if (-not $SemPsExec) {
     if (-not $script:PsExecPath) {
         $cmdPsExec = Get-Command PsExec64.exe, PsExec.exe -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($cmdPsExec) { $script:PsExecPath = $cmdPsExec.Source }
+    }
+    # A assinatura é verificada uma vez só: o executável não muda durante a coleta.
+    if (-not $script:PsExecPath) { $script:PsExecMotivo = 'PsExec Microsoft não encontrado' }
+    else {
+        $assinaturaPsExec = Get-AuthenticodeSignature -LiteralPath $script:PsExecPath
+        if ($assinaturaPsExec.Status -ne 'Valid' -or "$($assinaturaPsExec.SignerCertificate.Subject)" -notmatch '(?i)Microsoft Corporation') {
+            $script:PsExecMotivo = 'PsExec rejeitado: assinatura Microsoft inválida ou ausente'
+            $script:PsExecPath = ''
+        } else { $script:PsExecMotivo = '' }
     }
 }
 
@@ -911,8 +924,11 @@ function Test-AcessoRemoto {
     $p5985 = Test-PortaRapida $Alvo 5985 1000
     $p135  = Test-PortaRapida $Alvo 135 1000
     $p445  = Test-PortaRapida $Alvo 445 1000
-    if (-not ($p5985 -or $p135 -or $p445)) {
-        $r.Resultado = 'Inacessível'; $r.Detalhe = 'Portas WinRM/5985, RPC/135 e SMB/445 fechadas (desligado ou firewall)'
+    if (-not ($p5985 -or $p135)) {
+        # Só a 445 aberta: WinRM/DCOM continuam inacessíveis. O PsExec é tentado no inventário, não aqui.
+        $r.Resultado = 'Inacessível'
+        $r.Detalhe = if ($p445) { 'WinRM/5985 e RPC/135 fechadas; SMB/445 aberta (PsExec será tentado no inventário)' }
+                     else { 'Portas WinRM/5985, RPC/135 e SMB/445 fechadas (desligado ou firewall)' }
         return [pscustomobject]$r
     }
     $negou = $false
@@ -2354,16 +2370,12 @@ if (-not $SemVarreduraRede) {
 
 function Invoke-PsExecInventory {
     param([string]$Computador)
-    if ($SemPsExec) { return [pscustomobject]@{ Computador = $Computador; Status = 'Sem acesso (WinRM/DCOM; PsExec desativado)' } }
+    # Caminho e assinatura já validados no início; aqui só o motivo de não haver PsExec utilizável.
     if (-not $PsExecPath -or -not (Test-Path -LiteralPath $PsExecPath -PathType Leaf)) {
-        return [pscustomobject]@{ Computador = $Computador; Status = 'Sem acesso (WinRM/DCOM; PsExec Microsoft não encontrado)' }
-    }
-    $assinatura = Get-AuthenticodeSignature -LiteralPath $PsExecPath
-    if ($assinatura.Status -ne 'Valid' -or "$($assinatura.SignerCertificate.Subject)" -notmatch '(?i)Microsoft Corporation') {
-        return [pscustomobject]@{ Computador = $Computador; Status = 'Sem acesso (PsExec rejeitado: assinatura Microsoft inválida ou ausente)' }
+        return [pscustomobject]@{ Computador = $Computador; Status = "Sem acesso (WinRM/DCOM; $PsExecMotivo)" }
     }
     if (-not (Test-PortaRapida $Computador 445 1000)) {
-        return [pscustomobject]@{ Computador = $Computador; Status = 'Desligado ou inacessível (SMB/445 fechado; PsExec não executado)' }
+        return [pscustomobject]@{ Computador = $Computador; Status = 'Sem acesso (WinRM/DCOM falharam; SMB/445 fechado, PsExec não executado)' }
     }
     $SemaforoPsExec.Wait()
     $saida = $null; $erro = $null; $entrada = $null; $processo = $null
@@ -2371,69 +2383,93 @@ function Invoke-PsExecInventory {
         $saida = [IO.Path]::GetTempFileName()
         $erro = [IO.Path]::GetTempFileName()
         $entrada = [IO.Path]::GetTempFileName()
+        # Compatível com PowerShell 2.0: o PsExec é o caminho justamente das máquinas antigas, sem WinRM.
+        # Por isso Get-WmiObject (não Get-CimInstance) e saída em campos base64 (ConvertTo-Json não existe no 2.0).
         $coletor = @'
 $ErrorActionPreference = 'Stop'
-function Fmt($d, $f) { if ($d) { ([datetime]$d).ToString($f) } else { '' } }
-$cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
-$os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
-$bios = Get-CimInstance Win32_BIOS -ErrorAction Stop
-$cpu = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1
-$disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction Stop
 $collectSoftware = __NEXTEC_SOFTWARE__
-$programs = @()
-if ($collectSoftware) { $programs = @(Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -and -not $_.SystemComponent -and -not $_.ParentKeyName } | Select-Object @{n='Nome';e={$_.DisplayName.Trim()}},@{n='Versao';e={$_.DisplayVersion}},@{n='Fabricante';e={$_.Publisher}} | Sort-Object Nome,Versao -Unique) }
+$out = New-Object System.Collections.ArrayList
+function B64($v) { if ($null -eq $v) { return '' }; [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$v)) }
+function Add-F($k, $v) { [void]$out.Add('F|' + $k + '|' + (B64 $v)) }
+function Dmtf($v) { if (-not $v) { return $null }; try { return [Management.ManagementDateTimeConverter]::ToDateTime([string]$v) } catch { return $null } }
+function Fmt($d, $f) { if ($d) { return $d.ToString($f) }; return '' }
+function Dias($d) { if ($d) { return [int]((Get-Date) - $d).TotalDays }; return '' }
+$cs = Get-WmiObject Win32_ComputerSystem
+$os = Get-WmiObject Win32_OperatingSystem
+$bios = Get-WmiObject Win32_BIOS
+$cpu = @(Get-WmiObject Win32_Processor)[0]
+$disk = Get-WmiObject Win32_LogicalDisk -Filter "DeviceID='C:'"
+$qtd = ''
+if ($collectSoftware) {
+  $programs = @(Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -and -not $_.SystemComponent -and -not $_.ParentKeyName } | Select-Object @{n='Nome';e={$_.DisplayName.Trim()}},@{n='Versao';e={$_.DisplayVersion}},@{n='Fabricante';e={$_.Publisher}} | Sort-Object Nome,Versao -Unique)
+  foreach ($p in $programs) { [void]$out.Add('S|' + (B64 $p.Nome) + '|' + (B64 $p.Versao) + '|' + (B64 $p.Fabricante)) }
+  $qtd = $programs.Count
+}
+$regexAv = '(?i)Defender|WinDefend|Acronis|Kaspersky|ESET|Sophos|Bitdefender|Trend|McAfee|Trellix|Symantec|SentinelOne|CrowdStrike|Avast|Norton|Panda|Webroot|Malwarebytes|Cylance|Cortex|Huntress'
 $av = @()
-try { $av = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop | ForEach-Object displayName) } catch {}
-if (-not $av.Count) { try { $av = @(Get-CimInstance Win32_Service -Filter "State='Running'" -ErrorAction Stop | Where-Object { $_.Name -match '(?i)WinDefend|Acronis|Kaspersky|ESET|Sophos|Bitdefender|Trend|McAfee|Trellix|Symantec|SentinelOne|CrowdStrike|Avast|Norton|Panda|Webroot|Malwarebytes|Cylance|Cortex|Huntress' -or $_.DisplayName -match '(?i)Defender|Acronis|Kaspersky|ESET|Sophos|Bitdefender|Trend|McAfee|Trellix|Symantec|SentinelOne|CrowdStrike|Avast|Norton|Panda|Webroot|Malwarebytes|Cylance|Cortex|Huntress' } | ForEach-Object DisplayName | Select-Object -Unique -First 3) } catch {} }
+try { $av = @(Get-WmiObject -Namespace root\SecurityCenter2 -Class AntiVirusProduct | ForEach-Object { $_.displayName }) } catch {}
+if (-not $av.Count) { try { $av = @(Get-WmiObject Win32_Service -Filter "State='Running'" | Where-Object { $_.Name -match $regexAv -or $_.DisplayName -match $regexAv } | ForEach-Object { $_.DisplayName } | Select-Object -Unique -First 3) } catch {} }
 $mp = $null
-try { $mp = Get-CimInstance -Namespace root/Microsoft/Windows/Defender -ClassName MSFT_MpComputerStatus -ErrorAction Stop } catch {}
+try { $mp = Get-WmiObject -Namespace root\Microsoft\Windows\Defender -Class MSFT_MpComputerStatus } catch {}
+$assinaturaAv = $null
+if ($mp) { $assinaturaAv = Dmtf $mp.AntivirusSignatureLastUpdated }
 $patch = $null
-try { $patch = Get-CimInstance Win32_QuickFixEngineering -ErrorAction Stop | Where-Object InstalledOn | Sort-Object InstalledOn -Descending | Select-Object -First 1 } catch {}
+try {
+  $datas = @(Get-WmiObject Win32_QuickFixEngineering | ForEach-Object {
+    $v = $_.InstalledOn
+    if ($v -is [datetime]) { $v }
+    elseif ("$v" -match '^[0-9A-Fa-f]{15,16}$') { try { [datetime]::FromFileTimeUtc([Convert]::ToInt64("$v", 16)) } catch {} }
+    elseif ("$v") { try { [datetime]::Parse("$v", [Globalization.CultureInfo]::InvariantCulture) } catch {} }
+  })
+  if ($datas.Count) { $patch = @($datas | Sort-Object -Descending)[0] }
+} catch {}
 $media = 'N/D'
-try { $media = ((Get-CimInstance -Namespace root/Microsoft/Windows/Storage -ClassName MSFT_PhysicalDisk -ErrorAction Stop | ForEach-Object { switch ([int]$_.MediaType) { 3 {'HDD'} 4 {'SSD'} default {'Não informado'} } } | Select-Object -Unique) -join '; ') } catch {}
+try {
+  $tipos = @(Get-WmiObject -Namespace root\Microsoft\Windows\Storage -Class MSFT_PhysicalDisk | ForEach-Object { switch ([int]$_.MediaType) { 3 {'HDD'} 4 {'SSD'} default {'Não informado'} } } | Select-Object -Unique)
+  if ($tipos.Count) { $media = $tipos -join '; ' }
+} catch {}
 $bitlocker = 'N/D'
 try {
-  $vols = @(Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -ErrorAction Stop)
+  $vols = @(Get-WmiObject -Namespace root\cimv2\Security\MicrosoftVolumeEncryption -Class Win32_EncryptableVolume)
   if ($vols.Count) {
-    $bitlocker = (($vols | ForEach-Object {
-      $v = $_
-      $status = try { (Invoke-CimMethod -InputObject $v -MethodName GetProtectionStatus -ErrorAction Stop).ProtectionStatus } catch { $null }
-      $state = switch ($status) { 0 {'desprotegido'} 1 {'protegido'} default {'desconhecido'} }
+    $estados = foreach ($v in $vols) {
+      $status = $null
+      try { $status = $v.GetProtectionStatus().ProtectionStatus } catch {}
+      $state = 'desconhecido'
+      if ($status -eq 0) { $state = 'desprotegido' } elseif ($status -eq 1) { $state = 'protegido' }
       "$($v.DriveLetter) $state"
-    }) -join '; ')
+    }
+    $bitlocker = @($estados) -join '; '
   }
 } catch {}
 $admins = 'N/D'
 try {
-  $group = Get-CimInstance Win32_Group -Filter "SID='S-1-5-32-544'" -ErrorAction Stop | Select-Object -First 1
+  $group = @(Get-WmiObject Win32_Group -Filter "SID='S-1-5-32-544'")[0]
   if ($group) {
     $query = "ASSOCIATORS OF {Win32_Group.Domain='$($group.Domain)',Name='$($group.Name)'} WHERE AssocClass=Win32_GroupUser Role=GroupComponent"
-    $admins = (Get-CimInstance -Query $query -ErrorAction Stop | ForEach-Object { "$($_.Domain)\$($_.Name)" }) -join '; '
+    $admins = @(Get-WmiObject -Query $query | ForEach-Object { "$($_.Domain)\$($_.Name)" }) -join '; '
   }
 } catch {}
-$data = [pscustomobject]@{
- ComputerName=$env:COMPUTERNAME; Fabricante=$cs.Manufacturer; Modelo=$cs.Model; NumeroSerie=$bios.SerialNumber
- QtdSoftwares=if($collectSoftware){$programs.Count}else{$null}; Softwares=$programs; SO=$os.Caption; Build=$os.BuildNumber
- Processador="$($cpu.Name)".Trim(); MemoriaGB=[math]::Round($cs.TotalPhysicalMemory / 1GB,1)
- MemoriaLivreGB=[math]::Round($os.FreePhysicalMemory / 1MB,1); DiscoCGB=if($disk.Size){[math]::Round($disk.Size/1GB,0)}else{$null}
- LivreCPct=if($disk.Size){[math]::Round(100*$disk.FreeSpace/$disk.Size,0)}else{$null}
- TipoDisco=$media; Antivirus=if($av.Count){$av -join '; '}else{'N/D'}
- DefenderTempoReal=if($mp){$mp.RealTimeProtectionEnabled}else{$null}
- AssinaturaAV=Fmt $(if($mp){$mp.AntivirusSignatureLastUpdated}) 'dd/MM/yyyy HH:mm'
- DiasAssinaturaAV=if($mp -and $mp.AntivirusSignatureLastUpdated){[int]((Get-Date)-$mp.AntivirusSignatureLastUpdated).TotalDays}else{$null}
- BitLocker=$bitlocker; UltimoPatch=Fmt $(if($patch){$patch.InstalledOn}) 'dd/MM/yyyy'
- DiasSemPatch=if($patch -and $patch.InstalledOn){[int]((Get-Date)-$patch.InstalledOn).TotalDays}else{$null}
- AdministradoresLocais=$admins; UsuarioLogado=$cs.UserName
- UltimoBoot=Fmt $os.LastBootUpTime 'dd/MM/yyyy HH:mm'; InstaladoEm=Fmt $os.InstallDate 'dd/MM/yyyy HH:mm'
-}
-'###NEXTEC###' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($data | ConvertTo-Json -Compress -Depth 5))) + '###FIM###'
+Add-F ComputerName $env:COMPUTERNAME; Add-F Fabricante $cs.Manufacturer; Add-F Modelo $cs.Model; Add-F NumeroSerie $bios.SerialNumber
+Add-F QtdSoftwares $qtd; Add-F SO $os.Caption; Add-F Build $os.BuildNumber; Add-F Processador ("$($cpu.Name)".Trim())
+Add-F MemoriaGB ([math]::Round($cs.TotalPhysicalMemory / 1GB, 1)); Add-F MemoriaLivreGB ([math]::Round($os.FreePhysicalMemory / 1MB, 1))
+if ($disk -and $disk.Size) { Add-F DiscoCGB ([math]::Round($disk.Size / 1GB, 0)); Add-F LivreCPct ([math]::Round(100 * $disk.FreeSpace / $disk.Size, 0)) }
+Add-F TipoDisco $media
+if ($av.Count) { Add-F Antivirus ($av -join '; ') } else { Add-F Antivirus 'N/D' }
+if ($mp) { Add-F DefenderTempoReal ([string][bool]$mp.RealTimeProtectionEnabled) }
+Add-F AssinaturaAV (Fmt $assinaturaAv 'dd/MM/yyyy HH:mm'); Add-F DiasAssinaturaAV (Dias $assinaturaAv)
+Add-F BitLocker $bitlocker; Add-F UltimoPatch (Fmt $patch 'dd/MM/yyyy'); Add-F DiasSemPatch (Dias $patch)
+Add-F AdministradoresLocais $admins; Add-F UsuarioLogado $cs.UserName
+Add-F UltimoBoot (Fmt (Dmtf $os.LastBootUpTime) 'dd/MM/yyyy HH:mm'); Add-F InstaladoEm (Fmt (Dmtf $os.InstallDate) 'dd/MM/yyyy HH:mm')
+'###NEXTEC###' + ($out -join ';') + '###FIM###'
 '@
-        $coletor = $coletor.Replace('__NEXTEC_SOFTWARE__', [string][bool]$SoftwareEstacoes)
+        $coletor = $coletor.Replace('__NEXTEC_SOFTWARE__', $(if ($SoftwareEstacoes) { '$true' } else { '$false' }))
         $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($coletor))
         $service = 'NextecAssessment_' + [guid]::NewGuid().ToString('N').Substring(0,12)
         $argumentos = @("\\$Computador", '-accepteula', '-nobanner', '-n', '15', '-s', '-r', $service,
             'powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded)
-        $opcoes = @{ FilePath=$PsExecPath; ArgumentList=$argumentos; PassThru=$true
+        # Pasta de trabalho fixa: com -Credential, a conta informada pode não ler a pasta atual (perfil do técnico).
+        $opcoes = @{ FilePath=$PsExecPath; ArgumentList=$argumentos; PassThru=$true; WorkingDirectory=$env:SystemRoot
             RedirectStandardInput=$entrada; RedirectStandardOutput=$saida; RedirectStandardError=$erro }
         if ($CredencialRemota) { $opcoes.Credential=$CredencialRemota; $opcoes.WindowStyle='Hidden' }
         else { $opcoes.NoNewWindow=$true }
@@ -2444,30 +2480,45 @@ $data = [pscustomobject]@{
             return [pscustomobject]@{ Computador=$Computador; Status="Falha PsExec: limite de $TimeoutPsExecSegundos s; encerramento remoto não confirmado" }
         }
         $texto = [IO.File]::ReadAllText($saida)
-        if ($processo.ExitCode -ne 0 -or $texto -notmatch '###NEXTEC###(?<json>[A-Za-z0-9+/=]+)###FIM###') {
+        if ($processo.ExitCode -ne 0 -or $texto -notmatch '###NEXTEC###(?<dados>[^#]*)###FIM###') {
             $detalhe = [IO.File]::ReadAllText($erro)
             if (-not $detalhe) { $detalhe=$texto }
             $detalhe=($detalhe -replace '\s+',' ').Trim()
             if ($detalhe.Length -gt 180) { $detalhe=$detalhe.Substring(0,180) }
             return [pscustomobject]@{ Computador=$Computador; Status="Falha PsExec (código $($processo.ExitCode)): $detalhe" }
         }
-        $dados = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Matches.json)) | ConvertFrom-Json -ErrorAction Stop
+        $bruto = $Matches.dados
+        $texto64 = { param($b) if ($b) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b)) } else { '' } }
+        $numero = { param($v) if ("$v" -eq '') { $null } else { [double]::Parse("$v", [Globalization.CultureInfo]::InvariantCulture) } }
+        $dados = @{}
+        $softwares = New-Object System.Collections.Generic.List[object]
+        foreach ($parte in ($bruto -split ';')) {
+            $f = $parte -split '\|'
+            if ($f[0] -eq 'F' -and $f.Count -ge 3) { $dados[$f[1]] = & $texto64 $f[2] }
+            elseif ($f[0] -eq 'S' -and $f.Count -ge 4) {
+                $softwares.Add([pscustomobject]@{ Nome = (& $texto64 $f[1]); Versao = (& $texto64 $f[2]); Fabricante = (& $texto64 $f[3]) })
+            }
+        }
         if (-not $dados.ComputerName -or -not $dados.SO -or -not $dados.Build) {
             return [pscustomobject]@{ Computador=$Computador; Status='Falha PsExec: retorno sem identidade, SO ou build' }
         }
-        if ($Computador -notmatch '^\d{1,3}(\.\d{1,3}){3}$' -and $dados.ComputerName -ine (($Computador -split '\.')[0])) {
+        # COMPUTERNAME é o nome NetBIOS (até 15 caracteres); o nome DNS pode ser maior.
+        $nomeEsperado = ($Computador -split '\.')[0]
+        if ($nomeEsperado.Length -gt 15) { $nomeEsperado = $nomeEsperado.Substring(0, 15) }
+        if ($Computador -notmatch '^\d{1,3}(\.\d{1,3}){3}$' -and $dados.ComputerName -ine $nomeEsperado) {
             return [pscustomobject]@{ Computador=$Computador; Status="Falha PsExec: identidade divergente ($($dados.ComputerName))" }
         }
-        foreach ($soft in @($dados.Softwares)) {
-            if ($soft.Nome) { $script:SoftwaresEstacoes.Add([pscustomobject]@{ Computador=$dados.ComputerName; Nome=$soft.Nome; Versao=$soft.Versao; Fabricante=$soft.Fabricante }) }
+        foreach ($soft in $softwares) {
+            if ($soft.Nome) { $script:SoftwaresEstacoes.Add([pscustomobject]@{ Computador=$Computador; Nome=$soft.Nome; Versao=$soft.Versao; Fabricante=$soft.Fabricante }) }
         }
+        $defender = if ($dados.DefenderTempoReal -eq 'True') { $true } elseif ($dados.DefenderTempoReal -eq 'False') { $false } else { $null }
         [pscustomobject]@{
-            Computador=$dados.ComputerName; Status='OK'; Fabricante=$dados.Fabricante; Modelo=$dados.Modelo; NumeroSerie=$dados.NumeroSerie
-            QtdSoftwares=$dados.QtdSoftwares; SO=$dados.SO; Build=$dados.Build; Suporte=Get-SituacaoSuporte -Caption $dados.SO -Build ([int]$dados.Build)
-            Processador=$dados.Processador; MemoriaGB=$dados.MemoriaGB; MemoriaLivreGB=$dados.MemoriaLivreGB
-            DiscoCGB=$dados.DiscoCGB; LivreCPct=$dados.LivreCPct; TipoDisco=$dados.TipoDisco; Antivirus=$dados.Antivirus
-            DefenderTempoReal=$dados.DefenderTempoReal; AssinaturaAV=$dados.AssinaturaAV; DiasAssinaturaAV=$dados.DiasAssinaturaAV
-            BitLocker=$dados.BitLocker; UltimoPatch=$dados.UltimoPatch; DiasSemPatch=$dados.DiasSemPatch
+            Computador=$Computador; Status='OK'; Fabricante=$dados.Fabricante; Modelo=$dados.Modelo; NumeroSerie=$dados.NumeroSerie
+            QtdSoftwares=(& $numero $dados.QtdSoftwares); SO=$dados.SO; Build=$dados.Build; Suporte=Get-SituacaoSuporte -Caption $dados.SO -Build ([int]$dados.Build)
+            Processador=$dados.Processador; MemoriaGB=(& $numero $dados.MemoriaGB); MemoriaLivreGB=(& $numero $dados.MemoriaLivreGB)
+            DiscoCGB=(& $numero $dados.DiscoCGB); LivreCPct=(& $numero $dados.LivreCPct); TipoDisco=$dados.TipoDisco; Antivirus=$dados.Antivirus
+            DefenderTempoReal=$defender; AssinaturaAV=$dados.AssinaturaAV; DiasAssinaturaAV=(& $numero $dados.DiasAssinaturaAV)
+            BitLocker=$dados.BitLocker; UltimoPatch=$dados.UltimoPatch; DiasSemPatch=(& $numero $dados.DiasSemPatch)
             AdministradoresLocais=$dados.AdministradoresLocais; UsuarioLogado=$dados.UsuarioLogado
             UltimoBoot=$dados.UltimoBoot; InstaladoEm=$dados.InstaladoEm
         }
@@ -2487,7 +2538,15 @@ function Get-InventarioRemoto {
     $negou = $false
     # Mensagens de credencial recusada (inglês e português). Distingue "a conta não entra" de "máquina desligada".
     $regexRecusa = '(?i)access is denied|acesso negado|0x80070005|unauthorized|logon failure|0x8007052e|user name or password|nome de usu.rio ou senha|senha incorret|bad password'
-    foreach ($protocolo in 'Wsman', 'Dcom') {
+    # Só tenta o protocolo com porta aberta: máquina desligada custaria ~40 s de timeout do DCOM.
+    $protocolos = @('Wsman', 'Dcom')
+    if (-not $Local) {
+        $protocolos = @($(if (Test-PortaRapida $Computador 5985 800) { 'Wsman' }), $(if (Test-PortaRapida $Computador 135 800) { 'Dcom' }) | Where-Object { $_ })
+        if ($protocolos.Count -eq 0 -and -not (Test-PortaRapida $Computador 445 800)) {
+            return [pscustomobject]@{ Computador = $Computador; Status = 'Desligado ou inacessível' }
+        }
+    }
+    foreach ($protocolo in $protocolos) {
         try {
             $parametrosSessao = @{ ComputerName = $Computador; SessionOption = (New-CimSessionOption -Protocol $protocolo); OperationTimeoutSec = 20; ErrorAction = 'Stop' }
             if ($usarCredencial) { $parametrosSessao.Credential = $CredencialRemota }
@@ -2589,12 +2648,9 @@ function Get-InventarioRemoto {
                 }
                 $qtdSoftware = $lista.Count
             } catch {
-                if (-not $Local) {
-                    # Usa PsExec como fallback somente para o componente de softwares.
-                    $alternativaSoftware = Invoke-PsExecInventory -Computador $Computador
-                    if ($alternativaSoftware.Status -eq 'OK') { $qtdSoftware = $alternativaSoftware.QtdSoftwares }
-                    else { Write-Log "  Software de $Computador não coletado: $($alternativaSoftware.Status)" 'AVISO' }
-                } else { Write-Log "  Software local de $Computador não coletado: $($_.Exception.Message)" 'AVISO' }
+                # Sem PsExec aqui: o DCOM já inventariou a máquina, e criar um serviço remoto em cada estação
+                # só para a lista de softwares não compensa. O PsExec fica para quem não tem WinRM nem DCOM.
+                Write-Log "  Software de $Computador não coletado (WinRM indisponível): $($_.Exception.Message)" 'AVISO'
             }
         }
 
@@ -2626,19 +2682,30 @@ function Get-InventarioRemoto {
 
 if (-not $SemInventarioRemoto) {
     Invoke-Etapa 'Inventário de computadores Windows identificados no AD e na rede' {
+        # Chave = nome NetBIOS (até 15 caracteres), que é o que o AD guarda em Nome e o que a varredura
+        # obtém por NetBIOS. Host conhecido só pelo IP usa o IP inteiro, e é descartado se o IP já é de
+        # um computador do AD (sem isso a mesma máquina entraria duas vezes, por nome e por IP).
+        $chaveNetBios = { param($n) $c = ("$n" -split '\.')[0].ToUpperInvariant(); if ($c.Length -gt 15) { $c.Substring(0, 15) } else { $c } }
         $mapaCandidatos = @{}
+        $ipsAD = @{}
         foreach ($ad in @($script:ComputadoresAD | Where-Object { $_.Habilitado -and ((-not $_.SO) -or $_.SO -match '(?i)Windows') })) {
             $nome = if ($ad.DNS) { $ad.DNS } else { $ad.Nome }
-            if ($nome) { $chave = ($nome -split '\.')[0].ToUpperInvariant(); $mapaCandidatos[$chave] = [pscustomobject]@{ Nome=$ad.Nome; DNS=$nome; Alvo=$nome; Origem='AD' } }
+            if ($nome) { $mapaCandidatos[(& $chaveNetBios $ad.Nome)] = [pscustomobject]@{ Nome=$ad.Nome; DNS=$nome; Alvo=$nome; Origem='AD' } }
+            if ($ad.IPv4) { $ipsAD["$($ad.IPv4)"] = $true }
         }
         foreach ($itemRede in @($script:Hosts)) {
             $portasHost = @($itemRede.Portas)
             $provavelWindows = ($itemRede.SOProvavel -match '(?i)Windows') -or ($itemRede.TipoProvavel -eq 'Computador Windows') -or ((445 -in $portasHost) -and (($itemRede.NetBIOS) -or (135 -in $portasHost) -or (3389 -in $portasHost)))
             if (-not $provavelWindows -or $itemRede.IP -in $script:IpsLocais) { continue }
             $alvo = if ($itemRede.NetBIOS) { $itemRede.NetBIOS } elseif ($itemRede.NomeDNS) { $itemRede.NomeDNS } else { $itemRede.IP }
-            $nome = if ($itemRede.NetBIOS) { $itemRede.NetBIOS } elseif ($itemRede.NomeDNS) { ($itemRede.NomeDNS -split '\.')[0] } else { $itemRede.IP }
-            $chave = ($nome -split '\.')[0].ToUpperInvariant()
-            if (-not $mapaCandidatos.ContainsKey($chave)) { $mapaCandidatos[$chave] = [pscustomobject]@{ Nome=$nome; DNS=$host.NomeDNS; Alvo=$alvo; Origem='Rede' } }
+            if ($itemRede.NetBIOS -or $itemRede.NomeDNS) {
+                $nome = if ($itemRede.NetBIOS) { $itemRede.NetBIOS } else { ($itemRede.NomeDNS -split '\.')[0] }
+                $chave = & $chaveNetBios $nome
+            } else {
+                if ($ipsAD.ContainsKey("$($itemRede.IP)")) { continue }
+                $nome = "$($itemRede.IP)"; $chave = $nome
+            }
+            if (-not $mapaCandidatos.ContainsKey($chave)) { $mapaCandidatos[$chave] = [pscustomobject]@{ Nome=$nome; DNS=$itemRede.NomeDNS; Alvo=$alvo; Origem='Rede' } }
         }
         $candidatos = @($mapaCandidatos.Values | Sort-Object Nome)
         # Inventário em paralelo (runspaces). Sequencial, cada máquina sem acesso custava ~40 s de timeout
@@ -2652,7 +2719,7 @@ if (-not $SemInventarioRemoto) {
         $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry('Write-Log', 'param($Mensagem, $Nivel = "INFO") [void]$global:Mensagens.Add([pscustomobject]@{ Nivel = $Nivel; Texto = "$Mensagem".Trim() })')))
         $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('SoftwareEstacoes', [bool]$SoftwareEstacoes, '')))
         $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('CredencialRemota', $script:CredencialRemota, '')))
-        $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('SemPsExec', [bool]$SemPsExec, '')))
+        $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('PsExecMotivo', $script:PsExecMotivo, '')))
         $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('TimeoutPsExecSegundos', [int]$TimeoutPsExecSegundos, '')))
         $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('PsExecPath', $script:PsExecPath, '')))
         $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('SemaforoPsExec', $script:SemaforoPsExec, '')))
@@ -2879,7 +2946,7 @@ function New-ComputadoresHtml {
     # Vinte e seis colunas não cabem em tela. Um cartão por máquina, com o que importa em destaque.
     param($Estacoes)
     $lista = @($Estacoes | ForEach-Object { $_ })
-    if ($lista.Count -eq 0) { return '<p class="vazio">Sem inventário remoto (sem AD ou desativado).</p>' }
+    if ($lista.Count -eq 0) { return '<p class="vazio">Nenhum computador Windows inventariado (sem candidatos no AD e na rede, ou inventário desativado).</p>' }
     $ok = @($lista | Where-Object { $_.Status -eq 'OK' } | Sort-Object Computador)
     $fora = @($lista | Where-Object { $_.Status -ne 'OK' } | Sort-Object Computador)
     $badge = { param($Texto, $Classe) "<span class='badge $Classe'>$(ConvertTo-HtmlSeguro $Texto)</span>" }

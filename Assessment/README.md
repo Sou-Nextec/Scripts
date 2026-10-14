@@ -15,7 +15,7 @@ Num PowerShell, no servidor do cliente (troque a tag pela versão desejada):
 - Sem parâmetros, o script inicia a coleta completa, se reabre como administrador (confirme o UAC) e valida o ambiente antes de coletar.
 - A coleta das estações tenta WinRM, DCOM e, como última alternativa, PsExec por SMB/445. Se a conta atual não alcançar as máquinas, abre **uma** janela de login e senha do domínio. A credencial vale só para a execução e não é gravada.
 - O inventário consulta todos os computadores habilitados no AD e os Windows prováveis encontrados nas sub-redes locais descobertas. Prefixos maiores que `/22` continuam limitados pelo modo seguro; informe redes roteadas com `-Subredes`.
-- A lista de softwares por estação está ligada por padrão; `-SemSoftwareEstacoes` desativa essa coleta.
+- A lista de softwares por estação está ligada por padrão; `-SemSoftwareEstacoes` desativa essa coleta. Ela usa WinRM (ou o PsExec, quando a máquina não tem WinRM nem DCOM); máquina inventariada só por DCOM fica sem a lista. `-SoftwareEstacoes` é aceito por compatibilidade, sem efeito.
 - O resultado fica em `C:\Assessment\<cliente>_<servidor>_<data>.zip`. A pasta de trabalho é removida assim que o `.zip` é gerado (se o zip falhar, a pasta é mantida). Ao terminar, o Explorer abre com o `.zip` selecionado.
 - Use sempre uma **tag**, nunca a `main`: assim uma alteração futura no repositório não passa a rodar como administrador nas máquinas dos clientes.
 
