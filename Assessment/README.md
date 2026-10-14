@@ -14,7 +14,7 @@ Num PowerShell, no servidor do cliente (troque a tag pela versão desejada):
 
 - O script se reabre como administrador sozinho (confirme o UAC) e valida o ambiente antes de coletar.
 - Se a conta atual não alcançar as estações, abre **uma** janela de login e senha do domínio. A credencial vale só para a execução e não é gravada.
-- O resultado vai para `C:\Assessment\<cliente>_<servidor>_<data>` e um `.zip` ao lado. Ao terminar, a pasta abre no Explorer.
+- O resultado fica em `C:\Assessment\<cliente>_<servidor>_<data>.zip`. A pasta de trabalho é removida assim que o `.zip` é gerado (se o zip falhar, a pasta é mantida). Ao terminar, o Explorer abre com o `.zip` selecionado.
 - Use sempre uma **tag**, nunca a `main`: assim uma alteração futura no repositório não passa a rodar como administrador nas máquinas dos clientes.
 
 Alternativa por arquivo: baixe os dois arquivos desta pasta, na mesma pasta, e dê duplo clique em `Executar-Assessment.cmd`.
