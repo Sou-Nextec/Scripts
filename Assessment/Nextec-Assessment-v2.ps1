@@ -24,7 +24,7 @@
     antes de coletar e, só se a conta atual for negada nas estações, abre UMA janela de login e senha do domínio.
     Essa credencial vale apenas para esta execução, não é gravada e é descartada ao terminar.
 
-    Saída: pasta com CSVs (separador ';', UTF-8), textos, resumo.json, Resumo-Assessment.html e um .zip.
+    Saída: um .zip com CSVs (separador ';', UTF-8), textos, resumo.json e Resumo-Assessment.html. A pasta de trabalho é removida depois que o .zip é gerado.
     A varredura de rede abre conexões TCP nas portas listadas; se houver IPS/antivírus de rede, avise o cliente.
 
 .EXAMPLE
@@ -3216,25 +3216,43 @@ try {
 } catch { }
 
 $zip = "$script:PastaSaida.zip"
+$zipGerado = $false
 try {
     Compress-Archive -Path (Join-Path $script:PastaSaida '*') -DestinationPath $zip -Force
+    $zipGerado = (Test-Path -LiteralPath $zip) -and ((Get-Item -LiteralPath $zip).Length -gt 0)
     Write-Log "Pacote compactado: $zip"
 } catch { Write-Log "Não foi possível compactar: $($_.Exception.Message)" 'AVISO' }
 
+# Com o .zip íntegro, a pasta é redundante e some do servidor do cliente. Se o zip falhar, a pasta fica.
+# Nenhum Write-Log depois daqui: o log vive dentro da pasta removida.
+$pastaRemovida = $false
+if ($zipGerado) {
+    try {
+        Remove-Item -LiteralPath $script:PastaSaida -Recurse -Force -ErrorAction Stop
+        $pastaRemovida = $true
+    } catch { Write-Host "Não foi possível remover a pasta $script:PastaSaida: $($_.Exception.Message)" -ForegroundColor Yellow }
+}
+
 Write-Host ''
 Write-Host "Concluído. Alertas: $contagem" -ForegroundColor Green
-Write-Host "Resumo: $caminhoHtml" -ForegroundColor Green
-Write-Host "Envie o arquivo $zip para análise." -ForegroundColor Green
+if ($pastaRemovida) {
+    Write-Host "Pacote: $zip (Resumo-Assessment.html e os CSVs estão dentro dele)" -ForegroundColor Green
+    Write-Host "Envie o arquivo $zip para análise." -ForegroundColor Green
+} else {
+    Write-Host "Resumo: $caminhoHtml" -ForegroundColor Green
+    Write-Host "Envie o arquivo $zip para análise." -ForegroundColor Green
+}
 
 # Segura a janela no fim quando há alguém olhando (duplo clique); em agendador e automação, não trava.
 if ($Automatico) {
     # Sem perguntas: abre a pasta com o relatório e deixa a janela por alguns segundos para o técnico ler o caminho.
-    try { Start-Process explorer.exe -ArgumentList "/select,`"$caminhoHtml`"" } catch { }
+    $alvoExplorer = if ($pastaRemovida) { $zip } else { $caminhoHtml }
+    try { Start-Process explorer.exe -ArgumentList "/select,`"$alvoExplorer`"" } catch { }
     Write-Host ''
     Write-Host 'Esta janela fecha sozinha em 20 segundos.' -ForegroundColor DarkGray
     Start-Sleep -Seconds 20
 } elseif (Test-TemTeclado) {
     Write-Host ''
-    if ((Read-Preenchimento 'Abrir o relatório agora? (S/N)' 'S') -match '^(s|y)') { try { Start-Process $caminhoHtml } catch { } }
+    if (-not $pastaRemovida -and (Read-Preenchimento 'Abrir o relatório agora? (S/N)' 'S') -match '^(s|y)') { try { Start-Process $caminhoHtml } catch { } }
     Read-Host 'Pressione Enter para fechar' | Out-Null
 }
