@@ -236,7 +236,7 @@ function Get-UrlPorta {
 
 # ---------- Apresentação no console ----------
 # O arquivo coleta.log guarda tudo com hora e nível; a tela mostra só o necessário, organizado por seção e etapa.
-$script:VersaoAssessment = '2.6'
+$script:VersaoAssessment = '2.7'
 $script:LarguraTela = 64
 $script:EtapaAberta = $null
 $script:NumeroSecao = 0
@@ -571,7 +571,7 @@ function Get-TituloWeb {
         $buffer = New-Object char[] 16384
         $lidos = $leitor.Read($buffer, 0, $buffer.Length)
         $html = [string]::new($buffer, 0, [math]::Max($lidos, 0))
-        $titulo = if ($html -match '(?is)<title[^>]*>\s*(.*?)\s*</title>') { ($Matches[1] -replace '\s+', ' ') } else { '' }
+        $titulo = if ($html -match '(?is)<title[^>]*>\s*(.*?)\s*</title>') { [System.Net.WebUtility]::HtmlDecode(($Matches[1] -replace '\s+', ' ')).Trim() } else { '' }
         $realm = [string]$resposta.Headers['WWW-Authenticate']
         if (-not $titulo -and $realm) { $titulo = $realm }
         if ($titulo.Length -gt 120) { $titulo = $titulo.Substring(0, 120) }
@@ -602,6 +602,11 @@ function Get-NomeNetBios {
     # Consulta de status NetBIOS (NBSTAT, UDP 137) feita direto pelo script, sem abrir o nbtstat.exe.
     # Mesmo resultado do nbtstat -A: devolve o nome único <00> do equipamento.
     param([string]$Ip, [int]$TimeoutMs = 1500)
+    # A própria máquina de coleta nem sempre responde à consulta feita para o próprio IP.
+    if ($null -eq $script:IpsLocais) {
+        $script:IpsLocais = @(try { [System.Net.Dns]::GetHostAddresses($env:COMPUTERNAME) | ForEach-Object { $_.IPAddressToString } } catch { })
+    }
+    if ($script:IpsLocais -contains $Ip) { return $env:COMPUTERNAME.ToUpper() }
     $udp = New-Object System.Net.Sockets.UdpClient
     try {
         $udp.Client.ReceiveTimeout = $TimeoutMs
@@ -619,11 +624,15 @@ function Get-NomeNetBios {
         [void]$udp.Send($dados, $dados.Length, $Ip, 137)
         $origem = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
         $resposta = $udp.Receive([ref]$origem)
-        # Cabeçalho (12) + nome (34) + tipo e classe (4) + TTL (4) + tamanho (2) = 56; o byte 56 é a quantidade de nomes
-        if ($resposta.Length -lt 57) { return '' }
-        $quantidade = [int]$resposta[56]
+        # Depois do cabeçalho (12) vem o nome da resposta: completo (tamanho + nome + 0) ou ponteiro de 2 bytes.
+        # Em seguida tipo e classe (4), TTL (4) e tamanho (2); o próximo byte é a quantidade de nomes.
+        if ($resposta.Length -lt 14) { return '' }
+        $p = if (($resposta[12] -band 0xC0) -eq 0xC0) { 14 } else { 12 + 1 + [int]$resposta[12] + 1 }
+        $p += 10
+        if ($resposta.Length -le $p) { return '' }
+        $quantidade = [int]$resposta[$p]
         for ($n = 0; $n -lt $quantidade; $n++) {
-            $pos = 57 + ($n * 18)
+            $pos = $p + 1 + ($n * 18)
             if ($pos + 18 -gt $resposta.Length) { break }
             $sufixo = $resposta[$pos + 15]
             $grupo = ($resposta[$pos + 16] -band 0x80) -ne 0
