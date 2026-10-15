@@ -20,7 +20,7 @@
         disco, antivírus e usuário logado (via WinRM ou DCOM).
 
     Modo sem intervenção (-Automatico, usado pelo Executar-Assessment.cmd): não faz nenhuma pergunta.
-    Reabre elevado sozinho (o UAC é o único aviso), assume o nome do cliente pelo domínio, valida o ambiente
+    Exige PowerShell aberto como administrador (não se eleva sozinho), assume o nome do cliente pelo domínio, valida o ambiente
     antes de coletar e, só se a conta atual for negada nas estações, abre UMA janela de login e senha do domínio.
     Essa credencial vale apenas para esta execução, não é gravada e é descartada ao terminar.
 
@@ -824,30 +824,6 @@ $script:CorCategoria = [ordered]@{
 # Execução sem intervenção, credencial única e pré-validação
 # ============================================================================
 
-function New-ComandoRelancamento {
-    # Monta o comando para reabrir o script elevado com os mesmos parâmetros. Vai codificado
-    # (-EncodedCommand) porque o -File não entende lista separada por vírgula nem aspas dentro de valores.
-    param([System.Collections.IDictionary]$Informados)
-    $aspas = { param($t) "'" + ("$t" -replace "'", "''") + "'" }
-    $partes = New-Object System.Collections.Generic.List[string]
-    $partes.Add("& $(& $aspas $PSCommandPath)")
-    foreach ($nome in $Informados.Keys) {
-        if ($nome -eq 'Credencial') { continue }   # credencial não atravessa a elevação; o processo elevado pede de novo se precisar
-        $valor = $Informados[$nome]
-        if ($valor -is [System.Management.Automation.SwitchParameter]) {
-            if ($valor.IsPresent) { $partes.Add("-$nome") }
-        } elseif ($valor -is [array]) {
-            $itens = foreach ($v in $valor) { if ($v -is [string]) { & $aspas $v } else { "$v" } }
-            $partes.Add("-$nome " + ($itens -join ','))
-        } elseif ($valor -is [string]) {
-            $partes.Add("-$nome " + (& $aspas $valor))
-        } else {
-            $partes.Add("-$nome $valor")
-        }
-    }
-    $partes -join ' '
-}
-
 function Test-CredencialDominio {
     # $true = aceita, $false = recusada, $null = não deu para validar (DC inalcançável).
     param([pscredential]$Cred, [string]$Dominio)
@@ -1039,30 +1015,14 @@ $ehAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 Write-Log "Assessment Nextec | Cliente: $Cliente | Máquina: $env:COMPUTERNAME | Saída: $script:PastaSaida"
 
 if (-not $ehAdmin) {
-    Write-Log 'Sem privilégio de administrador: BitLocker, configurações de segurança e Hyper-V não serão coletados.' 'AVISO'
-    $reabrir = $false
-    if ($PSCommandPath) {
-        if ($Automatico) { $reabrir = $true }
-        elseif (Test-TemTeclado) { $reabrir = ((Read-Preenchimento 'Reabrir como administrador? (S/N)' 'S') -match '^(s|y)') }
-    }
-    if ($reabrir) {
-        try {
-            $informados = [ordered]@{}
-            foreach ($k in $PSBoundParameters.Keys) { $informados[$k] = $PSBoundParameters[$k] }
-            if (-not $informados.Contains('Cliente')) { $informados['Cliente'] = $Cliente }
-            if ($DominioEmail -and -not $informados.Contains('DominioEmail')) { $informados['DominioEmail'] = $DominioEmail }
-            $comando = New-ComandoRelancamento $informados
-            $codificado = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($comando))
-            Start-Process -FilePath 'powershell.exe' -Verb RunAs -ErrorAction Stop `
-                -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $codificado)
-            Write-Log 'Reaberto em janela com privilégio de administrador. Esta janela vai encerrar.'
-            # A pasta desta execução só tem o log; a janela elevada cria a sua.
-            Remove-Item -LiteralPath $script:PastaSaida -Recurse -Force -ErrorAction SilentlyContinue
-            exit 0
-        } catch {
-            Write-Log "Não foi possível elevar ($($_.Exception.Message)); seguindo sem privilégio." 'AVISO'
-        }
-    }
+    # O script não se eleva sozinho: o PowerShell precisa ser aberto como administrador antes de executar.
+    Write-Host ''
+    Write-Host 'Este assessment precisa ser executado como administrador.' -ForegroundColor Yellow
+    Write-Host 'Feche esta janela, abra o PowerShell com "Executar como administrador" e rode o comando de novo.' -ForegroundColor Yellow
+    Write-Host ''
+    Remove-Item -LiteralPath $script:PastaSaida -Recurse -Force -ErrorAction SilentlyContinue
+    if ($Automatico) { exit 1 }
+    return
 }
 
 # Pré-validação: confere o ambiente e, se a conta atual não alcançar as estações, pede o login único.

@@ -6,18 +6,18 @@ Funciona no Windows PowerShell 5.1. Executar no servidor principal do cliente, d
 
 ## Uso rápido
 
-Num PowerShell, no servidor do cliente (troque a tag pela versão desejada):
+Num PowerShell **aberto como administrador**, no servidor do cliente (troque a tag pela versão desejada):
 
 ```powershell
-[Net.ServicePointManager]::SecurityProtocol='Tls12'; $f="$env:TEMP\Nextec-Assessment-v2.ps1"; iwr 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/assessment-v2.3/Assessment/Nextec-Assessment-v2.ps1' -OutFile $f -UseBasicParsing; powershell -NoProfile -ExecutionPolicy Bypass -File $f -Automatico
+[Net.ServicePointManager]::SecurityProtocol='Tls12'; $f="$env:TEMP\Nextec-Assessment-v2.ps1"; iwr 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/assessment-v2.4/Assessment/Nextec-Assessment-v2.ps1' -OutFile $f -UseBasicParsing; powershell -NoProfile -ExecutionPolicy Bypass -File $f -Automatico
 ```
 
-- O script se reabre como administrador sozinho (confirme o UAC) e valida o ambiente antes de coletar.
+- O script não se eleva sozinho: se o PowerShell não estiver como administrador, avisa e encerra. Depois valida o ambiente antes de coletar.
 - Se a conta atual não alcançar as estações, abre **uma** janela de login e senha do domínio. A credencial vale só para a execução e não é gravada.
 - O resultado fica em `C:\Assessment\<cliente>_<servidor>_<data>.zip`. A pasta de trabalho é removida assim que o `.zip` é gerado (se o zip falhar, a pasta é mantida). Ao terminar, o Explorer abre com o `.zip` selecionado.
 - Use sempre uma **tag**, nunca a `main`: assim uma alteração futura no repositório não passa a rodar como administrador nas máquinas dos clientes.
 
-Alternativa por arquivo: baixe os dois arquivos desta pasta, na mesma pasta, e dê duplo clique em `Executar-Assessment.cmd`.
+Alternativa por arquivo: baixe os dois arquivos desta pasta, na mesma pasta, e execute `Executar-Assessment.cmd` com botão direito, Executar como administrador.
 
 ## Parâmetros mais usados
 
@@ -41,10 +41,10 @@ O material contém nomes de usuário, IPs, softwares e configurações do client
 
 ## Verificação de integridade
 
-SHA-256 do `Nextec-Assessment-v2.ps1` da tag `assessment-v2.3`:
+SHA-256 do `Nextec-Assessment-v2.ps1` da tag `assessment-v2.4`:
 
 ```
-C1921B9659978C21197991DBA0032827150711F3C699736C1397C880CB709DF7
+97E3AB9588525497DDAF497DD36E9FD0BD358E3FF20474C93A5B38DEAC4AF76C
 ```
 
 ```powershell
@@ -58,6 +58,7 @@ C1921B9659978C21197991DBA0032827150711F3C699736C1397C880CB709DF7
 
 ## Histórico
 
+- **v2.4**: o script deixou de se elevar sozinho (sem `RunAs` nem `-EncodedCommand`, que disparavam o antivírus); exige PowerShell aberto como administrador.
 - **v2.3**: depois de gerar o `.zip`, a pasta de saída é removida do servidor (só o zip fica).
 - **v2.2**: base de fabricantes embutida passou a carregar (antes ficava vazia e o fabricante saía em branco); textos de alerta e da pré-validação mais claros.
 - **v2.1**: modo sem intervenção (`-Automatico`), pré-validação, login único, relatório separa credencial recusada de máquina desligada.
