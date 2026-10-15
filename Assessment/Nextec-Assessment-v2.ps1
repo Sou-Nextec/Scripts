@@ -234,12 +234,80 @@ function Get-UrlPorta {
     }
 }
 
+# ---------- Apresentação no console ----------
+# O arquivo coleta.log guarda tudo com hora e nível; a tela mostra só o necessário, organizado por seção e etapa.
+$script:VersaoAssessment = '2.6'
+$script:LarguraTela = 64
+$script:EtapaAberta = $null
+$script:NumeroSecao = 0
+$script:TotalSecoes = 7
+
+function Close-LinhaEtapa {
+    # Fecha a linha da etapa em andamento antes de escrever qualquer outra coisa na tela.
+    if ($script:EtapaAberta) { Write-Host ''; $script:EtapaAberta = $null }
+}
+
 function Write-Log {
-    param([string]$Mensagem, [ValidateSet('INFO', 'AVISO', 'ERRO')][string]$Nivel = 'INFO')
+    param([string]$Mensagem, [ValidateSet('INFO', 'AVISO', 'ERRO')][string]$Nivel = 'INFO', [switch]$SoArquivo)
     $linha = '{0} [{1}] {2}' -f (Get-Date -Format 'HH:mm:ss'), $Nivel, $Mensagem
-    $cor = switch ($Nivel) { 'AVISO' { 'Yellow' } 'ERRO' { 'Red' } default { 'Gray' } }
-    Write-Host $linha -ForegroundColor $cor
-    Add-Content -Path $script:ArquivoLog -Value $linha -Encoding UTF8
+    if ($script:ArquivoLog) { Add-Content -Path $script:ArquivoLog -Value $linha -Encoding UTF8 }
+    if ($SoArquivo) { return }
+    Close-LinhaEtapa
+    $texto = $Mensagem.TrimStart()
+    $recuo = ' ' * (6 + ($Mensagem.Length - $texto.Length))
+    switch ($Nivel) {
+        'AVISO' { Write-Host "$recuo! $texto" -ForegroundColor Yellow }
+        'ERRO'  { Write-Host "${recuo}x $texto" -ForegroundColor Red }
+        default { Write-Host "$recuo$texto" -ForegroundColor DarkGray }
+    }
+}
+
+function Format-Duracao {
+    param([TimeSpan]$Tempo)
+    if ($Tempo.TotalMinutes -ge 1) { return '{0} min {1:00} s' -f [math]::Floor($Tempo.TotalMinutes), $Tempo.Seconds }
+    '{0:N1} s' -f $Tempo.TotalSeconds
+}
+
+function Write-Cabecalho {
+    $l = $script:LarguraTela
+    $titulo = '  NEXTEC  |  Assessment de TI'
+    $versao = "v$script:VersaoAssessment  "
+    Write-Host ''
+    Write-Host ('  ┌' + ('─' * $l) + '┐') -ForegroundColor Cyan
+    Write-Host '  │' -NoNewline -ForegroundColor Cyan
+    Write-Host $titulo -NoNewline -ForegroundColor White
+    Write-Host (' ' * ($l - $titulo.Length - $versao.Length)) -NoNewline
+    Write-Host $versao -NoNewline -ForegroundColor DarkGray
+    Write-Host '│' -ForegroundColor Cyan
+    Write-Host ('  └' + ('─' * $l) + '┘') -ForegroundColor Cyan
+    foreach ($campo in @(
+            @('Cliente', $Cliente),
+            @('Máquina', $env:COMPUTERNAME),
+            @('Conta', "$env:USERDOMAIN\$env:USERNAME"),
+            @('Saída', $Saida),
+            @('Início', (Get-Date -Format 'dd/MM/yyyy HH:mm')))) {
+        Write-Host ('   {0,-10}' -f $campo[0]) -NoNewline -ForegroundColor DarkGray
+        Write-Host $campo[1] -ForegroundColor Gray
+    }
+}
+
+function Write-Secao {
+    param([string]$Titulo)
+    Close-LinhaEtapa
+    $script:NumeroSecao++
+    Write-Log "== $Titulo" -SoArquivo
+    $rotulo = ' {0}/{1}  {2} ' -f $script:NumeroSecao, $script:TotalSecoes, $Titulo
+    Write-Host ''
+    Write-Host ('  ──' + $rotulo + ('─' * [math]::Max(4, $script:LarguraTela - $rotulo.Length - 2))) -ForegroundColor Cyan
+}
+
+function Write-ItemValidacao {
+    param([string]$Item, [string]$Status, [string]$Detalhe)
+    Close-LinhaEtapa
+    $cor = switch ($Status) { 'OK' { 'Green' } 'FALHA' { 'Red' } default { 'Yellow' } }
+    Write-Host ('   {0,-7}' -f $Status) -NoNewline -ForegroundColor $cor
+    Write-Host ('{0,-24}' -f $Item) -NoNewline -ForegroundColor Gray
+    Write-Host $Detalhe -ForegroundColor $(if ($Status -eq 'OK') { 'DarkGray' } else { $cor })
 }
 
 function Add-Alerta {
@@ -251,13 +319,29 @@ function Add-Alerta {
 }
 
 function Invoke-Etapa {
+    # Uma linha por etapa: "Nome ........ ok  1,2 s". Se a etapa escrever detalhes, eles aparecem logo abaixo.
     param([string]$Nome, [scriptblock]$Acao)
-    Write-Log "Coletando: $Nome"
+    Write-Log "Coletando: $Nome" -SoArquivo
+    Close-LinhaEtapa
+    Write-Host "   $Nome" -NoNewline -ForegroundColor Gray
+    $script:EtapaAberta = $Nome
+    $relogio = [System.Diagnostics.Stopwatch]::StartNew()
+    $falhou = $false
     try { & $Acao }
     catch {
+        $falhou = $true
         $mensagem = $_.Exception.Message
         $script:Erros.Add([pscustomobject]@{ Etapa = $Nome; Erro = $mensagem })
         Write-Log "Falha em ${Nome}: $mensagem" 'AVISO'
+    }
+    $tempo = Format-Duracao $relogio.Elapsed
+    if ($script:EtapaAberta) {
+        Write-Host (' ' + ('.' * [math]::Max(2, 44 - $Nome.Length)) + ' ') -NoNewline -ForegroundColor DarkGray
+        Write-Host 'ok' -NoNewline -ForegroundColor Green
+        Write-Host "  $tempo" -ForegroundColor DarkGray
+        $script:EtapaAberta = $null
+    } elseif (-not $falhou) {
+        Write-Host "      concluído em $tempo" -ForegroundColor Green
     }
 }
 
@@ -942,11 +1026,15 @@ function Invoke-PreValidacao {
         param($Item, $Status, $Detalhe)
         $itens.Add([pscustomobject]@{ Item = $Item; Status = $Status; Detalhe = $Detalhe })
         $nivel = switch ($Status) { 'OK' { 'INFO' } 'FALHA' { 'ERRO' } default { 'AVISO' } }
-        Write-Log "  [$Status] ${Item}: $Detalhe" $nivel
+        Write-Log "[$Status] ${Item}: $Detalhe" $nivel -SoArquivo
+        Write-ItemValidacao $Item $Status $Detalhe
     }
     $bloqueio = $false
     $credencialAtiva = $Credencial
-    Write-Log 'Pré-validação do ambiente'
+    Write-Secao 'Pré-validação'
+    $avs = @(Get-AntivirusComportamental)
+    if ($avs.Count) { & $registrar 'Antivírus' 'AVISO' "$($avs -join ', ') com bloqueio por comportamento. Se parar, libere C:\ProgramData\Nextec\" }
+    else { & $registrar 'Antivírus' 'OK' 'Sem bloqueio por comportamento conhecido' }
 
     # Máquina de coleta
     & $registrar 'PowerShell' 'OK' "$($PSVersionTable.PSVersion)"
@@ -1060,7 +1148,9 @@ function Invoke-PreValidacao {
 # ============================================================================
 
 $ehAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-Write-Log "Assessment Nextec | Cliente: $Cliente | Máquina: $env:COMPUTERNAME | Saída: $script:PastaSaida"
+Write-Log "Assessment Nextec v$script:VersaoAssessment | Cliente: $Cliente | Máquina: $env:COMPUTERNAME | Saída: $script:PastaSaida" -SoArquivo
+if ($SemValidacao) { $script:TotalSecoes-- }
+Write-Cabecalho
 
 if (-not $ehAdmin) {
     # O script não se eleva sozinho: o PowerShell precisa ser aberto como administrador antes de executar.
@@ -1073,15 +1163,12 @@ if (-not $ehAdmin) {
     return
 }
 
-# Antivírus com bloqueio por comportamento: avisa antes de começar, para não ser surpresa se a varredura for interrompida.
-$pastaLiberada = 'C:\ProgramData\Nextec\'
-$antivirusComportamental = @(Get-AntivirusComportamental)
-if ($antivirusComportamental.Count) {
-    Write-Log "Antivírus com bloqueio por comportamento ativo: $($antivirusComportamental -join ', ')." 'AVISO'
-    if (-not ($PSCommandPath -and $PSCommandPath.StartsWith($pastaLiberada, [StringComparison]::OrdinalIgnoreCase))) {
-        Write-Log "O script não está rodando de $pastaLiberada. Se o antivírus barrar a coleta, rode pelo comando padrão, que usa essa pasta, e confira a exclusão dela na política do antivírus." 'AVISO'
-    } else {
-        Write-Log "Script rodando de $pastaLiberada. Se o antivírus barrar a coleta, confira a exclusão dessa pasta na política do antivírus." 'AVISO'
+# Sem pré-validação, o aviso de antivírus com bloqueio por comportamento sai aqui mesmo.
+if ($SemValidacao) {
+    $antivirusComportamental = @(Get-AntivirusComportamental)
+    if ($antivirusComportamental.Count) {
+        Write-Host ''
+        Write-Log "$($antivirusComportamental -join ', ') com bloqueio por comportamento. Se a coleta parar, confira a exclusão de C:\ProgramData\Nextec\" 'AVISO'
     }
 }
 
@@ -1097,7 +1184,8 @@ if (-not $SemValidacao) {
     if ($validacao.Bloqueio) { throw 'Pré-validação reprovada: veja os itens FALHA acima e em validacao.csv.' }
     if ($SoValidar) {
         Write-Host ''
-        Write-Host "Validação concluída. Detalhes em $script:PastaSaida" -ForegroundColor Green
+        Write-Host "   Validação concluída. Detalhes em $script:PastaSaida" -ForegroundColor Green
+        Write-Host ''
         if ($Automatico) { try { Start-Process explorer.exe -ArgumentList "`"$script:PastaSaida`"" } catch { } }
         exit 0
     }
@@ -1117,6 +1205,8 @@ if ($Agressivo) { Write-Log 'Modo agressivo: rajadas maiores de conexões TCP. P
 # ============================================================================
 # 1. Servidor local
 # ============================================================================
+
+Write-Secao 'Servidor'
 
 Invoke-Etapa 'Hardware e sistema operacional' {
     $cs   = Get-CimInstance Win32_ComputerSystem
@@ -1910,6 +2000,9 @@ Invoke-Etapa 'Sincronização de horário' {
 # 2. Active Directory
 # ============================================================================
 
+Write-Secao 'Active Directory'
+if ($SemAD) { Write-Log 'Ignorado (-SemAD).' }
+
 $temAD = $false
 if (-not $SemAD) {
     try { Import-Module ActiveDirectory -ErrorAction Stop; $temAD = $true }
@@ -2049,6 +2142,7 @@ if ($temAD) {
     }
 }
 
+Write-Secao 'Serviços de rede'
 Invoke-Etapa 'DNS do servidor' {
     if (-not (Test-ComandoExiste 'Get-DnsServerZone')) { return }
     $zonas = @(Get-DnsServerZone -ErrorAction Stop | Select-Object ZoneName, ZoneType, IsDsIntegrated, IsReverseLookupZone, DynamicUpdate, IsAutoCreated)
@@ -2107,6 +2201,8 @@ Invoke-EtapaEmail
 # 3. Varredura da rede
 # ============================================================================
 
+Write-Secao 'Varredura da rede'
+if ($SemVarreduraRede) { Write-Log 'Ignorada (-SemVarreduraRede).' }
 if (-not $SemVarreduraRede) {
     Invoke-Etapa 'Varredura da rede' {
         $cidrs = if ($Subredes) { $Subredes } else { Get-SubredesLocais }
@@ -2476,6 +2572,10 @@ function Get-InventarioRemoto {
     finally { Remove-CimSession -CimSession $sessao -ErrorAction SilentlyContinue }
 }
 
+Write-Secao 'Estações do domínio'
+if ($SemInventarioRemoto) { Write-Log 'Ignorado (-SemInventarioRemoto).' }
+elseif (-not $temAD) { Write-Log 'Ignorado: sem acesso ao Active Directory.' }
+elseif ($script:ComputadoresAD.Count -eq 0) { Write-Log 'Nenhum computador encontrado no Active Directory.' }
 if (-not $SemInventarioRemoto -and $temAD -and $script:ComputadoresAD.Count -gt 0) {
     Invoke-Etapa 'Inventário das estações e servidores do domínio' {
         $limite = (Get-Date).AddDays(-60)
@@ -2644,6 +2744,8 @@ if (-not $SemInventarioRemoto -and $temAD -and $script:ComputadoresAD.Count -gt 
 # ============================================================================
 # 5. Relatório
 # ============================================================================
+
+Write-Secao 'Relatório'
 
 $ordemSeveridade = @{ 'Alta' = 0; 'Média' = 1; 'Baixa' = 2; 'Info' = 3 }
 $alertasOrdenados = @($script:Alertas | Sort-Object { $ordemSeveridade[$_.Severidade] }, Area)
@@ -3253,15 +3355,36 @@ if ($zipGerado) {
     } catch { Write-Host "Não foi possível remover a pasta $script:PastaSaida: $($_.Exception.Message)" -ForegroundColor Yellow }
 }
 
+# Resumo final
+Close-LinhaEtapa
+$duracaoTotal = Format-Duracao ((Get-Date) - $script:Inicio)
 Write-Host ''
-Write-Host "Concluído. Alertas: $contagem" -ForegroundColor Green
-if ($pastaRemovida) {
-    Write-Host "Pacote: $zip (Resumo-Assessment.html e os CSVs estão dentro dele)" -ForegroundColor Green
-    Write-Host "Envie o arquivo $zip para análise." -ForegroundColor Green
-} else {
-    Write-Host "Resumo: $caminhoHtml" -ForegroundColor Green
-    Write-Host "Envie o arquivo $zip para análise." -ForegroundColor Green
+Write-Host ('  ' + ('═' * ($script:LarguraTela + 2))) -ForegroundColor Cyan
+Write-Host '   Assessment concluído' -NoNewline -ForegroundColor Green
+Write-Host "  em $duracaoTotal" -ForegroundColor DarkGray
+Write-Host ''
+Write-Host ('   {0,-10}' -f 'Alertas') -NoNewline -ForegroundColor DarkGray
+$coresSeveridade = [ordered]@{ 'Alta' = 'Red'; 'Média' = 'Yellow'; 'Baixa' = 'Cyan'; 'Info' = 'Gray' }
+foreach ($sev in $coresSeveridade.Keys) {
+    $qtd = @($alertasOrdenados | Where-Object { $_.Severidade -eq $sev }).Count
+    Write-Host ("{0} {1}    " -f $sev, $qtd) -NoNewline -ForegroundColor $(if ($qtd) { $coresSeveridade[$sev] } else { 'DarkGray' })
 }
+Write-Host ''
+if ($script:Erros.Count) {
+    Write-Host ('   {0,-10}' -f 'Falhas') -NoNewline -ForegroundColor DarkGray
+    Write-Host "$($script:Erros.Count) etapa(s) com falha, detalhes no relatório" -ForegroundColor Yellow
+}
+if ($zipGerado) {
+    Write-Host ('   {0,-10}' -f 'Pacote') -NoNewline -ForegroundColor DarkGray
+    Write-Host $zip -ForegroundColor White
+}
+if (-not $pastaRemovida) {
+    Write-Host ('   {0,-10}' -f 'Relatório') -NoNewline -ForegroundColor DarkGray
+    Write-Host $caminhoHtml -ForegroundColor White
+}
+Write-Host ''
+Write-Host '   Envie o pacote para análise e não deixe cópias no servidor do cliente.' -ForegroundColor Gray
+Write-Host ('  ' + ('═' * ($script:LarguraTela + 2))) -ForegroundColor Cyan
 
 # Segura a janela no fim quando há alguém olhando (duplo clique); em agendador e automação, não trava.
 if ($Automatico) {
