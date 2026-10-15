@@ -24,7 +24,7 @@
     antes de coletar e, só se a conta atual for negada nas estações, abre UMA janela de login e senha do domínio.
     Essa credencial vale apenas para esta execução, não é gravada e é descartada ao terminar.
 
-    Saída: um .zip com CSVs (separador ';', UTF-8), textos, resumo.json e Resumo-Assessment.html. A pasta de trabalho é removida depois que o .zip é gerado.
+    Saída: em C:\Temp (mude com -Saida), um .zip com CSVs (separador ';', UTF-8), textos, resumo.json e Resumo-Assessment.html. A pasta de trabalho é removida depois que o .zip é gerado.
     A varredura de rede abre conexões TCP nas portas listadas; se houver IPS/antivírus de rede, avise o cliente.
 
 .EXAMPLE
@@ -46,7 +46,7 @@
 param(
     [string]$Cliente = 'Cliente',
     [string[]]$Subredes,
-    [string]$Saida = 'C:\Assessment',
+    [string]$Saida = 'C:\Temp',
     [int[]]$Portas = @(21, 22, 23, 25, 53, 80, 88, 110, 111, 135, 139, 143, 389, 443, 445, 465, 515, 554, 587,
                        631, 636, 993, 995, 1433, 1521, 1723, 2049, 3050, 3268, 3269, 3306, 3389, 4899, 5000,
                        5001, 5060, 5357, 5432, 5900, 5938, 5985, 5986, 6000, 7070, 8000, 8006, 8080, 8081,
@@ -515,11 +515,59 @@ function Invoke-ComandoComTimeout {
 }
 
 function Get-NomeNetBios {
-    param([string]$Ip)
-    $saida = Invoke-ComandoComTimeout 'nbtstat.exe' "-A $Ip" 3000
-    $linha = ($saida -split "`r?`n") | Where-Object { $_ -match '^\s*(\S+)\s+<00>\s+' -and $_ -notmatch '(?i)GRUPO|GROUP' } | Select-Object -First 1
-    if ($linha -match '^\s*(\S+)\s+<00>') { return $Matches[1] }
-    ''
+    # Consulta de status NetBIOS (NBSTAT, UDP 137) feita direto pelo script, sem abrir o nbtstat.exe.
+    # Mesmo resultado do nbtstat -A: devolve o nome único <00> do equipamento.
+    param([string]$Ip, [int]$TimeoutMs = 1500)
+    $udp = New-Object System.Net.Sockets.UdpClient
+    try {
+        $udp.Client.ReceiveTimeout = $TimeoutMs
+        $id = Get-Random -Minimum 1 -Maximum 65535
+        $pacote = New-Object System.Collections.Generic.List[byte]
+        # Cabeçalho: id, flags 0, 1 pergunta, sem respostas
+        $pacote.AddRange([byte[]]@([byte]($id -shr 8), [byte]($id -band 0xFF), 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00))
+        # Nome '*' completado com nulos até 16 bytes, na codificação NetBIOS (cada meio byte + 'A')
+        $pacote.Add(0x20)
+        $pacote.AddRange([byte[]]@(0x43, 0x4B))
+        for ($i = 0; $i -lt 15; $i++) { $pacote.AddRange([byte[]]@(0x41, 0x41)) }
+        # Fim do nome, tipo NBSTAT (0x21), classe IN (0x01)
+        $pacote.AddRange([byte[]]@(0x00, 0x00, 0x21, 0x00, 0x01))
+        $dados = $pacote.ToArray()
+        [void]$udp.Send($dados, $dados.Length, $Ip, 137)
+        $origem = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+        $resposta = $udp.Receive([ref]$origem)
+        # Cabeçalho (12) + nome (34) + tipo e classe (4) + TTL (4) + tamanho (2) = 56; o byte 56 é a quantidade de nomes
+        if ($resposta.Length -lt 57) { return '' }
+        $quantidade = [int]$resposta[56]
+        for ($n = 0; $n -lt $quantidade; $n++) {
+            $pos = 57 + ($n * 18)
+            if ($pos + 18 -gt $resposta.Length) { break }
+            $sufixo = $resposta[$pos + 15]
+            $grupo = ($resposta[$pos + 16] -band 0x80) -ne 0
+            if ($sufixo -eq 0x00 -and -not $grupo) {
+                return ([System.Text.Encoding]::ASCII.GetString($resposta, $pos, 15)).Trim([char]0, ' ')
+            }
+        }
+        ''
+    } catch { '' }
+    finally { $udp.Close() }
+}
+
+function Get-AntivirusComportamental {
+    # Antivírus com bloqueio por comportamento que costumam interromper a varredura de rede quando a pasta do script não está liberada.
+    $conhecidos = [ordered]@{
+        'Bitdefender'                     = '^(EPSecurityService|EPProtectedService|EPIntegrationService|bdredline)$'
+        'Sophos'                          = '^Sophos'
+        'CrowdStrike Falcon'              = '^CSFalconService$'
+        'SentinelOne'                     = '^SentinelAgent$'
+        'Microsoft Defender for Endpoint' = '^Sense$'
+        'Kaspersky'                       = '^(AVP|kavfs|klnagent)'
+        'ESET'                            = '^ekrn$'
+        'Trend Micro'                     = '^(ds_agent|TMBMServer|ntrtscan)$'
+    }
+    $servicos = @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Running' } | ForEach-Object { $_.Name })
+    foreach ($produto in $conhecidos.Keys) {
+        if (@($servicos -match $conhecidos[$produto]).Count) { $produto }
+    }
 }
 
 function Get-CompartilhamentosRemotos {
@@ -1023,6 +1071,18 @@ if (-not $ehAdmin) {
     Remove-Item -LiteralPath $script:PastaSaida -Recurse -Force -ErrorAction SilentlyContinue
     if ($Automatico) { exit 1 }
     return
+}
+
+# Antivírus com bloqueio por comportamento: avisa antes de começar, para não ser surpresa se a varredura for interrompida.
+$pastaLiberada = 'C:\ProgramData\Nextec\'
+$antivirusComportamental = @(Get-AntivirusComportamental)
+if ($antivirusComportamental.Count) {
+    Write-Log "Antivírus com bloqueio por comportamento ativo: $($antivirusComportamental -join ', ')." 'AVISO'
+    if (-not ($PSCommandPath -and $PSCommandPath.StartsWith($pastaLiberada, [StringComparison]::OrdinalIgnoreCase))) {
+        Write-Log "O script não está rodando de $pastaLiberada. Se o antivírus barrar a coleta, rode pelo comando padrão, que usa essa pasta, e confira a exclusão dela na política do antivírus." 'AVISO'
+    } else {
+        Write-Log "Script rodando de $pastaLiberada. Se o antivírus barrar a coleta, confira a exclusão dessa pasta na política do antivírus." 'AVISO'
+    }
 }
 
 # Pré-validação: confere o ambiente e, se a conta atual não alcançar as estações, pede o login único.

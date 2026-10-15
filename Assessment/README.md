@@ -9,12 +9,13 @@ Funciona no Windows PowerShell 5.1. Executar no servidor principal do cliente, d
 Num PowerShell **aberto como administrador**, no servidor do cliente (troque a tag pela versão desejada):
 
 ```powershell
-[Net.ServicePointManager]::SecurityProtocol='Tls12'; $f="$env:TEMP\Nextec-Assessment-v2.ps1"; iwr 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/assessment-v2.4/Assessment/Nextec-Assessment-v2.ps1' -OutFile $f -UseBasicParsing; powershell -NoProfile -ExecutionPolicy Bypass -File $f -Automatico
+[Net.ServicePointManager]::SecurityProtocol='Tls12'; $d='C:\ProgramData\Nextec\Assessment'; New-Item -ItemType Directory -Path $d -Force | Out-Null; $f="$d\Nextec-Assessment-v2.ps1"; iwr 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/assessment-v2.5/Assessment/Nextec-Assessment-v2.ps1' -OutFile $f -UseBasicParsing; powershell -NoProfile -ExecutionPolicy Bypass -File $f -Automatico
 ```
 
 - O script não se eleva sozinho: se o PowerShell não estiver como administrador, avisa e encerra. Depois valida o ambiente antes de coletar.
 - Se a conta atual não alcançar as estações, abre **uma** janela de login e senha do domínio. A credencial vale só para a execução e não é gravada.
-- O resultado fica em `C:\Assessment\<cliente>_<servidor>_<data>.zip`. A pasta de trabalho é removida assim que o `.zip` é gerado (se o zip falhar, a pasta é mantida). Ao terminar, o Explorer abre com o `.zip` selecionado.
+- O script fica em `C:\ProgramData\Nextec\Assessment\`, a pasta a liberar no antivírus. Se houver antivírus com bloqueio por comportamento, o script avisa logo no início.
+- O resultado fica em `C:\Temp\<cliente>_<servidor>_<data>.zip` (mude com `-Saida`). A pasta de trabalho é removida assim que o `.zip` é gerado (se o zip falhar, a pasta é mantida). Ao terminar, o Explorer abre com o `.zip` selecionado.
 - Use sempre uma **tag**, nunca a `main`: assim uma alteração futura no repositório não passa a rodar como administrador nas máquinas dos clientes.
 
 Alternativa por arquivo: baixe os dois arquivos desta pasta, na mesma pasta, e execute `Executar-Assessment.cmd` com botão direito, Executar como administrador.
@@ -41,14 +42,14 @@ O material contém nomes de usuário, IPs, softwares e configurações do client
 
 ## Verificação de integridade
 
-SHA-256 do `Nextec-Assessment-v2.ps1` da tag `assessment-v2.4`:
+SHA-256 do `Nextec-Assessment-v2.ps1` da tag `assessment-v2.5`:
 
 ```
-97E3AB9588525497DDAF497DD36E9FD0BD358E3FF20474C93A5B38DEAC4AF76C
+E121DB1A5DCED703F74F04C3163B6D2899F0DC64AE306C499F703BDC7015A944
 ```
 
 ```powershell
-(Get-FileHash $env:TEMP\Nextec-Assessment-v2.ps1 -Algorithm SHA256).Hash
+(Get-FileHash C:\ProgramData\Nextec\Assessment\Nextec-Assessment-v2.ps1 -Algorithm SHA256).Hash
 ```
 
 ## Notas
@@ -58,6 +59,7 @@ SHA-256 do `Nextec-Assessment-v2.ps1` da tag `assessment-v2.4`:
 
 ## Histórico
 
+- **v2.5**: nome NetBIOS consultado direto pela rede (sem `nbtstat.exe`); aviso no início quando há antivírus com bloqueio por comportamento; script em `C:\ProgramData\Nextec\Assessment\` e resultado em `C:\Temp`.
 - **v2.4**: o script deixou de se elevar sozinho (sem `RunAs` nem `-EncodedCommand`, que disparavam o antivírus); exige PowerShell aberto como administrador.
 - **v2.3**: depois de gerar o `.zip`, a pasta de saída é removida do servidor (só o zip fica).
 - **v2.2**: base de fabricantes embutida passou a carregar (antes ficava vazia e o fabricante saía em branco); textos de alerta e da pré-validação mais claros.
