@@ -236,7 +236,7 @@ function Get-UrlPorta {
 
 # ---------- Apresentação no console ----------
 # O arquivo coleta.log guarda tudo com hora e nível; a tela mostra só o necessário, organizado por seção e etapa.
-$script:VersaoAssessment = '2.7'
+$script:VersaoAssessment = '2.8'
 $script:LarguraTela = 64
 $script:EtapaAberta = $null
 $script:NumeroSecao = 0
@@ -1257,6 +1257,45 @@ Invoke-Etapa 'Hardware e sistema operacional' {
     elseif ($suporte -like '*encerra em*') { Add-Alerta 'Média' 'Servidor' 'SO perto do fim do suporte' "$($so.Caption): $suporte" }
     if ($uptime.TotalDays -gt 60) { Add-Alerta 'Baixa' 'Servidor' 'Muito tempo sem reiniciar' "$([int]$uptime.TotalDays) dias ligado; atualizações podem estar pendentes" }
 
+    # Equipamento que faz papel de servidor mas é estação comum (Windows de desktop ou sem linha de servidor).
+    $soDesktop = $so.Caption -notmatch 'Server'
+    $papelServidor = $script:EhServidor -or ($script:ComputadoresAD.Count -eq 0 -and $cs.DomainRole -ge 2)
+    if ($soDesktop -and ($script:PapelMaquina -eq 'Servidor' -or $cs.Model -match 'System Product Name|To be filled')) {
+        Add-Alerta 'Média' 'Servidor' 'Equipamento de estação no papel de servidor' "$($cs.Manufacturer) $($cs.Model) com $($so.Caption): sem hardware de servidor (RAID, fonte redundante, ECC) nem SO de servidor"
+    }
+
+    # Link de garantia pronto, a partir do fabricante e do número de série.
+    $serie = "$($bios.SerialNumber)".Trim()
+    $serieValida = $serie -and $serie -notmatch '(?i)^(System Serial Number|To be filled|Default string|None|0+)$'
+    if ($serieValida) {
+        $linkGarantia = switch -Wildcard ("$($cs.Manufacturer)".ToLower()) {
+            'dell*'               { "https://www.dell.com/support/home/pt-br/product-support/servicetag/$serie" }
+            '*lenovo*'            { "https://pcsupport.lenovo.com/br/pt/warrantylookup?serialnumber=$serie" }
+            { $_ -match 'hp|hewlett' } { 'https://support.hp.com/br-pt/checkwarranty' }
+            default               { '' }
+        }
+        if ($linkGarantia) { $script:Resumo['Consulta de garantia'] = $linkGarantia }
+    }
+
+    # Memória: pentes instalados, slots livres e máximo suportado, para planejar upgrade.
+    try {
+        $pentes = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop)
+        $array  = Get-CimInstance Win32_PhysicalMemoryArray -ErrorAction SilentlyContinue | Select-Object -First 1
+        $slots  = if ($array.MemoryDevices) { [int]$array.MemoryDevices } else { $pentes.Count }
+        $maxGB  = if ($array.MaxCapacityEx) { [math]::Round($array.MaxCapacityEx / 1MB, 0) } elseif ($array.MaxCapacity) { [math]::Round($array.MaxCapacity / 1MB, 0) } else { $null }
+        $tipoPente = { param($t) switch ([int]$t) { 20 { 'DDR' } 21 { 'DDR2' } 24 { 'DDR3' } 26 { 'DDR4' } 34 { 'DDR5' } default { '' } } }
+        $memModulos = @($pentes | ForEach-Object {
+            [pscustomobject]@{ Slot = $_.DeviceLocator; CapacidadeGB = [math]::Round($_.Capacity / 1GB, 0)
+                Tipo = (& $tipoPente $_.SMBIOSMemoryType); VelocidadeMHz = $_.Speed; Fabricante = "$($_.Manufacturer)".Trim(); NumeroSerie = "$($_.SerialNumber)".Trim() }
+        })
+        Save-Dados 'memoria_modulos' $memModulos 'Pentes de memória instalados, por slot'
+        $livres = $slots - $pentes.Count
+        $script:Resumo['Memória (slots)'] = "$($pentes.Count) de $slots ocupados$(if ($livres -gt 0) { ", $livres livre(s)" })$(if ($maxGB) { "; máximo $maxGB GB" })"
+        if ($livres -le 0 -and $maxGB -and ([math]::Round($cs.TotalPhysicalMemory / 1GB, 0) -ge $maxGB)) {
+            Add-Alerta 'Baixa' 'Servidor' 'Memória no limite da placa' "Todos os $slots slots ocupados e no máximo suportado ($maxGB GB); upgrade exige troca de pentes"
+        }
+    } catch { }
+
     Save-Dados 'maquina_hardware' ([pscustomobject]@{
         Computador = $env:COMPUTERNAME; Papel = $script:PapelMaquina; Fabricante = $cs.Manufacturer; Modelo = $cs.Model
         NumeroSerie = $bios.SerialNumber; BIOS = $bios.SMBIOSBIOSVersion; DataBIOS = Format-Data $bios.ReleaseDate
@@ -1279,6 +1318,26 @@ Invoke-Etapa 'Discos, RAID e volumes' {
         foreach ($d in $fisicos | Where-Object { $_.HealthStatus -ne 'Healthy' }) {
             Add-Alerta 'Alta' 'Armazenamento' "Disco com saúde $($d.HealthStatus)" "$($d.FriendlyName) ($($d.SerialNumber))"
         }
+
+        # Saúde real de cada disco: desgaste do SSD, horas ligado, temperatura e erros de leitura.
+        $saude = @(foreach ($pd in Get-PhysicalDisk) {
+            $c = try { $pd | Get-StorageReliabilityCounter -ErrorAction Stop } catch { $null }
+            if ($c) {
+                [pscustomobject]@{ Disco = $pd.FriendlyName; MediaType = $pd.MediaType
+                    DesgastePct = $c.Wear; TemperaturaC = $c.Temperature; HorasLigado = $c.PowerOnHours
+                    ErrosLeitura = $c.ReadErrorsTotal; ErrosEscrita = $c.WriteErrorsTotal }
+            }
+        })
+        if ($saude.Count) {
+            Save-Dados 'discos_saude' $saude 'Saúde SMART dos discos: desgaste, temperatura, horas ligado e erros'
+            foreach ($s in $saude) {
+                if ($null -ne $s.DesgastePct -and $s.DesgastePct -ge 90) { Add-Alerta 'Alta' 'Armazenamento' 'SSD perto do fim da vida útil' "$($s.Disco): $($s.DesgastePct)% de desgaste" }
+                elseif ($null -ne $s.DesgastePct -and $s.DesgastePct -ge 70) { Add-Alerta 'Média' 'Armazenamento' 'SSD com desgaste alto' "$($s.Disco): $($s.DesgastePct)% de desgaste" }
+                if ($s.ErrosLeitura -gt 0 -or $s.ErrosEscrita -gt 0) { Add-Alerta 'Média' 'Armazenamento' 'Disco com erros de E/S' "$($s.Disco): $($s.ErrosLeitura) leitura, $($s.ErrosEscrita) escrita" }
+                if ($s.TemperaturaC -ge 60) { Add-Alerta 'Média' 'Armazenamento' 'Disco em temperatura alta' "$($s.Disco): $($s.TemperaturaC) °C" }
+            }
+            $script:Resumo['Saúde dos discos'] = ($saude | ForEach-Object { "$($_.Disco): $(if ($null -ne $_.DesgastePct) { "$($_.DesgastePct)% desgaste, " })$($_.HorasLigado)h, $($_.TemperaturaC)°C" }) -join ' | '
+        }
     }
 
     try {
@@ -1288,8 +1347,24 @@ Invoke-Etapa 'Discos, RAID e volumes' {
 
     $raid = @($discosWmi | Where-Object { $_.Model -match 'PERC|RAID|LOGICAL|Virtual|MegaRAID|Smart Array' })
     $script:Resumo['Discos (Windows)'] = ($discosWmi | ForEach-Object { "$($_.Model) $($_.TamanhoGB) GB" }) -join ' | '
-    if ($discosWmi.Count -eq 1 -and $raid.Count -eq 0) {
-        Add-Alerta 'Alta' 'Armazenamento' 'Servidor com disco único sem RAID aparente' "$($discosWmi[0].Model); confirmar redundância na controladora"
+    # Sem redundância: servidor com um disco só, ou com vários discos avulsos sem RAID/espelhamento.
+    if ($script:EhServidor -and $raid.Count -eq 0) {
+        if ($discosWmi.Count -eq 1) {
+            Add-Alerta 'Alta' 'Armazenamento' 'Servidor com disco único sem RAID aparente' "$($discosWmi[0].Model); confirmar redundância na controladora"
+        } elseif ($discosWmi.Count -gt 1) {
+            Add-Alerta 'Alta' 'Armazenamento' 'Servidor com discos avulsos sem RAID aparente' "$($discosWmi.Count) discos sem espelhamento: perda de um disco derruba o que estiver nele; confirmar redundância"
+        }
+    }
+
+    # RAID por utilitário do fabricante, quando a controladora não aparece como disco lógico no Windows.
+    $raidUtils = @(
+        @{ Nome = 'storcli'; Cmd = { storcli /c0 show }; Desc = 'Broadcom/LSI MegaRAID (storcli)' },
+        @{ Nome = 'perccli'; Cmd = { perccli /c0 show }; Desc = 'Dell PERC (perccli)' },
+        @{ Nome = 'ssacli';  Cmd = { ssacli ctrl all show config }; Desc = 'HPE Smart Array (ssacli)' },
+        @{ Nome = 'arcconf'; Cmd = { arcconf getconfig 1 }; Desc = 'Microchip/Adaptec (arcconf)' }
+    )
+    foreach ($u in $raidUtils) {
+        if (Test-ComandoExiste $u.Nome) { Save-Texto "raid_$($u.Nome)" $u.Cmd $u.Desc }
     }
 
     $volumes = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
@@ -1321,6 +1396,7 @@ Invoke-Etapa 'Rede da máquina de coleta' {
         $tipo = Get-TipoAdaptador "$($a.InterfaceDescription) $($a.Name)"
         [pscustomobject]@{
             Nome = $a.Name; Tipo = $tipo; Descricao = $a.InterfaceDescription; MAC = $a.MacAddress; Status = $a.Status; Velocidade = $a.LinkSpeed
+            Duplex = $a.FullDuplex
             IPv4 = ($meus.IPAddress) -join ', '
             Mascara = (($meus | ForEach-Object { "/$($_.PrefixLength)" }) | Select-Object -Unique) -join ', '
             Gateway = ((@($rotas | Where-Object { $_.InterfaceIndex -eq $a.ifIndex }).NextHop | Where-Object { $_ -and $_ -ne '0.0.0.0' }) | Select-Object -Unique) -join ', '
@@ -1328,7 +1404,13 @@ Invoke-Etapa 'Rede da máquina de coleta' {
             DHCP = [bool](@($meus | Where-Object { $_.PrefixOrigin -eq 'Dhcp' }).Count)
         }
     })
-    Save-Dados 'rede_adaptadores' $adaptadores 'Placas de rede da máquina de coleta, com tipo (física/virtual), IP, gateway e DNS'
+    Save-Dados 'rede_adaptadores' $adaptadores 'Placas de rede da máquina de coleta, com tipo (física/virtual), velocidade, duplex, IP, gateway e DNS'
+    # Placa física ativa negociando abaixo de 1 Gbps ou em half duplex: cabo, porta do switch ou placa com problema.
+    foreach ($a in $adaptadores | Where-Object { $_.Tipo -eq 'Física' -and $_.Status -eq 'Up' -and $_.IPv4 }) {
+        $mbps = if ("$($a.Velocidade)" -match '([\d.]+)\s*Gbps') { [double]$Matches[1] * 1000 } elseif ("$($a.Velocidade)" -match '([\d.]+)\s*Mbps') { [double]$Matches[1] } else { $null }
+        if ($mbps -and $mbps -lt 1000) { Add-Alerta 'Média' 'Rede' 'Placa de rede abaixo de 1 Gbps' "$($a.Nome): negociou $($a.Velocidade); conferir cabo e porta do switch" }
+        if ($a.Duplex -eq $false) { Add-Alerta 'Média' 'Rede' 'Placa de rede em half duplex' "$($a.Nome): half duplex causa colisões e lentidão; conferir negociação com o switch" }
+    }
     $ativos   = @($adaptadores | Where-Object { $_.IPv4 })
     # Produção = tem rota padrão (gateway) ou é placa física. Cobre o vEthernet do vSwitch externo do Hyper-V.
     $producao = @($ativos | Where-Object { $_.Gateway -or $_.Tipo -eq 'Física' })
@@ -1418,6 +1500,43 @@ Invoke-Etapa 'Internet, operadora e rota de saída' {
     $primeiroExterno = $saltos | Where-Object { $_.Classe -in 'CGNAT', 'Público' } | Select-Object -First 1
     if ($primeiroExterno -and $primeiroExterno.Classe -eq 'CGNAT') {
         Add-Alerta 'Info' 'Rede' 'Possível CGNAT da operadora' "Primeiro salto externo $($primeiroExterno.IP) é endereço CGNAT (100.64.0.0/10): sem IP público próprio, VPN/acesso entrante exige IP fixo"
+    }
+}
+
+Invoke-Etapa 'Qualidade do link e DNS' {
+    # Latência e perda de pacotes até o gateway, o DNS e a internet, para separar problema interno de problema da operadora.
+    $alvos = [ordered]@{}
+    if ($script:Resumo['Gateway']) { $alvos['Gateway'] = ($script:Resumo['Gateway'] -split ',\s*')[0] }
+    $alvos['Internet (1.1.1.1)'] = '1.1.1.1'
+    $medicoes = @(foreach ($rotulo in $alvos.Keys) {
+        $ip = $alvos[$rotulo]
+        $r = @(Test-Connection -ComputerName $ip -Count 10 -ErrorAction SilentlyContinue)
+        $ok = $r.Count
+        $lat = if ($ok) { [math]::Round((($r | Measure-Object -Property ResponseTime -Average).Average), 0) } else { $null }
+        $perda = [math]::Round((10 - $ok) / 10 * 100, 0)
+        [pscustomobject]@{ Alvo = $rotulo; IP = $ip; LatenciaMediaMs = $lat; PerdaPct = $perda; Respostas = "$ok/10" }
+    })
+    Save-Dados 'rede_qualidade_link' $medicoes 'Latência e perda de pacotes até o gateway e a internet (10 pings cada)'
+    $script:Resumo['Qualidade do link'] = ($medicoes | ForEach-Object { "$($_.Alvo): $(if ($null -ne $_.LatenciaMediaMs) { "$($_.LatenciaMediaMs) ms" } else { 'sem resposta' }), $($_.PerdaPct)% perda" }) -join ' | '
+    foreach ($m in $medicoes) {
+        if ($m.PerdaPct -ge 20) { Add-Alerta 'Alta' 'Rede' "Perda de pacotes alta até $($m.Alvo)" "$($m.PerdaPct)% de perda ($($m.Respostas)): link instável" }
+        elseif ($m.PerdaPct -ge 5) { Add-Alerta 'Média' 'Rede' "Perda de pacotes até $($m.Alvo)" "$($m.PerdaPct)% de perda ($($m.Respostas))" }
+        if ($m.Alvo -like 'Internet*' -and $null -ne $m.LatenciaMediaMs -and $m.LatenciaMediaMs -gt 120) { Add-Alerta 'Média' 'Rede' 'Latência alta até a internet' "$($m.LatenciaMediaMs) ms médios" }
+    }
+
+    # DNS em uso: quais servidores a rede usa e o tempo de resposta de cada um.
+    $dnsSrv = @(($script:Resumo['DNS configurado'] -split ',\s*') | Where-Object { $_ -and $_ -notlike '127.*' } | Select-Object -Unique)
+    if ($dnsSrv.Count -and (Test-ComandoExiste 'Resolve-DnsName')) {
+        $testeDns = @(foreach ($srv in $dnsSrv) {
+            $t = [System.Diagnostics.Stopwatch]::StartNew()
+            $resolveu = try { [bool](Resolve-DnsName -Name 'www.google.com' -Server $srv -Type A -QuickTimeout -ErrorAction Stop) } catch { $false }
+            $t.Stop()
+            $classe = if ($srv -in '8.8.8.8','8.8.4.4','1.1.1.1','1.0.0.1','9.9.9.9') { 'Público' } elseif ($srv -in $script:IpsLocais) { 'Esta máquina' } elseif ($srv -match '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)') { 'Interno/local' } else { 'Externo' }
+            [pscustomobject]@{ Servidor = $srv; Classe = $classe; Resolveu = $resolveu; TempoMs = if ($resolveu) { [math]::Round($t.Elapsed.TotalMilliseconds, 0) } else { $null } }
+        })
+        Save-Dados 'rede_dns_em_uso' $testeDns 'Servidores DNS configurados, classe e tempo de resposta'
+        $script:Resumo['DNS em uso'] = ($testeDns | ForEach-Object { "$($_.Servidor) ($($_.Classe))$(if ($_.Resolveu) { ": $($_.TempoMs) ms" } else { ': sem resposta' })" }) -join ' | '
+        foreach ($d in $testeDns | Where-Object { -not $_.Resolveu }) { Add-Alerta 'Média' 'Rede' 'Servidor DNS não respondeu' "$($d.Servidor) ($($d.Classe)): configurado mas sem resposta" }
     }
 }
 
@@ -1824,6 +1943,25 @@ Invoke-Etapa 'Wi-Fi' {
     if ($ssid) {
         $script:Resumo['Wi-Fi conectado'] = (@("$ssid", "sinal $sinal", $banda, "canal $canal", $radio) | Where-Object { $_ -and $_ -notmatch '^(sinal|canal)\s*$' }) -join ' | '
         if ($script:EhServidor) { Add-Alerta 'Média' 'Rede' 'Servidor conectado por Wi-Fi' 'Servidor deve usar cabo; Wi-Fi compromete estabilidade e backup' }
+    }
+
+    # Wi-Fi do ambiente: redes visíveis, canal e sinal, para achar interferência e AP mal posicionado.
+    Save-Texto 'wifi_redes_visiveis' { netsh wlan show networks mode=bssid } 'Redes Wi-Fi visíveis no ambiente, com canal e sinal'
+    $saidaRedes = (netsh wlan show networks mode=bssid 2>&1 | Out-String)
+    $redes = New-Object System.Collections.Generic.List[object]
+    $ssidAtual = ''
+    foreach ($l in ($saidaRedes -split "`r?`n")) {
+        if ($l -match '(?im)^\s*SSID\s+\d+\s*:\s*(.*)$') { $ssidAtual = $Matches[1].Trim() }
+        elseif ($l -match '(?im)^\s*(?:Sinal|Signal)\s*:\s*(.+)$') { $sinalRede = $Matches[1].Trim() }
+        elseif ($l -match '(?im)^\s*(?:Canal|Channel)\s*:\s*(.+)$') {
+            $redes.Add([pscustomobject]@{ SSID = $(if ($ssidAtual) { $ssidAtual } else { '(oculto)' }); Canal = $Matches[1].Trim(); Sinal = $sinalRede })
+        }
+    }
+    if ($redes.Count) {
+        Save-Dados 'wifi_ambiente' $redes 'Redes Wi-Fi do ambiente (SSID, canal e sinal)'
+        $script:Resumo['Wi-Fi no ambiente'] = "$($redes.Count) rede(s) visível(eis)"
+        $porCanal = $redes | Group-Object Canal | Where-Object { $_.Count -ge 3 } | Sort-Object Count -Descending | Select-Object -First 1
+        if ($porCanal) { Add-Alerta 'Baixa' 'Rede' 'Canal Wi-Fi congestionado' "Canal $($porCanal.Name) com $($porCanal.Count) redes: avaliar mudança de canal do AP" }
     }
 }
 

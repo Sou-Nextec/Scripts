@@ -9,7 +9,7 @@ Funciona no Windows PowerShell 5.1. Executar no servidor principal do cliente, d
 Num PowerShell **aberto como administrador**, no servidor do cliente (troque a tag pela versão desejada):
 
 ```powershell
-[Net.ServicePointManager]::SecurityProtocol='Tls12'; $d='C:\ProgramData\Nextec\Assessment'; New-Item -ItemType Directory -Path $d -Force | Out-Null; $f="$d\Nextec-Assessment-v2.ps1"; iwr 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/assessment-v2.7/Assessment/Nextec-Assessment-v2.ps1' -OutFile $f -UseBasicParsing; powershell -NoProfile -ExecutionPolicy Bypass -File $f -Automatico
+[Net.ServicePointManager]::SecurityProtocol='Tls12'; $d='C:\ProgramData\Nextec\Assessment'; New-Item -ItemType Directory -Path $d -Force | Out-Null; $f="$d\Nextec-Assessment-v2.ps1"; iwr 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/assessment-v2.8/Assessment/Nextec-Assessment-v2.ps1' -OutFile $f -UseBasicParsing; powershell -NoProfile -ExecutionPolicy Bypass -File $f -Automatico
 ```
 
 - O script não se eleva sozinho: se o PowerShell não estiver como administrador, avisa e encerra. Depois valida o ambiente antes de coletar.
@@ -42,10 +42,10 @@ O material contém nomes de usuário, IPs, softwares e configurações do client
 
 ## Verificação de integridade
 
-SHA-256 do `Nextec-Assessment-v2.ps1` da tag `assessment-v2.7`:
+SHA-256 do `Nextec-Assessment-v2.ps1` da tag `assessment-v2.8`:
 
 ```
-11535CF63BA211298F6E9CEB3B5EA8EB953CEDB980064FF0A067490066B2AF35
+2F17249D5424B73B10E603BABCA39DB45FE38188D1E07826F6373CE9DF475BF4
 ```
 
 ```powershell
@@ -59,6 +59,7 @@ SHA-256 do `Nextec-Assessment-v2.ps1` da tag `assessment-v2.7`:
 
 ## Histórico
 
+- **v2.8**: memória (pentes, slots e máximo), saúde SMART dos discos (desgaste, temperatura, horas, erros), alerta de servidor sem RAID, RAID por utilitário (storcli/perccli/ssacli/arcconf), link de garantia, alerta de estação no papel de servidor, velocidade/duplex das placas, qualidade do link (latência e perda), DNS em uso e Wi-Fi do ambiente.
 - **v2.7**: nome NetBIOS aceita resposta com nome comprimido e a máquina de coleta usa o próprio nome; título das páginas web dos equipamentos sai legível (sem códigos HTML).
 - **v2.6**: tela reorganizada: cabeçalho, seções numeradas, uma linha por etapa com tempo e resumo final com alertas por severidade. O `coleta.log` continua completo, com hora e nível.
 - **v2.5**: nome NetBIOS consultado direto pela rede (sem `nbtstat.exe`); aviso no início quando há antivírus com bloqueio por comportamento; script em `C:\ProgramData\Nextec\Assessment\` e resultado em `C:\Temp`.
