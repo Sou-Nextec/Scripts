@@ -160,8 +160,8 @@ public static class NextecWin32 {
     } else {
         if ($atualEhQuadro) { $fundoOriginal.Caminho = BuscarNoHistorico; $fundoOriginal.Estilo = '10'; $fundoOriginal.Tile = '0' }
         if (-not $SalvarEm) {
+            New-Item -ItemType Directory -Path $PastaUsuario -Force | Out-Null
             if ($fundoOriginal.Caminho -and (Test-Path -LiteralPath $fundoOriginal.Caminho)) {
-                New-Item -ItemType Directory -Path $PastaUsuario -Force | Out-Null
                 $copia = Join-Path $PastaUsuario ('fundo-original' + [IO.Path]::GetExtension($fundoOriginal.Caminho))
                 if ($fundoOriginal.Caminho -ine $copia) { Copy-Item -LiteralPath $fundoOriginal.Caminho -Destination $copia -Force }
                 $fundoOriginal.Caminho = $copia

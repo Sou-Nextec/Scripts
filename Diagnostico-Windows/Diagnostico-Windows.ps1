@@ -124,7 +124,45 @@ if (($script:Raiz.Length + 110) -gt 255) {
 $pastas = '01_Sistema', '02_Hardware', '03_Eventos', '04_Falhas', '05_Desempenho',
           '06_Servicos', '07_Rede', '08_Seguranca', '09_Updates', '10_Integridade',
           '11_Software', '12_Energia', '13_Politicas'
-foreach ($p in $pastas) { New-Item -ItemType Directory -Path (Join-Path $script:Raiz $p) -Force | Out-Null }
+
+# Cria a pasta de saída; se o caminho já existir como arquivo, estiver bloqueado ou der erro,
+# tenta pastas alternativas (Temp_Nextec, etc.) até conseguir gravar.
+function New-PastaSaida {
+    param([string]$Base, [string]$Nome, [string[]]$Subpastas)
+    $candidatos = @(
+        $Base,
+        'C:\Temp_Nextec',
+        (Join-Path $env:PUBLIC 'Temp_Nextec'),
+        (Join-Path $env:TEMP 'Temp_Nextec'),
+        (Join-Path $env:SystemDrive 'Nextec_Diagnostico')
+    )
+    foreach ($b in $candidatos) {
+        if ([string]::IsNullOrWhiteSpace($b)) { continue }
+        try {
+            # Se existir um ARQUIVO com o nome da pasta base, não dá para criar: pula para a próxima
+            if (Test-Path -LiteralPath $b -PathType Leaf) { throw "'$b' já existe e é um arquivo." }
+            if (-not (Test-Path -LiteralPath $b -PathType Container)) {
+                New-Item -ItemType Directory -Path $b -Force -ErrorAction Stop | Out-Null
+            }
+            $raiz = Join-Path $b $Nome
+            $n = 1
+            while (Test-Path -LiteralPath $raiz) { $n++; $raiz = Join-Path $b ("{0}_{1}" -f $Nome, $n) }
+            foreach ($s in $Subpastas) {
+                New-Item -ItemType Directory -Path (Join-Path $raiz $s) -Force -ErrorAction Stop | Out-Null
+            }
+            # Teste de gravação
+            $teste = Join-Path $raiz '_teste.tmp'
+            Set-Content -LiteralPath $teste -Value 'ok' -ErrorAction Stop
+            Remove-Item -LiteralPath $teste -Force -ErrorAction SilentlyContinue
+            if ($b -ne $Base) { Write-Warning "Pasta '$Base' indisponível; usando '$b'" }
+            return $raiz
+        } catch {
+            Write-Warning "Não foi possível usar '$b': $($_.Exception.Message)"
+        }
+    }
+    throw 'Nenhuma pasta de saída disponível para o diagnóstico Nextec.'
+}
+$script:Raiz = New-PastaSaida -Base $OutputPath -Nome (Split-Path $script:Raiz -Leaf) -Subpastas $pastas
 
 $script:LogFile  = Join-Path $script:Raiz '_execucao.log'
 $script:Achados  = New-Object System.Collections.Generic.List[object]
@@ -323,6 +361,7 @@ function Get-UsuarioAlvo {
 }
 Write-Host ''
 Write-Host '=====================================================' -ForegroundColor Cyan
+Write-Host '  NEXTEC' -ForegroundColor Green
 Write-Host '  DIAGNÓSTICO COMPLETO DO WINDOWS' -ForegroundColor Cyan
 Write-Host "  Máquina : $env:COMPUTERNAME" -ForegroundColor Cyan
 Write-Host "  Período : últimos $Dias dias" -ForegroundColor Cyan

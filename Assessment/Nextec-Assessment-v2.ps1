@@ -27,11 +27,11 @@
     Executar sem parâmetros (ou com -Automatico, usado pelo Executar-Assessment.cmd) inicia o fluxo completo.
     A coleta de softwares está habilitada por padrão (-SemSoftwareEstacoes desativa essa parte; -SoftwareEstacoes
     é aceito só por compatibilidade). O coletor do PsExec funciona em PowerShell 2.0 (Windows 7/2008 R2).
-    Reabre elevado sozinho (o UAC é o único aviso), assume o nome do cliente pelo domínio, valida o ambiente
+    Exige PowerShell aberto como administrador (não se eleva sozinho), assume o nome do cliente pelo domínio, valida o ambiente
     antes de coletar e, só se a conta atual for negada nas estações, abre UMA janela de login e senha do domínio.
     Essa credencial vale apenas para esta execução, não é gravada e é descartada ao terminar.
 
-    Saída: um .zip com CSVs (separador ';', UTF-8), textos, resumo.json e Resumo-Assessment.html. A pasta de trabalho é removida depois que o .zip é gerado.
+    Saída: em C:\Temp (mude com -Saida), um .zip com CSVs (separador ';', UTF-8), textos, resumo.json e Resumo-Assessment.html. A pasta de trabalho é removida depois que o .zip é gerado.
     A varredura de rede abre conexões TCP nas portas listadas; se houver IPS/antivírus de rede, avise o cliente.
     A descoberta abrange as sub-redes locais que o script identifica (prefixos maiores que /22 são limitados pelo
     modo seguro existente) e os computadores habilitados no AD; redes roteadas adicionais exigem -Subredes.
@@ -55,7 +55,7 @@
 param(
     [string]$Cliente = 'Cliente',
     [string[]]$Subredes,
-    [string]$Saida = 'C:\Assessment',
+    [string]$Saida = 'C:\Temp',
     [int[]]$Portas = @(21, 22, 23, 25, 53, 80, 88, 110, 111, 135, 139, 143, 389, 443, 445, 465, 515, 554, 587,
                        631, 636, 993, 995, 1433, 1521, 1723, 2049, 3050, 3268, 3269, 3306, 3389, 4899, 5000,
                        5001, 5060, 5357, 5432, 5900, 5938, 5985, 5986, 6000, 7070, 8000, 8006, 8080, 8081,
@@ -273,12 +273,80 @@ function Get-UrlPorta {
     }
 }
 
+# ---------- Apresentação no console ----------
+# O arquivo coleta.log guarda tudo com hora e nível; a tela mostra só o necessário, organizado por seção e etapa.
+$script:VersaoAssessment = '2.8'
+$script:LarguraTela = 64
+$script:EtapaAberta = $null
+$script:NumeroSecao = 0
+$script:TotalSecoes = 7
+
+function Close-LinhaEtapa {
+    # Fecha a linha da etapa em andamento antes de escrever qualquer outra coisa na tela.
+    if ($script:EtapaAberta) { Write-Host ''; $script:EtapaAberta = $null }
+}
+
 function Write-Log {
-    param([string]$Mensagem, [ValidateSet('INFO', 'AVISO', 'ERRO')][string]$Nivel = 'INFO')
+    param([string]$Mensagem, [ValidateSet('INFO', 'AVISO', 'ERRO')][string]$Nivel = 'INFO', [switch]$SoArquivo)
     $linha = '{0} [{1}] {2}' -f (Get-Date -Format 'HH:mm:ss'), $Nivel, $Mensagem
-    $cor = switch ($Nivel) { 'AVISO' { 'Yellow' } 'ERRO' { 'Red' } default { 'Gray' } }
-    Write-Host $linha -ForegroundColor $cor
-    Add-Content -Path $script:ArquivoLog -Value $linha -Encoding UTF8
+    if ($script:ArquivoLog) { Add-Content -Path $script:ArquivoLog -Value $linha -Encoding UTF8 }
+    if ($SoArquivo) { return }
+    Close-LinhaEtapa
+    $texto = $Mensagem.TrimStart()
+    $recuo = ' ' * (6 + ($Mensagem.Length - $texto.Length))
+    switch ($Nivel) {
+        'AVISO' { Write-Host "$recuo! $texto" -ForegroundColor Yellow }
+        'ERRO'  { Write-Host "${recuo}x $texto" -ForegroundColor Red }
+        default { Write-Host "$recuo$texto" -ForegroundColor DarkGray }
+    }
+}
+
+function Format-Duracao {
+    param([TimeSpan]$Tempo)
+    if ($Tempo.TotalMinutes -ge 1) { return '{0} min {1:00} s' -f [math]::Floor($Tempo.TotalMinutes), $Tempo.Seconds }
+    '{0:N1} s' -f $Tempo.TotalSeconds
+}
+
+function Write-Cabecalho {
+    $l = $script:LarguraTela
+    $titulo = '  NEXTEC  |  Assessment de TI'
+    $versao = "v$script:VersaoAssessment  "
+    Write-Host ''
+    Write-Host ('  ┌' + ('─' * $l) + '┐') -ForegroundColor Cyan
+    Write-Host '  │' -NoNewline -ForegroundColor Cyan
+    Write-Host $titulo -NoNewline -ForegroundColor White
+    Write-Host (' ' * ($l - $titulo.Length - $versao.Length)) -NoNewline
+    Write-Host $versao -NoNewline -ForegroundColor DarkGray
+    Write-Host '│' -ForegroundColor Cyan
+    Write-Host ('  └' + ('─' * $l) + '┘') -ForegroundColor Cyan
+    foreach ($campo in @(
+            @('Cliente', $Cliente),
+            @('Máquina', $env:COMPUTERNAME),
+            @('Conta', "$env:USERDOMAIN\$env:USERNAME"),
+            @('Saída', $Saida),
+            @('Início', (Get-Date -Format 'dd/MM/yyyy HH:mm')))) {
+        Write-Host ('   {0,-10}' -f $campo[0]) -NoNewline -ForegroundColor DarkGray
+        Write-Host $campo[1] -ForegroundColor Gray
+    }
+}
+
+function Write-Secao {
+    param([string]$Titulo)
+    Close-LinhaEtapa
+    $script:NumeroSecao++
+    Write-Log "== $Titulo" -SoArquivo
+    $rotulo = ' {0}/{1}  {2} ' -f $script:NumeroSecao, $script:TotalSecoes, $Titulo
+    Write-Host ''
+    Write-Host ('  ──' + $rotulo + ('─' * [math]::Max(4, $script:LarguraTela - $rotulo.Length - 2))) -ForegroundColor Cyan
+}
+
+function Write-ItemValidacao {
+    param([string]$Item, [string]$Status, [string]$Detalhe)
+    Close-LinhaEtapa
+    $cor = switch ($Status) { 'OK' { 'Green' } 'FALHA' { 'Red' } default { 'Yellow' } }
+    Write-Host ('   {0,-7}' -f $Status) -NoNewline -ForegroundColor $cor
+    Write-Host ('{0,-24}' -f $Item) -NoNewline -ForegroundColor Gray
+    Write-Host $Detalhe -ForegroundColor $(if ($Status -eq 'OK') { 'DarkGray' } else { $cor })
 }
 
 function Add-Alerta {
@@ -290,13 +358,29 @@ function Add-Alerta {
 }
 
 function Invoke-Etapa {
+    # Uma linha por etapa: "Nome ........ ok  1,2 s". Se a etapa escrever detalhes, eles aparecem logo abaixo.
     param([string]$Nome, [scriptblock]$Acao)
-    Write-Log "Coletando: $Nome"
+    Write-Log "Coletando: $Nome" -SoArquivo
+    Close-LinhaEtapa
+    Write-Host "   $Nome" -NoNewline -ForegroundColor Gray
+    $script:EtapaAberta = $Nome
+    $relogio = [System.Diagnostics.Stopwatch]::StartNew()
+    $falhou = $false
     try { & $Acao }
     catch {
+        $falhou = $true
         $mensagem = $_.Exception.Message
         $script:Erros.Add([pscustomobject]@{ Etapa = $Nome; Erro = $mensagem })
         Write-Log "Falha em ${Nome}: $mensagem" 'AVISO'
+    }
+    $tempo = Format-Duracao $relogio.Elapsed
+    if ($script:EtapaAberta) {
+        Write-Host (' ' + ('.' * [math]::Max(2, 44 - $Nome.Length)) + ' ') -NoNewline -ForegroundColor DarkGray
+        Write-Host 'ok' -NoNewline -ForegroundColor Green
+        Write-Host "  $tempo" -ForegroundColor DarkGray
+        $script:EtapaAberta = $null
+    } elseif (-not $falhou) {
+        Write-Host "      concluído em $tempo" -ForegroundColor Green
     }
 }
 
@@ -526,7 +610,7 @@ function Get-TituloWeb {
         $buffer = New-Object char[] 16384
         $lidos = $leitor.Read($buffer, 0, $buffer.Length)
         $html = [string]::new($buffer, 0, [math]::Max($lidos, 0))
-        $titulo = if ($html -match '(?is)<title[^>]*>\s*(.*?)\s*</title>') { ($Matches[1] -replace '\s+', ' ') } else { '' }
+        $titulo = if ($html -match '(?is)<title[^>]*>\s*(.*?)\s*</title>') { [System.Net.WebUtility]::HtmlDecode(($Matches[1] -replace '\s+', ' ')).Trim() } else { '' }
         $realm = [string]$resposta.Headers['WWW-Authenticate']
         if (-not $titulo -and $realm) { $titulo = $realm }
         if ($titulo.Length -gt 120) { $titulo = $titulo.Substring(0, 120) }
@@ -554,11 +638,68 @@ function Invoke-ComandoComTimeout {
 }
 
 function Get-NomeNetBios {
-    param([string]$Ip)
-    $saida = Invoke-ComandoComTimeout 'nbtstat.exe' "-A $Ip" 3000
-    $linha = ($saida -split "`r?`n") | Where-Object { $_ -match '^\s*(\S+)\s+<00>\s+' -and $_ -notmatch '(?i)GRUPO|GROUP' } | Select-Object -First 1
-    if ($linha -match '^\s*(\S+)\s+<00>') { return $Matches[1] }
-    ''
+    # Consulta de status NetBIOS (NBSTAT, UDP 137) feita direto pelo script, sem abrir o nbtstat.exe.
+    # Mesmo resultado do nbtstat -A: devolve o nome único <00> do equipamento.
+    param([string]$Ip, [int]$TimeoutMs = 1500)
+    # A própria máquina de coleta nem sempre responde à consulta feita para o próprio IP.
+    if ($null -eq $script:IpsLocais) {
+        $script:IpsLocais = @(try { [System.Net.Dns]::GetHostAddresses($env:COMPUTERNAME) | ForEach-Object { $_.IPAddressToString } } catch { })
+    }
+    if ($script:IpsLocais -contains $Ip) { return $env:COMPUTERNAME.ToUpper() }
+    $udp = New-Object System.Net.Sockets.UdpClient
+    try {
+        $udp.Client.ReceiveTimeout = $TimeoutMs
+        $id = Get-Random -Minimum 1 -Maximum 65535
+        $pacote = New-Object System.Collections.Generic.List[byte]
+        # Cabeçalho: id, flags 0, 1 pergunta, sem respostas
+        $pacote.AddRange([byte[]]@([byte]($id -shr 8), [byte]($id -band 0xFF), 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00))
+        # Nome '*' completado com nulos até 16 bytes, na codificação NetBIOS (cada meio byte + 'A')
+        $pacote.Add(0x20)
+        $pacote.AddRange([byte[]]@(0x43, 0x4B))
+        for ($i = 0; $i -lt 15; $i++) { $pacote.AddRange([byte[]]@(0x41, 0x41)) }
+        # Fim do nome, tipo NBSTAT (0x21), classe IN (0x01)
+        $pacote.AddRange([byte[]]@(0x00, 0x00, 0x21, 0x00, 0x01))
+        $dados = $pacote.ToArray()
+        [void]$udp.Send($dados, $dados.Length, $Ip, 137)
+        $origem = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+        $resposta = $udp.Receive([ref]$origem)
+        # Depois do cabeçalho (12) vem o nome da resposta: completo (tamanho + nome + 0) ou ponteiro de 2 bytes.
+        # Em seguida tipo e classe (4), TTL (4) e tamanho (2); o próximo byte é a quantidade de nomes.
+        if ($resposta.Length -lt 14) { return '' }
+        $p = if (($resposta[12] -band 0xC0) -eq 0xC0) { 14 } else { 12 + 1 + [int]$resposta[12] + 1 }
+        $p += 10
+        if ($resposta.Length -le $p) { return '' }
+        $quantidade = [int]$resposta[$p]
+        for ($n = 0; $n -lt $quantidade; $n++) {
+            $pos = $p + 1 + ($n * 18)
+            if ($pos + 18 -gt $resposta.Length) { break }
+            $sufixo = $resposta[$pos + 15]
+            $grupo = ($resposta[$pos + 16] -band 0x80) -ne 0
+            if ($sufixo -eq 0x00 -and -not $grupo) {
+                return ([System.Text.Encoding]::ASCII.GetString($resposta, $pos, 15)).Trim([char]0, ' ')
+            }
+        }
+        ''
+    } catch { '' }
+    finally { $udp.Close() }
+}
+
+function Get-AntivirusComportamental {
+    # Antivírus com bloqueio por comportamento que costumam interromper a varredura de rede quando a pasta do script não está liberada.
+    $conhecidos = [ordered]@{
+        'Bitdefender'                     = '^(EPSecurityService|EPProtectedService|EPIntegrationService|bdredline)$'
+        'Sophos'                          = '^Sophos'
+        'CrowdStrike Falcon'              = '^CSFalconService$'
+        'SentinelOne'                     = '^SentinelAgent$'
+        'Microsoft Defender for Endpoint' = '^Sense$'
+        'Kaspersky'                       = '^(AVP|kavfs|klnagent)'
+        'ESET'                            = '^ekrn$'
+        'Trend Micro'                     = '^(ds_agent|TMBMServer|ntrtscan)$'
+    }
+    $servicos = @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Running' } | ForEach-Object { $_.Name })
+    foreach ($produto in $conhecidos.Keys) {
+        if (@($servicos -match $conhecidos[$produto]).Count) { $produto }
+    }
 }
 
 function Get-CompartilhamentosRemotos {
@@ -863,30 +1004,6 @@ $script:CorCategoria = [ordered]@{
 # Execução sem intervenção, credencial única e pré-validação
 # ============================================================================
 
-function New-ComandoRelancamento {
-    # Monta o comando para reabrir o script elevado com os mesmos parâmetros. Vai codificado
-    # (-EncodedCommand) porque o -File não entende lista separada por vírgula nem aspas dentro de valores.
-    param([System.Collections.IDictionary]$Informados)
-    $aspas = { param($t) "'" + ("$t" -replace "'", "''") + "'" }
-    $partes = New-Object System.Collections.Generic.List[string]
-    $partes.Add("& $(& $aspas $PSCommandPath)")
-    foreach ($nome in $Informados.Keys) {
-        if ($nome -eq 'Credencial') { continue }   # credencial não atravessa a elevação; o processo elevado pede de novo se precisar
-        $valor = $Informados[$nome]
-        if ($valor -is [System.Management.Automation.SwitchParameter]) {
-            if ($valor.IsPresent) { $partes.Add("-$nome") }
-        } elseif ($valor -is [array]) {
-            $itens = foreach ($v in $valor) { if ($v -is [string]) { & $aspas $v } else { "$v" } }
-            $partes.Add("-$nome " + ($itens -join ','))
-        } elseif ($valor -is [string]) {
-            $partes.Add("-$nome " + (& $aspas $valor))
-        } else {
-            $partes.Add("-$nome $valor")
-        }
-    }
-    $partes -join ' '
-}
-
 function Test-CredencialDominio {
     # $true = aceita, $false = recusada, $null = não deu para validar (DC inalcançável).
     param([pscredential]$Cred, [string]$Dominio)
@@ -962,11 +1079,15 @@ function Invoke-PreValidacao {
         param($Item, $Status, $Detalhe)
         $itens.Add([pscustomobject]@{ Item = $Item; Status = $Status; Detalhe = $Detalhe })
         $nivel = switch ($Status) { 'OK' { 'INFO' } 'FALHA' { 'ERRO' } default { 'AVISO' } }
-        Write-Log "  [$Status] ${Item}: $Detalhe" $nivel
+        Write-Log "[$Status] ${Item}: $Detalhe" $nivel -SoArquivo
+        Write-ItemValidacao $Item $Status $Detalhe
     }
     $bloqueio = $false
     $credencialAtiva = $Credencial
-    Write-Log 'Pré-validação do ambiente'
+    Write-Secao 'Pré-validação'
+    $avs = @(Get-AntivirusComportamental)
+    if ($avs.Count) { & $registrar 'Antivírus' 'AVISO' "$($avs -join ', ') com bloqueio por comportamento. Se parar, libere C:\ProgramData\Nextec\" }
+    else { & $registrar 'Antivírus' 'OK' 'Sem bloqueio por comportamento conhecido' }
 
     # Máquina de coleta
     & $registrar 'PowerShell' 'OK' "$($PSVersionTable.PSVersion)"
@@ -1080,33 +1201,27 @@ function Invoke-PreValidacao {
 # ============================================================================
 
 $ehAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-Write-Log "Assessment Nextec | Cliente: $Cliente | Máquina: $env:COMPUTERNAME | Saída: $script:PastaSaida"
+Write-Log "Assessment Nextec v$script:VersaoAssessment | Cliente: $Cliente | Máquina: $env:COMPUTERNAME | Saída: $script:PastaSaida" -SoArquivo
+if ($SemValidacao) { $script:TotalSecoes-- }
+Write-Cabecalho
 
 if (-not $ehAdmin) {
-    Write-Log 'Sem privilégio de administrador: BitLocker, configurações de segurança e Hyper-V não serão coletados.' 'AVISO'
-    $reabrir = $false
-    if ($PSCommandPath) {
-        if ($Automatico) { $reabrir = $true }
-        elseif (Test-TemTeclado) { $reabrir = ((Read-Preenchimento 'Reabrir como administrador? (S/N)' 'S') -match '^(s|y)') }
-    }
-    if ($reabrir) {
-        try {
-            $informados = [ordered]@{}
-            foreach ($k in $PSBoundParameters.Keys) { $informados[$k] = $PSBoundParameters[$k] }
-            if (-not $informados.Contains('Cliente')) { $informados['Cliente'] = $Cliente }
-            if ($Automatico) { $informados['Automatico'] = $true }
-            if ($DominioEmail -and -not $informados.Contains('DominioEmail')) { $informados['DominioEmail'] = $DominioEmail }
-            $comando = New-ComandoRelancamento $informados
-            $codificado = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($comando))
-            Start-Process -FilePath 'powershell.exe' -Verb RunAs -ErrorAction Stop `
-                -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $codificado)
-            Write-Log 'Reaberto em janela com privilégio de administrador. Esta janela vai encerrar.'
-            # A pasta desta execução só tem o log; a janela elevada cria a sua.
-            Remove-Item -LiteralPath $script:PastaSaida -Recurse -Force -ErrorAction SilentlyContinue
-            exit 0
-        } catch {
-            Write-Log "Não foi possível elevar ($($_.Exception.Message)); seguindo sem privilégio." 'AVISO'
-        }
+    # O script não se eleva sozinho: o PowerShell precisa ser aberto como administrador antes de executar.
+    Write-Host ''
+    Write-Host 'Este assessment precisa ser executado como administrador.' -ForegroundColor Yellow
+    Write-Host 'Feche esta janela, abra o PowerShell com "Executar como administrador" e rode o comando de novo.' -ForegroundColor Yellow
+    Write-Host ''
+    Remove-Item -LiteralPath $script:PastaSaida -Recurse -Force -ErrorAction SilentlyContinue
+    if ($Automatico) { exit 1 }
+    return
+}
+
+# Sem pré-validação, o aviso de antivírus com bloqueio por comportamento sai aqui mesmo.
+if ($SemValidacao) {
+    $antivirusComportamental = @(Get-AntivirusComportamental)
+    if ($antivirusComportamental.Count) {
+        Write-Host ''
+        Write-Log "$($antivirusComportamental -join ', ') com bloqueio por comportamento. Se a coleta parar, confira a exclusão de C:\ProgramData\Nextec\" 'AVISO'
     }
 }
 
@@ -1122,7 +1237,8 @@ if (-not $SemValidacao) {
     if ($validacao.Bloqueio) { throw 'Pré-validação reprovada: veja os itens FALHA acima e em validacao.csv.' }
     if ($SoValidar) {
         Write-Host ''
-        Write-Host "Validação concluída. Detalhes em $script:PastaSaida" -ForegroundColor Green
+        Write-Host "   Validação concluída. Detalhes em $script:PastaSaida" -ForegroundColor Green
+        Write-Host ''
         if ($Automatico) { try { Start-Process explorer.exe -ArgumentList "`"$script:PastaSaida`"" } catch { } }
         exit 0
     }
@@ -1142,6 +1258,8 @@ if ($Agressivo) { Write-Log 'Modo agressivo: rajadas maiores de conexões TCP. P
 # ============================================================================
 # 1. Servidor local
 # ============================================================================
+
+Write-Secao 'Servidor'
 
 Invoke-Etapa 'Hardware e sistema operacional' {
     $cs   = Get-CimInstance Win32_ComputerSystem
@@ -1183,6 +1301,45 @@ Invoke-Etapa 'Hardware e sistema operacional' {
     elseif ($suporte -like '*encerra em*') { Add-Alerta 'Média' 'Servidor' 'SO perto do fim do suporte' "$($so.Caption): $suporte" }
     if ($uptime.TotalDays -gt 60) { Add-Alerta 'Baixa' 'Servidor' 'Muito tempo sem reiniciar' "$([int]$uptime.TotalDays) dias ligado; atualizações podem estar pendentes" }
 
+    # Equipamento que faz papel de servidor mas é estação comum (Windows de desktop ou sem linha de servidor).
+    $soDesktop = $so.Caption -notmatch 'Server'
+    $papelServidor = $script:EhServidor -or ($script:ComputadoresAD.Count -eq 0 -and $cs.DomainRole -ge 2)
+    if ($soDesktop -and ($script:PapelMaquina -eq 'Servidor' -or $cs.Model -match 'System Product Name|To be filled')) {
+        Add-Alerta 'Média' 'Servidor' 'Equipamento de estação no papel de servidor' "$($cs.Manufacturer) $($cs.Model) com $($so.Caption): sem hardware de servidor (RAID, fonte redundante, ECC) nem SO de servidor"
+    }
+
+    # Link de garantia pronto, a partir do fabricante e do número de série.
+    $serie = "$($bios.SerialNumber)".Trim()
+    $serieValida = $serie -and $serie -notmatch '(?i)^(System Serial Number|To be filled|Default string|None|0+)$'
+    if ($serieValida) {
+        $linkGarantia = switch -Wildcard ("$($cs.Manufacturer)".ToLower()) {
+            'dell*'               { "https://www.dell.com/support/home/pt-br/product-support/servicetag/$serie" }
+            '*lenovo*'            { "https://pcsupport.lenovo.com/br/pt/warrantylookup?serialnumber=$serie" }
+            { $_ -match 'hp|hewlett' } { 'https://support.hp.com/br-pt/checkwarranty' }
+            default               { '' }
+        }
+        if ($linkGarantia) { $script:Resumo['Consulta de garantia'] = $linkGarantia }
+    }
+
+    # Memória: pentes instalados, slots livres e máximo suportado, para planejar upgrade.
+    try {
+        $pentes = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop)
+        $array  = Get-CimInstance Win32_PhysicalMemoryArray -ErrorAction SilentlyContinue | Select-Object -First 1
+        $slots  = if ($array.MemoryDevices) { [int]$array.MemoryDevices } else { $pentes.Count }
+        $maxGB  = if ($array.MaxCapacityEx) { [math]::Round($array.MaxCapacityEx / 1MB, 0) } elseif ($array.MaxCapacity) { [math]::Round($array.MaxCapacity / 1MB, 0) } else { $null }
+        $tipoPente = { param($t) switch ([int]$t) { 20 { 'DDR' } 21 { 'DDR2' } 24 { 'DDR3' } 26 { 'DDR4' } 34 { 'DDR5' } default { '' } } }
+        $memModulos = @($pentes | ForEach-Object {
+            [pscustomobject]@{ Slot = $_.DeviceLocator; CapacidadeGB = [math]::Round($_.Capacity / 1GB, 0)
+                Tipo = (& $tipoPente $_.SMBIOSMemoryType); VelocidadeMHz = $_.Speed; Fabricante = "$($_.Manufacturer)".Trim(); NumeroSerie = "$($_.SerialNumber)".Trim() }
+        })
+        Save-Dados 'memoria_modulos' $memModulos 'Pentes de memória instalados, por slot'
+        $livres = $slots - $pentes.Count
+        $script:Resumo['Memória (slots)'] = "$($pentes.Count) de $slots ocupados$(if ($livres -gt 0) { ", $livres livre(s)" })$(if ($maxGB) { "; máximo $maxGB GB" })"
+        if ($livres -le 0 -and $maxGB -and ([math]::Round($cs.TotalPhysicalMemory / 1GB, 0) -ge $maxGB)) {
+            Add-Alerta 'Baixa' 'Servidor' 'Memória no limite da placa' "Todos os $slots slots ocupados e no máximo suportado ($maxGB GB); upgrade exige troca de pentes"
+        }
+    } catch { }
+
     Save-Dados 'maquina_hardware' ([pscustomobject]@{
         Computador = $env:COMPUTERNAME; Papel = $script:PapelMaquina; Fabricante = $cs.Manufacturer; Modelo = $cs.Model
         NumeroSerie = $bios.SerialNumber; BIOS = $bios.SMBIOSBIOSVersion; DataBIOS = Format-Data $bios.ReleaseDate
@@ -1205,6 +1362,26 @@ Invoke-Etapa 'Discos, RAID e volumes' {
         foreach ($d in $fisicos | Where-Object { $_.HealthStatus -ne 'Healthy' }) {
             Add-Alerta 'Alta' 'Armazenamento' "Disco com saúde $($d.HealthStatus)" "$($d.FriendlyName) ($($d.SerialNumber))"
         }
+
+        # Saúde real de cada disco: desgaste do SSD, horas ligado, temperatura e erros de leitura.
+        $saude = @(foreach ($pd in Get-PhysicalDisk) {
+            $c = try { $pd | Get-StorageReliabilityCounter -ErrorAction Stop } catch { $null }
+            if ($c) {
+                [pscustomobject]@{ Disco = $pd.FriendlyName; MediaType = $pd.MediaType
+                    DesgastePct = $c.Wear; TemperaturaC = $c.Temperature; HorasLigado = $c.PowerOnHours
+                    ErrosLeitura = $c.ReadErrorsTotal; ErrosEscrita = $c.WriteErrorsTotal }
+            }
+        })
+        if ($saude.Count) {
+            Save-Dados 'discos_saude' $saude 'Saúde SMART dos discos: desgaste, temperatura, horas ligado e erros'
+            foreach ($s in $saude) {
+                if ($null -ne $s.DesgastePct -and $s.DesgastePct -ge 90) { Add-Alerta 'Alta' 'Armazenamento' 'SSD perto do fim da vida útil' "$($s.Disco): $($s.DesgastePct)% de desgaste" }
+                elseif ($null -ne $s.DesgastePct -and $s.DesgastePct -ge 70) { Add-Alerta 'Média' 'Armazenamento' 'SSD com desgaste alto' "$($s.Disco): $($s.DesgastePct)% de desgaste" }
+                if ($s.ErrosLeitura -gt 0 -or $s.ErrosEscrita -gt 0) { Add-Alerta 'Média' 'Armazenamento' 'Disco com erros de E/S' "$($s.Disco): $($s.ErrosLeitura) leitura, $($s.ErrosEscrita) escrita" }
+                if ($s.TemperaturaC -ge 60) { Add-Alerta 'Média' 'Armazenamento' 'Disco em temperatura alta' "$($s.Disco): $($s.TemperaturaC) °C" }
+            }
+            $script:Resumo['Saúde dos discos'] = ($saude | ForEach-Object { "$($_.Disco): $(if ($null -ne $_.DesgastePct) { "$($_.DesgastePct)% desgaste, " })$($_.HorasLigado)h, $($_.TemperaturaC)°C" }) -join ' | '
+        }
     }
 
     try {
@@ -1214,8 +1391,24 @@ Invoke-Etapa 'Discos, RAID e volumes' {
 
     $raid = @($discosWmi | Where-Object { $_.Model -match 'PERC|RAID|LOGICAL|Virtual|MegaRAID|Smart Array' })
     $script:Resumo['Discos (Windows)'] = ($discosWmi | ForEach-Object { "$($_.Model) $($_.TamanhoGB) GB" }) -join ' | '
-    if ($discosWmi.Count -eq 1 -and $raid.Count -eq 0) {
-        Add-Alerta 'Alta' 'Armazenamento' 'Servidor com disco único sem RAID aparente' "$($discosWmi[0].Model); confirmar redundância na controladora"
+    # Sem redundância: servidor com um disco só, ou com vários discos avulsos sem RAID/espelhamento.
+    if ($script:EhServidor -and $raid.Count -eq 0) {
+        if ($discosWmi.Count -eq 1) {
+            Add-Alerta 'Alta' 'Armazenamento' 'Servidor com disco único sem RAID aparente' "$($discosWmi[0].Model); confirmar redundância na controladora"
+        } elseif ($discosWmi.Count -gt 1) {
+            Add-Alerta 'Alta' 'Armazenamento' 'Servidor com discos avulsos sem RAID aparente' "$($discosWmi.Count) discos sem espelhamento: perda de um disco derruba o que estiver nele; confirmar redundância"
+        }
+    }
+
+    # RAID por utilitário do fabricante, quando a controladora não aparece como disco lógico no Windows.
+    $raidUtils = @(
+        @{ Nome = 'storcli'; Cmd = { storcli /c0 show }; Desc = 'Broadcom/LSI MegaRAID (storcli)' },
+        @{ Nome = 'perccli'; Cmd = { perccli /c0 show }; Desc = 'Dell PERC (perccli)' },
+        @{ Nome = 'ssacli';  Cmd = { ssacli ctrl all show config }; Desc = 'HPE Smart Array (ssacli)' },
+        @{ Nome = 'arcconf'; Cmd = { arcconf getconfig 1 }; Desc = 'Microchip/Adaptec (arcconf)' }
+    )
+    foreach ($u in $raidUtils) {
+        if (Test-ComandoExiste $u.Nome) { Save-Texto "raid_$($u.Nome)" $u.Cmd $u.Desc }
     }
 
     $volumes = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
@@ -1247,6 +1440,7 @@ Invoke-Etapa 'Rede da máquina de coleta' {
         $tipo = Get-TipoAdaptador "$($a.InterfaceDescription) $($a.Name)"
         [pscustomobject]@{
             Nome = $a.Name; Tipo = $tipo; Descricao = $a.InterfaceDescription; MAC = $a.MacAddress; Status = $a.Status; Velocidade = $a.LinkSpeed
+            Duplex = $a.FullDuplex
             IPv4 = ($meus.IPAddress) -join ', '
             Mascara = (($meus | ForEach-Object { "/$($_.PrefixLength)" }) | Select-Object -Unique) -join ', '
             Gateway = ((@($rotas | Where-Object { $_.InterfaceIndex -eq $a.ifIndex }).NextHop | Where-Object { $_ -and $_ -ne '0.0.0.0' }) | Select-Object -Unique) -join ', '
@@ -1254,7 +1448,13 @@ Invoke-Etapa 'Rede da máquina de coleta' {
             DHCP = [bool](@($meus | Where-Object { $_.PrefixOrigin -eq 'Dhcp' }).Count)
         }
     })
-    Save-Dados 'rede_adaptadores' $adaptadores 'Placas de rede da máquina de coleta, com tipo (física/virtual), IP, gateway e DNS'
+    Save-Dados 'rede_adaptadores' $adaptadores 'Placas de rede da máquina de coleta, com tipo (física/virtual), velocidade, duplex, IP, gateway e DNS'
+    # Placa física ativa negociando abaixo de 1 Gbps ou em half duplex: cabo, porta do switch ou placa com problema.
+    foreach ($a in $adaptadores | Where-Object { $_.Tipo -eq 'Física' -and $_.Status -eq 'Up' -and $_.IPv4 }) {
+        $mbps = if ("$($a.Velocidade)" -match '([\d.]+)\s*Gbps') { [double]$Matches[1] * 1000 } elseif ("$($a.Velocidade)" -match '([\d.]+)\s*Mbps') { [double]$Matches[1] } else { $null }
+        if ($mbps -and $mbps -lt 1000) { Add-Alerta 'Média' 'Rede' 'Placa de rede abaixo de 1 Gbps' "$($a.Nome): negociou $($a.Velocidade); conferir cabo e porta do switch" }
+        if ($a.Duplex -eq $false) { Add-Alerta 'Média' 'Rede' 'Placa de rede em half duplex' "$($a.Nome): half duplex causa colisões e lentidão; conferir negociação com o switch" }
+    }
     $ativos   = @($adaptadores | Where-Object { $_.IPv4 })
     # Produção = tem rota padrão (gateway) ou é placa física. Cobre o vEthernet do vSwitch externo do Hyper-V.
     $producao = @($ativos | Where-Object { $_.Gateway -or $_.Tipo -eq 'Física' })
@@ -1344,6 +1544,43 @@ Invoke-Etapa 'Internet, operadora e rota de saída' {
     $primeiroExterno = $saltos | Where-Object { $_.Classe -in 'CGNAT', 'Público' } | Select-Object -First 1
     if ($primeiroExterno -and $primeiroExterno.Classe -eq 'CGNAT') {
         Add-Alerta 'Info' 'Rede' 'Possível CGNAT da operadora' "Primeiro salto externo $($primeiroExterno.IP) é endereço CGNAT (100.64.0.0/10): sem IP público próprio, VPN/acesso entrante exige IP fixo"
+    }
+}
+
+Invoke-Etapa 'Qualidade do link e DNS' {
+    # Latência e perda de pacotes até o gateway, o DNS e a internet, para separar problema interno de problema da operadora.
+    $alvos = [ordered]@{}
+    if ($script:Resumo['Gateway']) { $alvos['Gateway'] = ($script:Resumo['Gateway'] -split ',\s*')[0] }
+    $alvos['Internet (1.1.1.1)'] = '1.1.1.1'
+    $medicoes = @(foreach ($rotulo in $alvos.Keys) {
+        $ip = $alvos[$rotulo]
+        $r = @(Test-Connection -ComputerName $ip -Count 10 -ErrorAction SilentlyContinue)
+        $ok = $r.Count
+        $lat = if ($ok) { [math]::Round((($r | Measure-Object -Property ResponseTime -Average).Average), 0) } else { $null }
+        $perda = [math]::Round((10 - $ok) / 10 * 100, 0)
+        [pscustomobject]@{ Alvo = $rotulo; IP = $ip; LatenciaMediaMs = $lat; PerdaPct = $perda; Respostas = "$ok/10" }
+    })
+    Save-Dados 'rede_qualidade_link' $medicoes 'Latência e perda de pacotes até o gateway e a internet (10 pings cada)'
+    $script:Resumo['Qualidade do link'] = ($medicoes | ForEach-Object { "$($_.Alvo): $(if ($null -ne $_.LatenciaMediaMs) { "$($_.LatenciaMediaMs) ms" } else { 'sem resposta' }), $($_.PerdaPct)% perda" }) -join ' | '
+    foreach ($m in $medicoes) {
+        if ($m.PerdaPct -ge 20) { Add-Alerta 'Alta' 'Rede' "Perda de pacotes alta até $($m.Alvo)" "$($m.PerdaPct)% de perda ($($m.Respostas)): link instável" }
+        elseif ($m.PerdaPct -ge 5) { Add-Alerta 'Média' 'Rede' "Perda de pacotes até $($m.Alvo)" "$($m.PerdaPct)% de perda ($($m.Respostas))" }
+        if ($m.Alvo -like 'Internet*' -and $null -ne $m.LatenciaMediaMs -and $m.LatenciaMediaMs -gt 120) { Add-Alerta 'Média' 'Rede' 'Latência alta até a internet' "$($m.LatenciaMediaMs) ms médios" }
+    }
+
+    # DNS em uso: quais servidores a rede usa e o tempo de resposta de cada um.
+    $dnsSrv = @(($script:Resumo['DNS configurado'] -split ',\s*') | Where-Object { $_ -and $_ -notlike '127.*' } | Select-Object -Unique)
+    if ($dnsSrv.Count -and (Test-ComandoExiste 'Resolve-DnsName')) {
+        $testeDns = @(foreach ($srv in $dnsSrv) {
+            $t = [System.Diagnostics.Stopwatch]::StartNew()
+            $resolveu = try { [bool](Resolve-DnsName -Name 'www.google.com' -Server $srv -Type A -QuickTimeout -ErrorAction Stop) } catch { $false }
+            $t.Stop()
+            $classe = if ($srv -in '8.8.8.8','8.8.4.4','1.1.1.1','1.0.0.1','9.9.9.9') { 'Público' } elseif ($srv -in $script:IpsLocais) { 'Esta máquina' } elseif ($srv -match '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)') { 'Interno/local' } else { 'Externo' }
+            [pscustomobject]@{ Servidor = $srv; Classe = $classe; Resolveu = $resolveu; TempoMs = if ($resolveu) { [math]::Round($t.Elapsed.TotalMilliseconds, 0) } else { $null } }
+        })
+        Save-Dados 'rede_dns_em_uso' $testeDns 'Servidores DNS configurados, classe e tempo de resposta'
+        $script:Resumo['DNS em uso'] = ($testeDns | ForEach-Object { "$($_.Servidor) ($($_.Classe))$(if ($_.Resolveu) { ": $($_.TempoMs) ms" } else { ': sem resposta' })" }) -join ' | '
+        foreach ($d in $testeDns | Where-Object { -not $_.Resolveu }) { Add-Alerta 'Média' 'Rede' 'Servidor DNS não respondeu' "$($d.Servidor) ($($d.Classe)): configurado mas sem resposta" }
     }
 }
 
@@ -1751,6 +1988,25 @@ Invoke-Etapa 'Wi-Fi' {
         $script:Resumo['Wi-Fi conectado'] = (@("$ssid", "sinal $sinal", $banda, "canal $canal", $radio) | Where-Object { $_ -and $_ -notmatch '^(sinal|canal)\s*$' }) -join ' | '
         if ($script:EhServidor) { Add-Alerta 'Média' 'Rede' 'Servidor conectado por Wi-Fi' 'Servidor deve usar cabo; Wi-Fi compromete estabilidade e backup' }
     }
+
+    # Wi-Fi do ambiente: redes visíveis, canal e sinal, para achar interferência e AP mal posicionado.
+    Save-Texto 'wifi_redes_visiveis' { netsh wlan show networks mode=bssid } 'Redes Wi-Fi visíveis no ambiente, com canal e sinal'
+    $saidaRedes = (netsh wlan show networks mode=bssid 2>&1 | Out-String)
+    $redes = New-Object System.Collections.Generic.List[object]
+    $ssidAtual = ''
+    foreach ($l in ($saidaRedes -split "`r?`n")) {
+        if ($l -match '(?im)^\s*SSID\s+\d+\s*:\s*(.*)$') { $ssidAtual = $Matches[1].Trim() }
+        elseif ($l -match '(?im)^\s*(?:Sinal|Signal)\s*:\s*(.+)$') { $sinalRede = $Matches[1].Trim() }
+        elseif ($l -match '(?im)^\s*(?:Canal|Channel)\s*:\s*(.+)$') {
+            $redes.Add([pscustomobject]@{ SSID = $(if ($ssidAtual) { $ssidAtual } else { '(oculto)' }); Canal = $Matches[1].Trim(); Sinal = $sinalRede })
+        }
+    }
+    if ($redes.Count) {
+        Save-Dados 'wifi_ambiente' $redes 'Redes Wi-Fi do ambiente (SSID, canal e sinal)'
+        $script:Resumo['Wi-Fi no ambiente'] = "$($redes.Count) rede(s) visível(eis)"
+        $porCanal = $redes | Group-Object Canal | Where-Object { $_.Count -ge 3 } | Sort-Object Count -Descending | Select-Object -First 1
+        if ($porCanal) { Add-Alerta 'Baixa' 'Rede' 'Canal Wi-Fi congestionado' "Canal $($porCanal.Name) com $($porCanal.Count) redes: avaliar mudança de canal do AP" }
+    }
 }
 
 Invoke-Etapa 'Proxy, VLAN e rotas de saída' {
@@ -1935,6 +2191,9 @@ Invoke-Etapa 'Sincronização de horário' {
 # 2. Active Directory
 # ============================================================================
 
+Write-Secao 'Active Directory'
+if ($SemAD) { Write-Log 'Ignorado (-SemAD).' }
+
 $temAD = $false
 if (-not $SemAD) {
     try { Import-Module ActiveDirectory -ErrorAction Stop; $temAD = $true }
@@ -2074,6 +2333,7 @@ if ($temAD) {
     }
 }
 
+Write-Secao 'Serviços de rede'
 Invoke-Etapa 'DNS do servidor' {
     if (-not (Test-ComandoExiste 'Get-DnsServerZone')) { return }
     $zonas = @(Get-DnsServerZone -ErrorAction Stop | Select-Object ZoneName, ZoneType, IsDsIntegrated, IsReverseLookupZone, DynamicUpdate, IsAutoCreated)
@@ -2132,6 +2392,8 @@ Invoke-EtapaEmail
 # 3. Varredura da rede
 # ============================================================================
 
+Write-Secao 'Varredura da rede'
+if ($SemVarreduraRede) { Write-Log 'Ignorada (-SemVarreduraRede).' }
 if (-not $SemVarreduraRede) {
     Invoke-Etapa 'Varredura da rede' {
         $cidrs = if ($Subredes) { $Subredes } else { Get-SubredesLocais }
@@ -2680,6 +2942,8 @@ function Get-InventarioRemoto {
     finally { Remove-CimSession -CimSession $sessao -ErrorAction SilentlyContinue }
 }
 
+Write-Secao 'Computadores Windows'
+if ($SemInventarioRemoto) { Write-Log 'Ignorado (-SemInventarioRemoto).' }
 if (-not $SemInventarioRemoto) {
     Invoke-Etapa 'Inventário de computadores Windows identificados no AD e na rede' {
         # Chave = nome NetBIOS (até 15 caracteres), que é o que o AD guarda em Nome e o que a varredura
@@ -2880,6 +3144,8 @@ if (-not $SemInventarioRemoto) {
 # ============================================================================
 # 5. Relatório
 # ============================================================================
+
+Write-Secao 'Relatório'
 
 $ordemSeveridade = @{ 'Alta' = 0; 'Média' = 1; 'Baixa' = 2; 'Info' = 3 }
 $alertasOrdenados = @($script:Alertas | Sort-Object { $ordemSeveridade[$_.Severidade] }, Area)
@@ -3489,15 +3755,36 @@ if ($zipGerado) {
     } catch { Write-Host "Não foi possível remover a pasta $script:PastaSaida: $($_.Exception.Message)" -ForegroundColor Yellow }
 }
 
+# Resumo final
+Close-LinhaEtapa
+$duracaoTotal = Format-Duracao ((Get-Date) - $script:Inicio)
 Write-Host ''
-Write-Host "Concluído. Alertas: $contagem" -ForegroundColor Green
-if ($pastaRemovida) {
-    Write-Host "Pacote: $zip (Resumo-Assessment.html e os CSVs estão dentro dele)" -ForegroundColor Green
-    Write-Host "Envie o arquivo $zip para análise." -ForegroundColor Green
-} else {
-    Write-Host "Resumo: $caminhoHtml" -ForegroundColor Green
-    Write-Host "Envie o arquivo $zip para análise." -ForegroundColor Green
+Write-Host ('  ' + ('═' * ($script:LarguraTela + 2))) -ForegroundColor Cyan
+Write-Host '   Assessment concluído' -NoNewline -ForegroundColor Green
+Write-Host "  em $duracaoTotal" -ForegroundColor DarkGray
+Write-Host ''
+Write-Host ('   {0,-10}' -f 'Alertas') -NoNewline -ForegroundColor DarkGray
+$coresSeveridade = [ordered]@{ 'Alta' = 'Red'; 'Média' = 'Yellow'; 'Baixa' = 'Cyan'; 'Info' = 'Gray' }
+foreach ($sev in $coresSeveridade.Keys) {
+    $qtd = @($alertasOrdenados | Where-Object { $_.Severidade -eq $sev }).Count
+    Write-Host ("{0} {1}    " -f $sev, $qtd) -NoNewline -ForegroundColor $(if ($qtd) { $coresSeveridade[$sev] } else { 'DarkGray' })
 }
+Write-Host ''
+if ($script:Erros.Count) {
+    Write-Host ('   {0,-10}' -f 'Falhas') -NoNewline -ForegroundColor DarkGray
+    Write-Host "$($script:Erros.Count) etapa(s) com falha, detalhes no relatório" -ForegroundColor Yellow
+}
+if ($zipGerado) {
+    Write-Host ('   {0,-10}' -f 'Pacote') -NoNewline -ForegroundColor DarkGray
+    Write-Host $zip -ForegroundColor White
+}
+if (-not $pastaRemovida) {
+    Write-Host ('   {0,-10}' -f 'Relatório') -NoNewline -ForegroundColor DarkGray
+    Write-Host $caminhoHtml -ForegroundColor White
+}
+Write-Host ''
+Write-Host '   Envie o pacote para análise e não deixe cópias no servidor do cliente.' -ForegroundColor Gray
+Write-Host ('  ' + ('═' * ($script:LarguraTela + 2))) -ForegroundColor Cyan
 
 # Segura a janela no fim quando há alguém olhando (duplo clique); em agendador e automação, não trava.
 if ($Automatico) {
