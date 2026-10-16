@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.15.0"
+INSTALLER_VERSION="2.16.0"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -2631,7 +2631,7 @@ EOF
     address = "$(alloy_escape "$bb_addr")"
     module  = "$(alloy_escape "$bb_module")"
     labels = {
-      cliente="$(alloy_escape "$CLIENTE")", host="$(alloy_escape "$bb_name")", servico="blackbox",
+      cliente="$(alloy_escape "$CLIENTE")", host="$(alloy_escape "$bb_name")", sonda_host="$(alloy_escape "$HOST_LABEL")", servico="blackbox",
       tipo="$(alloy_escape "$bb_type")", ambiente="$(alloy_escape "$AMBIENTE")", os="network",
       origem="blackbox", criticidade="$(alloy_escape "$CRITICIDADE")", local="$(alloy_escape "$LOCAL")",
     }
