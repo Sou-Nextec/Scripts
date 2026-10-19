@@ -34,7 +34,7 @@ function Registrar([string]$mensagem) {
     try {
         New-Item -ItemType Directory -Path $PastaUsuario -Force -ErrorAction SilentlyContinue | Out-Null
         $registro = "{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $mensagem
-        Add-Content -LiteralPath (Join-Path $PastaUsuario 'quadro.log') -Value $registro -ErrorAction SilentlyContinue
+        Add-Content -LiteralPath (Join-Path $PastaUsuario 'quadro.log') -Value $registro -Encoding UTF8 -ErrorAction SilentlyContinue
     } catch { }
 }
 
@@ -51,6 +51,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -86,10 +87,82 @@ public static class NextecWin32
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr depoisDe, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] static extern bool SetLayeredWindowAttributes(IntPtr h, uint chave, byte alfa, uint flags);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint comando);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder nome, int tamanho);
+    [DllImport("user32.dll")] static extern IntPtr OpenInputDesktop(uint flags, bool herdar, uint acesso);
+    [DllImport("user32.dll")] static extern bool CloseDesktop(IntPtr h);
+    [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int atributo, out int valor, int tamanho);
 
     // Como o painel foi ancorado na última busca (vai para o quadro.log): WorkerW, Progman ou janela comum
     public static string Modo = "";
+    // Nível de ancoragem, subido pela validação na tela quando o painel não aparece:
+    // 0 = automático, 1 = filho do Progman em camada, 2 = janela comum logo acima da área de trabalho
+    public static int Nivel = 0;
     static IntPtr abaixoDe = new IntPtr(1);   // HWND_BOTTOM
+
+    static string Classe(IntPtr h)
+    {
+        StringBuilder nome = new StringBuilder(64);
+        GetClassName(h, nome, nome.Capacity);
+        return nome.ToString();
+    }
+
+    static bool Oculta(IntPtr h)
+    {
+        if (!IsWindowVisible(h) || IsIconic(h)) return true;
+        int ocultaDwm;
+        // 14 = DWMWA_CLOAKED: janelas de apps universais escondidas pelo Windows
+        return DwmGetWindowAttribute(h, 14, out ocultaDwm, 4) == 0 && ocultaDwm != 0;
+    }
+
+    // Janela de topo mais alta da área de trabalho: o WorkerW com os ícones ou o Progman
+    static IntPtr TopoDaAreaDeTrabalho()
+    {
+        IntPtr achado = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr h, IntPtr l)
+        {
+            string c = Classe(h);
+            if (c == "Progman" || (c == "WorkerW" && FindWindowEx(h, IntPtr.Zero, "SHELLDLL_DefView", null) != IntPtr.Zero))
+            {
+                achado = h;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return achado;
+    }
+
+    // Tela bloqueada ou sessão RDP desconectada: não dá para conferir a tela
+    public static bool TelaDisponivel()
+    {
+        IntPtr d = OpenInputDesktop(0, false, 0x0100);   // DESKTOP_SWITCHDESKTOP
+        if (d == IntPtr.Zero) return false;
+        CloseDesktop(d);
+        return true;
+    }
+
+    // Existe janela de aplicativo (visível, não minimizada) sobre o ponto, acima do painel?
+    public static bool Coberto(int x, int y, IntPtr janela)
+    {
+        IntPtr raiz = GetAncestor(janela, 2);   // GA_ROOT
+        bool coberto = false;
+        EnumWindows(delegate(IntPtr h, IntPtr l)
+        {
+            if (h == raiz) return false;
+            string c = Classe(h);
+            if (c == "Progman" || c == "WorkerW" || Oculta(h)) return true;
+            RECT r;
+            if (GetWindowRect(h, out r) && x >= r.Left && x < r.Right && y >= r.Top && y < r.Bottom)
+            {
+                coberto = true;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return coberto;
+    }
 
     public static bool ShellPronto()
     {
@@ -106,11 +179,19 @@ public static class NextecWin32
         abaixoDe = new IntPtr(1);
         IntPtr progman = FindWindow("Progman", null);
         if (progman == IntPtr.Zero) { Modo = "janela comum (sem Progman)"; return IntPtr.Zero; }
+        if (Nivel >= 2) { Modo = "janela comum"; return IntPtr.Zero; }
         UIntPtr resultado;
         // 0x052C pede ao Progman que separe o fundo dos ícones (cria o WorkerW); repetir não tem efeito
         SendMessageTimeout(progman, 0x052C, UIntPtr.Zero, IntPtr.Zero, 0, 1000, out resultado);
 
         IntPtr iconesNoProgman = FindWindowEx(progman, IntPtr.Zero, "SHELLDLL_DefView", null);
+        if (Nivel == 1)
+        {
+            if (iconesNoProgman == IntPtr.Zero) { Modo = "janela comum"; return IntPtr.Zero; }
+            abaixoDe = iconesNoProgman;
+            Modo = "Progman (forçado)";
+            return progman;
+        }
         if (iconesNoProgman != IntPtr.Zero && FindWindowEx(progman, IntPtr.Zero, "WorkerW", null) != IntPtr.Zero)
         {
             abaixoDe = iconesNoProgman;
@@ -138,14 +219,24 @@ public static class NextecWin32
     }
 
     // Ancora a janela na área de trabalho e a posiciona (x e y em coordenadas de tela). Sem pai, a janela fica como
-    // janela comum no fundo da pilha, atrás das demais. Devolve o pai usado.
+    // janela comum logo acima da área de trabalho, atrás dos aplicativos (cobre os ícones naquele canto). Devolve o pai usado.
     public static IntPtr Fixar(IntPtr janela, int x, int y, int largura, int altura)
     {
         const uint SEM_ATIVAR = 0x10, MUDOU_MOLDURA = 0x20, MOSTRAR = 0x40;
         IntPtr pai = AcharPai();
         if (pai == IntPtr.Zero)
         {
-            SetWindowPos(janela, new IntPtr(1), x, y, largura, altura, SEM_ATIVAR | MOSTRAR);
+            IntPtr depoisDe = IntPtr.Zero;   // HWND_TOP quando não há nada acima da área de trabalho
+            IntPtr topo = TopoDaAreaDeTrabalho();
+            if (topo != IntPtr.Zero)
+            {
+                IntPtr acima = GetWindow(topo, 3);   // GW_HWNDPREV
+                if (acima != IntPtr.Zero && acima != janela) depoisDe = acima;
+                else if (acima == janela) depoisDe = new IntPtr(-2);   // já está no lugar: não mexe na ordem
+            }
+            uint flags = SEM_ATIVAR | MOSTRAR;
+            if (depoisDe == new IntPtr(-2)) { flags |= 0x4; depoisDe = IntPtr.Zero; }   // SWP_NOZORDER
+            SetWindowPos(janela, depoisDe, x, y, largura, altura, flags);
             return IntPtr.Zero;
         }
         SetParent(janela, pai);
@@ -353,6 +444,34 @@ public class NextecPainel : Form
         Desenhar(e.Graphics);
     }
 
+    // Confere na tela se o painel aparece: lê pixels da margem esquerda (só cor de fundo, sem texto).
+    // 1 = visível, 0 = não apareceu, -1 = não deu para conferir (tela bloqueada ou área coberta por outra janela)
+    public int Validar()
+    {
+        if (!IsHandleCreated || !NextecWin32.TelaDisponivel()) return -1;
+        int xi = Math.Max(2, Folga / 2);
+        int[] alturas = { alturaTotal / 4, alturaTotal / 2, alturaTotal * 3 / 4 };
+        bool conferiu = false;
+        foreach (int yi in alturas)
+        {
+            Point p = PointToScreen(new Point(xi, yi));
+            if (NextecWin32.Coberto(p.X, p.Y, Handle)) continue;
+            try
+            {
+                using (Bitmap b = new Bitmap(1, 1))
+                using (Graphics g = Graphics.FromImage(b))
+                {
+                    g.CopyFromScreen(p.X, p.Y, 0, 0, new Size(1, 1));
+                    Color c = b.GetPixel(0, 0);
+                    conferiu = true;
+                    if (Math.Abs(c.R - CorPainel.R) <= 12 && Math.Abs(c.G - CorPainel.G) <= 12 && Math.Abs(c.B - CorPainel.B) <= 12) return 1;
+                }
+            }
+            catch { return -1; }
+        }
+        return conferiu ? 0 : -1;
+    }
+
     // Imagem do painel (para conferir o visual sem abrir a janela); chame Aplicar antes
     public Bitmap Renderizar()
     {
@@ -541,6 +660,11 @@ public class NextecPainel : Form
         if ($fundoPreto) { AplicarFundoPreto } else { DevolverFundoAntigo }
     } catch { Registrar "Papel de parede: $($_.Exception.Message)" }
 
+    try {
+        $so = Get-CimInstance -ClassName Win32_OperatingSystem
+        Registrar ("Início: {0} (build {1}), sessão {2}, PowerShell {3}" -f $so.Caption, $so.BuildNumber, (Get-Process -Id $PID).SessionId, $PSVersionTable.PSVersion)
+    } catch { }
+
     # No logon o Explorer pode demorar; espera até um minuto antes de abrir o painel
     for ($i = 0; ($i -lt 30) -and (-not [NextecWin32]::ShellPronto()); $i++) { Start-Sleep -Seconds 2 }
 
@@ -549,19 +673,44 @@ public class NextecPainel : Form
     $script:ciclos = 0
     $script:modoRegistrado = ''
     while ($true) {
+        $script:validacao = 'pendente'   # pendente, ok ou falhou
+        $script:falhas = 0
         $script:painel = New-Object NextecPainel
         $timer = New-Object System.Windows.Forms.Timer
         try {
             $script:painel.Linhas = Coletar
             $script:painel.Aplicar()
-            $timer.Interval = $IntervaloMs
+            $timer.Interval = 2000   # primeira conferência logo depois de abrir; depois a cada 10 segundos
             $timer.Add_Tick({
                 try {
+                    $timer.Interval = $IntervaloMs
                     $pai = [NextecWin32]::AcharPai()
                     if ($pai.ToInt64() -ne $script:painel.Pai.ToInt64()) {
                         # Explorer reiniciou ou o pai mudou: sai do laço para recriar o painel
                         [System.Windows.Forms.Application]::ExitThread()
                         return
+                    }
+
+                    # Validação na tela: duas conferências seguidas sem o painel = passa para o próximo modo de ancoragem
+                    if ($script:validacao -eq 'pendente') {
+                        $resultado = $script:painel.Validar()
+                        if ($resultado -eq 1) {
+                            $script:validacao = 'ok'
+                            Registrar "Painel visível na tela: $([NextecWin32]::Modo)"
+                        } elseif ($resultado -eq 0) {
+                            $script:falhas++
+                            if ($script:falhas -ge 2) {
+                                $modo = [NextecWin32]::Modo
+                                if ([NextecWin32]::Nivel -lt 2) {
+                                    if ([NextecWin32]::Nivel -eq 0 -and $modo -like 'Progman*') { [NextecWin32]::Nivel = 2 } else { [NextecWin32]::Nivel++ }
+                                    Registrar "Painel não apareceu no modo '$modo'; tentando o próximo"
+                                    [System.Windows.Forms.Application]::ExitThread()
+                                    return
+                                }
+                                $script:validacao = 'falhou'
+                                Registrar "Painel não apareceu em nenhum modo de ancoragem (último: '$modo')"
+                            }
+                        }
                     }
                     $script:painel.Linhas = Coletar
                     $script:painel.Aplicar()

@@ -50,6 +50,17 @@ if (-not $principalAtual.IsInRole([Security.Principal.WindowsBuiltInRole]::Admin
     Falha 'execute o PowerShell como administrador.'
 }
 
+# Sistema suportado: Windows 8 / Server 2012 ou mais novo, Windows PowerShell 5.1 e .NET Framework 4.5 ou mais novo
+$so = Get-CimInstance -ClassName Win32_OperatingSystem
+if ([Version]$so.Version -lt [Version]'6.2') { Falha "$($so.Caption) não é suportado. O painel precisa do Windows 8 / Server 2012 ou mais novo." }
+if ($PSVersionTable.PSVersion -lt [Version]'5.1') { Falha "PowerShell $($PSVersionTable.PSVersion) encontrado. Instale o Windows Management Framework 5.1." }
+# Server Core não tem área de trabalho: só o aviso antes da senha é aplicado
+$temDesktop = Test-Path -LiteralPath (Join-Path $env:windir 'explorer.exe')
+$releaseNet = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -ErrorAction SilentlyContinue).Release
+if ($temDesktop -and (-not $releaseNet -or $releaseNet -lt 378389)) { Falha 'o painel precisa do .NET Framework 4.5 ou mais novo.' }
+Write-Host "Sistema: $($so.Caption) (build $($so.BuildNumber)), PowerShell $($PSVersionTable.PSVersion)"
+if (-not $temDesktop) { Write-Host 'Atenção: Windows sem área de trabalho (Server Core). Só o aviso antes da senha será aplicado.' }
+
 $Nome     = Limpar $Nome
 $Funcao   = Limpar $Funcao
 $Ambiente = Limpar $Ambiente
@@ -131,37 +142,42 @@ if ((Get-CimInstance -ClassName Win32_ComputerSystem).PartOfDomain) {
     Write-Host 'Atenção: servidor em domínio. Se existir GPO com o aviso de logon interativo, ela prevalece sobre o registro local.'
 }
 
-# ---------- 5. Tarefa agendada (abre o painel em cada sessão e o mantém rodando) ----------
-# O grupo Users é resolvido pelo SID, porque o nome muda conforme o idioma do Windows (Users, Usuários...)
-$grupoUsuarios = (New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')).Translate([Security.Principal.NTAccount]).Value
-$argumentos = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Quadro`""
-$acao      = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argumentos
-$gatilhos  = @(New-ScheduledTaskTrigger -AtLogOn)
-# Reforço: ao conectar ou desbloquear a sessão a tarefa roda de novo; o painel já aberto na sessão ignora a repetição
-try {
-    $classe = Get-CimClass -ClassName MSFT_TaskSessionStateChangeTrigger -Namespace 'Root/Microsoft/Windows/TaskScheduler'
-    foreach ($mudanca in 3, 7) {   # 3 = conexão remota (RDP), 7 = desbloqueio
-        $gatilhos += New-CimInstance -CimClass $classe -ClientOnly -Property @{ StateChange = $mudanca; Enabled = $true }
+if ($temDesktop) {
+    # ---------- 5. Tarefa agendada (abre o painel em cada sessão e o mantém rodando) ----------
+    # O grupo Users é resolvido pelo SID, porque o nome muda conforme o idioma do Windows (Users, Usuários...)
+    $grupoUsuarios = (New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')).Translate([Security.Principal.NTAccount]).Value
+    $argumentos = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Quadro`""
+    $acao      = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argumentos
+    $gatilhos  = @(New-ScheduledTaskTrigger -AtLogOn)
+    # Reforço: ao conectar ou desbloquear a sessão a tarefa roda de novo; o painel já aberto na sessão ignora a repetição
+    try {
+        $classe = Get-CimClass -ClassName MSFT_TaskSessionStateChangeTrigger -Namespace 'Root/Microsoft/Windows/TaskScheduler'
+        foreach ($mudanca in 3, 7) {   # 3 = conexão remota (RDP), 7 = desbloqueio
+            $gatilhos += New-CimInstance -CimClass $classe -ClientOnly -Property @{ StateChange = $mudanca; Enabled = $true }
+        }
+    } catch {
+        Write-Host "Aviso: gatilhos de reconexão não criados ($($_.Exception.Message)). Segue só com o gatilho de logon."
+        $gatilhos = @($gatilhos[0])
     }
-} catch {
-    Write-Host "Aviso: gatilhos de reconexão não criados ($($_.Exception.Message)). Segue só com o gatilho de logon."
-    $gatilhos = @($gatilhos[0])
-}
-$principal = New-ScheduledTaskPrincipal -GroupId $grupoUsuarios -RunLevel Limited
-# Sem limite de tempo (o painel roda a sessão inteira), uma instância por sessão (o próprio painel impede duplicar)
-$config    = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances Parallel -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-Register-ScheduledTask -TaskName $TarefaNome -Action $acao -Trigger $gatilhos -Principal $principal -Settings $config -Force | Out-Null
-Write-Host "Tarefa agendada registrada: $TarefaNome"
+    $principal = New-ScheduledTaskPrincipal -GroupId $grupoUsuarios -RunLevel Limited
+    # Sem limite de tempo (o painel roda a sessão inteira), uma instância por sessão (o próprio painel impede duplicar)
+    $config    = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances Parallel -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+    Register-ScheduledTask -TaskName $TarefaNome -Action $acao -Trigger $gatilhos -Principal $principal -Settings $config -Force | Out-Null
+    Write-Host "Tarefa agendada registrada: $TarefaNome"
 
-# ---------- 6. Aplica agora ----------
-# Encerra painéis da versão anterior (em qualquer sessão) para entrar o novo
-Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-    Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*quadro-windows.ps1*' } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Start-Sleep -Seconds 1
-Start-Process -FilePath 'powershell.exe' -ArgumentList $argumentos -WindowStyle Hidden
-try { Start-ScheduledTask -TaskName $TarefaNome } catch { }   # demais sessões ativas; quem já tem painel ignora
-Write-Host 'Painel aberto na sessão atual (outras sessões recebem no próximo login ou reconexão).'
+    # ---------- 6. Aplica agora ----------
+    # Encerra painéis da versão anterior (em qualquer sessão) para entrar o novo
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*quadro-windows.ps1*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 1
+    $inicioPainel = (Get-Date).AddSeconds(-1).ToString('yyyy-MM-dd HH:mm:ss')
+    Start-Process -FilePath 'powershell.exe' -ArgumentList $argumentos -WindowStyle Hidden
+    try { Start-ScheduledTask -TaskName $TarefaNome } catch { }   # demais sessões ativas; quem já tem painel ignora
+    Write-Host 'Painel aberto na sessão atual (outras sessões recebem no próximo login ou reconexão).'
+} else {
+    Unregister-ScheduledTask -TaskName $TarefaNome -Confirm:$false -ErrorAction SilentlyContinue
+}
 
 # ---------- 7. Conferência ----------
 Write-Host ''
@@ -170,7 +186,40 @@ foreach ($chave in 'NEXTEC_NOME_SERVIDOR', 'NEXTEC_FUNCAO', 'NEXTEC_AMBIENTE', '
     $valor = [Environment]::GetEnvironmentVariable($chave, 'Machine')
     if ($valor) { Write-Host ("  {0,-24} {1}" -f $chave, $valor) }
 }
-$estado = (Get-ScheduledTask -TaskName $TarefaNome).State
-Write-Host "Tarefa agendada: $estado"
+if ($temDesktop) {
+    $estado = (Get-ScheduledTask -TaskName $TarefaNome -ErrorAction SilentlyContinue).State
+    if (-not $estado) { Falha 'a tarefa agendada não foi encontrada depois do registro.' }
+    Write-Host "Tarefa agendada: $estado"
+}
+
+# Conferência do painel nesta sessão: o próprio painel confere na tela se apareceu e registra no quadro.log
+if ($temDesktop) {
+    Write-Host ''
+    Write-Host 'Conferindo o painel na tela (até 1 minuto). Deixe o canto superior direito da tela livre...'
+    $log = Join-Path $env:LOCALAPPDATA 'Nextec\quadro.log'
+    $resultado = ''
+    $novas = @()
+    for ($i = 0; $i -lt 30 -and -not $resultado; $i++) {
+        Start-Sleep -Seconds 2
+        if (Test-Path -LiteralPath $log) {
+            $novas = @(Get-Content -LiteralPath $log -Encoding UTF8 | Where-Object { $_.Length -ge 19 -and $_.Substring(0, 19) -ge $inicioPainel })
+            if ($novas -match 'Painel visível na tela') { $resultado = 'ok' }
+            elseif ($novas -match 'nenhum modo de ancoragem') { $resultado = 'falhou' }
+        }
+        $rodando = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+            Where-Object { $_.CommandLine -like '*quadro-windows.ps1*' -and $_.SessionId -eq (Get-Process -Id $PID).SessionId })
+        if (-not $rodando -and -not $resultado) { $resultado = 'encerrou' }
+    }
+    switch ($resultado) {
+        'ok'       { Write-Host "Validação: $(($novas -match 'Painel visível na tela' | Select-Object -Last 1).Substring(20))" }
+        'falhou'   { Write-Host 'Validação: FALHOU, o painel não apareceu na tela.' }
+        'encerrou' { Write-Host 'Validação: FALHOU, o painel encerrou logo depois de abrir.' }
+        default    { Write-Host 'Validação: não foi possível conferir na tela (área coberta por janela ou tela bloqueada). Confira o canto superior direito.' }
+    }
+    if ($resultado -ne 'ok' -and $novas) {
+        Write-Host "Últimas linhas de $($log):"
+        $novas | Select-Object -Last 8 | ForEach-Object { Write-Host "  $_" }
+    }
+}
 Write-Host ''
-Write-Host 'Concluído. Confira em uma nova sessão (sair e entrar de novo) antes de fechar esta. Erros do painel ficam em %LOCALAPPDATA%\Nextec\quadro.log.'
+Write-Host 'Concluído. Outras sessões já abertas recebem o painel ao reconectar ou no próximo login. Erros do painel ficam em %LOCALAPPDATA%\Nextec\quadro.log.'
