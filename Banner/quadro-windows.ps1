@@ -86,7 +86,16 @@ public static class NextecWin32
     [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int indice, int valor);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr depoisDe, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll")] static extern bool SetLayeredWindowAttributes(IntPtr h, uint chave, byte alfa, uint flags);
+    [StructLayout(LayoutKind.Sequential)] struct PONTO { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)] struct TAMANHO { public int L, A; }
+    [StructLayout(LayoutKind.Sequential, Pack = 1)] struct MISTURA { public byte Op, Flags, Alfa, Formato; }
+    [DllImport("user32.dll")] static extern bool UpdateLayeredWindow(IntPtr h, IntPtr dcDestino, IntPtr pontoDestino, ref TAMANHO tamanho, IntPtr dcOrigem, ref PONTO pontoOrigem, int chave, ref MISTURA mistura, int flags);
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr h, IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
+    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr objeto);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr objeto);
     [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint comando);
@@ -162,6 +171,29 @@ public static class NextecWin32
             return true;
         }, IntPtr.Zero);
         return coberto;
+    }
+
+    // Desenha a imagem (com transparência por pixel) na janela em camada; a posição fica como está
+    public static void Camada(IntPtr janela, Bitmap imagem)
+    {
+        IntPtr tela = GetDC(IntPtr.Zero);
+        IntPtr memoria = CreateCompatibleDC(tela);
+        IntPtr bitmap = imagem.GetHbitmap(Color.FromArgb(0));
+        IntPtr anterior = SelectObject(memoria, bitmap);
+        try
+        {
+            TAMANHO tamanho = new TAMANHO { L = imagem.Width, A = imagem.Height };
+            PONTO origem = new PONTO();
+            MISTURA mistura = new MISTURA { Op = 0, Flags = 0, Alfa = 255, Formato = 1 };   // AC_SRC_OVER, AC_SRC_ALPHA
+            UpdateLayeredWindow(janela, tela, IntPtr.Zero, ref tamanho, memoria, ref origem, 0, ref mistura, 2);   // ULW_ALPHA
+        }
+        finally
+        {
+            SelectObject(memoria, anterior);
+            DeleteObject(bitmap);
+            DeleteDC(memoria);
+            ReleaseDC(IntPtr.Zero, tela);
+        }
     }
 
     public static bool ShellPronto()
@@ -245,13 +277,6 @@ public static class NextecWin32
         int estilo = GetWindowLong(janela, -16);                 // GWL_STYLE
         estilo = (estilo & ~unchecked((int)0x80000000)) | 0x40000000 | 0x10000000;   // sem POPUP, com CHILD e VISIBLE
         SetWindowLong(janela, -16, estilo);
-        // Dentro do Progman (composição do 24H2) só janela em camada é desenhada; alfa 255 = totalmente opaca
-        int estiloEx = GetWindowLong(janela, -20);              // GWL_EXSTYLE
-        if (Modo.StartsWith("Progman") && (estiloEx & 0x80000) == 0)
-        {
-            SetWindowLong(janela, -20, estiloEx | 0x80000);    // WS_EX_LAYERED
-            SetLayeredWindowAttributes(janela, 0, 255, 2);     // LWA_ALPHA
-        }
         RECT r;
         GetWindowRect(pai, out r);
         SetWindowPos(janela, abaixoDe, x - r.Left, y - r.Top, largura, altura, SEM_ATIVAR | MUDOU_MOLDURA | MOSTRAR);
@@ -261,21 +286,31 @@ public static class NextecWin32
 
 public class NextecPainel : Form
 {
+    // Cabeçalho: nome do servidor, função e ambiente; corpo: métricas
+    public string Titulo = "";
+    public string Funcao = "";
+    public string Ambiente = "";
+    public Color CorAmbiente = Color.FromArgb(102, 187, 106);
     public List<NextecLinha> Linhas = new List<NextecLinha>();
+    public int Opacidade = 190;   // fundo do painel, 0 a 255; o texto fica sempre opaco
     public IntPtr Pai = IntPtr.Zero;
-    public int Margem, Folga, Raio, Px, AlturaLinha;
+    public int Margem, Px;
 
-    static readonly Color CorRotulo = Color.FromArgb(205, 210, 232);
-    static readonly Color CorValor = Color.FromArgb(244, 244, 244);
-    static readonly Color CorPainel = Color.FromArgb(8, 14, 30);
+    static readonly Color CorPainel = Color.FromArgb(10, 16, 34);
+    static readonly Color CorTitulo = Color.FromArgb(255, 255, 255);
+    static readonly Color CorSuave = Color.FromArgb(160, 170, 200);
+    static readonly Color CorValor = Color.FromArgb(236, 239, 246);
+    static readonly Color CorRodape = Color.FromArgb(150, 160, 190);
+    static readonly Color CorNextec = Color.FromArgb(110, 150, 255);
     const string TextoAviso = "Alterações neste servidor devem ser combinadas com a Nextec.";
-    static readonly string[] SegTexto = { "Gerenciado pela ", "Nextec", "   (62) 3602-1667 ", "· ", "noc@nex.tec.br" };
-    static readonly Color[] SegCor = { CorRotulo, CorValor, CorValor, CorRotulo, CorValor };
-    static readonly bool[] SegNegrito = { false, true, false, false, false };
+    static readonly string[] SegTexto = { "Gerenciado pela ", "Nextec", "  ·  (62) 3602-1667  ·  noc@nex.tec.br" };
+    static readonly bool[] SegNegrito = { false, true, false };
 
-    Font fonte, fonteBold, fontePeq, fontePeqB;
+    Font fTitulo, fSub, fEtiqueta, fRotulo, fValor, fRodape, fRodapeB;
     StringFormat formato;
-    float larguraRotulo, larguraValor, larguraAviso, larguraContato, larguraBloco;
+    // Medidas (Medir)
+    int folga, raio, barra, x0, alturaLinha, alturaTitulo, alturaSub, alturaRodape, espacoSecao;
+    float colunaRotulo, larguraConteudo, larguraEtiqueta, alturaEtiqueta;
     int larguraTotal, alturaTotal;
     bool eventoAtivo;
 
@@ -284,18 +319,20 @@ public class NextecPainel : Form
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
-        BackColor = CorPainel;
-        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint, true);
         formato = (StringFormat)StringFormat.GenericTypographic.Clone();
         formato.FormatFlags = formato.FormatFlags | StringFormatFlags.MeasureTrailingSpaces;
     }
+
+    // Cor da faixa lateral: a do ambiente ou, sem ambiente, a da Nextec. A validação na tela procura essa cor.
+    public Color CorFaixa { get { return Ambiente.Length > 0 ? CorAmbiente : CorNextec; } }
 
     protected override CreateParams CreateParams
     {
         get
         {
             CreateParams cp = base.CreateParams;
-            cp.ExStyle |= 0x80 | 0x08000000;   // WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+            // WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED (transparência por pixel) | WS_EX_TRANSPARENT (clique passa)
+            cp.ExStyle |= 0x80 | 0x08000000 | 0x80000 | 0x20;
             return cp;
         }
     }
@@ -339,42 +376,65 @@ public class NextecPainel : Form
         return g.MeasureString(texto, f, 10000, formato).Width;
     }
 
+    static int R(double v) { return (int)Math.Round(v); }
+
+    void CriarFontes(int px)
+    {
+        DescartarFontes();
+        Px = px;
+        fTitulo = new Font("Segoe UI Semibold", R(px * 1.3), FontStyle.Regular, GraphicsUnit.Pixel);
+        fSub = new Font("Segoe UI", R(px * 0.95), FontStyle.Regular, GraphicsUnit.Pixel);
+        fEtiqueta = new Font("Segoe UI", R(px * 0.8), FontStyle.Bold, GraphicsUnit.Pixel);
+        fRotulo = new Font("Segoe UI", R(px * 0.92), FontStyle.Regular, GraphicsUnit.Pixel);
+        fValor = new Font("Segoe UI", px, FontStyle.Regular, GraphicsUnit.Pixel);
+        fRodape = new Font("Segoe UI", R(px * 0.82), FontStyle.Regular, GraphicsUnit.Pixel);
+        fRodapeB = new Font("Segoe UI", R(px * 0.82), FontStyle.Bold, GraphicsUnit.Pixel);
+    }
+
     void Medir(Graphics g)
     {
         Rectangle tela = Screen.PrimaryScreen.Bounds;
         int altura = tela.Height >= 600 ? tela.Height : 1080;
-        int px = Math.Max(15, (int)Math.Round(altura / 62.0));
-        if (fonte == null || px != Px)
-        {
-            DescartarFontes();
-            Px = px;
-            fonte = new Font("Segoe UI", px, FontStyle.Regular, GraphicsUnit.Pixel);
-            fonteBold = new Font("Segoe UI", px, FontStyle.Bold, GraphicsUnit.Pixel);
-            fontePeq = new Font("Segoe UI", (float)Math.Round(px * 0.92), FontStyle.Regular, GraphicsUnit.Pixel);
-            fontePeqB = new Font("Segoe UI", (float)Math.Round(px * 0.92), FontStyle.Bold, GraphicsUnit.Pixel);
-        }
-        AlturaLinha = (int)Math.Round(px * 1.7);
-        Margem = (int)Math.Round(px * 2.4);
-        Folga = (int)Math.Round(px * 1.1);
-        Raio = (int)Math.Round(px * 0.7);
-
+        int px = Math.Max(15, R(altura / 62.0));
+        if (fTitulo == null || px != Px) CriarFontes(px);
         g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-        larguraRotulo = 0; larguraValor = 0;
-        int alturaBloco = (int)Math.Round(AlturaLinha * 1.6) + px;
+
+        Margem = R(px * 1.6);
+        folga = R(px * 1.25);
+        raio = R(px * 0.8);
+        barra = Math.Max(4, R(px * 0.28));
+        x0 = barra + folga;
+        alturaLinha = R(px * 1.6);
+        alturaTitulo = R(px * 1.3 * 1.4);
+        alturaSub = R(px * 1.55);
+        alturaRodape = R(px * 1.3);
+        espacoSecao = R(px * 1.5);
+        alturaEtiqueta = R(px * 1.3);
+
+        float largura = Larg(g, Titulo, fTitulo);
+        larguraEtiqueta = Ambiente.Length > 0 ? Larg(g, Ambiente.ToUpper(), fEtiqueta) + px : 0;
+        largura = Math.Max(largura, Larg(g, Funcao, fSub) + (larguraEtiqueta > 0 ? px + larguraEtiqueta : 0));
+
+        colunaRotulo = 0;
+        float larguraValor = 0;
         foreach (NextecLinha l in Linhas)
         {
-            if (l.Espaco) { alturaBloco += (int)Math.Round(AlturaLinha * 0.6); continue; }
-            larguraRotulo = Math.Max(larguraRotulo, Larg(g, l.Rotulo, fonte));
-            larguraValor = Math.Max(larguraValor, Larg(g, l.Valor, l.Negrito ? fonteBold : fonte));
-            alturaBloco += AlturaLinha;
+            if (l.Espaco) continue;
+            colunaRotulo = Math.Max(colunaRotulo, Larg(g, l.Rotulo, fRotulo));
+            larguraValor = Math.Max(larguraValor, Larg(g, l.Valor, l.Negrito ? fTitulo : fValor));
         }
-        larguraRotulo += Px * 2;
-        larguraAviso = Larg(g, TextoAviso, fontePeq);
-        larguraContato = 0;
-        for (int i = 0; i < SegTexto.Length; i++) larguraContato += Larg(g, SegTexto[i], SegNegrito[i] ? fontePeqB : fontePeq);
-        larguraBloco = Math.Max(larguraRotulo + larguraValor, Math.Max(larguraAviso, larguraContato));
-        larguraTotal = (int)Math.Ceiling(larguraBloco) + 2 * Folga;
-        alturaTotal = alturaBloco + 2 * Folga;
+        colunaRotulo += px * 1.6f;
+        largura = Math.Max(largura, colunaRotulo + larguraValor);
+        largura = Math.Max(largura, Larg(g, TextoAviso, fRodape));
+        float contato = 0;
+        for (int i = 0; i < SegTexto.Length; i++) contato += Larg(g, SegTexto[i], SegNegrito[i] ? fRodapeB : fRodape);
+        larguraConteudo = Math.Max(largura, contato);
+
+        int metricas = 0;
+        foreach (NextecLinha l in Linhas) metricas += l.Espaco ? R(alturaLinha * 0.5) : alturaLinha;
+        larguraTotal = x0 + (int)Math.Ceiling(larguraConteudo) + folga;
+        alturaTotal = folga + alturaTitulo + (Funcao.Length > 0 || Ambiente.Length > 0 ? alturaSub : 0)
+                    + espacoSecao + metricas + espacoSecao + 2 * alturaRodape + folga;
     }
 
     static GraphicsPath Arredondado(float x, float y, float w, float h, float r)
@@ -389,70 +449,101 @@ public class NextecPainel : Form
         return p;
     }
 
-    // Recalcula o tamanho e o canto superior direito da tela principal e, com a janela criada, ancora na área de trabalho
+    // Recalcula o tamanho, posiciona no canto superior direito da tela principal, ancora na área de trabalho e redesenha
     public void Aplicar()
     {
         using (Bitmap b = new Bitmap(1, 1))
         using (Graphics g = Graphics.FromImage(b)) Medir(g);
         Rectangle tela = Screen.PrimaryScreen.Bounds;
-        int x = tela.Right - Margem + Folga - larguraTotal;
-        int y = tela.Top + Margem - Folga;
-        if (!IsHandleCreated) SetBounds(x, y, larguraTotal, alturaTotal);   // com a janela criada, quem posiciona é o Fixar
-        using (GraphicsPath caminho = Arredondado(0, 0, larguraTotal, alturaTotal, Raio))
-        {
-            Region = new Region(caminho);
-        }
-        if (IsHandleCreated) Pai = NextecWin32.Fixar(Handle, x, y, larguraTotal, alturaTotal);
-        Invalidate();
+        int x = tela.Right - Margem - larguraTotal;
+        int y = tela.Top + Margem;
+        if (!IsHandleCreated) { SetBounds(x, y, larguraTotal, alturaTotal); return; }   // com a janela criada, quem posiciona é o Fixar
+        Pai = NextecWin32.Fixar(Handle, x, y, larguraTotal, alturaTotal);
+        using (Bitmap imagem = Renderizar()) NextecWin32.Camada(Handle, imagem);
+    }
+
+    void Separador(Graphics g, float y)
+    {
+        using (Pen p = new Pen(Color.FromArgb(38, 255, 255, 255), 1)) g.DrawLine(p, x0, y, larguraTotal - folga, y);
+    }
+
+    void Texto(Graphics g, string texto, Font f, Color cor, float x, float y)
+    {
+        using (SolidBrush b = new SolidBrush(cor)) g.DrawString(texto, f, b, x, y, formato);
     }
 
     void Desenhar(Graphics g)
     {
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-        using (GraphicsPath caminho = Arredondado(0.5f, 0.5f, larguraTotal - 1, alturaTotal - 1, Raio))
-        using (SolidBrush fundo = new SolidBrush(CorPainel))
-        using (Pen borda = new Pen(Color.FromArgb(90, 255, 255, 255), 1))
+        g.Clear(Color.Transparent);
+
+        // Fundo translúcido, faixa lateral opaca na cor do ambiente e borda leve
+        using (GraphicsPath painel = Arredondado(0.5f, 0.5f, larguraTotal - 1, alturaTotal - 1, raio))
         {
-            g.FillPath(fundo, caminho);
-            g.DrawPath(borda, caminho);
+            using (SolidBrush fundo = new SolidBrush(Color.FromArgb(Opacidade, CorPainel))) g.FillPath(fundo, painel);
+            g.SetClip(painel);
+            using (SolidBrush faixa = new SolidBrush(CorFaixa)) g.FillRectangle(faixa, 0, 0, barra, alturaTotal);
+            g.ResetClip();
+            using (Pen borda = new Pen(Color.FromArgb(50, 255, 255, 255), 1)) g.DrawPath(borda, painel);
         }
-        float x0 = Folga;
-        float y = Folga;
+
+        // Cabeçalho
+        float y = folga;
+        Texto(g, Titulo, fTitulo, CorTitulo, x0, y);
+        y += alturaTitulo;
+        if (Funcao.Length > 0 || Ambiente.Length > 0)
+        {
+            Texto(g, Funcao, fSub, CorSuave, x0, y + R(Px * 0.12));
+            if (larguraEtiqueta > 0)
+            {
+                // Etiqueta do ambiente à direita: fundo na cor do ambiente, bem suave, e texto na cor cheia
+                float ex = larguraTotal - folga - larguraEtiqueta;
+                using (GraphicsPath etiqueta = Arredondado(ex, y, larguraEtiqueta, alturaEtiqueta, alturaEtiqueta / 2))
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(55, CorAmbiente)))
+                    g.FillPath(b, etiqueta);
+                Texto(g, Ambiente.ToUpper(), fEtiqueta, CorAmbiente, ex + Px / 2f, y + (alturaEtiqueta - fEtiqueta.Height) / 2f);
+            }
+            y += alturaSub;
+        }
+
+        // Métricas: rótulo discreto à esquerda, valor claro (amarelo ou vermelho quando alto)
+        y += espacoSecao / 2f;
+        Separador(g, y);
+        y += espacoSecao / 2f;
         foreach (NextecLinha l in Linhas)
         {
-            if (l.Espaco) { y += (float)Math.Round(AlturaLinha * 0.6); continue; }
-            Color cor = l.TemCor ? l.Cor : CorValor;
-            using (SolidBrush p1 = new SolidBrush(CorRotulo)) g.DrawString(l.Rotulo, fonte, p1, x0, y, formato);
-            using (SolidBrush p2 = new SolidBrush(cor)) g.DrawString(l.Valor, l.Negrito ? fonteBold : fonte, p2, x0 + larguraRotulo, y, formato);
-            y += AlturaLinha;
+            if (l.Espaco) { y += R(alturaLinha * 0.5); continue; }
+            Texto(g, l.Rotulo, fRotulo, CorSuave, x0, y + R(Px * 0.06));
+            Texto(g, l.Valor, fValor, l.TemCor ? l.Cor : CorValor, x0 + colunaRotulo, y);
+            y += alturaLinha;
         }
-        y += (float)Math.Round(AlturaLinha * 0.5);
-        using (SolidBrush p3 = new SolidBrush(CorRotulo)) g.DrawString(TextoAviso, fontePeq, p3, x0 + larguraBloco - larguraAviso, y, formato);
-        y += (float)Math.Round(AlturaLinha * 1.1);
-        float x = x0 + larguraBloco - larguraContato;
+
+        // Rodapé
+        y += espacoSecao / 2f;
+        Separador(g, y);
+        y += espacoSecao / 2f;
+        Texto(g, TextoAviso, fRodape, CorRodape, x0, y);
+        y += alturaRodape;
+        float x = x0;
         for (int i = 0; i < SegTexto.Length; i++)
         {
-            Font f = SegNegrito[i] ? fontePeqB : fontePeq;
-            using (SolidBrush p4 = new SolidBrush(SegCor[i])) g.DrawString(SegTexto[i], f, p4, x, y, formato);
+            Font f = SegNegrito[i] ? fRodapeB : fRodape;
+            Texto(g, SegTexto[i], f, SegNegrito[i] ? CorTitulo : CorRodape, x, y);
             x += Larg(g, SegTexto[i], f);
         }
     }
 
-    protected override void OnPaint(PaintEventArgs e)
-    {
-        Desenhar(e.Graphics);
-    }
-
-    // Confere na tela se o painel aparece: lê pixels da margem esquerda (só cor de fundo, sem texto).
-    // 1 = visível, 0 = não apareceu, -1 = não deu para conferir (tela bloqueada ou área coberta por outra janela)
     public string Leitura = "";
 
+    // Confere na tela se o painel aparece: lê pixels da faixa lateral, que é opaca.
+    // 1 = visível, 0 = não apareceu, -1 = não deu para conferir (tela bloqueada ou área coberta por outra janela)
     public int Validar()
     {
         Leitura = "";
         if (!IsHandleCreated || !NextecWin32.TelaDisponivel()) return -1;
-        int xi = Math.Max(2, Folga / 2);
+        Color esperada = CorFaixa;
+        int xi = barra / 2;
         int[] alturas = { alturaTotal / 4, alturaTotal / 2, alturaTotal * 3 / 4 };
         bool conferiu = false;
         foreach (int yi in alturas)
@@ -468,7 +559,7 @@ public class NextecPainel : Form
                     Color c = b.GetPixel(0, 0);
                     conferiu = true;
                     Leitura += string.Format("({0},{1})=RGB {2},{3},{4} ", p.X, p.Y, c.R, c.G, c.B);
-                    if (Math.Abs(c.R - CorPainel.R) <= 12 && Math.Abs(c.G - CorPainel.G) <= 12 && Math.Abs(c.B - CorPainel.B) <= 12) return 1;
+                    if (Math.Abs(c.R - esperada.R) <= 12 && Math.Abs(c.G - esperada.G) <= 12 && Math.Abs(c.B - esperada.B) <= 12) return 1;
                 }
             }
             catch { return -1; }
@@ -476,17 +567,20 @@ public class NextecPainel : Form
         return conferiu ? 0 : -1;
     }
 
-    // Imagem do painel (para conferir o visual sem abrir a janela); chame Aplicar antes
+    // Imagem do painel com transparência; chame Aplicar (ou Medir) antes
     public Bitmap Renderizar()
     {
-        Bitmap b = new Bitmap(larguraTotal, alturaTotal);
+        if (fTitulo == null) { using (Bitmap t = new Bitmap(1, 1)) using (Graphics g = Graphics.FromImage(t)) Medir(g); }
+        Bitmap b = new Bitmap(larguraTotal, alturaTotal, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
         using (Graphics g = Graphics.FromImage(b)) Desenhar(g);
         return b;
     }
 
     void DescartarFontes()
     {
-        if (fonte != null) { fonte.Dispose(); fonteBold.Dispose(); fontePeq.Dispose(); fontePeqB.Dispose(); fonte = null; }
+        if (fTitulo == null) return;
+        fTitulo.Dispose(); fSub.Dispose(); fEtiqueta.Dispose(); fRotulo.Dispose(); fValor.Dispose(); fRodape.Dispose(); fRodapeB.Dispose();
+        fTitulo = null;
     }
 
     protected override void Dispose(bool disposing)
@@ -523,6 +617,15 @@ public class NextecPainel : Form
         return $l
     }
 
+    # Amarelo a partir de 80%, vermelho a partir de 90%
+    $corAlerta  = [System.Drawing.Color]::FromArgb(255, 213, 79)
+    $corCritica = [System.Drawing.Color]::FromArgb(239, 83, 80)
+    function CorDoUso([double]$porcento) {
+        if ($porcento -ge 90) { return $corCritica }
+        if ($porcento -ge 80) { return $corAlerta }
+        return $null
+    }
+
     # ---------- Métricas (mesmas informações do quadro Linux) ----------
     function Coletar {
         $nome     = Ler 'NEXTEC_NOME_SERVIDOR'
@@ -544,16 +647,21 @@ public class NextecPainel : Form
         $memUso   = (1 - ($sistema.FreePhysicalMemory / $sistema.TotalVisibleMemorySize)) * 100
         $memoria  = '{0:N0}% de {1:N1} GB' -f $memUso, $memTotal
 
-        $paginacao = Seguro {
-            $arquivos = @(Get-CimInstance Win32_PageFileUsage)
+        $paginacao = 'não configurada'
+        $pagUso = 0
+        $arquivos = Seguro { @(Get-CimInstance Win32_PageFileUsage) } $null
+        if ($arquivos) {
             $total = ($arquivos | Measure-Object AllocatedBaseSize -Sum).Sum
             $usado = ($arquivos | Measure-Object CurrentUsage -Sum).Sum
-            if ($total -gt 0) { '{0:N0}% de {1:N1} GB' -f ($usado / $total * 100), ($total / 1024) } else { 'não configurada' }
-        } 'não configurada'
+            if ($total -gt 0) { $pagUso = $usado / $total * 100; $paginacao = '{0:N0}% de {1:N1} GB' -f $pagUso, ($total / 1024) }
+        }
 
-        $disco = Seguro {
-            $d = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'"
-            '{0:N0}% usado ({1:N0} GB de {2:N0} GB)' -f (($d.Size - $d.FreeSpace) / $d.Size * 100), (($d.Size - $d.FreeSpace) / 1GB), ($d.Size / 1GB)
+        $disco = 'não identificado'
+        $discoUso = 0
+        $d = Seguro { Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" } $null
+        if ($d -and $d.Size) {
+            $discoUso = ($d.Size - $d.FreeSpace) / $d.Size * 100
+            $disco = '{0:N0}% usado ({1:N0} GB de {2:N0} GB)' -f $discoUso, (($d.Size - $d.FreeSpace) / 1GB), ($d.Size / 1GB)
         }
 
         $atividade = New-TimeSpan -Start $sistema.LastBootUpTime -End (Get-Date)
@@ -571,26 +679,38 @@ public class NextecPainel : Form
         }
 
         $linhas = New-Object 'System.Collections.Generic.List[NextecLinha]'
-        $linhas.Add((NovaLinha 'Servidor' $servidor $true))
-        if ($funcao)   { $linhas.Add((NovaLinha 'Função' $funcao)) }
-        if ($ambiente) { $linhas.Add((NovaLinha 'Ambiente' $ambiente $true $corAmbiente)) }
+        $linhas.Add((NovaLinha 'Carga' ('{0}% de CPU ({1} CPUs)' -f $cpuUso, $cpus) $false (CorDoUso $cpuUso)))
+        $linhas.Add((NovaLinha 'Memória' $memoria $false (CorDoUso $memUso)))
+        $linhas.Add((NovaLinha 'Disco' $disco $false (CorDoUso $discoUso)))
+        $linhas.Add((NovaLinha 'Paginação' $paginacao $false (CorDoUso $pagUso)))
         $espaco = New-Object NextecLinha
         $espaco.Espaco = $true
         $linhas.Add($espaco)
-        $linhas.Add((NovaLinha 'Carga' ('{0}% de CPU ({1} CPUs)' -f $cpuUso, $cpus)))
-        $linhas.Add((NovaLinha 'Disco' $disco))
-        $linhas.Add((NovaLinha 'Memória' $memoria))
-        $linhas.Add((NovaLinha 'Paginação' $paginacao))
         $linhas.Add((NovaLinha 'Uptime' $uptime))
-        $linhas.Add((NovaLinha 'Processos' ('{0}  |  Usuários: {1}' -f $processos, $usuarios)))
+        $linhas.Add((NovaLinha 'Processos' ('{0}  ·  Usuários: {1}' -f $processos, $usuarios)))
         $linhas.Add((NovaLinha 'IP' $ip))
-        return ,$linhas
+
+        return [pscustomobject]@{ Titulo = $servidor; Funcao = $funcao; Ambiente = $ambiente; CorAmbiente = $corAmbiente; Linhas = $linhas }
+    }
+
+    # Opacidade do fundo do painel: NEXTEC_OPACIDADE (0 a 255) ou 190
+    $lida = 0
+    $opacidade = if ([int]::TryParse((Ler 'NEXTEC_OPACIDADE'), [ref]$lida) -and $lida -ge 0 -and $lida -le 255) { $lida } else { 190 }
+
+    function Preencher($painel) {
+        $dados = Coletar
+        $painel.Titulo = $dados.Titulo
+        $painel.Funcao = $dados.Funcao
+        $painel.Ambiente = $dados.Ambiente
+        $painel.CorAmbiente = $dados.CorAmbiente
+        $painel.Linhas = $dados.Linhas
+        $painel.Opacidade = $opacidade
     }
 
     # ---------- Só gerar a imagem (conferência visual) ----------
     if ($SalvarEm) {
         $p = New-Object NextecPainel
-        $p.Linhas = Coletar
+        Preencher $p
         $p.Aplicar()
         $imgPainel = $p.Renderizar()
         $tela = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
@@ -604,7 +724,7 @@ public class NextecPainel : Form
             $g.DrawImage($fundoImg, 0, 0, $w, $h)
             $fundoImg.Dispose()
         }
-        $g.DrawImage($imgPainel, ($w - $p.Margem + $p.Folga - $imgPainel.Width), ($p.Margem - $p.Folga))
+        $g.DrawImage($imgPainel, ($w - $p.Margem - $imgPainel.Width), $p.Margem)
         $g.Dispose()
         $imagem.Save($SalvarEm, [System.Drawing.Imaging.ImageFormat]::Png)
         $imagem.Dispose(); $imgPainel.Dispose(); $p.Dispose()
@@ -686,7 +806,7 @@ public class NextecPainel : Form
         $script:validacao = 'pendente'   # pendente, ok ou falhou
         $script:falhas = 0
         $script:painel = New-Object NextecPainel
-        $script:painel.Linhas = Coletar
+        Preencher $script:painel
         $script:painel.Aplicar()
         $script:painel.Show()             # sem roubar o foco; ao aparecer, ancora na área de trabalho
     }
@@ -724,7 +844,7 @@ public class NextecPainel : Form
             }
         }
 
-        $script:painel.Linhas = Coletar
+        Preencher $script:painel
         $script:painel.Aplicar()
         if ([NextecWin32]::Modo -ne $script:modoRegistrado) {
             $script:modoRegistrado = [NextecWin32]::Modo
