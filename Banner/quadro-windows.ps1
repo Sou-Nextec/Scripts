@@ -84,41 +84,57 @@ public static class NextecWin32
     [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int indice);
     [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int indice, int valor);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr depoisDe, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] static extern bool SetLayeredWindowAttributes(IntPtr h, uint chave, byte alfa, uint flags);
+
+    // Como o painel foi ancorado na última busca (vai para o quadro.log): WorkerW, Progman ou janela comum
+    public static string Modo = "";
+    static IntPtr abaixoDe = new IntPtr(1);   // HWND_BOTTOM
 
     public static bool ShellPronto()
     {
         return FindWindow("Progman", null) != IntPtr.Zero;
     }
 
-    // Janela da área de trabalho que serve de pai do painel: o WorkerW que fica atrás dos ícones (padrão do
-    // Windows 8 em diante), o WorkerW filho do Progman (builds mais novos) ou o próprio Progman.
-    // Sem Progman (Explorer fora do ar) devolve zero.
+    // Janela da área de trabalho que serve de pai do painel. Sem Progman (Explorer fora do ar) devolve zero.
+    //   Windows 11 24H2 em diante: ícones (SHELLDLL_DefView) e fundo (WorkerW) ficam dentro do Progman; o painel vira
+    //   filho do Progman, logo abaixo dos ícones.
+    //   Windows 8 a 11 23H2 e Server 2012 a 2022: os ícones vão para um WorkerW de topo e o fundo fica no WorkerW
+    //   seguinte; o painel vira filho desse segundo WorkerW.
     public static IntPtr AcharPai()
     {
+        abaixoDe = new IntPtr(1);
         IntPtr progman = FindWindow("Progman", null);
-        if (progman == IntPtr.Zero) return IntPtr.Zero;
-        IntPtr pai = ProcurarWorkerW(progman);
-        if (pai == IntPtr.Zero)
-        {
-            UIntPtr resultado;
-            // 0x052C pede ao Progman que crie o WorkerW atrás dos ícones
-            SendMessageTimeout(progman, 0x052C, UIntPtr.Zero, IntPtr.Zero, 0, 1000, out resultado);
-            pai = ProcurarWorkerW(progman);
-        }
-        return pai == IntPtr.Zero ? progman : pai;
-    }
+        if (progman == IntPtr.Zero) { Modo = "janela comum (sem Progman)"; return IntPtr.Zero; }
+        UIntPtr resultado;
+        // 0x052C pede ao Progman que separe o fundo dos ícones (cria o WorkerW); repetir não tem efeito
+        SendMessageTimeout(progman, 0x052C, UIntPtr.Zero, IntPtr.Zero, 0, 1000, out resultado);
 
-    static IntPtr ProcurarWorkerW(IntPtr progman)
-    {
+        IntPtr iconesNoProgman = FindWindowEx(progman, IntPtr.Zero, "SHELLDLL_DefView", null);
+        if (iconesNoProgman != IntPtr.Zero && FindWindowEx(progman, IntPtr.Zero, "WorkerW", null) != IntPtr.Zero)
+        {
+            abaixoDe = iconesNoProgman;
+            Modo = "Progman (24H2)";
+            return progman;
+        }
+
         IntPtr achado = IntPtr.Zero;
         EnumWindows(delegate(IntPtr topo, IntPtr l)
         {
-            if (FindWindowEx(topo, IntPtr.Zero, "SHELLDLL_DefView", null) != IntPtr.Zero)
+            if (achado == IntPtr.Zero && topo != progman && FindWindowEx(topo, IntPtr.Zero, "SHELLDLL_DefView", null) != IntPtr.Zero)
                 achado = FindWindowEx(IntPtr.Zero, topo, "WorkerW", null);
             return true;
         }, IntPtr.Zero);
-        if (achado == IntPtr.Zero) achado = FindWindowEx(progman, IntPtr.Zero, "WorkerW", null);
-        return achado;
+        if (achado != IntPtr.Zero && IsWindowVisible(achado)) { Modo = "WorkerW"; return achado; }
+
+        if (iconesNoProgman != IntPtr.Zero)
+        {
+            abaixoDe = iconesNoProgman;
+            Modo = "Progman";
+            return progman;
+        }
+        Modo = "janela comum (sem WorkerW)";
+        return IntPtr.Zero;
     }
 
     // Ancora a janela na área de trabalho e a posiciona (x e y em coordenadas de tela). Sem pai, a janela fica como
@@ -126,20 +142,26 @@ public static class NextecWin32
     public static IntPtr Fixar(IntPtr janela, int x, int y, int largura, int altura)
     {
         const uint SEM_ATIVAR = 0x10, MUDOU_MOLDURA = 0x20, MOSTRAR = 0x40;
-        IntPtr fundo = new IntPtr(1);   // HWND_BOTTOM
         IntPtr pai = AcharPai();
         if (pai == IntPtr.Zero)
         {
-            SetWindowPos(janela, fundo, x, y, largura, altura, SEM_ATIVAR | MOSTRAR);
+            SetWindowPos(janela, new IntPtr(1), x, y, largura, altura, SEM_ATIVAR | MOSTRAR);
             return IntPtr.Zero;
         }
         SetParent(janela, pai);
         int estilo = GetWindowLong(janela, -16);                 // GWL_STYLE
         estilo = (estilo & ~unchecked((int)0x80000000)) | 0x40000000 | 0x10000000;   // sem POPUP, com CHILD e VISIBLE
         SetWindowLong(janela, -16, estilo);
+        // Dentro do Progman (composição do 24H2) só janela em camada é desenhada; alfa 255 = totalmente opaca
+        int estiloEx = GetWindowLong(janela, -20);              // GWL_EXSTYLE
+        if (Modo.StartsWith("Progman") && (estiloEx & 0x80000) == 0)
+        {
+            SetWindowLong(janela, -20, estiloEx | 0x80000);    // WS_EX_LAYERED
+            SetLayeredWindowAttributes(janela, 0, 255, 2);     // LWA_ALPHA
+        }
         RECT r;
         GetWindowRect(pai, out r);
-        SetWindowPos(janela, fundo, x - r.Left, y - r.Top, largura, altura, SEM_ATIVAR | MUDOU_MOLDURA | MOSTRAR);
+        SetWindowPos(janela, abaixoDe, x - r.Left, y - r.Top, largura, altura, SEM_ATIVAR | MUDOU_MOLDURA | MOSTRAR);
         return pai;
     }
 }
@@ -470,7 +492,7 @@ public class NextecPainel : Form
     # ---------- Uma instância por sessão (o prefixo Local\ isola cada sessão, inclusive RDP) ----------
     $criado = $false
     $mutex = New-Object System.Threading.Mutex($true, 'Local\NextecBannerPainel', [ref]$criado)
-    if (-not $criado) { $mutex.Dispose(); return }
+    if (-not $criado) { $mutex.Dispose(); Write-Host 'O painel já está aberto nesta sessão.'; return }
 
     # ---------- Papel de parede ----------
     $chaveDesktop = 'HKCU:\Control Panel\Desktop'
@@ -525,6 +547,7 @@ public class NextecPainel : Form
     # ---------- Painel: recriado sempre que o Explorer reinicia ----------
     $script:painel = $null
     $script:ciclos = 0
+    $script:modoRegistrado = ''
     while ($true) {
         $script:painel = New-Object NextecPainel
         $timer = New-Object System.Windows.Forms.Timer
@@ -542,6 +565,10 @@ public class NextecPainel : Form
                     }
                     $script:painel.Linhas = Coletar
                     $script:painel.Aplicar()
+                    if ([NextecWin32]::Modo -ne $script:modoRegistrado) {
+                        $script:modoRegistrado = [NextecWin32]::Modo
+                        Registrar "Painel ancorado: $($script:modoRegistrado)"
+                    }
                     $script:ciclos++
                     if ($fundoPreto -and ($script:ciclos % 6 -eq 0)) { AplicarFundoPreto }
                 } catch {
