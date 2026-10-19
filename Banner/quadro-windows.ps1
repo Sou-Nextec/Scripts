@@ -96,6 +96,32 @@ public static class NextecWin32
     [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
     [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr objeto);
     [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr objeto);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleBitmap(IntPtr dc, int largura, int altura);
+    [DllImport("gdi32.dll", SetLastError = true)] static extern bool BitBlt(IntPtr destino, int x, int y, int largura, int altura, IntPtr origem, int xo, int yo, uint operacao);
+    [DllImport("gdi32.dll")] static extern uint GetPixel(IntPtr dc, int x, int y);
+
+    // Cor de um ponto da tela, incluindo janelas em camada (translúcidas): BitBlt com SRCCOPY | CAPTUREBLT
+    public static Color LerPixel(int x, int y)
+    {
+        IntPtr tela = GetDC(IntPtr.Zero);
+        IntPtr memoria = CreateCompatibleDC(tela);
+        IntPtr bitmap = CreateCompatibleBitmap(tela, 1, 1);
+        IntPtr anterior = SelectObject(memoria, bitmap);
+        try
+        {
+            if (!BitBlt(memoria, 0, 0, 1, 1, tela, x, y, 0x00CC0020 | 0x40000000))
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            uint c = GetPixel(memoria, 0, 0);
+            return Color.FromArgb((int)(c & 0xFF), (int)((c >> 8) & 0xFF), (int)((c >> 16) & 0xFF));
+        }
+        finally
+        {
+            SelectObject(memoria, anterior);
+            DeleteObject(bitmap);
+            DeleteDC(memoria);
+            ReleaseDC(IntPtr.Zero, tela);
+        }
+    }
     [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint comando);
@@ -552,15 +578,10 @@ public class NextecPainel : Form
             if (NextecWin32.Coberto(p.X, p.Y, Handle)) continue;
             try
             {
-                using (Bitmap b = new Bitmap(1, 1))
-                using (Graphics g = Graphics.FromImage(b))
-                {
-                    g.CopyFromScreen(p.X, p.Y, 0, 0, new Size(1, 1), CopyPixelOperation.SourceCopy | CopyPixelOperation.CaptureBlt);   // CaptureBlt: inclui janelas translúcidas
-                    Color c = b.GetPixel(0, 0);
-                    conferiu = true;
-                    Leitura += string.Format("({0},{1})=RGB {2},{3},{4} ", p.X, p.Y, c.R, c.G, c.B);
-                    if (Math.Abs(c.R - esperada.R) <= 12 && Math.Abs(c.G - esperada.G) <= 12 && Math.Abs(c.B - esperada.B) <= 12) return 1;
-                }
+                Color c = NextecWin32.LerPixel(p.X, p.Y);
+                conferiu = true;
+                Leitura += string.Format("({0},{1})=RGB {2},{3},{4} ", p.X, p.Y, c.R, c.G, c.B);
+                if (Math.Abs(c.R - esperada.R) <= 12 && Math.Abs(c.G - esperada.G) <= 12 && Math.Abs(c.B - esperada.B) <= 12) return 1;
             }
             catch (Exception ex) { Leitura = "captura falhou: " + ex.Message; return -1; }
         }
