@@ -477,28 +477,37 @@ public class NextecPainel : Form
     $escolhaFundo = if ($PapelDeParede) { $PapelDeParede } else { Ler 'NEXTEC_PAPEL_DE_PAREDE' }
     $fundoPreto = [bool]($escolhaFundo -match '^(preto|remover)')
 
-    # Versão antiga: o papel de parede do usuário era o próprio quadro.bmp; devolve o original
+    # Devolve o papel de parede guardado quando o fundo preto foi aplicado (ou pela versão antiga, em que o papel de
+    # parede do usuário era o próprio quadro.bmp). Só age se o papel de parede atual está vazio ou é o quadro.bmp
     function DevolverFundoAntigo {
         $atual = (Get-ItemProperty -Path $chaveDesktop -ErrorAction SilentlyContinue).Wallpaper
-        if (-not $atual -or ($atual -ine $ArquivoQuadro)) { return }
+        if ($atual -and ($atual -ine $ArquivoQuadro)) { return }
+        if (-not (Test-Path -LiteralPath $ArquivoEstado)) { return }
         $original = ''
-        if (Test-Path -LiteralPath $ArquivoEstado) {
-            $estado = Get-Content -LiteralPath $ArquivoEstado -Raw -Encoding UTF8 | ConvertFrom-Json
-            if ($estado.Caminho -and (Test-Path -LiteralPath $estado.Caminho)) {
-                $original = $estado.Caminho
-                if ($estado.Estilo) { Set-ItemProperty -Path $chaveDesktop -Name 'WallpaperStyle' -Value "$($estado.Estilo)" }
-                if ($estado.Tile)   { Set-ItemProperty -Path $chaveDesktop -Name 'TileWallpaper' -Value "$($estado.Tile)" }
-            }
+        $estado = Get-Content -LiteralPath $ArquivoEstado -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($estado.Caminho -and (Test-Path -LiteralPath $estado.Caminho)) {
+            $original = $estado.Caminho
+            if ($estado.Estilo) { Set-ItemProperty -Path $chaveDesktop -Name 'WallpaperStyle' -Value "$($estado.Estilo)" }
+            if ($estado.Tile)   { Set-ItemProperty -Path $chaveDesktop -Name 'TileWallpaper' -Value "$($estado.Tile)" }
         }
         # 20 = SPI_SETDESKWALLPAPER; 3 = grava no perfil e avisa as janelas
         [void][NextecWin32]::SystemParametersInfo(20, 0, $original, 3)
-        Registrar "Papel de parede da versão antiga devolvido: '$original'"
+        Remove-Item -LiteralPath $ArquivoEstado -Force -ErrorAction SilentlyContinue
+        Registrar "Papel de parede devolvido: '$original'"
     }
 
-    # Preto liso: tira a imagem e deixa a cor da área de trabalho preta (só no perfil do usuário)
+    # Preto liso: guarda o papel de parede atual, tira a imagem e deixa a cor da área de trabalho preta (só no perfil do usuário)
     function AplicarFundoPreto {
-        $atual = (Get-ItemProperty -Path $chaveDesktop -ErrorAction SilentlyContinue).Wallpaper
-        if ($atual) { [void][NextecWin32]::SystemParametersInfo(20, 0, '', 3) }
+        $d = Get-ItemProperty -Path $chaveDesktop -ErrorAction SilentlyContinue
+        $atual = "$($d.Wallpaper)"
+        if ($atual) {
+            if ($atual -ine $ArquivoQuadro) {
+                New-Item -ItemType Directory -Path $PastaUsuario -Force | Out-Null
+                [pscustomobject]@{ Caminho = $atual; Estilo = "$($d.WallpaperStyle)"; Tile = "$($d.TileWallpaper)" } |
+                    ConvertTo-Json | Set-Content -LiteralPath $ArquivoEstado -Encoding UTF8
+            }
+            [void][NextecWin32]::SystemParametersInfo(20, 0, '', 3)
+        }
         $cor = (Get-ItemProperty -Path 'HKCU:\Control Panel\Colors' -ErrorAction SilentlyContinue).Background
         if ($cor -ne '0 0 0') {
             Set-ItemProperty -Path 'HKCU:\Control Panel\Colors' -Name 'Background' -Value '0 0 0'
