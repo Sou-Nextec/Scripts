@@ -555,7 +555,7 @@ public class NextecPainel : Form
                 using (Bitmap b = new Bitmap(1, 1))
                 using (Graphics g = Graphics.FromImage(b))
                 {
-                    g.CopyFromScreen(p.X, p.Y, 0, 0, new Size(1, 1));
+                    g.CopyFromScreen(p.X, p.Y, 0, 0, new Size(1, 1), CopyPixelOperation.SourceCopy | CopyPixelOperation.CaptureBlt);   // CaptureBlt: inclui janelas translúcidas
                     Color c = b.GetPixel(0, 0);
                     conferiu = true;
                     Leitura += string.Format("({0},{1})=RGB {2},{3},{4} ", p.X, p.Y, c.R, c.G, c.B);
