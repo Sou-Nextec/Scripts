@@ -318,7 +318,7 @@ public class NextecPainel : Form
     public string Ambiente = "";
     public Color CorAmbiente = Color.FromArgb(102, 187, 106);
     public List<NextecLinha> Linhas = new List<NextecLinha>();
-    public int Opacidade = 190;   // fundo do painel, 0 a 255; o texto fica sempre opaco
+    public int Opacidade = 230;   // fundo do painel, 0 a 255; o texto fica sempre opaco
     public IntPtr Pai = IntPtr.Zero;
     public int Margem, Px;
 
@@ -715,11 +715,11 @@ public class NextecPainel : Form
         return [pscustomobject]@{ Titulo = $servidor; Funcao = $funcao; Ambiente = $ambiente; CorAmbiente = $corAmbiente; Linhas = $linhas }
     }
 
-    # Opacidade do fundo do painel: NEXTEC_OPACIDADE (0 a 255) ou 190. Lida a cada segundo, para ajustar ao vivo
+    # Opacidade do fundo do painel: NEXTEC_OPACIDADE (0 a 255) ou 230. Lida a cada segundo, para ajustar ao vivo
     function LerOpacidade {
         $lida = 0
         if ([int]::TryParse((Ler 'NEXTEC_OPACIDADE'), [ref]$lida) -and $lida -ge 0 -and $lida -le 255) { return $lida }
-        return 190
+        return 230
     }
 
     function Preencher($painel) {

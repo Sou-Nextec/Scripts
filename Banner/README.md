@@ -65,7 +65,7 @@ Gravadas pelo `aplicar-banner.sh` em `/etc/environment` (Linux) e pelo `aplicar-
 | `NEXTEC_FUNCAO` | Para que o servidor serve |
 | `NEXTEC_AMBIENTE` | Produção (vermelho), Homologação (amarelo) ou outro valor, como Testes (verde) |
 | `NEXTEC_PAPEL_DE_PAREDE` | Só no Windows. `Manter` (padrão) não mexe no papel de parede nem na GPO; `Preto` (gravado quando o instalador recebe `$papel=''`) troca o papel de parede do usuário por preto liso. `Remover` ainda é aceito e equivale a `Preto`. Para mudar depois, basta rodar o instalador de novo |
-| `NEXTEC_OPACIDADE` | Opcional, só no Windows. Opacidade do fundo do painel, de 0 a 255 (padrão 190); o texto fica sempre opaco |
+| `NEXTEC_OPACIDADE` | Opcional, só no Windows. Opacidade do fundo do painel, de 0 a 255 (padrão 230); o texto fica sempre opaco |
 
 Os valores são tratados só como texto: aspas, barras, quebras de linha e caracteres de controle são ignorados.
 
