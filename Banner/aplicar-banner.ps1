@@ -5,8 +5,9 @@
 #
 #   $nome     Vazio = usa o nome real da máquina
 #   $ambiente Produção | Homologação | Testes
-#   $papel    Manter = quadro sobre o papel de parede atual | Preto = preto liso
+#   $papel    Manter = painel sobre o papel de parede atual, sem alterá-lo (vale também com GPO) | '' (vazio) = fundo preto
 #
+# O painel é uma janela ancorada na área de trabalho, atualizada a cada 10 segundos, uma por sessão (console ou RDP).
 # Pode ser executado de novo a qualquer momento: baixa o quadro do repositório, faz backup do que mudar e regrava tudo.
 # Este arquivo deve ficar salvo em UTF-8 com BOM, para o Windows PowerShell 5.1 ler os acentos.
 [CmdletBinding()]
@@ -14,8 +15,7 @@ param(
     [string]$Nome = '',
     [string]$Funcao = '',
     [string]$Ambiente = '',
-    [ValidateSet('Manter', 'Preto', 'Remover')]
-    [string]$PapelDeParede = 'Manter'
+    [string]$PapelDeParede = 'Manter'   # Manter ou vazio (fundo preto); Preto e Remover são nomes antigos do vazio
 )
 
 $ErrorActionPreference = 'Stop'
@@ -55,6 +55,12 @@ $Funcao   = Limpar $Funcao
 $Ambiente = Limpar $Ambiente
 if ([string]::IsNullOrWhiteSpace($Funcao))   { Falha 'informe a função.' }
 if ([string]::IsNullOrWhiteSpace($Ambiente)) { Falha 'informe o ambiente.' }
+
+# Manter preserva o papel de parede; vazio (e os nomes antigos) pede fundo preto, gravado como Preto
+$escolha = (Limpar $PapelDeParede).ToLower()
+if ($escolha -eq 'manter') { $PapelDeParede = 'Manter' }
+elseif ($escolha -in '', 'preto', 'remover') { $PapelDeParede = 'Preto' }
+else { Falha "papel de parede '$PapelDeParede' inválido. Use Manter ou deixe vazio para fundo preto." }
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
@@ -125,20 +131,37 @@ if ((Get-CimInstance -ClassName Win32_ComputerSystem).PartOfDomain) {
     Write-Host 'Atenção: servidor em domínio. Se existir GPO com o aviso de logon interativo, ela prevalece sobre o registro local.'
 }
 
-# ---------- 5. Tarefa agendada (redesenha o quadro a cada login) ----------
+# ---------- 5. Tarefa agendada (abre o painel em cada sessão e o mantém rodando) ----------
 # O grupo Users é resolvido pelo SID, porque o nome muda conforme o idioma do Windows (Users, Usuários...)
 $grupoUsuarios = (New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')).Translate([Security.Principal.NTAccount]).Value
 $argumentos = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Quadro`""
 $acao      = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argumentos
-$gatilho   = New-ScheduledTaskTrigger -AtLogOn
+$gatilhos  = @(New-ScheduledTaskTrigger -AtLogOn)
+# Reforço: ao conectar ou desbloquear a sessão a tarefa roda de novo; o painel já aberto na sessão ignora a repetição
+try {
+    $classe = Get-CimClass -ClassName MSFT_TaskSessionStateChangeTrigger -Namespace 'Root/Microsoft/Windows/TaskScheduler'
+    foreach ($mudanca in 3, 7) {   # 3 = conexão remota (RDP), 7 = desbloqueio
+        $gatilhos += New-CimInstance -CimClass $classe -ClientOnly -Property @{ StateChange = $mudanca; Enabled = $true }
+    }
+} catch {
+    Write-Host "Aviso: gatilhos de reconexão não criados ($($_.Exception.Message)). Segue só com o gatilho de logon."
+    $gatilhos = @($gatilhos[0])
+}
 $principal = New-ScheduledTaskPrincipal -GroupId $grupoUsuarios -RunLevel Limited
-$config    = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
-Register-ScheduledTask -TaskName $TarefaNome -Action $acao -Trigger $gatilho -Principal $principal -Settings $config -Force | Out-Null
+# Sem limite de tempo (o painel roda a sessão inteira), uma instância por sessão (o próprio painel impede duplicar)
+$config    = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances Parallel -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName $TarefaNome -Action $acao -Trigger $gatilhos -Principal $principal -Settings $config -Force | Out-Null
 Write-Host "Tarefa agendada registrada: $TarefaNome"
 
 # ---------- 6. Aplica agora ----------
-& $Quadro
-Write-Host 'Quadro aplicado na área de trabalho desta sessão.'
+# Encerra painéis da versão anterior (em qualquer sessão) para entrar o novo
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+    Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*quadro-windows.ps1*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Seconds 1
+Start-Process -FilePath 'powershell.exe' -ArgumentList $argumentos -WindowStyle Hidden
+try { Start-ScheduledTask -TaskName $TarefaNome } catch { }   # demais sessões ativas; quem já tem painel ignora
+Write-Host 'Painel aberto na sessão atual (outras sessões recebem no próximo login ou reconexão).'
 
 # ---------- 7. Conferência ----------
 Write-Host ''
@@ -150,4 +173,4 @@ foreach ($chave in 'NEXTEC_NOME_SERVIDOR', 'NEXTEC_FUNCAO', 'NEXTEC_AMBIENTE', '
 $estado = (Get-ScheduledTask -TaskName $TarefaNome).State
 Write-Host "Tarefa agendada: $estado"
 Write-Host ''
-Write-Host 'Concluído. Confira em uma nova sessão (sair e entrar de novo) antes de fechar esta.'
+Write-Host 'Concluído. Confira em uma nova sessão (sair e entrar de novo) antes de fechar esta. Erros do painel ficam em %LOCALAPPDATA%\Nextec\quadro.log.'
