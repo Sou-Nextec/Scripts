@@ -562,8 +562,9 @@ public class NextecPainel : Form
                     if (Math.Abs(c.R - esperada.R) <= 12 && Math.Abs(c.G - esperada.G) <= 12 && Math.Abs(c.B - esperada.B) <= 12) return 1;
                 }
             }
-            catch { return -1; }
+            catch (Exception ex) { Leitura = "captura falhou: " + ex.Message; return -1; }
         }
+        if (!conferiu) Leitura = "pontos cobertos por outras janelas ou tela indisponível";
         return conferiu ? 0 : -1;
     }
 
@@ -803,6 +804,7 @@ public class NextecPainel : Form
     $script:painel = $null
     $script:ciclos = 0
     $script:modoRegistrado = ''
+    $script:avisouSemConferir = $false
 
     function NovoPainel {
         if ($script:painel) { try { $script:painel.Dispose() } catch { } }
@@ -830,6 +832,11 @@ public class NextecPainel : Form
             if ($resultado -eq 1) {
                 $script:validacao = 'ok'
                 Registrar "Painel visível na tela: $([NextecWin32]::Modo)"
+            } elseif ($resultado -eq -1) {
+                if (-not $script:avisouSemConferir) {
+                    $script:avisouSemConferir = $true
+                    Registrar "Conferência na tela indisponível: $($script:painel.Leitura)"
+                }
             } elseif ($resultado -eq 0) {
                 $script:falhas++
                 $modo = [NextecWin32]::Modo
