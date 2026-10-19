@@ -63,6 +63,8 @@ param(
     [switch]$PortasCompletas,
     [switch]$IncluirRedesVirtuais,
     [switch]$SoftwareEstacoes,
+    [string]$PastaEstacoes,
+    [ValidateRange(1, 90)][int]$DiasValidadeColetaLocal = 7,
     [string]$DominioEmail,
     [switch]$Agressivo,
     [ValidateRange(1, 32)][int]$Paralelismo = 8,
@@ -113,6 +115,7 @@ $script:DominioEmailAD = ''
 $script:UpnSuffixesForest = @()
 $script:SoftwaresEstacoes = New-Object System.Collections.Generic.List[object]
 $script:CredencialRemota = $null
+$script:DiscosSemSmart = @()
 
 # Ritmo da varredura. O padrão é suave de propósito: rajada grande de conexões TCP esgota a tabela
 # de estado de roteador SOHO e derruba o DNS do cliente no meio do expediente. -Agressivo só em
@@ -236,7 +239,7 @@ function Get-UrlPorta {
 
 # ---------- Apresentação no console ----------
 # O arquivo coleta.log guarda tudo com hora e nível; a tela mostra só o necessário, organizado por seção e etapa.
-$script:VersaoAssessment = '2.8'
+$script:VersaoAssessment = '2.9'
 $script:LarguraTela = 64
 $script:EtapaAberta = $null
 $script:NumeroSecao = 0
@@ -1125,8 +1128,8 @@ function Invoke-PreValidacao {
         $quem = if ($credencialAtiva) { $credencialAtiva.UserName } else { "$env:USERDOMAIN\$env:USERNAME" }
         $inacessiveis = & $contar $resultado 'Inacessível'; $falhas = & $contar $resultado 'Falha'
         $detalheTeste = "$ok OK | $neg acesso negado | $inacessiveis sem resposta | $falhas outras falhas (de $($amostra.Count), conta $quem)"
-        if ($ok -gt 0 -and $neg -eq 0) { & $registrar 'Acesso remoto às estações' 'OK' $detalheTeste }
-        elseif ($ok -gt 0) { & $registrar 'Acesso remoto às estações' 'AVISO' "$detalheTeste. Parte das estações vai ficar sem inventário" }
+        if ($ok -eq $amostra.Count) { & $registrar 'Acesso remoto às estações' 'OK' $detalheTeste }
+        elseif ($ok -gt 0) { & $registrar 'Acesso remoto às estações' 'AVISO' "$detalheTeste. Parte das estações vai ficar sem inventário remoto (a coleta local por GPO cobre essas)" }
         elseif ($neg -gt 0) { & $registrar 'Acesso remoto às estações' 'AVISO' "$detalheTeste. A conta não é administradora nas estações: sem inventário delas" }
         elseif ($inacessiveis -eq $amostra.Count) {
             $agora = Get-Date
@@ -1322,12 +1325,18 @@ Invoke-Etapa 'Discos, RAID e volumes' {
         # Saúde real de cada disco: desgaste do SSD, horas ligado, temperatura e erros de leitura.
         $saude = @(foreach ($pd in Get-PhysicalDisk) {
             $c = try { $pd | Get-StorageReliabilityCounter -ErrorAction Stop } catch { $null }
-            if ($c) {
+            $semLeitura = (-not $c) -or (($null -eq $c.Wear -or $c.Wear -eq 0) -and (-not $c.Temperature) -and (-not $c.PowerOnHours) -and ($pd.BusType -eq 'RAID' -or "$($pd.MediaType)" -eq 'Unspecified'))
+            if ($semLeitura -and $c) { $script:DiscosSemSmart += "$($pd.FriendlyName)" }
+            if ($c -and -not $semLeitura) {
                 [pscustomobject]@{ Disco = $pd.FriendlyName; MediaType = $pd.MediaType
                     DesgastePct = $c.Wear; TemperaturaC = $c.Temperature; HorasLigado = $c.PowerOnHours
                     ErrosLeitura = $c.ReadErrorsTotal; ErrosEscrita = $c.WriteErrorsTotal }
             }
         })
+        if ($script:DiscosSemSmart.Count) {
+            $script:Resumo['Saúde dos discos'] = "Não lida: $(($script:DiscosSemSmart | Select-Object -Unique) -join ', ') esconde os discos físicos do Windows (SMART só pelo utilitário da controladora ou pelo iDRAC)"
+            Add-Alerta 'Info' 'Armazenamento' 'Saúde dos discos físicos não lida' "Controladora RAID ($(($script:DiscosSemSmart | Select-Object -Unique) -join ', ')) não expõe SMART ao Windows: conferir no iDRAC/OMSA ou instalar perccli/storcli"
+        }
         if ($saude.Count) {
             Save-Dados 'discos_saude' $saude 'Saúde SMART dos discos: desgaste, temperatura, horas ligado e erros'
             foreach ($s in $saude) {
@@ -1799,8 +1808,9 @@ Invoke-Etapa 'Backup' {
     if (Test-ComandoExiste 'Get-WBSummary') {
         try {
             $wb = Get-WBSummary
-            $script:Resumo['Windows Server Backup'] = 'Último sucesso: {0} | Último resultado: {1}' -f (Format-Data $wb.LastSuccessfulBackupTime), $wb.LastBackupResultHR
-            if (-not $wb.LastSuccessfulBackupTime -or $wb.LastSuccessfulBackupTime -eq [datetime]::MinValue) {
+            $semSucesso = (-not $wb.LastSuccessfulBackupTime -or $wb.LastSuccessfulBackupTime -eq [datetime]::MinValue)
+            $script:Resumo['Windows Server Backup'] = if ($semSucesso) { 'Nenhum backup concluído (rotina de backup nativa não configurada)' } else { 'Último sucesso: {0} | Último resultado: {1}' -f (Format-Data $wb.LastSuccessfulBackupTime), $wb.LastBackupResultHR }
+            if ($semSucesso) {
                 Add-Alerta 'Info' 'Backup' 'Windows Server Backup instalado sem backup concluído' 'Recurso presente, nenhum sucesso registrado; confirmar se a rotina real é outra ferramenta'
             } elseif (((Get-Date) - $wb.LastSuccessfulBackupTime).TotalDays -gt 2) {
                 Add-Alerta 'Média' 'Backup' 'Windows Server Backup atrasado' "Último sucesso em $(Format-Data $wb.LastSuccessfulBackupTime)"
@@ -2727,9 +2737,44 @@ if (-not $SemInventarioRemoto -and $temAD -and $script:ComputadoresAD.Count -gt 
     Invoke-Etapa 'Inventário das estações e servidores do domínio' {
         $limite = (Get-Date).AddDays(-60)
         $candidatos = @($script:ComputadoresAD | Where-Object { $_.Habilitado -and ($_.UltimoLogon -ge $limite -or -not $_.UltimoLogon) })
+
+        # Coleta local por GPO (Nextec-Assessment-Estacao.ps1): cada estação grava um .json no compartilhamento.
+        # Quem tem arquivo recente dispensa a consulta remota, então firewall e máquina desligada deixam de importar.
+        $resultados = @{}
+        if (-not $PastaEstacoes) {
+            try { $compartilhamento = Get-SmbShare -Name 'Assessment$' -ErrorAction Stop; $PastaEstacoes = Join-Path $compartilhamento.Path 'Estacoes' } catch { }
+        }
+        if ($PastaEstacoes -and (Test-Path -LiteralPath $PastaEstacoes)) {
+            $validade = (Get-Date).AddDays(-$DiasValidadeColetaLocal)
+            $arquivosLocais = @(Get-ChildItem -LiteralPath $PastaEstacoes -Filter '*.json' -File -ErrorAction SilentlyContinue)
+            $antigos = 0; $invalidos = 0
+            foreach ($arq in $arquivosLocais) {
+                $nomeMaq = [IO.Path]::GetFileNameWithoutExtension($arq.Name).ToUpper()
+                if ($nomeMaq -eq $env:COMPUTERNAME.ToUpper()) { continue }
+                $cand = $candidatos | Where-Object { $_.Nome.ToUpper() -eq $nomeMaq } | Select-Object -First 1
+                if (-not $cand) { continue }
+                if ($arq.LastWriteTime -lt $validade) { $antigos++; continue }
+                try {
+                    $j = Get-Content -LiteralPath $arq.FullName -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+                    $h = [ordered]@{}
+                    foreach ($prop in $j.PSObject.Properties) { if ($prop.Name -ne 'Softwares') { $h[$prop.Name] = $prop.Value } }
+                    $h['Computador'] = $cand.Nome
+                    $h['Suporte'] = Get-SituacaoSuporte -Caption "$($j.SO)" -Build ([int]$j.Build)
+                    $resultados[$cand.Nome] = [pscustomobject]$h
+                    foreach ($sw in @($j.Softwares)) {
+                        if ($sw.Nome) { $script:SoftwaresEstacoes.Add([pscustomobject]@{ Computador = $cand.Nome; Nome = $sw.Nome; Versao = $sw.Versao; Fabricante = $sw.Fabricante }) }
+                    }
+                } catch { $invalidos++; Write-Log "  Coleta local de $nomeMaq ilegível: $($_.Exception.Message)" 'AVISO' }
+            }
+            Write-Log "  Coleta local por GPO: $($resultados.Count) de $($candidatos.Count) estações com arquivo recente em $PastaEstacoes$(if ($antigos) { "; $antigos antigo(s) ignorado(s) (mais de $DiasValidadeColetaLocal dias)" })$(if ($invalidos) { "; $invalidos ilegível(is)" })"
+            $script:Resumo['Coleta local por GPO'] = "$($resultados.Count) de $($candidatos.Count) computadores (arquivos de até $DiasValidadeColetaLocal dias)"
+        } else {
+            $script:Resumo['Coleta local por GPO'] = 'Não configurada (sem pasta de estações); inventário só por consulta remota'
+        }
+        $remotos = @($candidatos | Where-Object { -not $resultados.ContainsKey($_.Nome) })
         # Inventário em paralelo (runspaces). Sequencial, cada máquina sem acesso custava ~40 s de timeout
         # de DCOM; com 20 estações eram 14 minutos. Em paralelo cai para o tempo das mais lentas.
-        Write-Log "  $($candidatos.Count) computador(es) candidatos; até $Paralelismo em paralelo."
+        Write-Log "  $($candidatos.Count) computador(es) candidatos; $($remotos.Count) por consulta remota, até $Paralelismo em paralelo."
         $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
         foreach ($nomeFn in 'Get-SituacaoSuporte', 'Format-Data', 'Test-PortaRapida', 'Get-InventarioRemoto') {
             $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($nomeFn, (Get-Command $nomeFn).Definition)))
@@ -2757,14 +2802,13 @@ if (-not $SemInventarioRemoto -and $temAD -and $script:ComputadoresAD.Count -gt 
             }
         }
         $trabalhos = New-Object System.Collections.Generic.List[object]
-        foreach ($c in $candidatos) {
+        foreach ($c in $remotos) {
             $alvo = if ($c.DNS) { $c.DNS } else { $c.Nome }
             $ps = [System.Management.Automation.PowerShell]::Create()
             $ps.RunspacePool = $pool
             [void]$ps.AddScript($bloco).AddArgument($c.Nome).AddArgument($alvo).AddArgument(($c.Nome -eq $env:COMPUTERNAME))
             $trabalhos.Add([pscustomobject]@{ Nome = $c.Nome; PS = $ps; Handle = $ps.BeginInvoke(); Lido = $false })
         }
-        $resultados = @{}
         $ultimoAviso = Get-Date
         while (@($trabalhos | Where-Object { -not $_.Lido }).Count -gt 0) {
             foreach ($t in @($trabalhos | Where-Object { -not $_.Lido -and $_.Handle.IsCompleted })) {
@@ -2810,14 +2854,14 @@ if (-not $SemInventarioRemoto -and $temAD -and $script:ComputadoresAD.Count -gt 
         # Cobertura de antivírus (AV.5, AV.6 e AV.7 do checklist; REQ-021 exige 100%).
         $semAv = @($ok | Where-Object { (-not $_.Antivirus -or $_.Antivirus -in 'N/D', '') -and $_.DefenderTempoReal -ne $true })
         $cobertura = if ($ok.Count -gt 0) { [math]::Round((($ok.Count - $semAv.Count) / $ok.Count) * 100, 0) } else { 0 }
-        $script:Resumo['Cobertura de antivírus'] = "$cobertura% ($($ok.Count - $semAv.Count) de $($ok.Count) inventariados)"
+        $script:Resumo['Cobertura de antivírus'] = "$cobertura% dos inventariados ($($ok.Count - $semAv.Count) de $($ok.Count)); $($candidatos.Count - $ok.Count) de $($candidatos.Count) computadores sem inventário, cobertura real desconhecida"
         if ($semAv.Count -gt 0) {
             Add-Alerta 'Alta' 'Estações' "$($semAv.Count) computador(es) sem antivírus ativo" ((($semAv.Computador) -join ', ') + ' | REQ-021 exige proteção em 100% das estações e servidores')
         }
         # Maioria "Sem acesso" = a conta não é administradora nas estações. Sem isso o inventário não sai.
         $semAcesso = @($script:Estacoes | Where-Object { $_.Status -like 'Sem acesso*' })
         if ($semAcesso.Count -ge 3 -and $semAcesso.Count -ge ($candidatos.Count / 2)) {
-            Add-Alerta 'Alta' 'Estações' "$($semAcesso.Count) de $($candidatos.Count) estações negaram acesso remoto" "A conta $($script:Resumo['Conta usada nas estações']) não é administradora nessas máquinas (WinRM e DCOM negados). Rodar a coleta como Admins. do domínio para obter SO, antivírus, BitLocker, patch e administradores de cada estação"
+            Add-Alerta 'Alta' 'Estações' "$($semAcesso.Count) de $($candidatos.Count) estações não responderam à consulta remota" "WinRM e DCOM sem resposta com a conta $($script:Resumo['Conta usada nas estações']) (tempo esgotado, não é acesso negado): firewall do Windows das estações bloqueando RPC/WMI. Liberar por GPO ou usar a coleta local por GPO (Nextec-Assessment-Estacao.ps1) para obter SO, antivírus, BitLocker, patch e administradores de cada estação"
         }
         $naoInventariados = @($script:Estacoes | Where-Object { $_.Status -ne 'OK' })
         if ($naoInventariados.Count -gt 0) {
@@ -2866,7 +2910,7 @@ if (-not $SemInventarioRemoto -and $temAD -and $script:ComputadoresAD.Count -gt 
         }
 
         # Software por estação (HD.5, REQ-011 e REQ-014).
-        if ($SoftwareEstacoes -and $script:SoftwaresEstacoes.Count -gt 0) {
+        if ($script:SoftwaresEstacoes.Count -gt 0) {
             $softEstacoes = $script:SoftwaresEstacoes.ToArray()
             Save-Dados 'estacoes_softwares' $softEstacoes 'Softwares instalados em cada estação do domínio'
 
