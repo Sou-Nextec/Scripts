@@ -10,10 +10,17 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.15.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.27.0 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.16.0 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.28.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.5.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
+
+## 2026-10-12
+
+### Instaladores Linux 2.16.0 e Windows 2.28.0, servidor de origem das sondas
+
+- **Rótulo `sonda_host` nos alvos de conectividade (blackbox).** Cada série `probe_*` passa a trazer o host do servidor que executa a sonda, além do `host` com o nome do alvo. No painel Nextec | Serviços, a coluna "Testado de" abre o servidor de origem, e "Sem coleta" fica ligado ao servidor parado.
+- Séries antigas continuam sem o rótulo até o servidor receber a atualização ou rodar o instalador; nada a fazer à mão.
 
 ## 2026-10-09
 
