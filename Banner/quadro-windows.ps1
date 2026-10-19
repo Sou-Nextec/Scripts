@@ -693,9 +693,12 @@ public class NextecPainel : Form
         return [pscustomobject]@{ Titulo = $servidor; Funcao = $funcao; Ambiente = $ambiente; CorAmbiente = $corAmbiente; Linhas = $linhas }
     }
 
-    # Opacidade do fundo do painel: NEXTEC_OPACIDADE (0 a 255) ou 190
-    $lida = 0
-    $opacidade = if ([int]::TryParse((Ler 'NEXTEC_OPACIDADE'), [ref]$lida) -and $lida -ge 0 -and $lida -le 255) { $lida } else { 190 }
+    # Opacidade do fundo do painel: NEXTEC_OPACIDADE (0 a 255) ou 190. Lida a cada segundo, para ajustar ao vivo
+    function LerOpacidade {
+        $lida = 0
+        if ([int]::TryParse((Ler 'NEXTEC_OPACIDADE'), [ref]$lida) -and $lida -ge 0 -and $lida -le 255) { return $lida }
+        return 190
+    }
 
     function Preencher($painel) {
         $dados = Coletar
@@ -704,7 +707,7 @@ public class NextecPainel : Form
         $painel.Ambiente = $dados.Ambiente
         $painel.CorAmbiente = $dados.CorAmbiente
         $painel.Linhas = $dados.Linhas
-        $painel.Opacidade = $opacidade
+        $painel.Opacidade = LerOpacidade
     }
 
     # ---------- Só gerar a imagem (conferência visual) ----------
@@ -863,12 +866,25 @@ public class NextecPainel : Form
                 try { Tique } catch { Registrar "Atualização: $($_.Exception.Message)" }
             })
             $timer.Start()
+            $timerOpacidade = New-Object System.Windows.Forms.Timer
+            $timerOpacidade.Interval = 1000
+            $timerOpacidade.Add_Tick({
+                try {
+                    $nova = LerOpacidade
+                    if ($script:painel -and $script:painel.IsHandleCreated -and $nova -ne $script:painel.Opacidade) {
+                        $script:painel.Opacidade = $nova
+                        $script:painel.Aplicar()
+                    }
+                } catch { }
+            })
+            $timerOpacidade.Start()
             [System.Windows.Forms.Application]::Run()
         } catch {
             Registrar "Painel: $($_.Exception.Message)"
         } finally {
             $timer.Stop()
             $timer.Dispose()
+            if ($timerOpacidade) { $timerOpacidade.Stop(); $timerOpacidade.Dispose() }
             if ($script:painel) { try { $script:painel.Dispose() } catch { } }
             $script:painel = $null
         }
