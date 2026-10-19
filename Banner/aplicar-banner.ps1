@@ -9,13 +9,15 @@
 #
 # O painel é uma janela ancorada na área de trabalho, atualizada a cada 10 segundos, uma por sessão (console ou RDP).
 # Pode ser executado de novo a qualquer momento: baixa o quadro do repositório, faz backup do que mudar e regrava tudo.
+# Para tirar do servidor, rode com -Remover: devolve o aviso anterior e o papel de parede guardado, apaga tarefa e variáveis.
 # Este arquivo deve ficar salvo em UTF-8 com BOM, para o Windows PowerShell 5.1 ler os acentos.
 [CmdletBinding()]
 param(
     [string]$Nome = '',
     [string]$Funcao = '',
     [string]$Ambiente = '',
-    [string]$PapelDeParede = 'Manter'   # Manter ou vazio (fundo preto); Preto e Remover são nomes antigos do vazio
+    [string]$PapelDeParede = 'Manter',  # Manter ou vazio (fundo preto); Preto e Remover são nomes antigos do vazio
+    [switch]$Remover                    # Tira o painel e o aviso do servidor
 )
 
 $ErrorActionPreference = 'Stop'
@@ -48,6 +50,60 @@ $identidade = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principalAtual = New-Object Security.Principal.WindowsPrincipal($identidade)
 if (-not $principalAtual.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Falha 'execute o PowerShell como administrador.'
+}
+
+# ---------- Remoção ----------
+if ($Remover) {
+    # Encerra os painéis de todas as sessões e apaga a tarefa
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*quadro-windows.ps1*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Unregister-ScheduledTask -TaskName $TarefaNome -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Host 'Painéis encerrados e tarefa agendada removida.'
+
+    # Papel de parede guardado pelo fundo preto: volta para este usuário; os demais são listados
+    $estadoFundo = Join-Path $env:LOCALAPPDATA 'Nextec\fundo-original.json'
+    if (Test-Path -LiteralPath $estadoFundo) {
+        $estado = Get-Content -LiteralPath $estadoFundo -Raw -Encoding UTF8 | ConvertFrom-Json
+        $chaveDesktop = 'HKCU:\Control Panel\Desktop'
+        $original = ''
+        if ($estado.Caminho -and (Test-Path -LiteralPath $estado.Caminho)) {
+            $original = $estado.Caminho
+            if ($estado.Estilo) { Set-ItemProperty -Path $chaveDesktop -Name 'WallpaperStyle' -Value "$($estado.Estilo)" }
+            if ($estado.Tile)   { Set-ItemProperty -Path $chaveDesktop -Name 'TileWallpaper' -Value "$($estado.Tile)" }
+        }
+        if (-not ('NextecRemocao' -as [type])) {
+            Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class NextecRemocao { [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int SystemParametersInfo(int a, int b, string c, int d); }'
+        }
+        [void][NextecRemocao]::SystemParametersInfo(20, 0, $original, 3)   # 20 = SPI_SETDESKWALLPAPER
+        Remove-Item -LiteralPath $estadoFundo -Force
+        Write-Host "Papel de parede deste usuário devolvido: '$original'"
+    }
+    $outros = @(Get-ChildItem -Path (Join-Path $env:SystemDrive 'Users\*\AppData\Local\Nextec\fundo-original.json') -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -ne $estadoFundo })
+    foreach ($o in $outros) {
+        Write-Host "Atenção: o usuário da pasta $($o.FullName.Split('\')[2]) ficou com fundo preto. Ele pode voltar o papel de parede pelas Configurações do Windows (o original está em $($o.FullName))."
+    }
+
+    # Aviso antes da senha: volta o que existia antes da primeira instalação, se havia; senão, apaga
+    $politica = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+    $backup = Get-ChildItem -Path $Pasta -Filter 'aviso-anterior.*.txt' -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -First 1
+    if ($backup) {
+        $linhas = @(Get-Content -LiteralPath $backup.FullName -Encoding UTF8)
+        Set-ItemProperty -Path $politica -Name 'legalnoticecaption' -Value "$($linhas[0])"
+        Set-ItemProperty -Path $politica -Name 'legalnoticetext' -Value (($linhas | Select-Object -Skip 1) -join "`r`n")
+        Write-Host "Aviso anterior devolvido (de $($backup.Name))."
+    } else {
+        Remove-ItemProperty -Path $politica -Name 'legalnoticecaption', 'legalnoticetext' -ErrorAction SilentlyContinue
+        Write-Host 'Aviso antes da senha removido (não havia aviso anterior).'
+    }
+
+    foreach ($chave in 'NEXTEC_NOME_SERVIDOR', 'NEXTEC_FUNCAO', 'NEXTEC_AMBIENTE', 'NEXTEC_PAPEL_DE_PAREDE', 'NEXTEC_OPACIDADE') {
+        [Environment]::SetEnvironmentVariable($chave, $null, 'Machine')
+    }
+    Remove-Item -LiteralPath $Pasta -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "Variáveis NEXTEC_* e a pasta $Pasta removidas. Concluído."
+    return
 }
 
 # Sistema suportado: Windows 8 / Server 2012 ou mais novo, Windows PowerShell 5.1 e .NET Framework 4.5 ou mais novo
@@ -152,7 +208,7 @@ if ($temDesktop) {
     # Reforço: ao conectar ou desbloquear a sessão a tarefa roda de novo; o painel já aberto na sessão ignora a repetição
     try {
         $classe = Get-CimClass -ClassName MSFT_TaskSessionStateChangeTrigger -Namespace 'Root/Microsoft/Windows/TaskScheduler'
-        foreach ($mudanca in 3, 7) {   # 3 = conexão remota (RDP), 7 = desbloqueio
+        foreach ($mudanca in 1, 3, 8) {   # 1 = conexão no console, 3 = conexão remota (RDP), 8 = desbloqueio
             $gatilhos += New-CimInstance -CimClass $classe -ClientOnly -Property @{ StateChange = $mudanca; Enabled = $true }
         }
     } catch {

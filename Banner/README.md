@@ -40,7 +40,7 @@ O `aplicar-banner.ps1` baixa o `quadro-windows.ps1` desta pasta, grava as variá
 
 ![Painel na área de trabalho do Windows](exemplos/cliente-windows-area-de-trabalho.png)
 
-O painel aparece na hora na sessão em que o instalador rodou, sem sair e entrar. Outras sessões já abertas recebem o painel ao reconectar (RDP) ou desbloquear, e as novas, no login. Pode ser executado de novo a qualquer momento, e é assim que se muda nome, função, ambiente ou papel de parede depois. Para só conferir o visual, sem alterar nada: `.\quadro-windows.ps1 -SalvarEm C:\Temp\quadro.png`.
+O painel aparece na hora na sessão em que o instalador rodou, sem sair e entrar. Outras sessões já abertas recebem o painel ao reconectar (console ou RDP) ou desbloquear, e as novas, no login. Pode ser executado de novo a qualquer momento, e é assim que se muda nome, função, ambiente ou papel de parede depois. Para só conferir o visual, sem alterar nada: `.\quadro-windows.ps1 -SalvarEm C:\Temp\quadro.png`.
 
 Validações: o instalador recusa Windows anterior ao 8 / Server 2012, PowerShell anterior ao 5.1 e .NET anterior ao 4.5; em Server Core aplica só o aviso antes da senha. O painel confere na própria tela se apareceu e, se não, troca sozinho o modo de ancoragem (WorkerW no Windows 8 a 11 23H2 e Server 2012 a 2022, Progman no Windows 11 24H2 e Server 2025, janela comum acima da área de trabalho como último recurso). No final, o instalador mostra o resultado dessa conferência na linha `Validação:`.
 
@@ -50,15 +50,13 @@ Se o painel não aparecer, o motivo fica em `%LOCALAPPDATA%\Nextec\quadro.log` d
 Get-Content "$env:LOCALAPPDATA\Nextec\quadro.log" -Tail 10
 ```
 
-Para tirar do servidor (o aviso anterior, se havia, fica salvo em `C:\ProgramData\Nextec\Banner\aviso-anterior.*.txt`; confira antes de remover a pasta):
+Para tirar do servidor, rode esta linha no PowerShell como administrador:
 
 ```powershell
-Unregister-ScheduledTask -TaskName 'Nextec - Banner da area de trabalho' -Confirm:$false
-Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object CommandLine -like '*quadro-windows*' | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-'NEXTEC_FUNCAO','NEXTEC_AMBIENTE','NEXTEC_PAPEL_DE_PAREDE','NEXTEC_OPACIDADE','NEXTEC_NOME_SERVIDOR' | ForEach-Object { [Environment]::SetEnvironmentVariable($_, $null, 'Machine') }
-Remove-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name legalnoticecaption, legalnoticetext -ErrorAction SilentlyContinue
-Remove-Item 'C:\ProgramData\Nextec\Banner' -Recurse -Force
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Banner/aplicar-banner.ps1').Content.TrimStart([char]0xFEFF))) -Remover
 ```
+
+A remoção encerra os painéis, apaga a tarefa, as variáveis e a pasta, devolve o aviso antes da senha que existia antes da primeira instalação (ou apaga o aviso, se não havia) e devolve o papel de parede guardado pelo fundo preto para o usuário que rodou. Outros usuários com papel de parede guardado são listados na saída.
 
 Os dois arquivos `.ps1` ficam salvos em UTF-8 com BOM, para o Windows PowerShell 5.1 ler os acentos.
 
@@ -103,6 +101,6 @@ Os valores são tratados só como texto: aspas, barras, quebras de linha e carac
 | 2.1.2 | 2026-10-10 | Windows: mais contraste no quadro (painel mais opaco com borda leve, rótulos e rodapé mais claros, rodapé maior); opacidade ajustável por `NEXTEC_OPACIDADE` ou `-Opacidade` |
 | 2.1.3 | 2026-10-10 | Windows: novas opções de fundo `Azul` (#0D0035) e `Preto` no `-PapelDeParede` (`Remover` segue valendo como `Azul`); comando de uma linha com os quatro valores editáveis no início |
 | 2.1.4 | 2026-10-10 | Windows: fundo liso passa a ser só preto (`Preto`; `Remover` equivale a `Preto`; `Azul` retirado); sem papel de parede nem cor sólida, o quadro também usa preto |
-| 2.2.0 | 2026-10-19 | Windows: o quadro deixa de ser imagem aplicada como papel de parede e vira um painel dinâmico (janela ancorada na área de trabalho, atrás das janelas, sem capturar clique ou foco), atualizado a cada 10 segundos, um por sessão (inclusive RDP), recriado após reinício do Explorer ou mudança de resolução; não conflita com GPO de papel de parede; `$papel=''` passa a ser o fundo preto; tarefa sem limite de tempo; novo visual com hierarquia (nome em destaque, etiqueta do ambiente, faixa lateral na cor do ambiente, métricas em amarelo a partir de 80% e vermelho a partir de 90%) e fundo translúcido com texto opaco (opacidade padrão 230); validações de sistema no instalador (Windows 8 / Server 2012, PowerShell 5.1, .NET 4.5, Server Core) e conferência do painel na tela, com troca automática do modo de ancoragem (WorkerW, Progman do 24H2, janela comum) e motivo no `quadro.log` |
+| 2.2.0 | 2026-10-19 | Windows: o quadro deixa de ser imagem aplicada como papel de parede e vira um painel dinâmico (janela ancorada na área de trabalho, atrás das janelas, sem capturar clique ou foco), atualizado a cada 10 segundos, um por sessão (inclusive RDP), recriado após reinício do Explorer ou mudança de resolução; não conflita com GPO de papel de parede; `$papel=''` passa a ser o fundo preto; tarefa sem limite de tempo; novo visual com hierarquia (nome em destaque, etiqueta do ambiente, faixa lateral na cor do ambiente, métricas em amarelo a partir de 80% e vermelho a partir de 90%) e fundo translúcido com texto opaco (opacidade padrão 230); validações de sistema no instalador (Windows 8 / Server 2012, PowerShell 5.1, .NET 4.5, Server Core) e conferência do painel na tela, com troca automática do modo de ancoragem (WorkerW, Progman do 24H2, janela comum) e motivo no `quadro.log`; opção `-Remover`, que devolve o aviso anterior e o papel de parede guardado |
 | 2.0.0 | 2026-10-07 | Instalador único `aplicar-banner.sh`; aviso no padrão NIST AC-8, também no console; resumo do sistema no quadro; cor do ambiente; logotipo centralizado com separador; identificação no `10-nextec-info`; limpeza dos scripts de MOTD do Ubuntu |
 | 1.0.0 | 2026-10-04 | Primeira versão: `05-nextec` (logotipo Nextec, nome real e nome Nextec do servidor) e `05-servidor` (quadro neutro para clientes, com contato noc@nex.tec.br) |
