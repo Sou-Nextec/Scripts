@@ -20,6 +20,17 @@ Num PowerShell **aberto como administrador**, no servidor do cliente (troque a t
 
 Alternativa por arquivo: baixe os dois arquivos desta pasta, na mesma pasta, e execute `Executar-Assessment.cmd` com botão direito, Executar como administrador.
 
+## Coleta das estações por GPO (sem depender de firewall nem de máquina ligada)
+
+Quando WinRM/DCOM estão bloqueados nas estações, o inventário remoto não funciona. Nesse caso cada estação coleta a si mesma, em segundo plano, e grava o resultado numa pasta compartilhada no servidor. O assessment lê esses arquivos no lugar de consultar as estações.
+
+1. No controlador de domínio, como administrador, rode `Preparar-Compartilhamento-Assessment.ps1` (cria `Assessment$`, as permissões e copia os scripts para `NETLOGON\Nextec`). As estações só conseguem gravar arquivos novos; não listam nem leem o que existe.
+2. Crie uma GPO ligada à OU dos computadores: Configuração do Computador, Políticas, Configurações do Windows, Scripts, Inicialização, aba Scripts do PowerShell. Nome do script: `\\<dominio>\NETLOGON\Nextec\Instalar-Assessment-Estacao.ps1`. Parâmetros: `-Destino "\\<servidor>\Assessment$\Estacoes"` (o passo 1 imprime os dois valores prontos).
+3. Na inicialização, cada máquina registra a tarefa `Nextec - Assessment da estacao` (SYSTEM, oculta, na inicialização e todo dia por volta de 12:15) e coleta uma primeira vez. Sem janela e sem intervenção.
+4. Rode o `Nextec-Assessment-v2.ps1` no servidor como de costume: ele acha `Assessment$` sozinho (ou use `-PastaEstacoes`) e usa os arquivos de até 7 dias (`-DiasValidadeColetaLocal`). Estações sem arquivo recente seguem pela consulta remota.
+
+Para desfazer: `Instalar-Assessment-Estacao.ps1 -Destino x -Remover`, ou retire a GPO e remova a tarefa.
+
 ## Parâmetros mais usados
 
 | Parâmetro | Efeito |
@@ -59,6 +70,7 @@ SHA-256 do `Nextec-Assessment-v2.ps1` da tag `assessment-v2.8`:
 
 ## Histórico
 
+- **v2.9**: coleta local das estações por GPO (`Nextec-Assessment-Estacao.ps1`, `Instalar-Assessment-Estacao.ps1`, `Preparar-Compartilhamento-Assessment.ps1`) e leitura no assessment; alerta de estação sem resposta deixa de dizer "negou acesso" quando foi tempo esgotado; pré-validação só marca OK quando todas as estações testadas respondem; cobertura de antivírus informa quantos computadores ficaram sem inventário; saúde de disco de controladora RAID que esconde o SMART sai como "não lida" (antes saía 0% e 0°C); Windows Server Backup sem sucesso aparece como "nenhum backup concluído".
 - **v2.8**: memória (pentes, slots e máximo), saúde SMART dos discos (desgaste, temperatura, horas, erros), alerta de servidor sem RAID, RAID por utilitário (storcli/perccli/ssacli/arcconf), link de garantia, alerta de estação no papel de servidor, velocidade/duplex das placas, qualidade do link (latência e perda), DNS em uso e Wi-Fi do ambiente.
 - **v2.7**: nome NetBIOS aceita resposta com nome comprimido e a máquina de coleta usa o próprio nome; título das páginas web dos equipamentos sai legível (sem códigos HTML).
 - **v2.6**: tela reorganizada: cabeçalho, seções numeradas, uma linha por etapa com tempo e resumo final com alertas por severidade. O `coleta.log` continua completo, com hora e nível.
