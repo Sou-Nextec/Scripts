@@ -874,8 +874,9 @@ public class NextecPainel : Form
                     if ($script:painel -and $script:painel.IsHandleCreated -and $nova -ne $script:painel.Opacidade) {
                         $script:painel.Opacidade = $nova
                         $script:painel.Aplicar()
+                        Registrar "Opacidade ajustada para $nova"
                     }
-                } catch { }
+                } catch { Registrar "Opacidade: $($_.Exception.Message)" }
             })
             $timerOpacidade.Start()
             [System.Windows.Forms.Application]::Run()
