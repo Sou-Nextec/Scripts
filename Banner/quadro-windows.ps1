@@ -183,6 +183,8 @@ public static class NextecWin32
         UIntPtr resultado;
         // 0x052C pede ao Progman que separe o fundo dos ícones (cria o WorkerW); repetir não tem efeito
         SendMessageTimeout(progman, 0x052C, UIntPtr.Zero, IntPtr.Zero, 0, 1000, out resultado);
+        if (FindWindowEx(progman, IntPtr.Zero, "WorkerW", null) == IntPtr.Zero)
+            SendMessageTimeout(progman, 0x052C, new UIntPtr(0xD), new IntPtr(1), 0, 1000, out resultado);   // variante usada em builds mais novos
 
         IntPtr iconesNoProgman = FindWindowEx(progman, IntPtr.Zero, "SHELLDLL_DefView", null);
         if (Nivel == 1)
@@ -314,13 +316,11 @@ public class NextecPainel : Form
         eventoAtivo = true;
     }
 
-    // Se a janela é destruída por fora (Explorer reiniciado leva o pai junto), encerra o laço de mensagens
-    // para o script recriar o painel
+    // A janela pode ser destruída por fora (Explorer reiniciado leva o pai junto); o script percebe e recria
     protected override void OnHandleDestroyed(EventArgs e)
     {
         if (eventoAtivo) { SystemEvents.DisplaySettingsChanged -= TelaMudou; eventoAtivo = false; }
         base.OnHandleDestroyed(e);
-        Application.ExitThread();
     }
 
     protected override void OnShown(EventArgs e)
@@ -446,8 +446,11 @@ public class NextecPainel : Form
 
     // Confere na tela se o painel aparece: lê pixels da margem esquerda (só cor de fundo, sem texto).
     // 1 = visível, 0 = não apareceu, -1 = não deu para conferir (tela bloqueada ou área coberta por outra janela)
+    public string Leitura = "";
+
     public int Validar()
     {
+        Leitura = "";
         if (!IsHandleCreated || !NextecWin32.TelaDisponivel()) return -1;
         int xi = Math.Max(2, Folga / 2);
         int[] alturas = { alturaTotal / 4, alturaTotal / 2, alturaTotal * 3 / 4 };
@@ -464,6 +467,7 @@ public class NextecPainel : Form
                     g.CopyFromScreen(p.X, p.Y, 0, 0, new Size(1, 1));
                     Color c = b.GetPixel(0, 0);
                     conferiu = true;
+                    Leitura += string.Format("({0},{1})=RGB {2},{3},{4} ", p.X, p.Y, c.R, c.G, c.B);
                     if (Math.Abs(c.R - CorPainel.R) <= 12 && Math.Abs(c.G - CorPainel.G) <= 12 && Math.Abs(c.B - CorPainel.B) <= 12) return 1;
                 }
             }
@@ -668,72 +672,87 @@ public class NextecPainel : Form
     # No logon o Explorer pode demorar; espera até um minuto antes de abrir o painel
     for ($i = 0; ($i -lt 30) -and (-not [NextecWin32]::ShellPronto()); $i++) { Start-Sleep -Seconds 2 }
 
-    # ---------- Painel: recriado sempre que o Explorer reinicia ----------
+    # ---------- Painel: um laço de mensagens só; a janela é recriada dentro dele quando o Explorer reinicia ----------
+    # Erros dentro da janela vão para o log, sem caixa de diálogo
+    [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+    [System.Windows.Forms.Application]::add_ThreadException({ Registrar "Janela: $($args[1].Exception.Message)" })
+
     $script:painel = $null
     $script:ciclos = 0
     $script:modoRegistrado = ''
-    while ($true) {
+
+    function NovoPainel {
+        if ($script:painel) { try { $script:painel.Dispose() } catch { } }
         $script:validacao = 'pendente'   # pendente, ok ou falhou
         $script:falhas = 0
         $script:painel = New-Object NextecPainel
-        $timer = New-Object System.Windows.Forms.Timer
-        try {
-            $script:painel.Linhas = Coletar
-            $script:painel.Aplicar()
-            $timer.Interval = 2000   # primeira conferência logo depois de abrir; depois a cada 10 segundos
-            $timer.Add_Tick({
-                try {
-                    $timer.Interval = $IntervaloMs
-                    $pai = [NextecWin32]::AcharPai()
-                    if ($pai.ToInt64() -ne $script:painel.Pai.ToInt64()) {
-                        # Explorer reiniciou ou o pai mudou: sai do laço para recriar o painel
-                        [System.Windows.Forms.Application]::ExitThread()
+        $script:painel.Linhas = Coletar
+        $script:painel.Aplicar()
+        $script:painel.Show()             # sem roubar o foco; ao aparecer, ancora na área de trabalho
+    }
+
+    function Tique {
+        $timer.Interval = $IntervaloMs
+        $pai = [NextecWin32]::AcharPai()
+        if (-not $script:painel.IsHandleCreated -or ($pai.ToInt64() -ne $script:painel.Pai.ToInt64())) {
+            # Explorer reiniciou (a janela foi junto) ou a área de trabalho mudou: recria o painel
+            Registrar 'Área de trabalho mudou; recriando o painel'
+            NovoPainel
+            return
+        }
+
+        # Validação na tela: duas conferências seguidas sem o painel = passa para o próximo modo de ancoragem
+        if ($script:validacao -eq 'pendente') {
+            $resultado = $script:painel.Validar()
+            if ($resultado -eq 1) {
+                $script:validacao = 'ok'
+                Registrar "Painel visível na tela: $([NextecWin32]::Modo)"
+            } elseif ($resultado -eq 0) {
+                $script:falhas++
+                $modo = [NextecWin32]::Modo
+                Registrar "Conferência sem o painel no modo '$modo': $($script:painel.Leitura)"
+                if ($script:falhas -ge 2) {
+                    if ([NextecWin32]::Nivel -lt 2) {
+                        if ([NextecWin32]::Nivel -eq 0 -and $modo -like 'Progman*') { [NextecWin32]::Nivel = 2 } else { [NextecWin32]::Nivel++ }
+                        Registrar "Painel não apareceu no modo '$modo'; tentando o próximo"
+                        NovoPainel
                         return
                     }
-
-                    # Validação na tela: duas conferências seguidas sem o painel = passa para o próximo modo de ancoragem
-                    if ($script:validacao -eq 'pendente') {
-                        $resultado = $script:painel.Validar()
-                        if ($resultado -eq 1) {
-                            $script:validacao = 'ok'
-                            Registrar "Painel visível na tela: $([NextecWin32]::Modo)"
-                        } elseif ($resultado -eq 0) {
-                            $script:falhas++
-                            if ($script:falhas -ge 2) {
-                                $modo = [NextecWin32]::Modo
-                                if ([NextecWin32]::Nivel -lt 2) {
-                                    if ([NextecWin32]::Nivel -eq 0 -and $modo -like 'Progman*') { [NextecWin32]::Nivel = 2 } else { [NextecWin32]::Nivel++ }
-                                    Registrar "Painel não apareceu no modo '$modo'; tentando o próximo"
-                                    [System.Windows.Forms.Application]::ExitThread()
-                                    return
-                                }
-                                $script:validacao = 'falhou'
-                                Registrar "Painel não apareceu em nenhum modo de ancoragem (último: '$modo')"
-                            }
-                        }
-                    }
-                    $script:painel.Linhas = Coletar
-                    $script:painel.Aplicar()
-                    if ([NextecWin32]::Modo -ne $script:modoRegistrado) {
-                        $script:modoRegistrado = [NextecWin32]::Modo
-                        Registrar "Painel ancorado: $($script:modoRegistrado)"
-                    }
-                    $script:ciclos++
-                    if ($fundoPreto -and ($script:ciclos % 6 -eq 0)) { AplicarFundoPreto }
-                } catch {
-                    Registrar "Atualização: $($_.Exception.Message)"
+                    $script:validacao = 'falhou'
+                    Registrar "Painel não apareceu em nenhum modo de ancoragem (último: '$modo')"
                 }
+            }
+        }
+
+        $script:painel.Linhas = Coletar
+        $script:painel.Aplicar()
+        if ([NextecWin32]::Modo -ne $script:modoRegistrado) {
+            $script:modoRegistrado = [NextecWin32]::Modo
+            Registrar "Painel ancorado: $($script:modoRegistrado)"
+        }
+        $script:ciclos++
+        if ($fundoPreto -and ($script:ciclos % 6 -eq 0)) { AplicarFundoPreto }
+    }
+
+    while ($true) {
+        $timer = New-Object System.Windows.Forms.Timer
+        try {
+            NovoPainel
+            $timer.Interval = 2000   # primeira conferência logo depois de abrir; depois a cada 10 segundos
+            $timer.Add_Tick({
+                try { Tique } catch { Registrar "Atualização: $($_.Exception.Message)" }
             })
             $timer.Start()
-            [System.Windows.Forms.Application]::Run($script:painel)
+            [System.Windows.Forms.Application]::Run()
         } catch {
             Registrar "Painel: $($_.Exception.Message)"
         } finally {
             $timer.Stop()
             $timer.Dispose()
-            $script:painel.Dispose()
+            if ($script:painel) { try { $script:painel.Dispose() } catch { } }
+            $script:painel = $null
         }
-        Start-Sleep -Seconds 3
+        Start-Sleep -Seconds 5
     }
 } catch {
     Registrar $_.Exception.Message
