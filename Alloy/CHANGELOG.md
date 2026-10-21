@@ -11,9 +11,17 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
 | Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.15.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.27.0 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.28.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.5.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
+
+## 2026-10-21
+
+### Instalador Windows 2.28.0, Windows em português e Speedtest
+
+- **Credenciais protegidas em Windows em português.** A restrição de acesso à chave do registro do Alloy e aos arquivos de credencial usa os SIDs de SYSTEM e Administradores. Antes o instalador procurava o grupo pelo nome em inglês (`BUILTIN\Administrators`), não achava no Windows em português e deixava a senha do NOC legível por usuários locais, com o aviso "Não foi possível converter algumas ou todas as referências de identidade".
+- **Speedtest não é mais desligado na instalação.** O instalador rodava um teste de velocidade completo só para aceitar a licença da Ookla; o texto da licença sai no stderr e o Windows PowerShell 5.1 transformava isso em erro, desligando o item. Agora ele só confere a versão do binário. A licença continua aceita pela Coleta Complementar em cada execução.
+- Servidor já instalado com o aviso: rode o instalador de novo (ou aguarde a atualização) para aplicar a ACL e ligar o Speedtest.
 
 ## 2026-10-09
 

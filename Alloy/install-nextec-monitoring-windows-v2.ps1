@@ -47,6 +47,12 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.28.0 ACL do registro e dos arquivos de credencial por SID (SYSTEM e
+           Administradores), que funciona em Windows em português; antes o
+           nome "BUILTIN\Administrators" não era encontrado e a senha do
+           NOC ficava legível por usuários locais. Speedtest deixa de rodar
+           um teste de velocidade na instalação só para aceitar a licença: a
+           saída da Ookla no stderr virava erro e o item era desligado.
     2.27.0 Sessões de usuário (entrada, saída, desconexão e reconexão por
            RDP ou console) do canal TerminalServices-LocalSessionManager,
            para o painel "Últimos logins" do Nextec | Servidor.
@@ -353,7 +359,11 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.27.0"
+$InstallerVersion = "2.28.0"
+
+# SYSTEM e Administradores locais, os únicos com acesso às credenciais do NOC.
+# Por SID porque os nomes mudam com o idioma do Windows.
+$NextecSidsProtegidos = @("S-1-5-18", "S-1-5-32-544")
 
 # Caminhos padrão de uma instalação nova. Resolve-AlloyInstallation ajusta
 # estes valores quando encontra uma instalação existente em outro lugar.
@@ -6137,9 +6147,11 @@ function Protect-AlloyRegistryKey {
             [void]$acl.RemoveAccessRule($rule)
         }
 
-        foreach ($identity in @("NT AUTHORITY\SYSTEM", "BUILTIN\Administrators")) {
+        # SID e não nome: em Windows em português o grupo se chama
+        # "Administradores" e "BUILTIN\Administrators" não é encontrado.
+        foreach ($sid in $NextecSidsProtegidos) {
             $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
-                $identity,
+                (New-Object System.Security.Principal.SecurityIdentifier($sid)),
                 [System.Security.AccessControl.RegistryRights]::FullControl,
                 [System.Security.AccessControl.InheritanceFlags]"ContainerInherit,ObjectInherit",
                 [System.Security.AccessControl.PropagationFlags]::None,
@@ -6384,10 +6396,9 @@ function Protect-NextecSecretFile {
             [void]$acl.RemoveAccessRule($rule)
         }
 
-        foreach ($identity in @("NT AUTHORITY\SYSTEM","BUILTIN\Administrators")) {
-            $account = New-Object Security.Principal.NTAccount($identity)
+        foreach ($sid in $NextecSidsProtegidos) {
             $rule = New-Object Security.AccessControl.FileSystemAccessRule(
-                $account,
+                (New-Object Security.Principal.SecurityIdentifier($sid)),
                 [Security.AccessControl.FileSystemRights]::FullControl,
                 [Security.AccessControl.AccessControlType]::Allow
             )
@@ -6447,10 +6458,21 @@ function Install-SpeedtestCli {
         throw ("O ZIP do Speedtest CLI foi baixado, mas {0} não apareceu depois de extrair. O layout do pacote da Ookla pode ter mudado." -f $SpeedtestExe)
     }
 
-    # Aceita a licença e o GDPR sem interação uma vez aqui, para que a
-    # primeira execução real (via tarefa agendada, sem console) não fique
-    # esperando confirmação que nunca chega.
-    & $SpeedtestExe --accept-license --accept-gdpr --format=json 2>&1 | Out-Null
+    # Só confere que o binário roda. A licença não é aceita aqui: a Coleta
+    # Complementar passa --accept-license e --accept-gdpr em toda execução
+    # (como SYSTEM, que tem perfil próprio), e rodar o teste aqui gastava uns
+    # 30 s. A Ookla escreve no stderr; com ErrorActionPreference Stop o
+    # Windows PowerShell 5.1 transforma essa linha em exceção, por isso a
+    # chamada roda com Continue e o resultado vem do código de saída.
+    $saida = & {
+        $ErrorActionPreference = "Continue"
+        & $SpeedtestExe --version 2>&1
+    }
+    if ($LASTEXITCODE -ne 0) {
+        $texto = (@($saida) | ForEach-Object { [string]$_ } | Where-Object { $_ -match '\w' } | Select-Object -First 3) -join " "
+        throw ("O Speedtest CLI foi extraído, mas não executou (código {0}): {1}" -f $LASTEXITCODE, $texto)
+    }
+    Write-Ok ("Speedtest CLI pronto: {0}" -f ((@($saida) | ForEach-Object { [string]$_ } | Select-Object -First 1).Trim()))
 }
 
 function New-SpeedtestTrigger {
