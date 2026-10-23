@@ -7,13 +7,13 @@ Verifica se o servidor está corrigido, mostra o resultado em verde ou vermelho,
 Como root:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Seguranca-Linux/nextec-cve.sh -o /tmp/nextec-cve.sh && NEXTEC_BREVO_API_KEY='CHAVE' bash /tmp/nextec-cve.sh
+curl -fsSL https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Seguranca-Linux/nextec-cve.sh -o ~/nextec-cve.sh && NEXTEC_BREVO_API_KEY='CHAVE' bash ~/nextec-cve.sh
 ```
 
 Com usuário comum:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Seguranca-Linux/nextec-cve.sh -o /tmp/nextec-cve.sh && sudo env NEXTEC_BREVO_API_KEY='CHAVE' bash /tmp/nextec-cve.sh
+curl -fsSL https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Seguranca-Linux/nextec-cve.sh -o ~/nextec-cve.sh && sudo env NEXTEC_BREVO_API_KEY='CHAVE' bash ~/nextec-cve.sh
 ```
 
 ## Variáveis
