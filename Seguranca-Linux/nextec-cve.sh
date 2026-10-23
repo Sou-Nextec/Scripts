@@ -742,13 +742,19 @@ principal() {
   printf '%s\n' "$RELATORIO"
 
   if configurar_email; then
-    if ! enviar_email "$(assunto "verificação")"; then
+    echo "Enviando relatório..."
+    if enviar_email "$(assunto "verificação")"; then
+      printf '%s✔ Relatório enviado para %s.%s\n' "$VERDE" "$EMAIL_PARA" "$FIM"
+    else
       aviso "Falha no envio. Seguindo sem e-mail."
       EMAIL_ATIVO=0
     fi
   fi
 
-  if ! escolher_correcao; then echo "Nada agendado."; exit 0; fi
+  if ! escolher_correcao; then
+    printf '%s✔ Verificação concluída. Nada agendado neste servidor.%s\n' "$VERDE" "$FIM"
+    exit 0
+  fi
   if ! command -v systemd-run >/dev/null 2>&1; then aviso "Servidor sem systemd: agende manualmente."; exit 1; fi
 
   local agora hora_atualizar hora_reiniciar="" quando ref reiniciar_apos=0
@@ -789,6 +795,7 @@ principal() {
 
   echo "Conferir: systemctl list-timers 'nextec-cve-*'"
   echo "Cancelar: sudo ${SCRIPT} --cancelar"
+  printf '%s✔ Concluído.%s\n' "$VERDE" "$FIM"
 }
 
 case "${1:-}" in
