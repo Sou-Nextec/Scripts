@@ -85,7 +85,7 @@ pacote_do_arquivo() {
 changelog_do_pacote() {
   local pkg="$1" texto="" f
   if command -v dpkg >/dev/null 2>&1; then
-    texto="$(apt-get changelog "$pkg" 2>/dev/null || true)"
+    texto="$(timeout 30 apt-get -o Acquire::http::Timeout=10 changelog "$pkg" 2>/dev/null || true)"
     if [ -z "$texto" ]; then
       for f in /usr/share/doc/"$pkg"/changelog*.gz; do
         texto="$(zcat "$f" 2>/dev/null || true)"
@@ -129,7 +129,7 @@ kernel_atualizacao_disponivel() {
   local pacotes rc=0
   case "$(gerenciador)" in
     apt)
-      apt-get update -qq >/dev/null 2>&1 || true
+      timeout 90 apt-get -o Acquire::http::Timeout=10 update -qq >/dev/null 2>&1 || true
       pacotes="$(pacotes_apt_instalados 'linux-image-*' 'proxmox-kernel-*' 'proxmox-default-kernel' 'pve-kernel-*')"
       if [ -z "$pacotes" ]; then return 1; fi
       # shellcheck disable=SC2086
@@ -737,6 +737,7 @@ principal() {
   if [ "$(id -u)" -ne 0 ]; then aviso "Execute como root (sudo)."; exit 3; fi
   touch "$LOG"; chmod 600 "$LOG"
 
+  echo "Verificando kernel e PHP (consulta os repositórios, pode levar até 2 minutos)..."
   montar_relatorio "verificação"
   printf '%s\n' "$RELATORIO"
 
