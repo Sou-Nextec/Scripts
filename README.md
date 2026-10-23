@@ -16,3 +16,7 @@ O `TrimStart([char]0xFEFF)` é obrigatório: os `.ps1` do repositório são grav
 ## Assessment Nextec
 
 Levantamento completo e somente leitura do ambiente de TI de um cliente (servidor, AD, estações, rede e topologia), sem intervenção. Comando de execução, parâmetros e verificação de integridade em [Assessment/README.md](Assessment/README.md).
+
+## Segurança Linux (kernel e PHP)
+
+Verificação e correção do CVE-2026-99999 (kernel) e dos CVEs de PHP, com agendamento e relatório por e-mail. Comando e variáveis em [Seguranca-Linux/README.md](Seguranca-Linux/README.md).
