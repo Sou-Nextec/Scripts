@@ -88,6 +88,19 @@ Gravadas pelo `aplicar-banner.sh` em `/etc/environment` (Linux) e pelo `aplicar-
 
 Os valores são tratados só como texto: aspas, barras, quebras de linha e caracteres de controle são ignorados.
 
+## Testes
+
+`testes/quadro-windows.testes.ps1` roda no CI a cada push e pull request, e também pode ser rodado à mão:
+
+```powershell
+.\Banner\testes\quadro-windows.testes.ps1
+```
+
+- Regras de código (qualquer sistema): sem `Get-NetIPConfiguration`, `Get-CimInstance` só pela sessão reaproveitada com descarte das instâncias, sem `Get-Process` no ciclo de coleta, proteção de memória ativa.
+- Coleta real (só Windows): executa a coleta 360 vezes (1 hora de painel) e falha se a memória crescer mais de 20 MB ou os handles mais de 60.
+
+Toda correção de bug no painel deve vir com um teste novo aqui, para o mesmo erro não voltar.
+
 ## Referências
 
 - NIST SP 800-53, controle AC-8 (System Use Notification): conteúdo do aviso.

@@ -915,8 +915,8 @@ public class NextecPainel : Form
     } catch { Registrar "Papel de parede: $($_.Exception.Message)" }
 
     try {
-        $so = Get-CimInstance -ClassName Win32_OperatingSystem
-        Registrar ("Início: {0} (build {1}), sessão {2}, PowerShell {3}" -f $so.Caption, $so.BuildNumber, (Get-Process -Id $PID).SessionId, $PSVersionTable.PSVersion)
+        $so = ConsultarCim 'Win32_OperatingSystem' '' { param($i) [pscustomobject]@{ Caption = $i[0].Caption; BuildNumber = $i[0].BuildNumber } }
+        Registrar ("Início: {0} (build {1}), sessão {2}, PowerShell {3}" -f $so.Caption, $so.BuildNumber, [System.Diagnostics.Process]::GetCurrentProcess().SessionId, $PSVersionTable.PSVersion)
     } catch { }
 
     # No logon o Explorer pode demorar; espera até um minuto antes de abrir o painel
