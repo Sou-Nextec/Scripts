@@ -65,6 +65,9 @@ jobs:
         env:
           EXIGIR_PSSA: "1"
         run: ./.github/scripts/validar_powershell.ps1
+      - name: Testes dos scripts (regras de código)
+        shell: pwsh
+        run: Get-ChildItem -Recurse -Filter '*.testes.ps1' | ForEach-Object { & $_.FullName; if ($LASTEXITCODE -ne 0) { exit 1 } }
 
   powershell-51:
     name: Windows PowerShell 5.1
@@ -74,3 +77,6 @@ jobs:
       - name: Sintaxe no parser do 5.1 (o que roda nos servidores dos clientes)
         shell: powershell
         run: .\.github\scripts\validar_powershell.ps1
+      - name: Testes dos scripts (inclui coleta real em laço)
+        shell: powershell
+        run: Get-ChildItem -Recurse -Filter '*.testes.ps1' | ForEach-Object { & $_.FullName; if ($LASTEXITCODE -ne 0) { exit 1 } }
