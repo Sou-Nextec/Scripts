@@ -36,6 +36,8 @@ O que editar:
 | `$ambiente` | `Produção` (vermelho), `Homologação` (amarelo) ou `Testes` (verde) |
 | `$papel` | `Manter` (painel sobre o papel de parede atual, sem alterá-lo, inclusive com GPO) ou vazio `''` (fundo preto) |
 
+Nos servidores da Nextec, acrescente ` -Tipo nextec` no fim da linha, para receberem versões novas do painel na hora (o padrão é `cliente`).
+
 O `aplicar-banner.ps1` baixa o `quadro-windows.ps1` desta pasta, grava as variáveis, aplica o aviso antes da senha, registra a tarefa agendada que abre o painel dinâmico em cada sessão (console ou RDP) e já o abre na sessão atual. O painel é uma janela ancorada na área de trabalho, atrás das janelas e sem capturar clique, e atualiza CPU, memória, disco, paginação, uptime, processos, usuários e IP a cada 10 segundos; não gera imagem nem altera o papel de parede nem a GPO. Erros ficam em `%LOCALAPPDATA%\Nextec\quadro.log`.
 
 ![Painel na área de trabalho do Windows](exemplos/cliente-windows-area-de-trabalho.png)
@@ -43,6 +45,30 @@ O `aplicar-banner.ps1` baixa o `quadro-windows.ps1` desta pasta, grava as variá
 O painel aparece na hora na sessão em que o instalador rodou, sem sair e entrar. Outras sessões já abertas recebem o painel ao reconectar (console ou RDP) ou desbloquear, e as novas, no login. Pode ser executado de novo a qualquer momento, e é assim que se muda nome, função, ambiente ou papel de parede depois. Para só conferir o visual, sem alterar nada: `.\quadro-windows.ps1 -SalvarEm C:\Temp\quadro.png`.
 
 Validações: o instalador recusa Windows anterior ao 8 / Server 2012, PowerShell anterior ao 5.1 e .NET anterior ao 4.5; em Server Core aplica só o aviso antes da senha. O painel confere na própria tela se apareceu e, se não, troca sozinho o modo de ancoragem (WorkerW no Windows 8 a 11 23H2 e Server 2012 a 2022, Progman no Windows 11 24H2 e Server 2025, janela comum acima da área de trabalho como último recurso). No final, o instalador mostra o resultado dessa conferência na linha `Validação:`.
+
+### Atualização do painel
+
+O instalador também registra a tarefa `Nextec - Atualizar banner da area de trabalho` (SYSTEM, todo dia entre 7h e 9h e 10 minutos depois de ligar), que roda o `atualizar-banner.ps1`:
+
+1. Consulta no GitHub só o último commit que alterou o `quadro-windows.ps1`, sem baixar o arquivo.
+2. Mesmo commit da versão instalada: não faz nada.
+3. Commit diferente: busca o arquivo daquele commit e confere se veio inteiro. Igual ao instalado: só registra o commit.
+4. Servidores `nextec` instalam na hora; servidores `cliente` só quando o commit tem 2 dias ou mais. Assim os servidores da Nextec testam a versão antes dos clientes.
+5. Confere a sintaxe, guarda a versão anterior, instala e reabre os painéis. Se nenhum painel voltar em 1 minuto, devolve a versão anterior e não tenta aquele commit de novo.
+
+O registro fica em `C:\ProgramData\Nextec\Banner\atualizacao.log` e o commit instalado em `versao.json`, na mesma pasta. Para instalar a versão do `main` na hora, sem esperar os 2 dias:
+
+```powershell
+& 'C:\ProgramData\Nextec\Banner\atualizar-banner.ps1' -Agora
+```
+
+Só o `quadro-windows.ps1` é atualizado assim; mudanças no instalador ou no próprio atualizador pedem rodar o instalador de novo. Para reinstalar mantendo os valores já gravados no servidor:
+
+```powershell
+$v = { param($n) [Environment]::GetEnvironmentVariable($n, 'Machine') }; $tipo = if ((& $v 'NEXTEC_BANNER_TIPO') -eq 'nextec') { 'nextec' } else { 'cliente' }; $papel = if ((& $v 'NEXTEC_PAPEL_DE_PAREDE') -match '^(preto|remover)') { '' } else { 'Manter' }; Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Banner/aplicar-banner.ps1').Content.TrimStart([char]0xFEFF))) -Nome (& $v 'NEXTEC_NOME_SERVIDOR') -Funcao (& $v 'NEXTEC_FUNCAO') -Ambiente (& $v 'NEXTEC_AMBIENTE') -PapelDeParede $papel -Tipo $tipo
+```
+
+### Problemas
 
 Se o painel não aparecer, o motivo fica em `%LOCALAPPDATA%\Nextec\quadro.log` do usuário (início, modo de ancoragem, conferência na tela e erros):
 
@@ -70,6 +96,7 @@ Os dois arquivos `.ps1` ficam salvos em UTF-8 com BOM, para o Windows PowerShell
 | `05-nextec` | `/etc/update-motd.d/05-nextec` | Logotipo e boas-vindas, só para servidores da Nextec |
 | `10-nextec-info` | `/etc/update-motd.d/10-nextec-info` | Identificação e resumo do sistema dos servidores da Nextec |
 | `aplicar-banner.ps1` | Executado uma vez | Windows: instala tudo (quadro, variáveis, aviso antes da senha e tarefa agendada) |
+| `atualizar-banner.ps1` | `C:\ProgramData\Nextec\Banner\` | Windows: mantém o painel na versão do repositório (clientes com 2 dias de espera) |
 | `quadro-windows.ps1` | `C:\ProgramData\Nextec\Banner\` | Windows: painel dinâmico sobre a área de trabalho, com as mesmas informações do quadro Linux, atualizado a cada 10 segundos |
 | `exemplos/` | | Telas de exemplo (a do Windows é da versão 2.2.0) |
 
@@ -84,6 +111,7 @@ Gravadas pelo `aplicar-banner.sh` em `/etc/environment` (Linux) e pelo `aplicar-
 | `NEXTEC_AMBIENTE` | Produção (vermelho), Homologação (amarelo) ou outro valor, como Testes (verde) |
 | `NEXTEC_PAPEL_DE_PAREDE` | Só no Windows. `Manter` (padrão) não mexe no papel de parede nem na GPO; `Preto` (gravado quando o instalador recebe `$papel=''`) troca o papel de parede do usuário por preto liso. `Remover` ainda é aceito e equivale a `Preto`. Para mudar depois, basta rodar o instalador de novo |
 | `NEXTEC_OPACIDADE` | Opcional, só no Windows. Opacidade do fundo do painel, de 0 a 255 (padrão 230, 90%); o texto fica sempre opaco. O painel relê o valor a cada segundo, então dá para ajustar com ele aberto |
+| `NEXTEC_BANNER_TIPO` | Só no Windows. `cliente` (padrão) recebe versões novas do painel 2 dias depois de publicadas; `nextec` recebe na hora |
 | `NEXTEC_QUADRO_LIMITE_MB` | Opcional, só no Windows. Memória máxima do processo do painel, em MB (padrão 300, mínimo 100). Acima disso o painel registra no `quadro.log` e abre um painel novo no lugar dele |
 
 Os valores são tratados só como texto: aspas, barras, quebras de linha e caracteres de controle são ignorados.
@@ -116,6 +144,7 @@ Toda correção de bug no painel deve vir com um teste novo aqui, para o mesmo e
 | 2.1.3 | 2026-10-10 | Windows: novas opções de fundo `Azul` (#0D0035) e `Preto` no `-PapelDeParede` (`Remover` segue valendo como `Azul`); comando de uma linha com os quatro valores editáveis no início |
 | 2.1.4 | 2026-10-10 | Windows: fundo liso passa a ser só preto (`Preto`; `Remover` equivale a `Preto`; `Azul` retirado); sem papel de parede nem cor sólida, o quadro também usa preto |
 | 2.2.0 | 2026-10-19 | Windows: o quadro deixa de ser imagem aplicada como papel de parede e vira um painel dinâmico (janela ancorada na área de trabalho, atrás das janelas, sem capturar clique ou foco), atualizado a cada 10 segundos, um por sessão (inclusive RDP), recriado após reinício do Explorer ou mudança de resolução; não conflita com GPO de papel de parede; `$papel=''` passa a ser o fundo preto; tarefa sem limite de tempo; novo visual com hierarquia (nome em destaque, etiqueta do ambiente, faixa lateral na cor do ambiente, métricas em amarelo a partir de 80% e vermelho a partir de 90%) e fundo translúcido com texto opaco (opacidade padrão 230); validações de sistema no instalador (Windows 8 / Server 2012, PowerShell 5.1, .NET 4.5, Server Core) e conferência do painel na tela, com troca automática do modo de ancoragem (WorkerW, Progman do 24H2, janela comum) e motivo no `quadro.log`; opção `-Remover`, que devolve o aviso anterior e o papel de parede guardado |
+| 2.3.0 | 2026-10-24 | Windows: atualização diária do painel pela tarefa `Nextec - Atualizar banner da area de trabalho` (compara o commit antes de baixar, servidores `nextec` na hora e `cliente` após 2 dias, confere sintaxe, devolve a versão anterior se o painel não abrir); novo parâmetro `-Tipo` no instalador; testes do atualizador no CI |
 | 2.2.1 | 2026-10-24 | Windows: corrige o crescimento de memória e handles do painel aberto por dias (uma sessão CIM reaproveitada, instâncias CIM descartadas, IP lido por .NET no lugar do `Get-NetIPConfiguration`, processos descartados, IP, processos e usuários relidos a cada minuto); proteção que reinicia o painel acima de `NEXTEC_QUADRO_LIMITE_MB` |
 | 2.0.0 | 2026-10-07 | Instalador único `aplicar-banner.sh`; aviso no padrão NIST AC-8, também no console; resumo do sistema no quadro; cor do ambiente; logotipo centralizado com separador; identificação no `10-nextec-info`; limpeza dos scripts de MOTD do Ubuntu |
 | 1.0.0 | 2026-10-04 | Primeira versão: `05-nextec` (logotipo Nextec, nome real e nome Nextec do servidor) e `05-servidor` (quadro neutro para clientes, com contato noc@nex.tec.br) |

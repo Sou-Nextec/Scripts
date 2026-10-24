@@ -4,6 +4,7 @@
 #   $nome=''; $funcao='Servidor Escriba'; $ambiente='Produção'; $papel='Manter'; Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/Sou-Nextec/Scripts/main/Banner/aplicar-banner.ps1').Content.TrimStart([char]0xFEFF))) -Nome $nome -Funcao $funcao -Ambiente $ambiente -PapelDeParede $papel
 #
 #   $nome     Vazio = usa o nome real da máquina
+#   -Tipo     cliente (padrão) recebe versões novas do painel 2 dias depois de publicadas; nextec recebe na hora
 #   $ambiente Produção | Homologação | Testes
 #   $papel    Manter = painel sobre o papel de parede atual, sem alterá-lo (vale também com GPO) | '' (vazio) = fundo preto
 #
@@ -17,6 +18,8 @@ param(
     [string]$Funcao = '',
     [string]$Ambiente = '',
     [string]$PapelDeParede = 'Manter',  # Manter ou vazio (fundo preto); Preto e Remover são nomes antigos do vazio
+    [ValidateSet('cliente', 'nextec')]
+    [string]$Tipo = 'cliente',          # nextec: servidores da Nextec recebem versões novas do painel na hora
     [switch]$Remover                    # Tira o painel e o aviso do servidor
 )
 
@@ -27,6 +30,8 @@ $BaseUrl    = if ($env:BANNER_BASE_URL) { $env:BANNER_BASE_URL } else { 'https:/
 $Pasta      = Join-Path $env:ProgramData 'Nextec\Banner'
 $Quadro     = Join-Path $Pasta 'quadro-windows.ps1'
 $TarefaNome = 'Nextec - Banner da area de trabalho'
+$Atualizador = Join-Path $Pasta 'atualizar-banner.ps1'
+$TarefaAtualizacao = 'Nextec - Atualizar banner da area de trabalho'
 $Stamp      = Get-Date -Format 'yyyyMMddHHmmss'
 
 function Falha([string]$mensagem) { throw "Erro: $mensagem" }
@@ -59,7 +64,8 @@ if ($Remover) {
         Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*quadro-windows.ps1*' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Unregister-ScheduledTask -TaskName $TarefaNome -Confirm:$false -ErrorAction SilentlyContinue
-    Write-Host 'Painéis encerrados e tarefa agendada removida.'
+    Unregister-ScheduledTask -TaskName $TarefaAtualizacao -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Host 'Painéis encerrados e tarefas agendadas removidas.'
 
     # Papel de parede guardado pelo fundo preto: volta para este usuário; os demais são listados
     $estadoFundo = Join-Path $env:LOCALAPPDATA 'Nextec\fundo-original.json'
@@ -98,7 +104,7 @@ if ($Remover) {
         Write-Host 'Aviso antes da senha removido (não havia aviso anterior).'
     }
 
-    foreach ($chave in 'NEXTEC_NOME_SERVIDOR', 'NEXTEC_FUNCAO', 'NEXTEC_AMBIENTE', 'NEXTEC_PAPEL_DE_PAREDE', 'NEXTEC_OPACIDADE') {
+    foreach ($chave in 'NEXTEC_NOME_SERVIDOR', 'NEXTEC_FUNCAO', 'NEXTEC_AMBIENTE', 'NEXTEC_PAPEL_DE_PAREDE', 'NEXTEC_OPACIDADE', 'NEXTEC_BANNER_TIPO') {
         [Environment]::SetEnvironmentVariable($chave, $null, 'Machine')
     }
     Remove-Item -LiteralPath $Pasta -Recurse -Force -ErrorAction SilentlyContinue
@@ -142,6 +148,12 @@ try {
     if ($erros) { Falha "quadro-windows.ps1 tem erro de sintaxe ($($erros[0].Message))." }
     Write-Host "Quadro baixado de $BaseUrl"
 
+    $novoAtualizador = Join-Path $tmp 'atualizar-banner.ps1'
+    Baixar "$BaseUrl/atualizar-banner.ps1" $novoAtualizador
+    $erros = $null; $tokens = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile($novoAtualizador, [ref]$tokens, [ref]$erros)
+    if ($erros) { Falha "atualizar-banner.ps1 tem erro de sintaxe ($($erros[0].Message))." }
+
     # ---------- 2. Instala o quadro ----------
     New-Item -ItemType Directory -Path $Pasta -Force | Out-Null
     if ((Test-Path -LiteralPath $Quadro) -and ((Get-FileHash $Quadro).Hash -ne (Get-FileHash $novoQuadro).Hash)) {
@@ -150,6 +162,8 @@ try {
     }
     Copy-Item -LiteralPath $novoQuadro -Destination $Quadro -Force
     Write-Host "Quadro instalado em $Quadro"
+    Copy-Item -LiteralPath $novoAtualizador -Destination $Atualizador -Force
+    Write-Host "Atualizador instalado em $Atualizador"
 } finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -169,6 +183,7 @@ $variaveis = [ordered]@{
     NEXTEC_FUNCAO        = $Funcao
     NEXTEC_AMBIENTE      = $Ambiente
     NEXTEC_PAPEL_DE_PAREDE = $PapelDeParede
+    NEXTEC_BANNER_TIPO   = $Tipo
     NEXTEC_SERVIDOR      = $null   # usada só pela versão antiga; removida
 }
 foreach ($chave in $variaveis.Keys) {
@@ -231,14 +246,31 @@ if ($temDesktop) {
     Start-Process -FilePath 'powershell.exe' -ArgumentList $argumentos -WindowStyle Hidden
     try { Start-ScheduledTask -TaskName $TarefaNome } catch { }   # demais sessões ativas; quem já tem painel ignora
     Write-Host 'Painel aberto na sessão atual (outras sessões recebem no próximo login ou reconexão).'
+
+    # ---------- 5b. Atualização do painel (SYSTEM, todo dia e na inicialização) ----------
+    # Compara o commit instalado com o do repositório; cliente instala versões com 2 dias ou mais, nextec na hora
+    $argsAtualizacao = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Atualizador`""
+    $acaoAtualizacao = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argsAtualizacao
+    $diario = New-ScheduledTaskTrigger -Daily -At '07:00' -RandomDelay (New-TimeSpan -Hours 2)
+    $inicializacao = New-ScheduledTaskTrigger -AtStartup
+    $inicializacao.Delay = 'PT10M'
+    $principalSistema = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
+    $configAtualizacao = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName $TarefaAtualizacao -Action $acaoAtualizacao -Trigger @($diario, $inicializacao) -Principal $principalSistema -Settings $configAtualizacao -Force | Out-Null
+    Write-Host "Tarefa agendada registrada: $TarefaAtualizacao (tipo $Tipo)"
+
+    # Registra o commit da versão instalada, para a primeira verificação já saber de onde parte
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Atualizador | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Host "Aviso: verificação de versão falhou; veja $Pasta\atualizacao.log. O painel funciona normalmente." }
 } else {
     Unregister-ScheduledTask -TaskName $TarefaNome -Confirm:$false -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $TarefaAtualizacao -Confirm:$false -ErrorAction SilentlyContinue
 }
 
 # ---------- 7. Conferência ----------
 Write-Host ''
 Write-Host 'Variáveis gravadas:'
-foreach ($chave in 'NEXTEC_NOME_SERVIDOR', 'NEXTEC_FUNCAO', 'NEXTEC_AMBIENTE', 'NEXTEC_PAPEL_DE_PAREDE') {
+foreach ($chave in 'NEXTEC_NOME_SERVIDOR', 'NEXTEC_FUNCAO', 'NEXTEC_AMBIENTE', 'NEXTEC_PAPEL_DE_PAREDE', 'NEXTEC_BANNER_TIPO') {
     $valor = [Environment]::GetEnvironmentVariable($chave, 'Machine')
     if ($valor) { Write-Host ("  {0,-24} {1}" -f $chave, $valor) }
 }
