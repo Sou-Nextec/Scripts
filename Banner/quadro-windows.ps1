@@ -7,6 +7,9 @@
 # seu próprio painel. As métricas são atualizadas a cada 10 segundos. Nenhuma imagem é gerada e o papel de parede
 # (inclusive o da GPO) não é alterado.
 #
+# O processo confere a própria memória a cada minuto. Acima de NEXTEC_QUADRO_LIMITE_MB (padrão 300), registra no
+# quadro.log e abre um painel novo no lugar dele.
+#
 # Uso manual:
 #   .\quadro-windows.ps1                                 # abre o painel na sessão atual (fica rodando)
 #   .\quadro-windows.ps1 -SalvarEm C:\Temp\quadro.png    # só gera a imagem, para conferir o resultado
@@ -649,6 +652,86 @@ public class NextecPainel : Form
     }
 
     # ---------- Métricas (mesmas informações do quadro Linux) ----------
+    # O painel fica aberto por dias e coleta a cada 10 segundos. Para não acumular memória nem handles:
+    #   - uma única sessão CIM (DCOM) é aberta e reaproveitada, em vez de uma sessão nova a cada consulta;
+    #   - toda instância CIM lida é descartada logo depois de usada;
+    #   - IP, processos e usuários vêm de .NET e de 'quser', e só são relidos a cada minuto;
+    #   - Get-NetIPConfiguration não é usado (abre várias consultas CIM por chamada e acumulava memória).
+    $script:sessaoCim = $null
+    $script:lentos = $null
+    $script:ciclosLentos = 0
+    $CiclosEntreLentos = 6   # 6 x 10 s = 1 minuto
+
+    $script:avisouSessaoCim = $false
+
+    # Sessão CIM local por DCOM (não depende do WinRM). Sem sessão, as consultas seguem pelo caminho padrão.
+    function SessaoCim {
+        if ($script:sessaoCim) { return $script:sessaoCim }
+        try {
+            $opcao = New-CimSessionOption -Protocol Dcom
+            $script:sessaoCim = New-CimSession -ComputerName localhost -SessionOption $opcao -ErrorAction Stop
+        } catch {
+            if (-not $script:avisouSessaoCim) {
+                $script:avisouSessaoCim = $true
+                Registrar "Sessão CIM indisponível, usando consulta padrão: $($_.Exception.Message)"
+            }
+        }
+        return $script:sessaoCim
+    }
+
+    function FecharSessaoCim {
+        if ($script:sessaoCim) { try { $script:sessaoCim.Dispose() } catch { } }
+        $script:sessaoCim = $null
+    }
+
+    # Executa a consulta, entrega as instâncias ao bloco e descarta todas em seguida.
+    # Se a sessão cair, ela é fechada e recriada na próxima consulta.
+    function ConsultarCim([string]$classe, [string]$filtro, [scriptblock]$usar) {
+        $parametros = @{ ClassName = $classe; ErrorAction = 'Stop' }
+        $sessao = SessaoCim
+        if ($sessao) { $parametros.CimSession = $sessao }
+        if ($filtro) { $parametros.Filter = $filtro }
+        try { $instancias = @(Get-CimInstance @parametros) }
+        catch { FecharSessaoCim; throw }
+        try { return & $usar $instancias }
+        finally { foreach ($i in $instancias) { if ($i -is [System.IDisposable]) { $i.Dispose() } } }
+    }
+
+    function IpPrincipal {
+        $interfaces = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()
+        foreach ($nic in $interfaces) {
+            if ($nic.OperationalStatus -ne [System.Net.NetworkInformation.OperationalStatus]::Up) { continue }
+            $propriedades = $nic.GetIPProperties()
+            $temGateway = @($propriedades.GatewayAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' -and $_.Address.ToString() -ne '0.0.0.0' }).Count -gt 0
+            if (-not $temGateway) { continue }
+            $ipv4 = $propriedades.UnicastAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
+            if ($ipv4) { return $ipv4.Address.ToString() }
+        }
+        return ''
+    }
+
+    function ContarProcessos {
+        $lista = [System.Diagnostics.Process]::GetProcesses()
+        try { return $lista.Count }
+        finally { foreach ($p in $lista) { $p.Dispose() } }
+    }
+
+    # IP, processos e usuários mudam pouco: relidos a cada minuto
+    function ColetarLentos {
+        $script:ciclosLentos++
+        if ($script:lentos -and ($script:ciclosLentos -lt $CiclosEntreLentos)) { return $script:lentos }
+        $script:ciclosLentos = 0
+        $script:lentos = [pscustomobject]@{
+            Processos = Seguro { ContarProcessos } 0
+            Usuarios  = Seguro {
+                $linhasQuser = @(cmd /c 'quser 2>nul')
+                if ($linhasQuser.Count -gt 1) { $linhasQuser.Count - 1 } else { 0 }
+            } 0
+            Ip        = Seguro { IpPrincipal }
+        }
+        return $script:lentos
+    }
+
     function Coletar {
         $nome     = Ler 'NEXTEC_NOME_SERVIDOR'
         $funcao   = Ler 'NEXTEC_FUNCAO'
@@ -662,43 +745,65 @@ public class NextecPainel : Form
             default    { [System.Drawing.Color]::FromArgb(102, 187, 106) }
         }
 
-        $sistema  = Get-CimInstance -ClassName Win32_OperatingSystem
-        $cpus     = Seguro { (Get-CimInstance Win32_Processor | Measure-Object NumberOfLogicalProcessors -Sum).Sum } 0
-        $cpuUso   = Seguro { [math]::Round((Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average) } 0
-        $memTotal = $sistema.TotalVisibleMemorySize / 1MB
-        $memUso   = (1 - ($sistema.FreePhysicalMemory / $sistema.TotalVisibleMemorySize)) * 100
+        $sistema = ConsultarCim 'Win32_OperatingSystem' '' {
+            param($i)
+            [pscustomobject]@{
+                Total = [double]$i[0].TotalVisibleMemorySize
+                Livre = [double]$i[0].FreePhysicalMemory
+                Boot  = [datetime]$i[0].LastBootUpTime
+            }
+        }
+        $cpu = Seguro {
+            ConsultarCim 'Win32_Processor' '' {
+                param($i)
+                [pscustomobject]@{
+                    Cpus = ($i | Measure-Object NumberOfLogicalProcessors -Sum).Sum
+                    Uso  = [math]::Round(($i | Measure-Object LoadPercentage -Average).Average)
+                }
+            }
+        } ([pscustomobject]@{ Cpus = 0; Uso = 0 })
+        $cpus     = $cpu.Cpus
+        $cpuUso   = $cpu.Uso
+        $memTotal = $sistema.Total / 1MB
+        $memUso   = (1 - ($sistema.Livre / $sistema.Total)) * 100
         $memoria  = '{0:N0}% de {1:N1} GB' -f $memUso, $memTotal
 
         $paginacao = 'não configurada'
         $pagUso = 0
-        $arquivos = Seguro { @(Get-CimInstance Win32_PageFileUsage) } $null
-        if ($arquivos) {
-            $total = ($arquivos | Measure-Object AllocatedBaseSize -Sum).Sum
-            $usado = ($arquivos | Measure-Object CurrentUsage -Sum).Sum
-            if ($total -gt 0) { $pagUso = $usado / $total * 100; $paginacao = '{0:N0}% de {1:N1} GB' -f $pagUso, ($total / 1024) }
+        $pagina = Seguro {
+            ConsultarCim 'Win32_PageFileUsage' '' {
+                param($i)
+                [pscustomobject]@{
+                    Total = ($i | Measure-Object AllocatedBaseSize -Sum).Sum
+                    Usado = ($i | Measure-Object CurrentUsage -Sum).Sum
+                }
+            }
+        } $null
+        if ($pagina -and $pagina.Total -gt 0) {
+            $pagUso = $pagina.Usado / $pagina.Total * 100
+            $paginacao = '{0:N0}% de {1:N1} GB' -f $pagUso, ($pagina.Total / 1024)
         }
 
         $disco = 'não identificado'
         $discoUso = 0
-        $d = Seguro { Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" } $null
+        $d = Seguro {
+            ConsultarCim 'Win32_LogicalDisk' "DeviceID='$($env:SystemDrive)'" {
+                param($i)
+                if ($i.Count -gt 0) { [pscustomobject]@{ Size = [double]$i[0].Size; FreeSpace = [double]$i[0].FreeSpace } }
+            }
+        } $null
         if ($d -and $d.Size) {
             $discoUso = ($d.Size - $d.FreeSpace) / $d.Size * 100
             $disco = '{0:N0}% usado ({1:N0} GB de {2:N0} GB)' -f $discoUso, (($d.Size - $d.FreeSpace) / 1GB), ($d.Size / 1GB)
         }
 
-        $atividade = New-TimeSpan -Start $sistema.LastBootUpTime -End (Get-Date)
+        $atividade = New-TimeSpan -Start $sistema.Boot -End (Get-Date)
         $uptime = '{0}d {1}h {2}min' -f $atividade.Days, $atividade.Hours, $atividade.Minutes
 
-        $processos = Seguro { (Get-Process).Count } 0
-        $usuarios  = Seguro {
-            $linhasQuser = @(cmd /c 'quser 2>nul')
-            if ($linhasQuser.Count -gt 1) { $linhasQuser.Count - 1 } else { 0 }
-        } 0
-
-        $ip = Seguro {
-            $config = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' } | Select-Object -First 1
-            @($config.IPv4Address)[0].IPAddress
-        }
+        $lentos    = ColetarLentos
+        $processos = $lentos.Processos
+        $usuarios  = $lentos.Usuarios
+        $ip        = $lentos.Ip
 
         $linhas = New-Object 'System.Collections.Generic.List[NextecLinha]'
         $linhas.Add((NovaLinha 'Carga' ('{0}% de CPU ({1} CPUs)' -f $cpuUso, $cpus) $false (CorDoUso $cpuUso)))
@@ -883,9 +988,41 @@ public class NextecPainel : Form
         }
         $script:ciclos++
         if ($fundoPreto -and ($script:ciclos % 6 -eq 0)) { AplicarFundoPreto }
+        if ($script:ciclos % 6 -eq 0) { ConferirMemoria }
     }
 
-    while ($true) {
+    # ---------- Proteção: o painel não pode crescer sem limite ----------
+    # A cada minuto confere a memória do próprio processo. Acima do limite, registra no log e abre um painel novo
+    # no lugar deste, sem deixar a sessão sem painel. Limite em NEXTEC_QUADRO_LIMITE_MB (padrão 300).
+    $script:reiniciar = $false
+
+    function LimiteMemoriaMB {
+        $lido = 0
+        if ([int]::TryParse((Ler 'NEXTEC_QUADRO_LIMITE_MB'), [ref]$lido) -and $lido -ge 100) { return $lido }
+        return 300
+    }
+
+    function ConferirMemoria {
+        $eu = [System.Diagnostics.Process]::GetCurrentProcess()
+        try {
+            $privadaMB = [math]::Round($eu.PrivateMemorySize64 / 1MB)
+            $handles = $eu.HandleCount
+        } finally { $eu.Dispose() }
+        $limite = LimiteMemoriaMB
+        if ($privadaMB -gt $limite) {
+            Registrar "Memória do painel em $privadaMB MB ($handles handles), acima do limite de $limite MB; reiniciando o painel"
+            $script:reiniciar = $true
+            [System.Windows.Forms.Application]::ExitThread()
+        }
+    }
+
+    function AbrirNovaInstancia {
+        $argumentos = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$PSCommandPath`"")
+        if ($PapelDeParede) { $argumentos += @('-PapelDeParede', $PapelDeParede) }
+        Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $argumentos -WindowStyle Hidden
+    }
+
+    while (-not $script:reiniciar) {
         $timer = New-Object System.Windows.Forms.Timer
         try {
             NovoPainel
@@ -917,8 +1054,15 @@ public class NextecPainel : Form
             if ($script:painel) { try { $script:painel.Dispose() } catch { } }
             $script:painel = $null
         }
-        Start-Sleep -Seconds 5
+        if (-not $script:reiniciar) { Start-Sleep -Seconds 5 }
     }
+
+    # Só chega aqui no reinício pela proteção de memória: libera a sessão para o painel novo e encerra este
+    FecharSessaoCim
+    $mutex.ReleaseMutex()
+    $mutex.Dispose()
+    AbrirNovaInstancia
+    Registrar 'Painel novo aberto; encerrando o anterior'
 } catch {
     Registrar $_.Exception.Message
     throw
