@@ -109,6 +109,31 @@ function ReabrirPaineis {
     Start-ScheduledTask -TaskName $TarefaPainel
 }
 
+# O painel registra "Painel ancorado" no quadro.log do usuário quando abre e desenha de verdade. Processo vivo
+# não basta: um painel com erro fica rodando e tentando de novo sem nunca aparecer.
+function PainelAbriu([string[]]$linhas, [datetime]$desde) {
+    foreach ($linha in $linhas) {
+        if ($linha -notmatch '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) Painel (ancorado|visível na tela)') { continue }
+        $momento = [datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+        if ($momento -ge $desde) { return $true }
+    }
+    return $false
+}
+
+function LinhasDosLogsDoPainel {
+    $logs = Get-ChildItem -Path (Join-Path $env:SystemDrive 'Users\*\AppData\Local\Nextec\quadro.log') -ErrorAction SilentlyContinue
+    foreach ($log in $logs) { Get-Content -LiteralPath $log.FullName -Tail 50 -Encoding UTF8 -ErrorAction SilentlyContinue }
+}
+
+function AguardarPainel([datetime]$desde) {
+    $limite = (Get-Date).AddSeconds($EsperaPainelSegundos)
+    while ((Get-Date) -lt $limite) {
+        if (PainelAbriu @(LinhasDosLogsDoPainel) $desde) { return $true }
+        Start-Sleep -Seconds 5
+    }
+    return $false
+}
+
 function SintaxeValida([string]$arquivo) {
     $tokens = $null; $erros = $null
     [void][System.Management.Automation.Language.Parser]::ParseFile($arquivo, [ref]$tokens, [ref]$erros)
@@ -163,23 +188,30 @@ function Atualizar {
     }
     $tinhaPainel = (PaineisAbertos).Count -gt 0
     Copy-Item -LiteralPath $Quadro -Destination $anterior -Force
-    Move-Item -LiteralPath $temporario -Destination $Quadro -Force
-    GravarEstado $commitRemoto ''
-    Registrar "Versão $curto instalada (tipo $tipo)."
+    $instalada = $false
+    try {
+        Move-Item -LiteralPath $temporario -Destination $Quadro -Force
+        $instalada = $true
+        GravarEstado $commitRemoto ''
+        Registrar "Versão $curto instalada (tipo $tipo)."
 
-    if (-not $tinhaPainel) { Registrar 'Nenhuma sessão com painel aberto; a versão nova vale a partir do próximo login.'; return }
+        if (-not $tinhaPainel) { Registrar 'Nenhuma sessão com painel aberto; a versão nova vale a partir do próximo login.'; return }
 
-    # 4. Reabre os painéis e confere; sem painel em 1 minuto, devolve a anterior
-    ReabrirPaineis
-    $limite = (Get-Date).AddSeconds($EsperaPainelSegundos)
-    while ((Get-Date) -lt $limite -and (PaineisAbertos).Count -eq 0) { Start-Sleep -Seconds 5 }
-    Start-Sleep -Seconds 15   # um painel que cai logo depois de abrir também conta como falha
-    if ((PaineisAbertos).Count -gt 0) { Registrar "Painéis reabertos na versão $curto."; return }
+        # 4. Reabre os painéis e confere no log do painel que ele abriu de verdade
+        $inicio = (Get-Date).AddSeconds(-1)
+        ReabrirPaineis
+        if (AguardarPainel $inicio) { Registrar "Painéis reabertos na versão $curto."; return }
+        $motivo = "o painel não abriu em $EsperaPainelSegundos segundos"
+    } catch {
+        if (-not $instalada) { throw }
+        $motivo = "erro ao reabrir o painel ($($_.Exception.Message))"
+    }
 
+    # 5. Qualquer falha depois da troca: devolve a versão anterior e não tenta este commit de novo
     Copy-Item -LiteralPath $anterior -Destination $Quadro -Force
     GravarEstado $estado.Commit $commitRemoto
-    ReabrirPaineis
-    Registrar "Versão $curto não abriu o painel; versão anterior devolvida e $curto não será tentada de novo."
+    try { ReabrirPaineis } catch { Registrar "Painel anterior não reaberto: $($_.Exception.Message)" }
+    Registrar "Versão $curto devolvida: $motivo. Versão anterior reinstalada e $curto não será tentada de novo."
 }
 
 try {

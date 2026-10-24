@@ -33,7 +33,7 @@ $funcoes = @{}
 foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     $funcoes[$f.Name] = $f
 }
-foreach ($nome in 'Decidir', 'ShaGit', 'ParaUtc') {
+foreach ($nome in 'Decidir', 'ShaGit', 'ParaUtc', 'PainelAbriu') {
     if (-not $funcoes.ContainsKey($nome)) { throw "Função $nome não encontrada no atualizar-banner.ps1" }
     . ([scriptblock]::Create($funcoes[$nome].Extent.Text))
 }
@@ -70,6 +70,17 @@ $local = [datetime]::SpecifyKind([datetime]'2026-10-24 10:35:06', 'Local')
 Conferir 'Data já convertida pelo PowerShell 7 vira UTC certo' ((ParaUtc $local) -eq $local.ToUniversalTime())
 Conferir 'Decisão usa UTC dos dois lados' ($funcoes['Atualizar'].Extent.Text -match '-Momento \(\[DateTime\]::UtcNow\)')
 
+# ---------- Sinal de que o painel abriu ----------
+Write-Host 'Sinal de que o painel abriu'
+$reabertura = [datetime]'2026-10-24 10:00:00'
+$antigo = '2026-10-24 09:59:58 Painel ancorado: WorkerW'
+Conferir 'Painel ancorado depois da reabertura: abriu' (PainelAbriu @($antigo, '2026-10-24 10:00:05 Painel ancorado: WorkerW') $reabertura)
+Conferir 'Painel visível na tela depois da reabertura: abriu' (PainelAbriu @('2026-10-24 10:00:07 Painel visível na tela: Progman (24H2)') $reabertura)
+Conferir 'Só registro anterior à reabertura: não abriu' (-not (PainelAbriu @($antigo) $reabertura))
+Conferir 'Processo vivo com erro repetido: não abriu' `
+    (-not (PainelAbriu @('2026-10-24 10:00:03 Início: Windows', '2026-10-24 10:00:04 Painel: Exception calling Aplicar', '2026-10-24 10:00:09 Painel: Exception calling Aplicar') $reabertura))
+Conferir 'Log vazio: não abriu' (-not (PainelAbriu @() $reabertura))
+
 # ---------- Parte 2: identificador do conteúdo ----------
 Write-Host 'Parte 2: identificador do conteúdo'
 $amostras = @(
@@ -101,6 +112,11 @@ Conferir 'Confere o conteúdo baixado contra o identificador do GitHub' ($corpoA
 Conferir 'Confere a sintaxe antes de instalar' ($corpoAtualizar.IndexOf('SintaxeValida') -ge 0 -and $corpoAtualizar.IndexOf('SintaxeValida') -lt $corpoAtualizar.IndexOf('Move-Item'))
 Conferir 'Guarda a versão anterior antes de trocar' ($corpoAtualizar.IndexOf('$anterior -Force') -lt $corpoAtualizar.IndexOf('Move-Item'))
 Conferir 'Devolve a versão anterior quando o painel não abre' ($corpoAtualizar -match 'Copy-Item -LiteralPath \$anterior -Destination \$Quadro')
+Conferir 'Erro depois da troca também devolve a versão anterior (catch com volta)' `
+    ($corpoAtualizar -match 'catch \{\s*if \(-not \$instalada\) \{ throw \}' -and $corpoAtualizar.IndexOf('catch {') -lt $corpoAtualizar.IndexOf('Copy-Item -LiteralPath $anterior -Destination $Quadro'))
+Conferir 'Confere o painel pelo log (AguardarPainel), não só pelo processo' ($corpoAtualizar -match 'AguardarPainel \$inicio')
+Conferir 'Painel ancorado é o sinal registrado pelo quadro-windows.ps1' `
+    ((Get-Content (Join-Path $PSScriptRoot '..\quadro-windows.ps1') -Raw -Encoding UTF8) -match 'Registrar "Painel ancorado: ')
 Conferir 'Espera padrão de 2 dias para clientes' ($texto -match '\$DiasEspera\s*=\s*2\b')
 Conferir 'Só o tipo nextec atualiza sem espera' ($funcoes['Decidir'].Extent.Text -match "\`$Tipo -eq 'nextec'")
 Conferir 'Erros vão para o log e encerram com código 1' ($texto -match 'catch \{\s*Registrar[^\}]*\}?\s*[\s\S]*exit 1')
