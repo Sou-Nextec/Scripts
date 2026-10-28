@@ -239,7 +239,7 @@ function Get-UrlPorta {
 
 # ---------- Apresentação no console ----------
 # O arquivo coleta.log guarda tudo com hora e nível; a tela mostra só o necessário, organizado por seção e etapa.
-$script:VersaoAssessment = '2.9'
+$script:VersaoAssessment = '2.10'
 $script:LarguraTela = 64
 $script:EtapaAberta = $null
 $script:NumeroSecao = 0
@@ -585,20 +585,67 @@ function Get-TituloWeb {
 }
 
 function Invoke-ComandoComTimeout {
-    # Executa um utilitário do Windows e devolve a saída; mata o processo se passar do tempo.
+    # Executa um utilitário do Windows e devolve a saída (stdout + stderr).
+    # Se passar do tempo, mata o processo e devolve $null, para quem chamou saber que não houve resposta.
     param([string]$Arquivo, [string]$Argumentos, [int]$TimeoutMs = 8000)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Arquivo; $psi.Arguments = $Argumentos
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
-    try { $psi.StandardOutputEncoding = [System.Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage) } catch { }
+    # Mesma decodificação da chamada nativa do PowerShell (página OEM do console), para manter os acentos.
+    $codificacao = try { [Console]::OutputEncoding } catch { $null }
+    if (-not $codificacao) { $codificacao = [System.Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage) }
+    $psi.StandardOutputEncoding = $codificacao; $psi.StandardErrorEncoding = $codificacao
+    $proc = $null
     try {
         $proc = [System.Diagnostics.Process]::Start($psi)
         $saida = $proc.StandardOutput.ReadToEndAsync()
-        [void]$proc.StandardError.ReadToEndAsync()
-        if (-not $proc.WaitForExit($TimeoutMs)) { try { $proc.Kill() } catch { }; return '' }
-        $saida.Result
+        $erro = $proc.StandardError.ReadToEndAsync()
+        if (-not $proc.WaitForExit($TimeoutMs)) { try { $proc.Kill() } catch { }; return $null }
+        $proc.WaitForExit()
+        ($saida.Result + $erro.Result)
     } catch { '' }
+    finally { if ($proc) { $proc.Dispose() } }
+}
+
+function Invoke-Externo {
+    # Roda uma linha de comando ("netsh wlan show interfaces") com limite de tempo e registra no log quando trava.
+    param([string]$Linha, [int]$TimeoutSeg = 20)
+    $partes = $Linha.Trim() -split '\s+', 2
+    $argumentos = if ($partes.Count -gt 1) { $partes[1] } else { '' }
+    $saida = Invoke-ComandoComTimeout -Arquivo $partes[0] -Argumentos $argumentos -TimeoutMs ($TimeoutSeg * 1000)
+    if ($null -eq $saida) { Write-Log "  '$Linha' sem resposta em $TimeoutSeg s: interrompido, a coleta seguiu sem esse dado." 'AVISO' }
+    $saida
+}
+
+function Save-TextoExterno {
+    # Igual ao Save-Texto, mas para utilitários do Windows: cada comando tem limite de tempo e não trava a coleta.
+    param([string]$Nome, [string[]]$Comandos, [string]$Descricao, [int]$TimeoutSeg = 20)
+    $partes = foreach ($c in $Comandos) {
+        $saida = Invoke-Externo -Linha $c -TimeoutSeg $TimeoutSeg
+        if ($null -eq $saida) { "[$c] sem resposta em $TimeoutSeg s (comando interrompido)" } else { $saida }
+    }
+    ($partes -join [Environment]::NewLine) | Out-File -FilePath (Join-Path $script:PastaSaida "$Nome.txt") -Encoding UTF8
+    $script:Arquivos.Add([pscustomobject]@{ Arquivo = "$Nome.txt"; Registros = $null; Descricao = $Descricao })
+}
+
+function Invoke-ComLimiteTempo {
+    # Roda cmdlets que podem travar (WMI, Storage, Defender, Windows Server Backup) num runspace à parte.
+    # Se não responder no prazo, a coleta segue e a chamada travada é abandonada (morre junto com o script).
+    # O bloco não enxerga variáveis nem funções do script: passar valores por -Argumentos (param no bloco).
+    param([scriptblock]$Bloco, [string]$Descricao = 'Consulta', [int]$TimeoutSeg = 30, [object[]]$Argumentos = @())
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript($Bloco.ToString())
+    foreach ($a in $Argumentos) { [void]$ps.AddArgument($a) }
+    $assinc = $ps.BeginInvoke()
+    if ($assinc.AsyncWaitHandle.WaitOne($TimeoutSeg * 1000)) {
+        try { $ps.EndInvoke($assinc) }
+        finally { $ps.Dispose() }
+    } else {
+        [void]$ps.BeginStop($null, $null)
+        Write-Log "  $Descricao sem resposta em $TimeoutSeg s: a coleta seguiu sem esse dado." 'AVISO'
+        throw [System.TimeoutException]::new("$Descricao sem resposta em $TimeoutSeg s")
+    }
 }
 
 function Get-NomeNetBios {
@@ -1315,7 +1362,27 @@ Invoke-Etapa 'Discos, RAID e volumes' {
     Save-Dados 'discos_wmi' $discosWmi 'Discos vistos pelo Windows (inclui discos virtuais da controladora RAID)'
 
     if (Test-ComandoExiste 'Get-PhysicalDisk') {
-        $fisicos = @(Get-PhysicalDisk | Select-Object FriendlyName, SerialNumber, MediaType, BusType, HealthStatus, OperationalStatus,
+        # O serviço de armazenamento (Storage Spaces/SMAPI) trava com controladora ou disco USB com defeito: consulta com limite.
+        $discosPd = @(try {
+            # Os campos viram texto e número dentro do runspace, onde o módulo Storage traduz os enums (0 vira "Healthy").
+            Invoke-ComLimiteTempo {
+                foreach ($pd in Get-PhysicalDisk) {
+                    $c = try { $pd | Get-StorageReliabilityCounter -ErrorAction Stop } catch { $null }
+                    [pscustomobject]@{
+                        Disco = [pscustomobject]@{
+                            FriendlyName = "$($pd.FriendlyName)"; SerialNumber = "$($pd.SerialNumber)".Trim()
+                            MediaType = "$($pd.MediaType)"; BusType = "$($pd.BusType)"
+                            HealthStatus = "$($pd.HealthStatus)"; OperationalStatus = "$($pd.OperationalStatus)"; Size = [double]$pd.Size
+                        }
+                        Contador = if ($c) {
+                            [pscustomobject]@{ Wear = $c.Wear; Temperature = $c.Temperature; PowerOnHours = $c.PowerOnHours
+                                ReadErrorsTotal = $c.ReadErrorsTotal; WriteErrorsTotal = $c.WriteErrorsTotal }
+                        } else { $null }
+                    }
+                }
+            } 'Discos físicos e SMART' 60
+        } catch { })
+        $fisicos = @($discosPd.Disco | Select-Object FriendlyName, SerialNumber, MediaType, BusType, HealthStatus, OperationalStatus,
             @{ n = 'TamanhoGB'; e = { [math]::Round($_.Size / 1GB, 1) } })
         Save-Dados 'discos_fisicos' $fisicos 'Discos físicos (Storage Spaces)'
         foreach ($d in $fisicos | Where-Object { $_.HealthStatus -ne 'Healthy' }) {
@@ -1323,8 +1390,9 @@ Invoke-Etapa 'Discos, RAID e volumes' {
         }
 
         # Saúde real de cada disco: desgaste do SSD, horas ligado, temperatura e erros de leitura.
-        $saude = @(foreach ($pd in Get-PhysicalDisk) {
-            $c = try { $pd | Get-StorageReliabilityCounter -ErrorAction Stop } catch { $null }
+        $saude = @(foreach ($item in $discosPd) {
+            $pd = $item.Disco
+            $c = $item.Contador
             $semLeitura = (-not $c) -or (($null -eq $c.Wear -or $c.Wear -eq 0) -and (-not $c.Temperature) -and (-not $c.PowerOnHours) -and ($pd.BusType -eq 'RAID' -or "$($pd.MediaType)" -eq 'Unspecified'))
             if ($semLeitura -and $c) { $script:DiscosSemSmart += "$($pd.FriendlyName)" }
             if ($c -and -not $semLeitura) {
@@ -1389,8 +1457,8 @@ Invoke-Etapa 'Discos, RAID e volumes' {
     $script:Resumo['Volumes'] = ($volumes | ForEach-Object { "$($_.Unidade) $($_.TamanhoGB) GB ($($_.LivrePct)% livre)" }) -join ' | '
 
     if (Test-ComandoExiste 'omreport') {
-        Save-Texto 'dell_omsa_storage' { omreport storage vdisk; omreport storage pdisk controller=0 } 'Dell OpenManage: discos virtuais e físicos'
-        Save-Texto 'dell_omsa_chassis' { omreport chassis; omreport system summary } 'Dell OpenManage: chassi e resumo'
+        Save-TextoExterno 'dell_omsa_storage' @('omreport storage vdisk', 'omreport storage pdisk controller=0') 'Dell OpenManage: discos virtuais e físicos' 60
+        Save-TextoExterno 'dell_omsa_chassis' @('omreport chassis', 'omreport system summary') 'Dell OpenManage: chassi e resumo' 60
     }
 }
 
@@ -1694,7 +1762,9 @@ Invoke-Etapa 'Antivírus e proteção' {
     $defenderAtivo = $false
     if (Test-ComandoExiste 'Get-MpComputerStatus') {
         try {
-            $mp = Get-MpComputerStatus
+            # Com outro antivírus no lugar, o Defender às vezes não responde e o cmdlet fica parado.
+            $mp = Invoke-ComLimiteTempo { Get-MpComputerStatus } 'Status do Microsoft Defender' 30 | Select-Object -First 1
+            if (-not $mp) { throw 'Defender sem status' }
             $defenderAtivo = [bool]$mp.RealTimeProtectionEnabled
             $script:Resumo['Microsoft Defender'] = 'Antivírus: {0} | Tempo real: {1} | Assinaturas: {2}' -f $mp.AntivirusEnabled, $mp.RealTimeProtectionEnabled, (Format-Data $mp.AntivirusSignatureLastUpdated)
             if ($defenderAtivo -and ((Get-Date) - $mp.AntivirusSignatureLastUpdated).TotalDays -gt 7) { Add-Alerta 'Média' 'Segurança' 'Assinaturas do Defender desatualizadas' "Última atualização em $(Format-Data $mp.AntivirusSignatureLastUpdated)" }
@@ -1719,7 +1789,7 @@ Invoke-Etapa 'Configurações de segurança' {
     $uac = Get-ValorRegistro 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'EnableLUA'
     $llmnr = Get-ValorRegistro 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'EnableMulticast'
     $secureBoot = try { Confirm-SecureBootUEFI } catch { 'Não suportado/BIOS legado' }
-    $tpm = try { $t = Get-Tpm; "Presente: $($t.TpmPresent) | Pronto: $($t.TpmReady)" } catch { 'Não identificado' }
+    $tpm = try { $t = Invoke-ComLimiteTempo { Get-Tpm } 'TPM' 20 | Select-Object -First 1; "Presente: $($t.TpmPresent) | Pronto: $($t.TpmReady)" } catch { 'Não identificado' }
     $script:Resumo['Secure Boot'] = $secureBoot
     $script:Resumo['TPM'] = $tpm
     $script:Resumo['Proteção LSA (RunAsPPL)'] = if ($lsaPpl -ge 1) { 'Sim' } else { 'Não' }
@@ -1732,8 +1802,8 @@ Invoke-Etapa 'Configurações de segurança' {
         Save-Dados 'bitlocker' $bl 'Criptografia BitLocker por volume'
         $script:Resumo['BitLocker'] = ($bl | ForEach-Object { "$($_.MountPoint) $($_.ProtectionStatus)" }) -join ' | '
     }
-    Save-Texto 'politica_auditoria' { auditpol /get /category:* } 'Política de auditoria do Windows'
-    Save-Texto 'politica_senha_local' { net accounts } 'Política de senha efetiva (local/domínio)'
+    Save-TextoExterno 'politica_auditoria' @('auditpol /get /category:*') 'Política de auditoria do Windows' 20
+    Save-TextoExterno 'politica_senha_local' @('net accounts') 'Política de senha efetiva (local/domínio)' 30
 }
 
 Invoke-Etapa 'SQL Server e bancos de dados' {
@@ -1807,7 +1877,8 @@ Invoke-Etapa 'Backup' {
     if ($softwares.Count -eq 0 -and $servicos.Count -eq 0) { Add-Alerta 'Alta' 'Backup' 'Nenhuma ferramenta de backup identificada no servidor' 'Confirmar rotina de backup local e em nuvem' }
     if (Test-ComandoExiste 'Get-WBSummary') {
         try {
-            $wb = Get-WBSummary
+            $wb = Invoke-ComLimiteTempo { Get-WBSummary } 'Windows Server Backup' 45 | Select-Object -First 1
+            if (-not $wb) { throw 'Windows Server Backup sem resposta' }
             $semSucesso = (-not $wb.LastSuccessfulBackupTime -or $wb.LastSuccessfulBackupTime -eq [datetime]::MinValue)
             $script:Resumo['Windows Server Backup'] = if ($semSucesso) { 'Nenhum backup concluído (rotina de backup nativa não configurada)' } else { 'Último sucesso: {0} | Último resultado: {1}' -f (Format-Data $wb.LastSuccessfulBackupTime), $wb.LastBackupResultHR }
             if ($semSucesso) {
@@ -1817,8 +1888,9 @@ Invoke-Etapa 'Backup' {
             }
         } catch { }
     }
-    Save-Texto 'vss_armazenamento' { vssadmin list shadowstorage } 'Armazenamento de cópias de sombra (VSS)'
-    Save-Texto 'vss_writers' { vssadmin list writers } 'Estado dos gravadores VSS'
+    # vssadmin fica parado quando o serviço VSS está travado (comum em servidor com backup com problema).
+    Save-TextoExterno 'vss_armazenamento' @('vssadmin list shadowstorage') 'Armazenamento de cópias de sombra (VSS)' 30
+    Save-TextoExterno 'vss_writers' @('vssadmin list writers') 'Estado dos gravadores VSS' 60
 }
 
 Invoke-Etapa 'Certificados digitais (máquina, usuário e A3)' {
@@ -1939,11 +2011,19 @@ Invoke-Etapa 'Monitores' {
 }
 
 Invoke-Etapa 'Wi-Fi' {
-    # Chamada nativa: decodifica os acentos da saída do netsh corretamente.
-    $saida = (netsh wlan show interfaces 2>&1 | Out-String)
+    # Sem placa Wi-Fi ou sem o serviço WLAN rodando, o netsh wlan pode ficar parado esperando o serviço: nem chama.
+    $placasWifi = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.NdisPhysicalMedium -in 1, 9 -or $_.PhysicalMediaType -match '802\.11|Wireless' })
+    $servicoWlan = Get-Service -Name WlanSvc -ErrorAction SilentlyContinue
+    if ($placasWifi.Count -eq 0 -or -not $servicoWlan -or $servicoWlan.Status -ne 'Running') {
+        Write-Log "Wi-Fi ignorado: $(if ($placasWifi.Count -eq 0) { 'nenhuma placa Wi-Fi' } else { 'serviço WLAN parado' })." -SoArquivo
+        return
+    }
+    # Cada consulta do netsh tem limite de tempo e roda uma vez só; a mesma saída vai para o arquivo e para a análise.
+    $saida = Invoke-Externo 'netsh wlan show interfaces' 10
     if (-not $saida -or $saida -match '(?i)não está em execução|is not running|nenhuma interface|no wireless') { return }
-    Save-Texto 'wifi_interface' { netsh wlan show interfaces } 'Conexão Wi-Fi atual (SSID, sinal, canal, taxa)'
-    Save-Texto 'wifi_perfis' { netsh wlan show profiles } 'Redes Wi-Fi salvas nesta máquina'
+    $saida | Out-File -FilePath (Join-Path $script:PastaSaida 'wifi_interface.txt') -Encoding UTF8
+    $script:Arquivos.Add([pscustomobject]@{ Arquivo = 'wifi_interface.txt'; Registros = $null; Descricao = 'Conexão Wi-Fi atual (SSID, sinal, canal, taxa)' })
+    Save-TextoExterno 'wifi_perfis' @('netsh wlan show profiles') 'Redes Wi-Fi salvas nesta máquina' 10
     $pegar = { param($Rotulo) if ($saida -match "(?im)^\s*$Rotulo\s*:\s*(.+)$") { $Matches[1].Trim() } else { '' } }
     $ssid  = & $pegar 'SSID'
     $sinal = & $pegar '(?:Sinal|Signal)'
@@ -1956,8 +2036,10 @@ Invoke-Etapa 'Wi-Fi' {
     }
 
     # Wi-Fi do ambiente: redes visíveis, canal e sinal, para achar interferência e AP mal posicionado.
-    Save-Texto 'wifi_redes_visiveis' { netsh wlan show networks mode=bssid } 'Redes Wi-Fi visíveis no ambiente, com canal e sinal'
-    $saidaRedes = (netsh wlan show networks mode=bssid 2>&1 | Out-String)
+    $saidaRedes = Invoke-Externo 'netsh wlan show networks mode=bssid' 15
+    $(if ($null -eq $saidaRedes) { 'Sem resposta do netsh em 15 s (comando interrompido)' } else { $saidaRedes }) |
+        Out-File -FilePath (Join-Path $script:PastaSaida 'wifi_redes_visiveis.txt') -Encoding UTF8
+    $script:Arquivos.Add([pscustomobject]@{ Arquivo = 'wifi_redes_visiveis.txt'; Registros = $null; Descricao = 'Redes Wi-Fi visíveis no ambiente, com canal e sinal' })
     $redes = New-Object System.Collections.Generic.List[object]
     $ssidAtual = ''
     foreach ($l in ($saidaRedes -split "`r?`n")) {
@@ -1981,7 +2063,7 @@ Invoke-Etapa 'Proxy, VLAN e rotas de saída' {
     $proxyAuto    = Get-ValorRegistro 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' 'AutoConfigURL'
     $script:Resumo['Proxy configurado'] = if ($proxyAtivo -eq 1 -and $proxyUsuario) { $proxyUsuario }
         elseif ($proxyAuto) { "Automático: $proxyAuto" } else { 'Não' }
-    Save-Texto 'proxy_winhttp' { netsh winhttp show proxy } 'Proxy do WinHTTP (usado por serviços e atualizações)'
+    Save-TextoExterno 'proxy_winhttp' @('netsh winhttp show proxy') 'Proxy do WinHTTP (usado por serviços e atualizações)' 10
 
     # Só interessa a propriedade que carrega o número da VLAN. "Prioridade & VLAN ativado" é outra coisa.
     $vlans = @(Get-NetAdapterAdvancedProperty -ErrorAction SilentlyContinue |
@@ -2148,8 +2230,8 @@ Invoke-Etapa 'Eventos críticos' {
 }
 
 Invoke-Etapa 'Sincronização de horário' {
-    Save-Texto 'horario_w32tm' { w32tm /query /status; w32tm /query /source; w32tm /query /configuration } 'Sincronização de horário (w32tm)'
-    $script:Resumo['Fonte de horário'] = ((w32tm /query /source) | Out-String).Trim()
+    Save-TextoExterno 'horario_w32tm' @('w32tm /query /status', 'w32tm /query /source', 'w32tm /query /configuration') 'Sincronização de horário (w32tm)' 15
+    $script:Resumo['Fonte de horário'] = "$(Invoke-Externo 'w32tm /query /source' 15)".Trim()
     $script:Resumo['Fuso horário'] = (Get-TimeZone).DisplayName
 }
 
@@ -2294,8 +2376,9 @@ if ($temAD) {
     }
 
     Invoke-Etapa 'AD: saúde (dcdiag e replicação)' {
-        if (Test-ComandoExiste 'dcdiag') { Save-Texto 'ad_dcdiag' { dcdiag /q } 'Testes do dcdiag (só falhas)' }
-        if (Test-ComandoExiste 'repadmin') { Save-Texto 'ad_replicacao' { repadmin /replsummary } 'Resumo da replicação do AD' }
+        # dcdiag é lento por natureza (testa DNS, replicação e serviços); o limite só corta quando um DC parceiro não responde.
+        if (Test-ComandoExiste 'dcdiag') { Save-TextoExterno 'ad_dcdiag' @('dcdiag /q') 'Testes do dcdiag (só falhas)' 300 }
+        if (Test-ComandoExiste 'repadmin') { Save-TextoExterno 'ad_replicacao' @('repadmin /replsummary') 'Resumo da replicação do AD' 120 }
     }
 }
 
@@ -2680,7 +2763,8 @@ function Get-InventarioRemoto {
         $qtdSoftware = $null
         if ($SoftwareEstacoes) {
             try {
-                $paramIc = @{ ComputerName = $Computador; ErrorAction = 'Stop' }
+                # Limite para abrir a sessão e para a consulta: estação com WinRM meio quebrado não segura a coleta.
+                $paramIc = @{ ComputerName = $Computador; ErrorAction = 'Stop'; SessionOption = (New-PSSessionOption -OpenTimeout 15000 -OperationTimeout 60000) }
                 if ($usarCredencial) { $paramIc.Credential = $CredencialRemota }
                 $lista = @(Invoke-Command @paramIc -ScriptBlock {
                     $chaves = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
