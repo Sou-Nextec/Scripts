@@ -239,7 +239,12 @@ function Get-UrlPorta {
 
 # ---------- Apresentação no console ----------
 # O arquivo coleta.log guarda tudo com hora e nível; a tela mostra só o necessário, organizado por seção e etapa.
-$script:VersaoAssessment = '2.10'
+$script:VersaoAssessment = '2.11'
+
+# Toda consulta WMI/CIM tem prazo: com o WMI corrompido ou um provedor travado, a etapa falha e a coleta segue.
+# Vale para as consultas locais e para as feitas pelas sessões CIM das estações. Quem precisa de mais tempo informa o próprio.
+$script:TimeoutWmiSeg = 60
+$PSDefaultParameterValues['Get-CimInstance:OperationTimeoutSec'] = $script:TimeoutWmiSeg
 $script:LarguraTela = 64
 $script:EtapaAberta = $null
 $script:NumeroSecao = 0
@@ -1661,7 +1666,14 @@ Invoke-Etapa 'Softwares instalados' {
 }
 
 Invoke-Etapa 'Atualizações do Windows' {
-    $hotfixes = @(Get-HotFix | Select-Object HotFixID, Description, InstalledBy, @{ n = 'InstaladoEm'; e = { $_.InstalledOn } } | Sort-Object InstaladoEm -Descending)
+    # Get-HotFix não aceita prazo: roda à parte e já volta com a data convertida.
+    # Se estourar, o resto da etapa (reinício pendente e política do Windows Update) continua.
+    $hotfixes = @(try {
+            Invoke-ComLimiteTempo {
+                Get-HotFix | Select-Object HotFixID, Description, InstalledBy, @{ n = 'InstaladoEm'; e = { $_.InstalledOn } }
+            } 'Lista de atualizações (Get-HotFix)' $script:TimeoutWmiSeg
+        } catch { })
+    $hotfixes = @($hotfixes | Sort-Object InstaladoEm -Descending)
     Save-Dados 'atualizacoes_instaladas' $hotfixes 'Atualizações instaladas (Get-HotFix)'
     $ultima = ($hotfixes | Where-Object { $_.InstaladoEm } | Select-Object -First 1).InstaladoEm
     $script:Resumo['Última atualização instalada'] = Format-Data $ultima
@@ -1798,7 +1810,12 @@ Invoke-Etapa 'Configurações de segurança' {
     if ($uac -eq 0) { Add-Alerta 'Média' 'Segurança' 'UAC desligado' 'EnableLUA = 0' }
 
     if (Test-ComandoExiste 'Get-BitLockerVolume') {
-        $bl = @(Get-BitLockerVolume | Select-Object MountPoint, VolumeStatus, ProtectionStatus, EncryptionMethod, EncryptionPercentage)
+        $bl = @(try {
+            Invoke-ComLimiteTempo {
+                Get-BitLockerVolume | ForEach-Object { [pscustomobject]@{ MountPoint = "$($_.MountPoint)"; VolumeStatus = "$($_.VolumeStatus)"
+                    ProtectionStatus = "$($_.ProtectionStatus)"; EncryptionMethod = "$($_.EncryptionMethod)"; EncryptionPercentage = $_.EncryptionPercentage } }
+            } 'BitLocker' $script:TimeoutWmiSeg
+        } catch { })
         Save-Dados 'bitlocker' $bl 'Criptografia BitLocker por volume'
         $script:Resumo['BitLocker'] = ($bl | ForEach-Object { "$($_.MountPoint) $($_.ProtectionStatus)" }) -join ' | '
     }
@@ -1990,8 +2007,16 @@ Invoke-Etapa 'Periféricos (scanners, biometria e digitalização)' {
 
 Invoke-Etapa 'Impressoras' {
     if (Test-ComandoExiste 'Get-Printer') {
-        Save-Dados 'impressoras' (Get-Printer | Select-Object Name, DriverName, PortName, Shared, ShareName, Published) 'Impressoras instaladas na máquina'
-        Save-Dados 'impressoras_portas' (Get-PrinterPort | Where-Object { $_.PrinterHostAddress } | Select-Object Name, PrinterHostAddress, PortNumber) 'Portas TCP/IP de impressão'
+        # Spooler travado (driver de impressora com problema) deixa o Get-Printer parado indefinidamente.
+        $impressoras = @(Invoke-ComLimiteTempo {
+                Get-Printer | ForEach-Object { [pscustomobject]@{ Name = $_.Name; DriverName = $_.DriverName; PortName = $_.PortName
+                    Shared = $_.Shared; ShareName = $_.ShareName; Published = $_.Published } }
+            } 'Impressoras (spooler)' 30)
+        Save-Dados 'impressoras' $impressoras 'Impressoras instaladas na máquina'
+        $portas = @(Invoke-ComLimiteTempo {
+                Get-PrinterPort | Where-Object { $_.PrinterHostAddress } | ForEach-Object { [pscustomobject]@{ Name = $_.Name; PrinterHostAddress = $_.PrinterHostAddress; PortNumber = $_.PortNumber } }
+            } 'Portas de impressão (spooler)' 30)
+        Save-Dados 'impressoras_portas' $portas 'Portas TCP/IP de impressão'
     }
 }
 
@@ -2180,14 +2205,15 @@ Invoke-Etapa 'Hyper-V' {
 
 Invoke-Etapa 'Licenciamento do Windows' {
     $mapaStatus = @{ 0 = 'Não licenciado'; 1 = 'Licenciado'; 2 = 'Carência OOB'; 3 = 'Carência OOT'; 4 = 'Carência não genuína'; 5 = 'Notificação'; 6 = 'Carência estendida' }
-    $licencas = @(Get-CimInstance SoftwareLicensingProduct -Filter "PartialProductKey IS NOT NULL AND ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'" |
+    # SoftwareLicensingProduct é lento por natureza (consulta o serviço de licenciamento): prazo maior que o padrão.
+    $licencas = @(Get-CimInstance SoftwareLicensingProduct -Filter "PartialProductKey IS NOT NULL AND ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'" -OperationTimeoutSec 120 |
         Select-Object Name, Description, @{ n = 'Status'; e = { $mapaStatus[[int]$_.LicenseStatus] } })
     Save-Dados 'licenciamento_windows' $licencas 'Ativação do Windows (sem chave)'
     $script:Resumo['Ativação do Windows'] = ($licencas.Status | Select-Object -Unique) -join ', '
     if ($licencas | Where-Object { $_.Status -ne 'Licenciado' }) { Add-Alerta 'Média' 'Licenciamento' 'Windows não ativado' (($licencas.Status) -join ', ') }
 
     # Office: o assessment cobra comprovante de licença, e ativação por método alternativo é achado comum (REQ-011).
-    $office = @(Get-CimInstance SoftwareLicensingProduct -Filter "PartialProductKey IS NOT NULL" -ErrorAction SilentlyContinue |
+    $office = @(Get-CimInstance SoftwareLicensingProduct -Filter "PartialProductKey IS NOT NULL" -OperationTimeoutSec 120 -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match '(?i)office|project|visio' } |
         Select-Object Name, Description, @{ n = 'Status'; e = { $mapaStatus[[int]$_.LicenseStatus] } },
                       @{ n = 'Canal'; e = { if ($_.Description -match 'KMS') { 'KMS' } elseif ($_.Description -match 'MAK') { 'MAK' } elseif ($_.Description -match 'Retail') { 'Varejo' } elseif ($_.Description -match 'OEM') { 'OEM' } else { '' } } },

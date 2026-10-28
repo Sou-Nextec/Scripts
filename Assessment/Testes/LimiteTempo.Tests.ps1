@@ -78,3 +78,31 @@ Describe 'Discos físicos pelo runspace' {
         $discos[0].Disco.HealthStatus | Should Not Match '^\d+$'
     }
 }
+
+Describe 'Consultas WMI com prazo' {
+    It 'define prazo padrão para todo Get-CimInstance' {
+        $linha = Select-String -Path $arquivo -Pattern "PSDefaultParameterValues\['Get-CimInstance:OperationTimeoutSec'\]" -Encoding UTF8
+        @($linha).Count | Should Be 1
+    }
+    It 'o prazo do Get-CimInstance corta uma consulta lenta' {
+        $estourou = $false
+        try { $null = Get-CimInstance Win32_PnPSignedDriver -OperationTimeoutSec 1 -ErrorAction Stop } catch { $estourou = $true }
+        $estourou | Should Be $true
+    }
+
+    function Get-BlocoDaEtapa([string]$Descricao) {
+        $chamada = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Invoke-ComLimiteTempo' -and $n.Extent.Text -match [regex]::Escape($Descricao) }, $true) | Select-Object -First 1
+        [scriptblock]::Create((($chamada.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.ScriptBlockExpressionAst] } | Select-Object -First 1).ScriptBlock.GetScriptBlock()).ToString())
+    }
+
+    It 'Get-HotFix pelo runspace devolve a data de instalação como data' {
+        $lista = @(Invoke-ComLimiteTempo (Get-BlocoDaEtapa 'Lista de atualizações (Get-HotFix)') 'HotFix' 60)
+        $lista.Count | Should BeGreaterThan 0
+        @($lista | Where-Object { $_.InstaladoEm -is [datetime] }).Count | Should BeGreaterThan 0
+    }
+    It 'impressoras pelo runspace devolvem nome e driver' {
+        $lista = @(Invoke-ComLimiteTempo (Get-BlocoDaEtapa 'Impressoras (spooler)') 'Impressoras' 30)
+        $lista.Count | Should BeGreaterThan 0
+        $lista[0].Name | Should Not BeNullOrEmpty
+    }
+}
