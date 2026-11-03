@@ -7,7 +7,8 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($arquivo, [ref]
 
 $nomes = 'Get-ExecutavelDoComando', 'Test-CaminhoDoWindows', 'ConvertTo-CanalLicenca', 'ConvertTo-StatusLicenca',
     'Format-DataEstacao', 'ConvertTo-LinhaCertificado', 'Format-AcessoEntrada', 'Format-PoliticaSenha',
-    'Format-BloqueioTela', 'Get-TamanhoPasta', 'Get-ResumoEventos', 'Format-SaudeDiscos'
+    'Format-BloqueioTela', 'Get-TamanhoPasta', 'Get-ResumoEventos', 'Format-SaudeDiscos', 'Test-PortaCoberta', 'Get-SituacaoPortaFirewall',
+    'Test-ItemLocal', 'Resolve-PastaUsuario', 'Test-CaminhoNaRede', 'Test-CaminhoDentroDe', 'Get-PastasConhecidas', 'Get-PastasUsuarios'
 $achadas = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $nomes }, $true))
 foreach ($f in $achadas) {
     . ([scriptblock]::Create($f.Extent.Text))
@@ -155,6 +156,7 @@ Describe 'Get-TamanhoPasta' {
         $r.Bytes | Should Be 0
         $r.Arquivos | Should Be 0
         $r.Parcial | Should Be $false
+        $r.Disponivel | Should Be $false
     }
     It 'não segue junction e não conta o arquivo do destino' {
         $raiz = New-PastaTemp
@@ -200,22 +202,215 @@ Describe 'Get-TamanhoPasta' {
     }
 }
 
+function New-RegraTeste {
+    param([string[]]$Portas, [string]$Perfis = 'Any', [string]$Acao = 'Allow', [bool]$Restrita = $false)
+    [pscustomobject]@{ Acao = $Acao; Perfis = $Perfis; Portas = $Portas; Restrita = $Restrita }
+}
+
+function New-PerfilTeste {
+    param([string]$Nome = 'Public', [bool]$Filtra = $true, [bool]$PadraoPermite = $false)
+    [pscustomobject]@{ Nome = $Nome; Filtra = $Filtra; PadraoPermite = $PadraoPermite }
+}
+
 Describe 'Format-AcessoEntrada' {
+    $publico = @(New-PerfilTeste 'Public')
     It 'monta as quatro portas no formato esperado' {
-        Format-AcessoEntrada -Portas ([string[]]('5985', '445')) | Should Be 'WinRM 5985: liberada | WMI/RPC 135: bloqueada | SMB 445: liberada | RDP 3389: bloqueada'
+        $regras = @((New-RegraTeste '5985'), (New-RegraTeste '445'))
+        Format-AcessoEntrada $regras $publico | Should Be 'WinRM 5985: liberada | WMI/RPC 135: bloqueada | SMB 445: liberada | RDP 3389: bloqueada'
     }
-    It 'sem nenhuma porta liberada tudo fica bloqueado' {
-        Format-AcessoEntrada -Portas ([string[]]@()) | Should Be 'WinRM 5985: bloqueada | WMI/RPC 135: bloqueada | SMB 445: bloqueada | RDP 3389: bloqueada'
+    It 'sem nenhuma regra tudo fica bloqueado' {
+        Format-AcessoEntrada @() $publico | Should Be 'WinRM 5985: bloqueada | WMI/RPC 135: bloqueada | SMB 445: bloqueada | RDP 3389: bloqueada'
     }
     It 'regra Any libera todos os serviços' {
-        Format-AcessoEntrada -Portas ([string[]]('Any')) | Should Be 'WinRM 5985: liberada | WMI/RPC 135: liberada | SMB 445: liberada | RDP 3389: liberada'
+        Format-AcessoEntrada @(New-RegraTeste 'Any') $publico | Should Be 'WinRM 5985: liberada | WMI/RPC 135: liberada | SMB 445: liberada | RDP 3389: liberada'
     }
     It 'RPC ou RPCEPMap libera o WMI/RPC' {
-        Format-AcessoEntrada -Portas ([string[]]('RPCEPMap', '3389')) | Should Match 'WMI/RPC 135: liberada'
-        Format-AcessoEntrada -Portas ([string[]]('RPCEPMap', '3389')) | Should Match 'RDP 3389: liberada'
+        $regras = @((New-RegraTeste 'RPCEPMap'), (New-RegraTeste '3389'))
+        Format-AcessoEntrada $regras $publico | Should Match 'WMI/RPC 135: liberada'
+        Format-AcessoEntrada $regras $publico | Should Match 'RDP 3389: liberada'
+    }
+    It 'faixa de portas cobre a porta do serviço' {
+        Format-AcessoEntrada @(New-RegraTeste '5000-6000') $publico | Should Match 'WinRM 5985: liberada'
+        Format-AcessoEntrada @(New-RegraTeste '5000-5100') $publico | Should Match 'WinRM 5985: bloqueada'
     }
     It 'valor nulo vira N/D' {
-        Format-AcessoEntrada -Portas $null | Should Be 'N/D'
+        Format-AcessoEntrada $null $null | Should Be 'N/D'
+        Format-AcessoEntrada @() @() | Should Be 'N/D'
+    }
+    It 'regra só do perfil Domain não libera quem está em rede Public' {
+        Format-AcessoEntrada @(New-RegraTeste '5985' 'Domain') $publico | Should Match 'WinRM 5985: bloqueada'
+        Format-AcessoEntrada @(New-RegraTeste '5985' 'Domain, Private') @(New-PerfilTeste 'Private') | Should Match 'WinRM 5985: liberada'
+    }
+    It 'regra limitada a algumas origens sai como restrita, sem alertar bloqueio' {
+        Format-AcessoEntrada @(New-RegraTeste '5985' 'Any' 'Allow' $true) $publico | Should Match 'WinRM 5985: restrita'
+    }
+    It 'regra de bloqueio vence a de permissão' {
+        $regras = @((New-RegraTeste '445'), (New-RegraTeste '445' 'Any' 'Block'))
+        Format-AcessoEntrada $regras $publico | Should Match 'SMB 445: bloqueada'
+    }
+    It 'bloqueio limitado a algumas origens deixa a porta restrita' {
+        $regras = @((New-RegraTeste '445'), (New-RegraTeste '445' 'Any' 'Block' $true))
+        Format-AcessoEntrada $regras $publico | Should Match 'SMB 445: restrita'
+    }
+    It 'com duas redes ativas vale a mais aberta' {
+        $regras = @((New-RegraTeste '3389' 'Private'), (New-RegraTeste '3389' 'Public' 'Block'))
+        Format-AcessoEntrada $regras @((New-PerfilTeste 'Public'), (New-PerfilTeste 'Private')) | Should Match 'RDP 3389: liberada'
+    }
+    It 'firewall desligado no perfil ativo não bloqueia nada' {
+        Format-AcessoEntrada @() @(New-PerfilTeste 'Public' $false) | Should Match 'SMB 445: liberada'
+    }
+    It 'padrão de entrada Allow libera, mas regra de bloqueio ainda vence' {
+        $aberto = @(New-PerfilTeste 'Public' $true $true)
+        Format-AcessoEntrada @() $aberto | Should Match 'SMB 445: liberada'
+        Format-AcessoEntrada @(New-RegraTeste '445' 'Any' 'Block') $aberto | Should Match 'SMB 445: bloqueada'
+    }
+}
+
+Describe 'Test-ItemLocal' {
+    # Atributos lidos de uma pasta real do OneDrive.
+    It 'conta arquivo já baixado, que também tem ReparsePoint' {
+        Test-ItemLocal ([int]([IO.FileAttributes]'Archive, ReparsePoint')) '' | Should Be $true
+        Test-ItemLocal 525344 '' | Should Be $true
+    }
+    It 'não conta arquivo só na nuvem' {
+        Test-ItemLocal 4199968 '' | Should Be $false
+    }
+    It 'entra na pasta do OneDrive, que não é atalho' {
+        Test-ItemLocal 525363 '' | Should Be $true
+    }
+    It 'não entra em pasta ainda não baixada' {
+        Test-ItemLocal (0x40000 -bor 0x400 -bor 0x10) '' | Should Be $false
+    }
+    It 'não segue junction nem link simbólico' {
+        Test-ItemLocal ([int]([IO.FileAttributes]'Directory, ReparsePoint')) 'Junction' | Should Be $false
+        Test-ItemLocal ([int]([IO.FileAttributes]'Directory, ReparsePoint')) 'SymbolicLink' | Should Be $false
+    }
+}
+
+Describe 'Resolve-PastaUsuario' {
+    It 'troca %USERPROFILE% pelo perfil do dono, não pelo de quem roda a coleta' {
+        Resolve-PastaUsuario '%USERPROFILE%\Documents' 'C:\Users\ana' 'Documents' | Should Be 'C:\Users\ana\Documents'
+    }
+    It 'sem valor gravado usa o padrão' {
+        Resolve-PastaUsuario '' 'C:\Users\ana' 'Downloads' | Should Be 'C:\Users\ana\Downloads'
+    }
+    It 'usa as variáveis do próprio usuário' {
+        Resolve-PastaUsuario '%OneDrive%\Desktop' 'C:\Users\ana' 'Desktop' @{ OneDrive = 'C:\Users\ana\OneDrive - Org' } | Should Be 'C:\Users\ana\OneDrive - Org\Desktop'
+    }
+    It 'caminho absoluto fica como está' {
+        Resolve-PastaUsuario 'D:\Dados\Docs' 'C:\Users\ana' 'Documents' | Should Be 'D:\Dados\Docs'
+    }
+    It 'variável desconhecida devolve nulo, sem inventar caminho' {
+        Resolve-PastaUsuario '%DESCONHECIDA%\Docs' 'C:\Users\ana' 'Documents' | Should Be $null
+    }
+    It 'perfil com cifrão no nome não quebra a troca' {
+        Resolve-PastaUsuario '%USERPROFILE%\Docs' 'C:\Users\a$1' 'Documents' | Should Be 'C:\Users\a$1\Docs'
+    }
+}
+
+Describe 'Test-CaminhoNaRede e Test-CaminhoDentroDe' {
+    It 'UNC é rede; caminho sem unidade válida não é' {
+        Test-CaminhoNaRede '\\servidor\pasta' | Should Be $true
+        Test-CaminhoNaRede 'C:\Users' | Should Be $false
+    }
+    It 'reconhece a mesma pasta e a subpasta, sem confundir prefixo' {
+        Test-CaminhoDentroDe 'C:\A\Docs' 'c:\a\docs\' | Should Be $true
+        Test-CaminhoDentroDe 'C:\A\Docs\Sub' 'C:\A\Docs' | Should Be $true
+        Test-CaminhoDentroDe 'C:\A\Docs2' 'C:\A\Docs' | Should Be $false
+    }
+}
+
+Describe 'Get-PastasUsuarios' {
+    function New-PerfilRedirecionado {
+        # Hive de mentira em HKCU: a função lê a mesma estrutura de HKEY_USERS\<SID>.
+        param([string]$Pasta, [hashtable]$Valores)
+        $raiz = "HKCU:\Software\NextecTesteColeta_$([guid]::NewGuid().ToString('N'))"
+        $chave = "$raiz\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+        [void](New-Item -Path $chave -Force)
+        foreach ($n in $Valores.Keys) { [void](New-ItemProperty -Path $chave -Name $n -Value $Valores[$n] -PropertyType ExpandString -Force) }
+        [pscustomobject]@{ Usuario = 'ana'; Pasta = $Pasta; Raiz = $raiz; Carregado = $true }
+    }
+    It 'mede a pasta redirecionada, não o caminho padrão' {
+        $perfil = New-PastaTemp; $destino = New-PastaTemp; $p = $null
+        try {
+            New-ArquivoComBytes (Join-Path $destino 'a.bin') 1000
+            New-ArquivoComBytes (Join-Path $perfil 'Documents\velho.bin') 10
+            $p = New-PerfilRedirecionado $perfil @{ Personal = $destino }
+            $r = @(Get-PastasUsuarios $p)
+            $r.Count | Should Be 1
+            $r[0].Arquivos | Should Be 1
+            $r[0].Observacao | Should Match 'Documentos em '
+        } finally {
+            if ($p) { Remove-Item -LiteralPath $p.Raiz -Recurse -Force -ErrorAction SilentlyContinue }
+            Remove-Item -LiteralPath $perfil, $destino -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    It 'expande %USERPROFILE% para o dono do perfil' {
+        $perfil = New-PastaTemp; $p = $null
+        try {
+            New-ArquivoComBytes (Join-Path $perfil 'OneDrive - Org\Desktop\a.bin') 1000
+            $p = New-PerfilRedirecionado $perfil @{ Desktop = '%USERPROFILE%\OneDrive - Org\Desktop' }
+            $r = @(Get-PastasUsuarios $p)
+            $r[0].Arquivos | Should Be 1
+        } finally {
+            if ($p) { Remove-Item -LiteralPath $p.Raiz -Recurse -Force -ErrorAction SilentlyContinue }
+            Remove-Item -LiteralPath $perfil -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    It 'destino que não abre aparece como indisponível, em vez de sumir como pasta vazia' {
+        $perfil = New-PastaTemp; $p = $null
+        try {
+            $p = New-PerfilRedirecionado $perfil @{ Personal = (Join-Path $perfil 'naoexiste') }
+            $r = @(Get-PastasUsuarios $p)
+            $r.Count | Should Be 1
+            $r[0].TotalGB | Should Be 0
+            $r[0].Observacao | Should Match 'Documentos: indisponível'
+        } finally {
+            if ($p) { Remove-Item -LiteralPath $p.Raiz -Recurse -Force -ErrorAction SilentlyContinue }
+            Remove-Item -LiteralPath $perfil -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    It 'pasta na rede não é varrida nem somada' {
+        $perfil = New-PastaTemp; $p = $null
+        try {
+            $p = New-PerfilRedirecionado $perfil @{ Desktop = '\\servidor-inexistente\pasta' }
+            $medida = [Diagnostics.Stopwatch]::StartNew()
+            $r = @(Get-PastasUsuarios $p)
+            ($medida.Elapsed.TotalSeconds -lt 5) | Should Be $true
+            $r[0].Observacao | Should Match 'Área de Trabalho: na rede'
+        } finally {
+            if ($p) { Remove-Item -LiteralPath $p.Raiz -Recurse -Force -ErrorAction SilentlyContinue }
+            Remove-Item -LiteralPath $perfil -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    It 'pasta dentro de outra da lista só conta uma vez' {
+        $perfil = New-PastaTemp; $destino = New-PastaTemp; $p = $null
+        try {
+            New-ArquivoComBytes (Join-Path $destino 'Downloads\a.bin') 1000
+            $p = New-PerfilRedirecionado $perfil @{ Personal = $destino; '{374DE290-123F-4565-9164-39C4925E467B}' = (Join-Path $destino 'Downloads') }
+            $r = @(Get-PastasUsuarios $p)
+            $r[0].Arquivos | Should Be 1
+        } finally {
+            if ($p) { Remove-Item -LiteralPath $p.Raiz -Recurse -Force -ErrorAction SilentlyContinue }
+            Remove-Item -LiteralPath $perfil, $destino -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    It 'usuário não logado: soma padrão e OneDrive, e avisa que não confirmou' {
+        $perfil = New-PastaTemp
+        try {
+            New-ArquivoComBytes (Join-Path $perfil 'Documents\a.bin') 1000
+            New-ArquivoComBytes (Join-Path $perfil 'OneDrive - Org\Documentos\b.bin') 1000
+            $r = @(Get-PastasUsuarios ([pscustomobject]@{ Usuario = 'ana'; Pasta = $perfil; Raiz = 'HKCU:\Software\NextecNaoExiste'; Carregado = $false }))
+            $r[0].Arquivos | Should Be 2
+            $r[0].Observacao | Should Match 'não confirmado'
+        } finally { Remove-Item -LiteralPath $perfil -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    It 'perfil de verdade vazio continua fora da lista' {
+        $perfil = New-PastaTemp
+        try {
+            foreach ($s in 'Desktop', 'Documents', 'Downloads') { [void](New-Item -ItemType Directory -Path (Join-Path $perfil $s)) }
+            @(Get-PastasUsuarios ([pscustomobject]@{ Usuario = 'ana'; Pasta = $perfil; Raiz = 'HKCU:\Software\NextecNaoExiste'; Carregado = $false })).Count | Should Be 0
+        } finally { Remove-Item -LiteralPath $perfil -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
 

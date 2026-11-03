@@ -219,33 +219,81 @@ function Get-CertificadosIcp {
     }
 }
 
+function Test-PortaCoberta {
+    # LocalPort vem como número, faixa (5000-6000), nome (RPC, RPCEPMap) ou Any.
+    param($Portas, [string[]]$Alvos)
+    foreach ($p in @($Portas)) {
+        $texto = "$p"
+        if ($texto -eq 'Any' -or $Alvos -contains $texto) { return $true }
+        if ($texto -match '^(\d+)-(\d+)$') {
+            $de = [int]$Matches[1]; $ate = [int]$Matches[2]
+            foreach ($a in $Alvos) { if ($a -match '^\d+$' -and [int]$a -ge $de -and [int]$a -le $ate) { return $true } }
+        }
+    }
+    $false
+}
+
+function Get-SituacaoPortaFirewall {
+    # Só conta regra do perfil ativo; bloqueio vence permissão. Com mais de uma rede ativa, vale a mais aberta: basta uma deixar entrar.
+    param($Regras, [string[]]$Alvos, $Perfis)
+    $melhor = 'bloqueada'
+    foreach ($perfil in @($Perfis)) {
+        if (-not $perfil.Filtra) { return 'liberada' }
+        $daqui = @($Regras | Where-Object {
+            $nomes = "$($_.Perfis)" -split ',\s*'
+            ($nomes -contains 'Any' -or $nomes -contains $perfil.Nome) -and (Test-PortaCoberta $_.Portas $Alvos)
+        })
+        $bloqueios = @($daqui | Where-Object { $_.Acao -eq 'Block' })
+        if (@($bloqueios | Where-Object { -not $_.Restrita }).Count) { continue }
+        $permissoes = @($daqui | Where-Object { $_.Acao -eq 'Allow' })
+        if (-not $perfil.PadraoPermite -and -not $permissoes.Count) { continue }
+        $paraTodos = $perfil.PadraoPermite -or @($permissoes | Where-Object { -not $_.Restrita }).Count -gt 0
+        if ($paraTodos -and -not $bloqueios.Count) { return 'liberada' }
+        $melhor = 'restrita'
+    }
+    $melhor
+}
+
 function Format-AcessoEntrada {
-    # Responde por que a consulta remota falha: cada serviço tem regra de entrada ativa ou não.
-    param([string[]]$Portas)
-    if ($null -eq $Portas) { return 'N/D' }
+    # Responde por que a consulta remota falha. "restrita": a regra vale só para algumas origens, então a resposta depende de quem consulta.
+    param($Regras, $Perfis)
+    if ($null -eq $Regras -or -not $Perfis) { return 'N/D' }
     $servicos = [ordered]@{
-        'WinRM 5985'  = @('5985', '5986', 'Any')
-        'WMI/RPC 135' = @('RPC', 'RPCEPMap', '135', 'Any')
-        'SMB 445'     = @('445', 'Any')
-        'RDP 3389'    = @('3389', 'Any')
+        'WinRM 5985'  = @('5985', '5986')
+        'WMI/RPC 135' = @('RPC', 'RPCEPMap', '135')
+        'SMB 445'     = @('445')
+        'RDP 3389'    = @('3389')
     }
     @(foreach ($s in $servicos.Keys) {
-        $liberada = @($servicos[$s] | Where-Object { $Portas -contains $_ }).Count -gt 0
-        "${s}: $(if ($liberada) { 'liberada' } else { 'bloqueada' })"
+        "${s}: $(Get-SituacaoPortaFirewall $Regras $servicos[$s] $Perfis)"
     }) -join ' | '
 }
 
-function Get-PortasLiberadas {
-    # Regras efetivas (inclui as de GPO). Exige administrador: fora disso devolve $null e o campo sai N/D.
-    $portas = Invoke-ComLimite {
+function Get-FirewallEntrada {
+    # Regras efetivas (inclui as de GPO) e perfis das redes ativas. Exige administrador: fora disso devolve $null e o campo sai N/D.
+    Invoke-ComLimite {
         $regras = @{}
-        Get-NetFirewallRule -PolicyStore ActiveStore -Direction Inbound -Enabled True -Action Allow -ErrorAction Stop | ForEach-Object { $regras[$_.InstanceID] = $true }
-        Get-NetFirewallPortFilter -PolicyStore ActiveStore -ErrorAction Stop |
-            Where-Object { $regras.ContainsKey($_.InstanceID) -and $_.Protocol -eq 'TCP' } |
-            ForEach-Object { $_.LocalPort } | Select-Object -Unique
-    } 'Regras do firewall' 90 $null
-    if ($null -eq $portas) { return $null }
-    [string[]]@($portas | ForEach-Object { "$_" })
+        Get-NetFirewallRule -PolicyStore ActiveStore -Direction Inbound -Enabled True -ErrorAction Stop | ForEach-Object { $regras[$_.InstanceID] = @{ Acao = "$($_.Action)"; Perfis = "$($_.Profile)" } }
+        $abertas = @{}
+        Get-NetFirewallAddressFilter -PolicyStore ActiveStore -ErrorAction Stop | ForEach-Object {
+            $abertas[$_.InstanceID] = -not @(@($_.RemoteAddress) + @($_.LocalAddress) | Where-Object { "$_" -ne 'Any' }).Count
+        }
+        $lista = @(Get-NetFirewallPortFilter -PolicyStore ActiveStore -ErrorAction Stop |
+            Where-Object { $regras.ContainsKey($_.InstanceID) -and "$($_.Protocol)" -in 'TCP', '6', 'Any' } |
+            ForEach-Object {
+                $r = $regras[$_.InstanceID]
+                # Sem filtro de endereço conhecido, não dá para afirmar que vale para todas as origens.
+                [pscustomobject]@{ Acao = $r.Acao; Perfis = $r.Perfis; Portas = [string[]]@($_.LocalPort | ForEach-Object { "$_" }); Restrita = (-not $abertas[$_.InstanceID]) }
+            })
+        $ativos = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | ForEach-Object {
+            switch ("$($_.NetworkCategory)") { 'DomainAuthenticated' { 'Domain' } 'Private' { 'Private' } default { 'Public' } }
+        })
+        if (-not $ativos.Count) { $ativos = @('Public') }
+        $perfis = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { $ativos -contains "$($_.Name)" } | ForEach-Object {
+            [pscustomobject]@{ Nome = "$($_.Name)"; Filtra = ("$($_.Enabled)" -ne 'False'); PadraoPermite = ("$($_.DefaultInboundAction)" -eq 'Allow') }
+        })
+        [pscustomobject]@{ Regras = $lista; Perfis = $perfis }
+    } 'Regras do firewall' 120 $null
 }
 
 function Get-SituacaoLaps {
@@ -323,12 +371,21 @@ function Get-BloqueioTela {
     $resultado
 }
 
+function Test-ItemLocal {
+    # Arquivo só na nuvem fica de fora, e pasta nessa condição nem é listada (listar baixaria o conteúdo dela).
+    # O ReparsePoint sozinho não basta: no OneDrive, pasta e arquivo já baixados também o têm, sem ser atalho.
+    # Offline 0x1000, RecallOnOpen 0x40000, RecallOnDataAccess 0x400000.
+    param([int]$Atributos, [string]$Vinculo)
+    if ($Vinculo) { return $false }
+    ($Atributos -band 0x441000) -eq 0
+}
+
 function Get-TamanhoPasta {
-    # Soma só metadados: nenhum arquivo é aberto. Atalho de pasta e arquivo que está só na nuvem (reparse, offline) não contam.
+    # Soma só metadados: nenhum arquivo é aberto. Atalho de pasta e o que está só na nuvem não contam.
     param([string]$Caminho, [Diagnostics.Stopwatch]$Relogio, [int]$PrazoSeg = 120)
     $bytes = [int64]0; $arquivos = 0; $parcial = $false
-    if (Test-Path -LiteralPath $Caminho) {
-        $fora = [IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Offline
+    $disponivel = [bool](Test-Path -LiteralPath $Caminho)
+    if ($disponivel) {
         $pilha = New-Object System.Collections.Generic.Stack[string]
         $pilha.Push($Caminho)
         while ($pilha.Count -gt 0) {
@@ -336,34 +393,114 @@ function Get-TamanhoPasta {
             $pasta = $pilha.Pop()
             try {
                 foreach ($i in (New-Object IO.DirectoryInfo $pasta).EnumerateFileSystemInfos()) {
-                    if ($i.Attributes -band $fora) { continue }
-                    if ($i -is [IO.DirectoryInfo]) { $pilha.Push($i.FullName) }
+                    $ehPasta = $i -is [IO.DirectoryInfo]
+                    $vinculo = if ($ehPasta -and ($i.Attributes -band [IO.FileAttributes]::ReparsePoint)) { "$($i.LinkType)" } else { '' }
+                    if (-not (Test-ItemLocal ([int]$i.Attributes) $vinculo)) { continue }
+                    if ($ehPasta) { $pilha.Push($i.FullName) }
                     else { $bytes += $i.Length; $arquivos++ }
                 }
-            } catch { }
+            } catch { if ($pasta -eq $Caminho) { $disponivel = $false } }
         }
     }
-    [pscustomobject]@{ Bytes = $bytes; Arquivos = $arquivos; Parcial = $parcial }
+    [pscustomobject]@{ Bytes = $bytes; Arquivos = $arquivos; Parcial = $parcial; Disponivel = $disponivel }
+}
+
+function Resolve-PastaUsuario {
+    # Recebe o valor como está gravado (%USERPROFILE%\Documents). Expandir pelo ambiente do processo daria a pasta de quem roda a coleta (SYSTEM).
+    # Devolve $null se sobrar variável sem valor conhecido.
+    param([string]$Bruto, [string]$Perfil, [string]$Padrao, [hashtable]$Variaveis = @{})
+    if (-not $Bruto) { return (Join-Path $Perfil $Padrao) }
+    $caminho = [regex]::Replace($Bruto, '%USERPROFILE%', $Perfil.Replace('$', '$$'), 'IgnoreCase')
+    foreach ($n in $Variaveis.Keys) {
+        $caminho = [regex]::Replace($caminho, [regex]::Escape("%$n%"), "$($Variaveis[$n])".Replace('$', '$$'), 'IgnoreCase')
+    }
+    if ($caminho -match '%[^%\\]+%') { return $null }
+    $caminho
+}
+
+function Test-CaminhoNaRede {
+    param([string]$Caminho)
+    if ($Caminho -match '^\\\\') { return $true }
+    if ($Caminho -notmatch '^[A-Za-z]:') { return $false }
+    try { "$((New-Object IO.DriveInfo $Caminho.Substring(0, 1)).DriveType)" -eq 'Network' } catch { $false }
+}
+
+function Test-CaminhoDentroDe {
+    param([string]$Caminho, [string]$Pai)
+    $c = $Caminho.TrimEnd('\'); $p = $Pai.TrimEnd('\')
+    $c -ieq $p -or $c.StartsWith("$p\", [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-PastasConhecidas {
+    # Só a hive carregada diz para onde a pasta foi. Sem ela, vale o padrão mais as pastas do OneDrive no perfil, o redirecionamento mais comum.
+    param($Perfil)
+    $chave = $null; $variaveis = @{}
+    if ($Perfil.Carregado) {
+        $chave = Get-Item -LiteralPath "$($Perfil.Raiz)\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders" -ErrorAction SilentlyContinue
+        foreach ($sub in 'Environment', 'Volatile Environment') {
+            $k = Get-Item -LiteralPath "$($Perfil.Raiz)\$sub" -ErrorAction SilentlyContinue
+            if (-not $k) { continue }
+            foreach ($n in 'OneDrive', 'OneDriveCommercial', 'OneDriveConsumer', 'HOMEDRIVE', 'HOMEPATH', 'HOMESHARE') {
+                $v = $k.GetValue($n, $null, 'DoNotExpandEnvironmentNames')
+                if ($v) { $variaveis[$n] = "$v" }
+            }
+        }
+    }
+    $nuvens = @(Get-ChildItem -LiteralPath $Perfil.Pasta -Directory -Filter 'OneDrive*' -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    foreach ($d in @(
+        @{ Nome = 'Área de Trabalho'; Valores = @('Desktop'); Padrao = 'Desktop'; NaNuvem = @('Desktop', 'Área de Trabalho') }
+        @{ Nome = 'Documentos'; Valores = @('Personal', '{F42EE2D3-909F-4907-8871-4C22FC0BF756}'); Padrao = 'Documents'; NaNuvem = @('Documents', 'Documentos') }
+        @{ Nome = 'Downloads'; Valores = @('{374DE290-123F-4565-9164-39C4925E467B}'); Padrao = 'Downloads'; NaNuvem = @('Downloads') }
+    )) {
+        $padrao = Join-Path $Perfil.Pasta $d.Padrao
+        if ($chave) {
+            $bruto = @($d.Valores | ForEach-Object { $chave.GetValue($_, $null, 'DoNotExpandEnvironmentNames') } | Where-Object { $_ }) | Select-Object -First 1
+            $real = Resolve-PastaUsuario "$bruto" $Perfil.Pasta $d.Padrao $variaveis
+            [pscustomobject]@{ Nome = $d.Nome; Caminhos = @($real); Redirecionada = ($real -and -not (Test-CaminhoDentroDe $real $padrao)) }
+        } else {
+            $achadas = @(foreach ($n in $nuvens) { foreach ($s in $d.NaNuvem) { $c = Join-Path $n $s; if (Test-Path -LiteralPath $c) { $c } } })
+            [pscustomobject]@{ Nome = $d.Nome; Caminhos = @(@($padrao) + $achadas); Redirecionada = $false }
+        }
+    }
 }
 
 function Get-PastasUsuarios {
     param($Perfis)
     $relogio = [Diagnostics.Stopwatch]::StartNew()
     foreach ($p in @($Perfis)) {
-        $d = Get-TamanhoPasta (Join-Path $p.Pasta 'Desktop') $relogio
-        $o = Get-TamanhoPasta (Join-Path $p.Pasta 'Documents') $relogio
-        $w = Get-TamanhoPasta (Join-Path $p.Pasta 'Downloads') $relogio
-        $total = $d.Bytes + $o.Bytes + $w.Bytes
-        if ($total -eq 0 -and -not ($d.Parcial -or $o.Parcial -or $w.Parcial)) { continue }
+        $pastas = @(Get-PastasConhecidas $p)
+        $todos = @($pastas | ForEach-Object { $_.Caminhos } | Where-Object { $_ })
+        $medidos = New-Object System.Collections.Generic.List[string]
+        $notas = New-Object System.Collections.Generic.List[string]
+        $gb = @{}; $total = [int64]0; $arquivos = 0; $parcial = $false; $revisar = $false
+        foreach ($pasta in $pastas) {
+            $bytes = [int64]0
+            foreach ($c in @($pasta.Caminhos)) {
+                if (-not $c) { $notas.Add("$($pasta.Nome): caminho não resolvido"); $revisar = $true; continue }
+                if (Test-CaminhoNaRede $c) { $notas.Add("$($pasta.Nome): na rede, fora da conta"); $revisar = $true; continue }
+                # Mesma pasta, ou pasta dentro de outra da lista, só conta uma vez.
+                if ($medidos -contains $c -or @($todos | Where-Object { $_ -ine $c -and (Test-CaminhoDentroDe $c $_) }).Count) { continue }
+                $medidos.Add($c)
+                $m = Get-TamanhoPasta $c $relogio
+                $bytes += $m.Bytes; $arquivos += $m.Arquivos
+                if ($m.Parcial) { $parcial = $true }
+                if (-not $m.Disponivel) { $notas.Add("$($pasta.Nome): indisponível"); $revisar = $true }
+                elseif ($pasta.Redirecionada) { $notas.Add("$($pasta.Nome) em $c") }
+            }
+            $gb[$pasta.Nome] = $bytes; $total += $bytes
+        }
+        if ($total -eq 0 -and -not $parcial -and -not $revisar) { continue }
+        if (-not $p.Carregado) { $notas.Add('Usuário não logado: redirecionamento não confirmado') }
         [pscustomobject]@{
             Usuario         = $p.Usuario
-            AreaTrabalhoGB  = [math]::Round($d.Bytes / 1GB, 2)
-            DocumentosGB    = [math]::Round($o.Bytes / 1GB, 2)
-            DownloadsGB     = [math]::Round($w.Bytes / 1GB, 2)
+            AreaTrabalhoGB  = [math]::Round($gb['Área de Trabalho'] / 1GB, 2)
+            DocumentosGB    = [math]::Round($gb['Documentos'] / 1GB, 2)
+            DownloadsGB     = [math]::Round($gb['Downloads'] / 1GB, 2)
             TotalGB         = [math]::Round($total / 1GB, 2)
-            Arquivos        = $d.Arquivos + $o.Arquivos + $w.Arquivos
-            Parcial         = ($d.Parcial -or $o.Parcial -or $w.Parcial)
+            Arquivos        = $arquivos
+            Parcial         = $parcial
             OneDriveNoPerfil = [bool](Get-ChildItem -LiteralPath $p.Pasta -Directory -Filter 'OneDrive*' -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
+            Observacao      = ($notas.ToArray() -join '; ')
         }
     }
 }
@@ -638,7 +775,7 @@ try {
     $driversToken = (@(@($softwares | Where-Object { $_.Nome -match '(?i)SafeNet|SafeSign|eToken|Gemalto|Thales|Aladdin|StarSign|WatchData|Watchkey|ePass|Feitian|Pronova|Bit4id|Athena|\bToken\b' } | ForEach-Object { $_.Nome }) + $leitoras) | Select-Object -Unique) -join '; '
 
     # Segurança
-    $acessoEntrada = Invoke-Seguro { Format-AcessoEntrada (Get-PortasLiberadas) } 'N/D'
+    $acessoEntrada = Invoke-Seguro { $fw = Get-FirewallEntrada; if ($fw) { Format-AcessoEntrada $fw.Regras $fw.Perfis } else { 'N/D' } } 'N/D'
     $winrm = Invoke-Seguro {
         $s = Get-Service WinRM -ErrorAction Stop
         $ouvinte = @(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WSMAN\Listener' -ErrorAction SilentlyContinue).Count -gt 0

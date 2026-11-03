@@ -614,7 +614,7 @@ function New-EstacoesHtml {
     $listas = @(
         @{ Titulo = 'Certificados nas estações'; Lista = 'Certificados'; Colunas = 'Computador', 'Titular', 'Tipo', 'ValidoAte', 'DiasRestantes', 'Usuario' }
         @{ Titulo = 'Pastas compartilhadas nas estações'; Lista = 'Compartilhamentos'; Colunas = 'Computador', 'Compartilhamento', 'Caminho', 'AcessoTodos' }
-        @{ Titulo = 'Dados locais por usuário'; Lista = 'PastasUsuario'; Colunas = 'Computador', 'Usuario', 'AreaTrabalhoGB', 'DocumentosGB', 'DownloadsGB', 'TotalGB', 'OneDriveNoPerfil' }
+        @{ Titulo = 'Dados locais por usuário'; Lista = 'PastasUsuario'; Colunas = 'Computador', 'Usuario', 'AreaTrabalhoGB', 'DocumentosGB', 'DownloadsGB', 'TotalGB', 'OneDriveNoPerfil', 'Observacao' }
         @{ Titulo = 'Discos'; Lista = 'Discos'; Colunas = @($null) }
         @{ Titulo = 'Eventos mais frequentes (30 dias)'; Lista = 'Eventos'; Colunas = 'Computador', 'Origem', 'Id', 'Nivel', 'Quantidade', 'Ultimo', 'Mensagem' }
     )
