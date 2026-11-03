@@ -71,7 +71,7 @@ New-Item -ItemType Directory -Path $netlogon -Force | Out-Null
 $origem = Split-Path -Parent $MyInvocation.MyCommand.Path
 foreach ($arquivo in 'Nextec-Assessment-Estacao.ps1', 'Instalar-Assessment-Estacao.ps1') {
     $fonte = Join-Path $origem $arquivo
-    if (Test-Path $fonte) { Copy-Item $fonte -Destination $netlogon -Force }
+    if (Test-Path $fonte) { Copy-Item $fonte -Destination $netlogon -Force; Unblock-File -LiteralPath (Join-Path $netlogon $arquivo) }
     else { Write-Warning "Não encontrei $arquivo ao lado deste script; copie manualmente para $netlogon" }
 }
 

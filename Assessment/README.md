@@ -26,7 +26,7 @@ Quando WinRM/DCOM estão bloqueados nas estações, o inventário remoto não fu
 
 1. No controlador de domínio, como administrador, rode `Preparar-Compartilhamento-Assessment.ps1` (cria `Assessment$`, as permissões e copia os scripts para `NETLOGON\Nextec`). As estações só conseguem gravar arquivos novos; não listam nem leem o que existe.
 2. Crie uma GPO ligada à OU dos computadores: Configuração do Computador, Políticas, Configurações do Windows, Scripts, Inicialização, aba Scripts do PowerShell. Nome do script: `\\<dominio>\NETLOGON\Nextec\Instalar-Assessment-Estacao.ps1`. Parâmetros: `-Destino "\\<servidor>\Assessment$\Estacoes"` (o passo 1 imprime os dois valores prontos).
-3. Na inicialização, cada máquina registra a tarefa `Nextec - Assessment da estacao` (SYSTEM, oculta, na inicialização e todo dia por volta de 12:15) e coleta uma primeira vez. Sem janela e sem intervenção.
+3. Na inicialização, cada máquina registra a tarefa `Nextec - Assessment da estacao` (SYSTEM, visível no Agendador, na inicialização e todo dia por volta de 12:15) e coleta uma primeira vez. Sem janela e sem intervenção.
 4. Rode o `Nextec-Assessment-v2.ps1` no servidor como de costume: ele acha `Assessment$` sozinho (ou use `-PastaEstacoes`) e usa os arquivos de até 7 dias (`-DiasValidadeColetaLocal`). Estações sem arquivo recente seguem pela consulta remota.
 
 Para desfazer: `Instalar-Assessment-Estacao.ps1 -Destino x -Remover`, ou retire a GPO e remova a tarefa.
@@ -44,12 +44,14 @@ Para desfazer: `Instalar-Assessment-Estacao.ps1 -Destino x -Remover`, ou retire 
 | `-SemAD` | Não coleta o Active Directory. |
 | `-SemConsultaInternet` | Nenhuma consulta pela internet. |
 | `-PedirCredencial` | Abre o login e senha do domínio logo no início. |
+| `-ComandosExternos` | Liga `net view` (compartilhamentos dos equipamentos da rede), `net accounts` e `vssadmin`. Desligado por padrão. |
+| `-ConsultasWeb` | Liga `ipinfo.io` (cidade do IP público), `api.macvendors.com` e o download da base IEEE. Desligado por padrão. |
 
 Todos os parâmetros e o que é coletado estão no próprio cabeçalho do script (`Get-Help .\Nextec-Assessment-v2.ps1 -Full`).
 
 ## Confidencialidade
 
-O material contém nomes de usuário, IPs, softwares e configurações do cliente. Trate a pasta e o `.zip` como confidenciais. O script não altera nada no cliente: grava apenas a pasta de saída e um cache de fabricantes em `%LOCALAPPDATA%\Nextec-Assessment`. As únicas consultas externas são a base de fabricantes da IEEE, o `api.macvendors.com` (só o prefixo do MAC) e o `ipinfo.io`; `-SemConsultaInternet` desliga todas.
+O material contém nomes de usuário, IPs, softwares e configurações do cliente. Trate a pasta e o `.zip` como confidenciais. O script não altera nada no cliente: grava apenas a pasta de saída e um cache de fabricantes em `%LOCALAPPDATA%\Nextec-Assessment`. Por padrão, a única consulta externa é por DNS, para o IP público e a operadora (`ns1.google.com` e `asn.cymru.com`). Com `-ConsultasWeb` entram a base de fabricantes da IEEE, o `api.macvendors.com` (só o prefixo do MAC) e o `ipinfo.io`. `-SemConsultaInternet` desliga todas.
 
 ## Verificação de integridade
 
@@ -66,10 +68,12 @@ SHA-256 do `Nextec-Assessment-v2.ps1` da tag `assessment-v2.8`:
 ## Notas
 
 - Salve o `.ps1` sempre em UTF-8 **com BOM** (o `.gitattributes` desta pasta impede o Git de converter). Sem o BOM, os acentos quebram no PowerShell 5.1.
-- Clientes com EDR podem alertar sobre o download e a execução de um `.ps1` e sobre a varredura de portas. Avise a equipe de segurança antes.
+- Clientes com EDR podem alertar sobre o download e a execução de um `.ps1` e sobre a varredura de portas. Avise a equipe de segurança antes. O script não usa ofuscação nem desliga proteção; o que resolve de fato é assinatura Authenticode mais liberação por hash ou pela pasta. Enquanto não houver assinatura, o `.cmd` segue com `-ExecutionPolicy Bypass`.
+- O coletor roda como SYSTEM: dados por usuário (conta do Office, unidades mapeadas, bloqueio de tela) só saem de quem está logado na hora, e certificado A3 só aparece se estiver registrado no repositório do Windows. Novas colunas só existem nas máquinas com o coletor 2.0; para atualizar, rode de novo o `Preparar-Compartilhamento-Assessment.ps1`.
 
 ## Histórico
 
+- **v2.12**: coletor da estação 2.0: ativação do Windows e do Office, certificados ICP-Brasil e drivers de token, firewall, WinRM, SMB, administrador local, LAPS, política de senha, compartilhamentos, USB, bloqueio de tela, tarefas, serviços e inicialização fora do padrão, logons com falha, IP e Wi-Fi, impressoras, scanners, unidades mapeadas, saúde de disco, telas azuis, dados locais e BIOS, com CSVs `estacoes_*`, alertas e seção no relatório. Antivírus: base de fabricantes em texto puro (sem base64 e gzip), `net`, `vssadmin` e consultas web só por parâmetro, IP público por DNS, tarefa da estação sem janela oculta forçada e com `RemoteSigned`. Correções: inventário paralelo com prazo; firewall lê a política efetiva; `ESET` e `AVG` não casam mais "Reset" nem nomes parciais; suporte por edição (LTSC, Enterprise e Education); TPM sem leitura deixa de sair vazio; arquivo de estação validado antes de entrar em conta e no HTML; `Get-LocalGroupMember` com SID órfão não aborta a etapa; alerta de "nenhum backup" volta a disparar; ausência de monitor deixa de contar como erro; Office Click-to-Run aparece no resumo.
 - **v2.11**: toda consulta WMI/CIM tem prazo (60 s por padrão, 120 s para licenciamento), inclusive nas estações; Get-HotFix, BitLocker e impressoras (spooler) consultados com limite. WMI corrompido ou spooler travado faz a etapa falhar com aviso no log, sem parar a coleta.
 - **v2.10**: fim das travas: Wi-Fi só consulta o netsh se houver placa Wi-Fi e serviço WLAN rodando, cada netsh roda uma vez e com limite de tempo; netsh, vssadmin, auditpol, net accounts, w32tm, omreport, dcdiag e repadmin passam a ter limite de tempo (se estourar, o processo é encerrado e o arquivo registra "sem resposta"); Defender, Windows Server Backup, TPM e discos físicos/SMART consultados com limite; inventário de software das estações via WinRM com tempo máximo de conexão e consulta; testes em `Testes\LimiteTempo.Tests.ps1` (Pester).
 - **v2.9**: coleta local das estações por GPO (`Nextec-Assessment-Estacao.ps1`, `Instalar-Assessment-Estacao.ps1`, `Preparar-Compartilhamento-Assessment.ps1`) e leitura no assessment; alerta de estação sem resposta deixa de dizer "negou acesso" quando foi tempo esgotado; pré-validação só marca OK quando todas as estações testadas respondem; cobertura de antivírus informa quantos computadores ficaram sem inventário; saúde de disco de controladora RAID que esconde o SMART sai como "não lida" (antes saía 0% e 0°C); Windows Server Backup sem sucesso aparece como "nenhum backup concluído".
