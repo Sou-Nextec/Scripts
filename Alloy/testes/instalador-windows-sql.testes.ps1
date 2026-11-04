@@ -32,6 +32,12 @@ if (-not $funcao) { throw 'Função Get-SqlErrorLogPaths não encontrada no inst
 . ([scriptblock]::Create($funcao.Extent.Text))
 
 Write-Host 'Parte 1: caminho do ERRORLOG no registro'
+# No PowerShell 7 em Linux (job do CI) não há registro: a parte 1 roda no
+# job do Windows PowerShell 5.1, que é onde o instalador roda de verdade.
+$semRegistro = (Test-Path variable:IsWindows) -and -not $IsWindows
+if ($semRegistro) {
+    Write-Host '  pulado: sem registro do Windows neste sistema'
+} else {
 $raiz = "HKCU:\Software\NextecTesteSql\$([guid]::NewGuid().ToString('N'))"
 $pasta = Join-Path ([System.IO.Path]::GetTempPath()) ("nextec-sql-" + [guid]::NewGuid().ToString('N'))
 try {
@@ -64,6 +70,7 @@ try {
 } finally {
     Remove-Item -LiteralPath (Split-Path $raiz) -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $pasta -Recurse -Force -ErrorAction SilentlyContinue
+}
 }
 
 Write-Host 'Parte 2: filtro dos eventos de serviço'
