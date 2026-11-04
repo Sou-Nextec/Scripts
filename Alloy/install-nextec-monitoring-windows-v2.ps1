@@ -4040,7 +4040,9 @@ function Get-SqlErrorLogPaths {
         }
     }
 
-    return @($resultado)
+    # ToArray e não @($resultado): no Windows PowerShell 5.1, @() sobre essa
+    # List lança "Os tipos de argumento não correspondem".
+    return $resultado.ToArray()
 }
 
 function Get-FirebirdDetection {
