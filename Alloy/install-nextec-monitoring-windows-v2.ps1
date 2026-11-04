@@ -3990,9 +3990,14 @@ function Get-SqlServerDetection {
 
 function Get-SqlErrorLogPaths {
     # Caminho do ERRORLOG de cada instância, lido do argumento de inicialização
-    # "-e" do serviço (registro). Só devolve arquivo que existe.
+    # "-e" do serviço (registro). Só devolve arquivo que existe. RaizRegistro
+    # só muda nos testes.
+    param([string]$RaizRegistro = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server")
+
     $resultado = New-Object System.Collections.Generic.List[object]
-    $nomes = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL"
+    $nomes = Join-Path $RaizRegistro "Instance Names\SQL"
+    # Propriedades que o PowerShell acrescenta ao item do registro (não são instâncias).
+    $propriedadesDoPowerShell = @("PSPath", "PSParentPath", "PSChildName", "PSDrive", "PSProvider")
 
     if (-not (Test-Path -LiteralPath $nomes)) {
         return @()
@@ -4005,11 +4010,11 @@ function Get-SqlErrorLogPaths {
     }
 
     foreach ($propriedade in $item.PSObject.Properties) {
-        if ($propriedade.Name -match "^PS") {
+        if ($propriedadesDoPowerShell -contains $propriedade.Name) {
             continue
         }
 
-        $chave = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\{0}\MSSQLServer\Parameters" -f [string]$propriedade.Value
+        $chave = Join-Path $RaizRegistro ("{0}\MSSQLServer\Parameters" -f [string]$propriedade.Value)
 
         if (-not (Test-Path -LiteralPath $chave)) {
             continue
@@ -7937,14 +7942,6 @@ function New-AlloyConfiguration {
             [void]$builder.AppendLine("    drop  = true")
             [void]$builder.AppendLine("  }")
             [void]$builder.AppendLine("")
-            if ($stream.PSObject.Properties["DropSelector"]) {
-                [void]$builder.AppendLine("  stage.match {")
-                [void]$builder.AppendLine(('    selector = "{0}"' -f [string]$stream.DropSelector))
-                [void]$builder.AppendLine('    action   = "drop"')
-                [void]$builder.AppendLine("  }")
-                [void]$builder.AppendLine("")
-            }
-
             [void]$builder.AppendLine("  stage.static_labels {")
             [void]$builder.AppendLine("    values = {")
             [void]$builder.AppendLine(('      cliente     = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Cliente)))
@@ -7963,6 +7960,16 @@ function New-AlloyConfiguration {
             [void]$builder.AppendLine(('      local       = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Local)))
             [void]$builder.AppendLine("    }")
             [void]$builder.AppendLine("  }")
+
+            # Depois do static_labels: o seletor usa o rótulo canal, que o
+            # loki.source.windowsevent não traz e só existe a partir daqui.
+            if ($stream.PSObject.Properties["DropSelector"]) {
+                [void]$builder.AppendLine("")
+                [void]$builder.AppendLine("  stage.match {")
+                [void]$builder.AppendLine(('    selector = "{0}"' -f [string]$stream.DropSelector))
+                [void]$builder.AppendLine('    action   = "drop"')
+                [void]$builder.AppendLine("  }")
+            }
             [void]$builder.AppendLine("}")
             [void]$builder.AppendLine("")
 
