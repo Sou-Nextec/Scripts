@@ -2472,6 +2472,9 @@ class ModuloVirtualizacao:
 #   SATA/SAS  SMART geral, temperatura, setores realocados, pendentes e
 #             incorrigíveis (atributos 5, 197 e 198, somados em erros de
 #             mídia) e vida útil usada (atributo 177, 231 ou 233)
+# Discos atrás de controladora RAID (Dell PERC, LSI/Broadcom MegaRAID e o que
+# mais o "smartctl --scan-open" listar com "-d tipo,N") são lidos um a um; o
+# volume lógico que a controladora apresenta fica de fora, porque não tem SMART.
 # Discos virtuais (VirtIO, QEMU, VMware, Hyper-V, Xen) e dispositivos lógicos
 # (dm-, loop, zram, md) ficam de fora. Um disco sem resposta não apaga os
 # outros: o erro vai para o log de eventos e a rodada segue.
@@ -2571,11 +2574,11 @@ class LeituraSmart:
         self.erro = erro
 
 
-def rodar_smartctl(binario, nome):
+def rodar_smartctl(binario, caminho, tipo=None):
     """smartctl -j -a; -n standby não acorda HD parado (volta com espera=True)."""
+    comando = [binario, "-j", "-a", "-n", "standby"] + (["-d", tipo] if tipo else []) + [caminho]
     try:
-        saida = subprocess.run([binario, "-j", "-a", "-n", "standby", f"/dev/{nome}"],
-                               capture_output=True, text=True, timeout=TIMEOUT_SMARTCTL)
+        saida = subprocess.run(comando, capture_output=True, text=True, timeout=TIMEOUT_SMARTCTL)
     except subprocess.TimeoutExpired:
         return LeituraSmart(erro=f"smartctl sem resposta em {TIMEOUT_SMARTCTL} s")
     except OSError as erro:
@@ -2595,6 +2598,48 @@ def interpretar_smartctl(codigo, texto):
             return LeituraSmart(dados, espera=True)
         return LeituraSmart(dados, erro=(mensagens or f"smartctl terminou com código {codigo}")[:300])
     return LeituraSmart(dados)
+
+
+def interpretar_varredura(texto):
+    """Discos atrás de controladora no "smartctl --scan-open -j": [(rótulo, caminho, tipo)].
+
+    Só entram os tipos com número do disco na controladora (megaraid,0;
+    cciss,1; areca,1/1): os discos comuns já vêm do /sys/block. O rótulo é o
+    nome que o próprio smartctl dá (megaraid_disk_00); com mais de uma
+    controladora, o rótulo repetido ganha o barramento no fim.
+    """
+    try:
+        dispositivos = (json.loads(texto) or {}).get("devices") or []
+    except ValueError:
+        return []
+    achados = []
+    for item in dispositivos:
+        caminho, tipo = str(item.get("name", "")), str(item.get("type", ""))
+        if not caminho or "," not in tipo or item.get("open_error"):
+            continue
+        casamento = re.search(r"\[([^\]]+)\]", str(item.get("info_name", "")))
+        base = casamento.group(1) if casamento else f"{os.path.basename(caminho)}_{tipo}"
+        achados.append([re.sub(r"[^A-Za-z0-9_.-]+", "_", base).strip("_"), caminho, tipo])
+    vistos = {}
+    for item in achados:
+        vistos[item[0]] = vistos.get(item[0], 0) + 1
+    for item in achados:
+        if vistos[item[0]] > 1:
+            item[0] = f"{item[0]}_{os.path.basename(item[1])}"
+    return [tuple(item) for item in achados]
+
+
+def discos_controladora(binario):
+    """Roda o "smartctl --scan-open"; sem smartctl ou com erro, nenhum disco."""
+    if not binario:
+        return []
+    try:
+        saida = subprocess.run([binario, "--scan-open", "-j"], capture_output=True, text=True,
+                               timeout=TIMEOUT_SMARTCTL)
+    except (OSError, subprocess.TimeoutExpired) as erro:
+        log("aviso", "varredura de controladoras do smartctl falhou", erro=erro)
+        return []
+    return interpretar_varredura(saida.stdout)
 
 
 def _inteiro(valor):
@@ -2667,13 +2712,16 @@ class ModuloDiscos:
         "link_largura_max": "Largura máxima do link PCIe (só NVMe)",
     }
 
-    def __init__(self, config, eventos, estado, dir_textfile, raiz_sys="/sys", smartctl=None):
+    def __init__(self, config, eventos, estado, dir_textfile, raiz_sys="/sys", smartctl=None, varrer=None):
         secao = config["discos"] if config.has_section("discos") else {}
         self.intervalo = max(5, int(secao.get("intervalo_minutos", "10"))) * 60
         self.binario = binario_smartctl(config)
         self.eventos = eventos
         self.raiz_sys = raiz_sys
-        self.ler = smartctl or (lambda nome: rodar_smartctl(self.binario, nome))
+        # Disco atrás de controladora: rótulo -> (caminho, tipo do -d).
+        self.alvos = {}
+        self.ler = smartctl or (lambda nome: rodar_smartctl(self.binario, *self.alvos.get(nome, (f"/dev/{nome}", None))))
+        self.varrer = varrer or (lambda: discos_controladora(self.binario))
         self.arquivo = os.path.join(dir_textfile, "coleta_complementar_discos.prom")
         self.avulso = os.path.join(dir_textfile, ARQUIVO_SMART_AVULSO)
         self.avisou_avulso = False
@@ -2730,6 +2778,8 @@ class ModuloDiscos:
             return 0
         metricas = Metricas()
         nomes = discos_fisicos(self.raiz_sys)
+        self.alvos = {rotulo: (caminho, tipo) for rotulo, caminho, tipo in self.varrer()}
+        nomes += [rotulo for rotulo in self.alvos if rotulo not in nomes]
         encontrados = 0
         for nome in nomes:
             try:
@@ -2926,7 +2976,7 @@ def verificar():
                              "smartmontools (apt install smartmontools, dnf install smartmontools ou "
                              "zypper install smartmontools) e reinicie o serviço")
         else:
-            nomes = discos_fisicos()
+            nomes = discos_fisicos() + [r for r, _, _ in discos_controladora(binario_smartctl(config))]
             avulso = os.path.join(preparar_caminhos(config)[0], ARQUIVO_SMART_AVULSO)
             if os.path.exists(avulso):
                 print(f"Aviso: coleta SMART avulsa ainda ativa ({avulso}); o módulo discos só grava depois que ela sair.")

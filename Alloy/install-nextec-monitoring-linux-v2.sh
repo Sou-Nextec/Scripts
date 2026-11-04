@@ -123,6 +123,7 @@ declare -A HV_SEGREDOS=()
 ENABLE_DISCOS=0
 DISCOS_FISICOS=0
 DISCOS_LISTA=""
+DISCOS_RAID=0
 EM_VIRTUAL=0
 SYS_RAIZ="${SYS_RAIZ:-/sys}"
 
@@ -704,11 +705,12 @@ detect_virtualizacao() {
 
 # Discos físicos para o módulo discos da Coleta Complementar. Mesmas regras da
 # coleta (discos_fisicos): fica de fora o que é lógico (dm-, loop, zram, md,
-# zvol), removível, virtual (VirtIO, Hyper-V, Xen, QEMU, VMware) e volume de
-# controladora RAID.
+# zvol), removível e virtual (VirtIO, Hyper-V, Xen, QEMU, VMware). Volume de
+# controladora RAID conta em DISCOS_RAID: a coleta lê os discos atrás dele.
 detect_discos() {
   DISCOS_FISICOS=0
   DISCOS_LISTA=""
+  DISCOS_RAID=0
   EM_VIRTUAL=0
   if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --quiet 2>/dev/null; then
     EM_VIRTUAL=1
@@ -728,8 +730,12 @@ detect_discos() {
       continue
     fi
     texto="$(cat "${caminho}/device/vendor" "${caminho}/device/model" 2>/dev/null | tr '\n' ' ' || true)"
-    # Disco de VM ou volume de controladora RAID (PERC, Smart Array, MegaRAID).
-    if grep -Eqi 'qemu|vmware|virtio|vbox|virtual|msft|xen|perc |logical volume|megaraid|mr9[0-9]{3}|raid' <<<"$texto"; then
+    if grep -Eqi 'qemu|vmware|virtio|vbox|virtual|msft|xen' <<<"$texto"; then
+      continue
+    fi
+    # Volume de controladora RAID (PERC, Smart Array, MegaRAID).
+    if grep -Eqi 'perc |logical volume|megaraid|mr9[0-9]{3}|raid' <<<"$texto"; then
+      DISCOS_RAID=$((DISCOS_RAID + 1))
       continue
     fi
     DISCOS_FISICOS=$((DISCOS_FISICOS + 1))
@@ -740,11 +746,18 @@ detect_discos() {
 
 # Padrão da pergunta de discos: liga com disco físico fora de VM ou container.
 discos_padrao() {
-  if (( DISCOS_FISICOS > 0 )) && [[ "$EM_VIRTUAL" == "0" ]]; then echo 1; else echo 0; fi
+  if (( DISCOS_FISICOS + DISCOS_RAID > 0 )) && [[ "$EM_VIRTUAL" == "0" ]]; then echo 1; else echo 0; fi
+}
+
+# Há o que ler: disco direto ou volume de RAID (discos lidos pela controladora).
+discos_existem() {
+  (( DISCOS_FISICOS + DISCOS_RAID > 0 ))
 }
 
 discos_resumo() {
-  echo "${DISCOS_FISICOS} disco(s)${DISCOS_LISTA:+: ${DISCOS_LISTA}}"
+  local texto="${DISCOS_FISICOS} disco(s)${DISCOS_LISTA:+: ${DISCOS_LISTA}}"
+  (( DISCOS_RAID > 0 )) && texto+=" e ${DISCOS_RAID} volume(s) RAID, discos lidos pela controladora"
+  echo "$texto"
 }
 
 # Servidor físico Dell (PowerEdge): o iDRAC é monitorado por SNMP junto com o
@@ -805,9 +818,9 @@ show_detection() {
   if [[ -n "$VIRT_DETECTADA" ]]; then
     ok "Hipervisor detectado: $(virt_rotulo "$VIRT_DETECTADA") (VMs, armazenamento e snapshots sem senha)."
   fi
-  if (( DISCOS_FISICOS > 0 )) && [[ "$EM_VIRTUAL" == "0" ]]; then
+  if discos_existem && [[ "$EM_VIRTUAL" == "0" ]]; then
     ok "Discos físicos para SMART: $(discos_resumo)."
-  elif (( DISCOS_FISICOS > 0 )); then
+  elif discos_existem; then
     info "Servidor virtual com $(discos_resumo) visível(is); saúde dos discos fica desligada por padrão."
   else
     info "Nenhum disco físico (servidor virtual): saúde dos discos não se aplica."
@@ -3617,7 +3630,7 @@ resource_checklist() {
     details[9]="marque para consultar hipervisores pela rede"
   fi
 
-  if (( DISCOS_FISICOS == 0 )); then
+  if ! discos_existem; then
     disabled[10]=1
     selected[10]=0
     details[10]="nenhum disco físico"
@@ -5129,7 +5142,7 @@ main_somente_coleta() {
   else
     ENABLE_VIRT=0
   fi
-  if (( DISCOS_FISICOS > 0 )); then
+  if discos_existem; then
     ask_yes_no "Monitorar a saúde dos discos pelo SMART ($(discos_resumo))?" "$p_discos" && ENABLE_DISCOS=1
   fi
 

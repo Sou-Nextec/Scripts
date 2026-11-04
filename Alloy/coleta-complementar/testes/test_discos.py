@@ -252,9 +252,10 @@ class TesteRodada(unittest.TestCase):
             raise OSError("dispositivo travado")
         return cc.interpretar_smartctl(codigo, saida(arquivo))
 
-    def modulo(self):
+    def modulo(self, varredura=()):
         return cc.ModuloDiscos(config_discos(), self.eventos, None, self.textfile,
-                               raiz_sys=self.sys.raiz, smartctl=self.smartctl_falso)
+                               raiz_sys=self.sys.raiz, smartctl=self.smartctl_falso,
+                               varrer=lambda: list(varredura))
 
     def test_prom_gerado(self):
         modulo = self.modulo()
@@ -358,17 +359,74 @@ class TesteRodada(unittest.TestCase):
         self.assertEqual(modulo.rodada(), 4)
         self.assertTrue(os.path.exists(caminho))
 
+    def test_discos_atras_da_controladora_raid(self):
+        # Servidor Dell: o volume do PERC (sde) fica de fora e os discos entram pela controladora.
+        self.sys.disco("sde", "pci0000:00/0000:00:1c.0/0000:05:00.0/host5/target5:2:0/5:2:0:0",
+                       vendor="DELL", model="PERC H730P Mini")
+        self.respostas["megaraid_disk_00"] = (0, "sata-realocados.json")
+        self.respostas["megaraid_disk_01"] = (2, "falha-abrir.json")
+        varredura = cc.interpretar_varredura(saida("varredura-megaraid.json"))
+        modulo = self.modulo(varredura)
+        self.assertEqual(modulo.rodada(), 6)
+        self.assertNotIn("sde", self.chamados)
+        amostras = ler_prom(os.path.join(self.textfile, "coleta_complementar_discos.prom"))
+        self.assertEqual(valor(amostras, "nextec_disco_erros_midia", "megaraid_disk_00"), 11)
+        self.assertEqual(rotulos_de(amostras, "nextec_disco_smart_ok", "megaraid_disk_00")["modelo"],
+                         "Samsung SSD 870 EVO 500GB")
+        self.assertEqual(valor(amostras, "nextec_disco_leitura_ok", "megaraid_disk_01"), 0)
+        self.assertEqual(modulo.alvos["megaraid_disk_00"], ("/dev/bus/0", "megaraid,0"))
+
     def test_vm_sem_disco_fisico(self):
         vazio = SysFalso()
         try:
             vazio.disco("vda", "pci0000:00/0000:00:04.0/virtio2")
             modulo = cc.ModuloDiscos(config_discos(), self.eventos, None, self.textfile,
-                                     raiz_sys=vazio.raiz, smartctl=self.smartctl_falso)
+                                     raiz_sys=vazio.raiz, smartctl=self.smartctl_falso, varrer=list)
             self.assertEqual(modulo.rodada(), 0)
             amostras = ler_prom(os.path.join(self.textfile, "coleta_complementar_discos.prom"))
             self.assertEqual(amostras[("nextec_discos_encontrados", frozenset())], 0)
         finally:
             vazio.remover()
+
+
+class TesteControladora(unittest.TestCase):
+    def test_varredura_megaraid(self):
+        self.assertEqual(cc.interpretar_varredura(saida("varredura-megaraid.json")), [
+            ("megaraid_disk_00", "/dev/bus/0", "megaraid,0"),
+            ("megaraid_disk_01", "/dev/bus/0", "megaraid,1"),
+        ])
+
+    def test_varredura_com_duas_controladoras(self):
+        texto = json.dumps({"devices": [
+            {"name": "/dev/bus/0", "info_name": "/dev/bus/0 [megaraid_disk_00]", "type": "megaraid,0"},
+            {"name": "/dev/bus/1", "info_name": "/dev/bus/1 [megaraid_disk_00]", "type": "megaraid,0"},
+            {"name": "/dev/sg1", "info_name": "/dev/sg1", "type": "cciss,3"},
+        ]})
+        self.assertEqual([r for r, _, _ in cc.interpretar_varredura(texto)],
+                         ["megaraid_disk_00_0", "megaraid_disk_00_1", "sg1_cciss_3"])
+
+    def test_varredura_ilegivel(self):
+        self.assertEqual(cc.interpretar_varredura("não é json"), [])
+        self.assertEqual(cc.discos_controladora(""), [])
+
+    def test_comando_usa_o_tipo_da_controladora(self):
+        chamadas = []
+
+        class Resultado:
+            returncode = 0
+            stdout = saida("sata-realocados.json")
+
+        original = cc.subprocess.run
+        cc.subprocess.run = lambda comando, **_: chamadas.append(comando) or Resultado()
+        try:
+            cc.rodar_smartctl("/usr/sbin/smartctl", "/dev/bus/0", "megaraid,0")
+            cc.rodar_smartctl("/usr/sbin/smartctl", "/dev/sda")
+        finally:
+            cc.subprocess.run = original
+        self.assertEqual(chamadas, [
+            ["/usr/sbin/smartctl", "-j", "-a", "-n", "standby", "-d", "megaraid,0", "/dev/bus/0"],
+            ["/usr/sbin/smartctl", "-j", "-a", "-n", "standby", "/dev/sda"],
+        ])
 
 
 class TesteLigarModulo(unittest.TestCase):

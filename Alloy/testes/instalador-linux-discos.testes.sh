@@ -219,7 +219,7 @@ conferir "ajuste local do .ini preservado" "$(valor_ini "$d" geral limite_latenc
 conferir "origens conhecidas preservadas" "$(valor_ini "$d" acessos origens_conhecidas)" "203.0.113.0/24"
 conferir_contem "instala o smartmontools sem recommends" "$d/log/apt-get" "--no-install-recommends smartmontools"
 conferir_contem "desliga o smartd do pacote" "$d/log/systemctl" "disable --now smartmontools.service"
-conferir_contem "mostra os discos encontrados" "$d/saida.log" "Saúde dos discos: 2 disco(s): nvme0n1, sda."
+conferir_contem "mostra os discos encontrados" "$d/saida.log" "Saúde dos discos: 2 disco(s): nvme0n1, sda e 1 volume(s) RAID, discos lidos pela controladora."
 
 echo "2. --atualizar, instalação antiga sem ENABLE_DISCOS, VM"
 d="$(preparar_cenario vm)"
@@ -258,6 +258,15 @@ sed -i 's/^ENABLE_LINKS=0/ENABLE_LINKS=1/' "$d/etc/nextec/instalacao.conf"
 rodar_atualizar "$d" "$SYS_FISICO" 0 0 1
 conferir "[discos] ativo no .ini novo" "$(valor_ini "$d" discos ativo)" "sim"
 conferir "link no .ini novo" "$(valor_ini "$d" 'link:Cyberline Fibra' papel)" "primario"
+
+echo "6b. --atualizar em servidor Dell só com volume do PERC"
+SYS_PERC="${BASE}/sys-perc"
+sys_falso "$SYS_PERC" "sda|pci0000:00/0000:00:1c.0/0000:05:00.0/host5/target5:2:0/5:2:0:0|DELL|PERC H730P Mini"
+d="$(preparar_cenario perc)"
+rodar_atualizar "$d" "$SYS_PERC" 0 0 1
+conferir "ENABLE_DISCOS gravado ligado" "$(valor_conf "$d" ENABLE_DISCOS)" "1"
+conferir "[discos] ativo no .ini" "$(valor_ini "$d" discos ativo)" "sim"
+conferir_contem "resumo cita o volume RAID" "$d/saida.log" "0 disco(s) e 1 volume(s) RAID"
 
 echo "7. ENABLE_DISCOS inválido no instalacao.conf é recusado"
 d="$(preparar_cenario invalido)"

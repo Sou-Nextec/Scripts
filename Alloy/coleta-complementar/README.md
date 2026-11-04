@@ -155,7 +155,7 @@ VMs e hosts a cada `intervalo_segundos` (padrão 120); snapshots, discos e saúd
 | `nextec_disco_leitura_ok` | disco | 1 com o SMART lido (ou HD em espera), 0 sem resposta do smartctl |
 | `nextec_discos_encontrados`, `nextec_discos_coletor_ultima_execucao_segundos` | | Discos físicos na rodada e saúde do módulo |
 
-Ficam de fora os discos virtuais (VirtIO, QEMU, VMware, Hyper-V, Xen), os lógicos (`dm-`, `loop`, `zram`, `md`, zvol `zd`), os removíveis e os volumes de controladora RAID, cujo SMART fica atrás da controladora (Dell: iDRAC por SNMP). HD em espera não é acordado: a rodada repete a última leitura. Enquanto existir `textfile/smart.prom` (coleta avulsa antiga), o módulo não grava, para não duplicar as séries. Sem `smartctl` o módulo fica desligado e o `verificar` mostra como instalar.
+Discos atrás de controladora RAID (Dell PERC, LSI/Broadcom MegaRAID e o que mais o `smartctl --scan-open` listar com `-d tipo,N`) são lidos um a um, com `disco` igual ao nome que o smartctl dá (`megaraid_disk_00`); o volume lógico da controladora não entra, porque não tem SMART. Ficam de fora os discos virtuais (VirtIO, QEMU, VMware, Hyper-V, Xen), os lógicos (`dm-`, `loop`, `zram`, `md`, zvol `zd`) e os removíveis. HD em espera não é acordado: a rodada repete a última leitura. Enquanto existir `textfile/smart.prom` (coleta avulsa antiga), o módulo não grava, para não duplicar as séries. Sem `smartctl` o módulo fica desligado e o `verificar` mostra como instalar.
 
 **A própria coleta**: `nextec_coleta_complementar_info{versao, modulos}` e `nextec_coleta_complementar_modulo_ok{modulo}`.
 
