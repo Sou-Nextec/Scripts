@@ -7936,14 +7936,6 @@ function New-AlloyConfiguration {
             [void]$builder.AppendLine(('loki.process "{0}" {{' -f $processorName))
             [void]$builder.AppendLine("  forward_to = [loki.write.nextec.receiver]")
             [void]$builder.AppendLine("")
-            [void]$builder.AppendLine("  // Freio contra tempestade de log. Uma aplicacao em loop de erro pode")
-            [void]$builder.AppendLine("  // despejar milhares de eventos por segundo e saturar o link do cliente.")
-            [void]$builder.AppendLine("  stage.limit {")
-            [void]$builder.AppendLine(("    rate  = {0}" -f $stream.Rate))
-            [void]$builder.AppendLine(("    burst = {0}" -f ($stream.Rate * 5)))
-            [void]$builder.AppendLine("    drop  = true")
-            [void]$builder.AppendLine("  }")
-            [void]$builder.AppendLine("")
             [void]$builder.AppendLine("  stage.static_labels {")
             [void]$builder.AppendLine("    values = {")
             [void]$builder.AppendLine(('      cliente     = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Cliente)))
@@ -7963,8 +7955,10 @@ function New-AlloyConfiguration {
             [void]$builder.AppendLine("    }")
             [void]$builder.AppendLine("  }")
 
-            # Depois do static_labels: o seletor usa o rótulo canal, que o
-            # loki.source.windowsevent não traz e só existe a partir daqui.
+            # Ordem: rótulos, filtro e só então o limite. O seletor usa o rótulo
+            # canal, que o loki.source.windowsevent não traz; e o limite depois
+            # do filtro impede que eventos descartados de outros serviços
+            # esgotem o burst e levem junto a parada do SQL ou um 1074.
             if ($stream.PSObject.Properties["DropSelector"]) {
                 [void]$builder.AppendLine("")
                 [void]$builder.AppendLine("  stage.match {")
@@ -7972,6 +7966,14 @@ function New-AlloyConfiguration {
                 [void]$builder.AppendLine('    action   = "drop"')
                 [void]$builder.AppendLine("  }")
             }
+            [void]$builder.AppendLine("")
+            [void]$builder.AppendLine("  // Freio contra tempestade de log. Uma aplicacao em loop de erro pode")
+            [void]$builder.AppendLine("  // despejar milhares de eventos por segundo e saturar o link do cliente.")
+            [void]$builder.AppendLine("  stage.limit {")
+            [void]$builder.AppendLine(("    rate  = {0}" -f $stream.Rate))
+            [void]$builder.AppendLine(("    burst = {0}" -f ($stream.Rate * 5)))
+            [void]$builder.AppendLine("    drop  = true")
+            [void]$builder.AppendLine("  }")
             [void]$builder.AppendLine("}")
             [void]$builder.AppendLine("")
 

@@ -68,7 +68,12 @@ try {
     Conferir 'instância sem arquivo fica de fora' (-not ($achados.Instancia -contains 'SEMARQUIVO'))
     Conferir 'sem SQL instalado devolve vazio' (@(Get-SqlErrorLogPaths -RaizRegistro "$raiz\nada").Count -eq 0)
 } finally {
-    Remove-Item -LiteralPath (Split-Path $raiz) -Recurse -Force -ErrorAction SilentlyContinue
+    # Só a chave desta execução; o ramo pai sai apenas se ficou vazio.
+    Remove-Item -LiteralPath $raiz -Recurse -Force -ErrorAction SilentlyContinue
+    $pai = Split-Path $raiz
+    if ((Test-Path -LiteralPath $pai) -and -not (Get-ChildItem -LiteralPath $pai -ErrorAction SilentlyContinue)) {
+        Remove-Item -LiteralPath $pai -Force -ErrorAction SilentlyContinue
+    }
     Remove-Item -LiteralPath $pasta -Recurse -Force -ErrorAction SilentlyContinue
 }
 }
@@ -103,7 +108,10 @@ Conferir 'laço dos fluxos de log encontrado' ($null -ne $laco)
 $corpo = $laco.Body.Extent.Text
 $posRotulos = $corpo.IndexOf('stage.static_labels {')
 $posFiltro = $corpo.IndexOf('stage.match {')
+$posLimite = $corpo.IndexOf('stage.limit {')
 Conferir 'stage.match depois do stage.static_labels (o rótulo canal já existe)' ($posRotulos -ge 0 -and $posFiltro -gt $posRotulos) "static_labels em $posRotulos, match em $posFiltro"
+Conferir 'stage.limit depois do stage.match (descartado não gasta o burst)' ($posLimite -gt $posFiltro) "match em $posFiltro, limit em $posLimite"
+Conferir 'um stage.limit só por fluxo' (([regex]::Matches($corpo, 'stage\.limit \{')).Count -eq 1)
 
 if ($script:falhas -gt 0) {
     Write-Host "$script:falhas teste(s) falharam."
