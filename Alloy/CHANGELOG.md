@@ -12,7 +12,7 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 | --- | --- | --- |
 | Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.16.0 |
 | Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.28.0 |
-| Coleta Complementar | `coleta-complementar/` | 1.6.0 (Linux), 1.5.0 (Windows) |
+| Coleta Complementar | `coleta-complementar/` | 1.6.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
 ## 2026-11-04
@@ -26,6 +26,7 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 - **Instalador.** Item novo "Saúde dos discos" no checklist (e pergunta no `--somente-coleta`), marcado quando há disco físico ou volume RAID e desmarcado em VM ou container. Instala o `smartmontools` sem pacotes recomendados e desliga o `smartd` que vem com ele. O resumo final mostra quantos discos foram encontrados.
 - **Atualização.** Grava `ENABLE_DISCOS` em `/etc/nextec/instalacao.conf`. Instalação antiga, sem a chave, liga sozinha quando o servidor tem disco físico; a resposta gravada é respeitada. Falha passageira ao instalar o pacote não desliga o módulo.
 - **Coleta avulsa (`nxt-srv-hv01`).** Enquanto `textfile/smart.prom` existir, o módulo não grava (evita série duplicada no Alloy) e o `verificar` avisa. Depois de receber a versão, remover `nextec-smart.timer`, `/usr/local/sbin/nextec-smart.py` e `textfile/smart.prom`; o módulo assume na rodada seguinte.
+- **Windows.** A Coleta Complementar do Windows só acompanha o número da versão (1.6.0), sem mudança de comportamento.
 - **Testes.** `python3 -m unittest discover -s Alloy/coleta-complementar/testes` e `bash Alloy/testes/instalador-linux-discos.testes.sh`.
 
 ## 2026-10-21
