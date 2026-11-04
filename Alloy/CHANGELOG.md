@@ -11,11 +11,19 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
 | Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.16.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.28.0 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.29.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.6.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
 ## 2026-11-04
+
+### Instalador Windows 2.29.0, eventos e ERRORLOG do SQL Server
+
+- **Por que.** O alerta de serviço parado do MSSQL não mostrava quem parou o serviço: os eventos informativos do Service Control Manager e o ERRORLOG não eram coletados, só erro e aviso.
+- **Eventos do sistema (`canal="sql_sistema"`).** Em servidor com instância SQL detectada e logs ligados, entram os eventos 7036 e 7040 só dos serviços SQL (o filtro roda no Alloy), mais 7045, 1074, 6005, 6006 e 6008. Mostram parada e início do serviço, desligamento solicitado e desligamento inesperado.
+- **ERRORLOG (`canal="sql_errorlog"`, `servico="sql_errorlog"`).** Uma fonte por instância, com o caminho lido do registro (argumento `-e` do serviço), leitura em UTF-16LE e registros de várias linhas agrupados. Rótulo extra `instancia`. Limite de 20 linhas por segundo.
+- **Fora dos painéis atuais.** Canais novos, separados de `system`, para não entrarem nas contagens de erro e aviso existentes.
+- **Servidor já instalado** recebe na próxima atualização ou ao rodar o instalador. Sem instância SQL, a configuração não muda.
 
 ### Instalador Linux 2.16.0 e Coleta Complementar 1.6.0, saúde dos discos
 
