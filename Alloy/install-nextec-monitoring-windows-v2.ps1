@@ -47,6 +47,11 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.29.0 Coleta de eventos e do ERRORLOG do SQL Server. Em servidor com
+           instância SQL detectada e logs ligados, o Alloy passa a enviar
+           os eventos de serviço do SQL (7036 e 7040), 7045, 1074, 6005,
+           6006 e 6008 do canal System (canal="sql_sistema") e o ERRORLOG
+           de cada instância (canal="sql_errorlog").
     2.28.0 ACL do registro e dos arquivos de credencial por SID (SYSTEM e
            Administradores), que funciona em Windows em português; antes o
            nome "BUILTIN\Administrators" não era encontrado e a senha do
@@ -359,7 +364,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.28.0"
+$InstallerVersion = "2.29.0"
 
 # SYSTEM e Administradores locais, os únicos com acesso às credenciais do NOC.
 # Por SID porque os nomes mudam com o idioma do Windows.
@@ -3981,6 +3986,63 @@ function Get-SqlServerDetection {
         Instances = if ($instances.Count -gt 0) { @($instances | Sort-Object -Unique) } else { @() }
         Processes = $processes.Count
     }
+}
+
+function Get-SqlErrorLogPaths {
+    # Caminho do ERRORLOG de cada instância, lido do argumento de inicialização
+    # "-e" do serviço (registro). Só devolve arquivo que existe. RaizRegistro
+    # só muda nos testes.
+    param([string]$RaizRegistro = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server")
+
+    $resultado = New-Object System.Collections.Generic.List[object]
+    $nomes = Join-Path $RaizRegistro "Instance Names\SQL"
+    # Propriedades que o PowerShell acrescenta ao item do registro (não são instâncias).
+    $propriedadesDoPowerShell = @("PSPath", "PSParentPath", "PSChildName", "PSDrive", "PSProvider")
+
+    if (-not (Test-Path -LiteralPath $nomes)) {
+        return @()
+    }
+
+    $item = Get-ItemProperty -LiteralPath $nomes -ErrorAction SilentlyContinue
+
+    if ($null -eq $item) {
+        return @()
+    }
+
+    foreach ($propriedade in $item.PSObject.Properties) {
+        if ($propriedadesDoPowerShell -contains $propriedade.Name) {
+            continue
+        }
+
+        $chave = Join-Path $RaizRegistro ("{0}\MSSQLServer\Parameters" -f [string]$propriedade.Value)
+
+        if (-not (Test-Path -LiteralPath $chave)) {
+            continue
+        }
+
+        $parametros = Get-ItemProperty -LiteralPath $chave -ErrorAction SilentlyContinue
+
+        if ($null -eq $parametros) {
+            continue
+        }
+
+        $caminho = $null
+
+        foreach ($parametro in $parametros.PSObject.Properties) {
+            if ($parametro.Name -match "^SQLArg\d+$" -and ([string]$parametro.Value).StartsWith("-e")) {
+                $caminho = ([string]$parametro.Value).Substring(2)
+                break
+            }
+        }
+
+        if ($caminho -and (Test-Path -LiteralPath $caminho)) {
+            $resultado.Add([pscustomobject]@{ Instancia = [string]$propriedade.Name; Caminho = $caminho })
+        }
+    }
+
+    # ToArray e não @($resultado): no Windows PowerShell 5.1, @() sobre essa
+    # List lança "Os tipos de argumento não correspondem".
+    return $resultado.ToArray()
 }
 
 function Get-FirebirdDetection {
@@ -7807,6 +7869,26 @@ function New-AlloyConfiguration {
             }
         }
 
+        # SQL Server: eventos que explicam parada e início do serviço, que não
+        # chegam pelos fluxos de erro e aviso. 7036 (mudança de estado) e 7040
+        # (tipo de início) vêm de todos os serviços; o filtro em DropSelector
+        # mantém só os do SQL. Os demais IDs são raros e entram sem filtro:
+        #   7045 serviço instalado   1074 desligamento ou reinício solicitado
+        #   6005/6006 Event Log iniciou/parou   6008 desligamento inesperado
+        $sqlDetectado = Get-SqlServerDetection
+
+        if ($script:EnableLogsResolved -and $sqlDetectado.Detected) {
+            $logStreams.Add([pscustomobject]@{
+                Component    = "sql_sistema"
+                EventLog     = "System"
+                Canal        = "sql_sistema"
+                Nivel        = "info"
+                XPath        = "*[System[(EventID=7036 or EventID=7040 or EventID=7045 or EventID=1074 or EventID=6005 or EventID=6006 or EventID=6008)]]"
+                Rate         = 20
+                DropSelector = '{canal=\"sql_sistema\"} |~ \"event_id.:(7036|7040),\" !~ \"(?i)message.:.[^,]*sql\"'
+            })
+        }
+
         if ($script:EnableSecurityLogsResolved) {
             # Event IDs acionáveis do canal Security:
             #   4625 falha de logon             4740 conta bloqueada
@@ -7854,14 +7936,6 @@ function New-AlloyConfiguration {
             [void]$builder.AppendLine(('loki.process "{0}" {{' -f $processorName))
             [void]$builder.AppendLine("  forward_to = [loki.write.nextec.receiver]")
             [void]$builder.AppendLine("")
-            [void]$builder.AppendLine("  // Freio contra tempestade de log. Uma aplicacao em loop de erro pode")
-            [void]$builder.AppendLine("  // despejar milhares de eventos por segundo e saturar o link do cliente.")
-            [void]$builder.AppendLine("  stage.limit {")
-            [void]$builder.AppendLine(("    rate  = {0}" -f $stream.Rate))
-            [void]$builder.AppendLine(("    burst = {0}" -f ($stream.Rate * 5)))
-            [void]$builder.AppendLine("    drop  = true")
-            [void]$builder.AppendLine("  }")
-            [void]$builder.AppendLine("")
             [void]$builder.AppendLine("  stage.static_labels {")
             [void]$builder.AppendLine("    values = {")
             [void]$builder.AppendLine(('      cliente     = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Cliente)))
@@ -7880,6 +7954,26 @@ function New-AlloyConfiguration {
             [void]$builder.AppendLine(('      local       = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Local)))
             [void]$builder.AppendLine("    }")
             [void]$builder.AppendLine("  }")
+
+            # Ordem: rótulos, filtro e só então o limite. O seletor usa o rótulo
+            # canal, que o loki.source.windowsevent não traz; e o limite depois
+            # do filtro impede que eventos descartados de outros serviços
+            # esgotem o burst e levem junto a parada do SQL ou um 1074.
+            if ($stream.PSObject.Properties["DropSelector"]) {
+                [void]$builder.AppendLine("")
+                [void]$builder.AppendLine("  stage.match {")
+                [void]$builder.AppendLine(('    selector = "{0}"' -f [string]$stream.DropSelector))
+                [void]$builder.AppendLine('    action   = "drop"')
+                [void]$builder.AppendLine("  }")
+            }
+            [void]$builder.AppendLine("")
+            [void]$builder.AppendLine("  // Freio contra tempestade de log. Uma aplicacao em loop de erro pode")
+            [void]$builder.AppendLine("  // despejar milhares de eventos por segundo e saturar o link do cliente.")
+            [void]$builder.AppendLine("  stage.limit {")
+            [void]$builder.AppendLine(("    rate  = {0}" -f $stream.Rate))
+            [void]$builder.AppendLine(("    burst = {0}" -f ($stream.Rate * 5)))
+            [void]$builder.AppendLine("    drop  = true")
+            [void]$builder.AppendLine("  }")
             [void]$builder.AppendLine("}")
             [void]$builder.AppendLine("")
 
@@ -7895,6 +7989,69 @@ function New-AlloyConfiguration {
             [void]$builder.AppendLine(('  forward_to = [loki.process.{0}.receiver]' -f $processorName))
             [void]$builder.AppendLine("}")
             [void]$builder.AppendLine("")
+        }
+
+        # ERRORLOG de cada instância SQL Server. O arquivo é UTF-16LE e cada
+        # registro começa com data e hora; linhas seguintes (pilha, detalhe)
+        # são agrupadas no registro anterior pelo multiline.
+        if ($script:EnableLogsResolved -and $sqlDetectado.Detected) {
+            $errorLogs = @(Get-SqlErrorLogPaths)
+
+            if ($errorLogs.Count -gt 0) {
+                [void]$builder.AppendLine("// ERRORLOG do SQL Server")
+                [void]$builder.AppendLine('loki.source.file "sql_errorlog" {')
+                [void]$builder.AppendLine("  targets = [")
+
+                foreach ($errorLog in $errorLogs) {
+                    [void]$builder.AppendLine("    {")
+                    [void]$builder.AppendLine(('      "__path__" = "{0}",' -f (ConvertTo-AlloyEscapedString $errorLog.Caminho)))
+                    [void]$builder.AppendLine(('      instancia  = "{0}",' -f (ConvertTo-AlloyEscapedString $errorLog.Instancia)))
+                    [void]$builder.AppendLine("    },")
+                }
+
+                [void]$builder.AppendLine("  ]")
+                [void]$builder.AppendLine('  encoding      = "UTF-16LE"')
+                [void]$builder.AppendLine("  tail_from_end = true")
+                [void]$builder.AppendLine("  forward_to    = [loki.process.sql_errorlog.receiver]")
+                [void]$builder.AppendLine("}")
+                [void]$builder.AppendLine("")
+                [void]$builder.AppendLine('loki.process "sql_errorlog" {')
+                [void]$builder.AppendLine("  forward_to = [loki.write.nextec.receiver]")
+                [void]$builder.AppendLine("")
+                [void]$builder.AppendLine("  stage.multiline {")
+                [void]$builder.AppendLine('    firstline     = "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d+"')
+                [void]$builder.AppendLine('    max_wait_time = "3s"')
+                [void]$builder.AppendLine("    max_lines     = 200")
+                [void]$builder.AppendLine("  }")
+                [void]$builder.AppendLine("")
+                [void]$builder.AppendLine("  stage.limit {")
+                [void]$builder.AppendLine("    rate  = 20")
+                [void]$builder.AppendLine("    burst = 100")
+                [void]$builder.AppendLine("    drop  = true")
+                [void]$builder.AppendLine("  }")
+                [void]$builder.AppendLine("")
+                [void]$builder.AppendLine("  stage.label_drop {")
+                [void]$builder.AppendLine('    values = ["filename"]')
+                [void]$builder.AppendLine("  }")
+                [void]$builder.AppendLine("")
+                [void]$builder.AppendLine("  stage.static_labels {")
+                [void]$builder.AppendLine("    values = {")
+                [void]$builder.AppendLine(('      cliente     = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Cliente)))
+                [void]$builder.AppendLine(('      host        = "{0}",' -f (ConvertTo-AlloyEscapedString $script:HostLabel)))
+                [void]$builder.AppendLine('      servico     = "sql_errorlog",')
+                [void]$builder.AppendLine('      canal       = "sql_errorlog",')
+                [void]$builder.AppendLine('      nivel       = "info",')
+                [void]$builder.AppendLine(('      tipo        = "{0}",' -f (ConvertTo-AlloyEscapedString $script:TipoLabel)))
+                [void]$builder.AppendLine(('      ambiente    = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Ambiente)))
+                [void]$builder.AppendLine('      os          = "windows",')
+                [void]$builder.AppendLine('      origem      = "alloy",')
+                [void]$builder.AppendLine(('      criticidade = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Criticidade)))
+                [void]$builder.AppendLine(('      local       = "{0}",' -f (ConvertTo-AlloyEscapedString $script:Local)))
+                [void]$builder.AppendLine("    }")
+                [void]$builder.AppendLine("  }")
+                [void]$builder.AppendLine("}")
+                [void]$builder.AppendLine("")
+            }
         }
     }
 
