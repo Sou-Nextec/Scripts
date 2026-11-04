@@ -1,5 +1,5 @@
 {
-  "commit": "a4bfca85f656aa12aad078a243236196845a204a",
+  "commit": "1ddb6fbef620d38937eb3318a70bb801c1355ac4",
   "formato": 1,
   "linux": {
     "alloy": "1.20.1",
@@ -16,27 +16,27 @@
     "arquivos": {
       "atualizador": {
         "sha256": "1c3bf5ea64e071aa7d555ef1e1c8b42f4ac91a8a0055a2bef8352d2beec5154e",
-        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/a4bfca85f656aa12aad078a243236196845a204a/Alloy/atualizador/nextec-atualizador.py"
+        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/1ddb6fbef620d38937eb3318a70bb801c1355ac4/Alloy/atualizador/nextec-atualizador.py"
       },
       "coleta": {
-        "sha256": "29709019ed19fdb50effea72ebdaf285219e390b6b87071291ef9946d4221b92",
-        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/a4bfca85f656aa12aad078a243236196845a204a/Alloy/coleta-complementar/coleta-complementar.py"
+        "sha256": "16e5820644c68e134670ec28749cf266a6a94fa29a68776aabe6186d6d4f5126",
+        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/1ddb6fbef620d38937eb3318a70bb801c1355ac4/Alloy/coleta-complementar/coleta-complementar.py"
       },
       "instalador": {
-        "sha256": "c6d197c68cc0b4c9cd114763025c0b8b52aacd1fa990fae8b275c837241b9759",
-        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/a4bfca85f656aa12aad078a243236196845a204a/Alloy/install-nextec-monitoring-linux-v2.sh"
+        "sha256": "eff669450e1d7daabe8138bb323effc594db1ab5dbea50f4e87a14a5a091ea53",
+        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/1ddb6fbef620d38937eb3318a70bb801c1355ac4/Alloy/install-nextec-monitoring-linux-v2.sh"
       }
     }
   },
   "ondas": {
-    "0": "2026-10-07T21:56:35Z",
-    "1": "2026-10-08T21:56:35Z",
-    "2": "2026-10-09T11:02:33Z"
+    "0": "2026-11-04T16:08:26Z",
+    "1": "2026-11-05T16:08:26Z",
+    "2": null
   },
-  "publicado_em": "2026-10-07T21:56:35Z",
-  "sequencia": 1791543753,
-  "valido_ate": "2026-11-06T21:56:35Z",
-  "versao": "2026.10.07-1",
+  "publicado_em": "2026-11-04T16:08:26Z",
+  "sequencia": 1793808506,
+  "valido_ate": "2026-12-04T16:08:26Z",
+  "versao": "2026.11.04-1",
   "windows": {
     "alloy": {
       "sha256": "23fcfe3755f02e8a6a83f27149851322ab2b66d584e76d239d9c031f50d3a8f0",
@@ -46,15 +46,15 @@
     "arquivos": {
       "atualizador": {
         "sha256": "e72c8583dd606fa3a371823e0306bf4b5ad3e7361ed5f99a4582b671e54954d1",
-        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/a4bfca85f656aa12aad078a243236196845a204a/Alloy/atualizador/nextec-atualizador.ps1"
+        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/1ddb6fbef620d38937eb3318a70bb801c1355ac4/Alloy/atualizador/nextec-atualizador.ps1"
       },
       "coleta": {
-        "sha256": "4ffc7627732dba42500bee19a662f03d5033153c67b6839287b5f8d1ac14a8e2",
-        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/a4bfca85f656aa12aad078a243236196845a204a/Alloy/coleta-complementar/coleta-complementar.ps1"
+        "sha256": "950540bf7b4ea33cef1a45ccdab3453eb4d11b18e9e7293a2bbcc41f4af2f543",
+        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/1ddb6fbef620d38937eb3318a70bb801c1355ac4/Alloy/coleta-complementar/coleta-complementar.ps1"
       },
       "instalador": {
-        "sha256": "e67f7041a76909c4c50a69fec7d03f4692e91b50bc380585e665a29ac1187eae",
-        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/a4bfca85f656aa12aad078a243236196845a204a/Alloy/install-nextec-monitoring-windows-v2.ps1"
+        "sha256": "fa927abb2063bb91e6e3b6249c9225a45935f31c738652030c484aed441198d4",
+        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/1ddb6fbef620d38937eb3318a70bb801c1355ac4/Alloy/install-nextec-monitoring-windows-v2.ps1"
       }
     }
   }
