@@ -356,14 +356,17 @@ class TesteRodada(unittest.TestCase):
         self.assertIn("SMART Status command failed", falha["detalhe"])
 
     def test_codigo_4_seguido_nao_gera_recuperacao_falsa(self):
-        self.respostas["sda"] = (4, "sata-sem-dados.json")
         modulo = self.modulo()
-        modulo.rodada()
-        modulo.rodada()
-        self.respostas["sda"] = (64, "sata-realocados.json")
-        modulo.rodada()
-        eventos_sda = [e["evento"] for e in self.eventos.registros if e.get("disco") == "sda"]
-        self.assertEqual(eventos_sda, ["disco_sem_resposta", "disco_voltou"])
+        caminho = os.path.join(self.textfile, "coleta_complementar_discos.prom")
+        leitura_ok, eventos_por_rodada = [], []
+        for codigo, arquivo in ((4, "sata-sem-dados.json"), (4, "sata-sem-dados.json"), (64, "sata-realocados.json")):
+            self.respostas["sda"] = (codigo, arquivo)
+            antes = len(self.eventos.registros)
+            modulo.rodada()
+            leitura_ok.append(valor(ler_prom(caminho), "nextec_disco_leitura_ok", "sda"))
+            eventos_por_rodada.append([e["evento"] for e in self.eventos.registros[antes:] if e.get("disco") == "sda"])
+        self.assertEqual(leitura_ok, [0, 0, 1])
+        self.assertEqual(eventos_por_rodada, [["disco_sem_resposta"], [], ["disco_voltou"]])
 
     def test_codigo_4_com_dados_parciais_mantem_o_que_veio(self):
         self.respostas["sda"] = (4, "sata-status-falhou.json")
