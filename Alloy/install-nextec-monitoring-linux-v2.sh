@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.12.0 (Virtualização: Proxmox VE e KVM/libvirt no servidor; VMware, Proxmox e XCP-ng pela rede)
+# Versão: 2.16.0 (Saúde dos discos pelo SMART: NVMe e SATA/SAS)
 #
 # USO
 # ---
@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.15.0"
+INSTALLER_VERSION="2.16.0"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -118,6 +118,13 @@ VIRT_DETECTADA=""
 ENABLE_VIRT=0
 HIPERVISORES=()
 declare -A HV_SEGREDOS=()
+# Saúde dos discos (SMART). DISCOS_FISICOS e DISCOS_LISTA vêm de detect_discos;
+# SYS_RAIZ só muda nos testes. Em VM ou container o padrão é desligado.
+ENABLE_DISCOS=0
+DISCOS_FISICOS=0
+DISCOS_LISTA=""
+EM_VIRTUAL=0
+SYS_RAIZ="${SYS_RAIZ:-/sys}"
 
 # O pacote oficial usa /etc/default/alloy em Debian. No fallback binário também
 # adotamos o mesmo local para manter um único padrão de manutenção.
@@ -695,6 +702,51 @@ detect_virtualizacao() {
   return 0
 }
 
+# Discos físicos para o módulo discos da Coleta Complementar. Mesmas regras da
+# coleta (discos_fisicos): fica de fora o que é lógico (dm-, loop, zram, md,
+# zvol), removível, virtual (VirtIO, Hyper-V, Xen, QEMU, VMware) e volume de
+# controladora RAID.
+detect_discos() {
+  DISCOS_FISICOS=0
+  DISCOS_LISTA=""
+  EM_VIRTUAL=0
+  if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --quiet 2>/dev/null; then
+    EM_VIRTUAL=1
+  fi
+  local caminho nome real texto
+  for caminho in "${SYS_RAIZ}"/block/*; do
+    [[ -e "$caminho" ]] || continue
+    nome="${caminho##*/}"
+    case "$nome" in
+      loop*|ram*|zram*|dm-*|md*|sr*|fd*|nbd*|rbd*|vd*|xvd*|zd*|mmcblk*) continue ;;
+    esac
+    if [[ "$(cat "${caminho}/removable" 2>/dev/null || true)" == "1" || "$(cat "${caminho}/hidden" 2>/dev/null || true)" == "1" ]]; then
+      continue
+    fi
+    real="$(readlink -f "$caminho" 2>/dev/null || true)"
+    if [[ "$real" == */virtio* || "${real,,}" == */vmbus* || "$real" == */vbd-* ]]; then
+      continue
+    fi
+    texto="$(cat "${caminho}/device/vendor" "${caminho}/device/model" 2>/dev/null | tr '\n' ' ' || true)"
+    # Disco de VM ou volume de controladora RAID (PERC, Smart Array, MegaRAID).
+    if grep -Eqi 'qemu|vmware|virtio|vbox|virtual|msft|xen|perc |logical volume|megaraid|mr9[0-9]{3}|raid' <<<"$texto"; then
+      continue
+    fi
+    DISCOS_FISICOS=$((DISCOS_FISICOS + 1))
+    DISCOS_LISTA+="${DISCOS_LISTA:+, }${nome}"
+  done
+  return 0
+}
+
+# Padrão da pergunta de discos: liga com disco físico fora de VM ou container.
+discos_padrao() {
+  if (( DISCOS_FISICOS > 0 )) && [[ "$EM_VIRTUAL" == "0" ]]; then echo 1; else echo 0; fi
+}
+
+discos_resumo() {
+  echo "${DISCOS_FISICOS} disco(s)${DISCOS_LISTA:+: ${DISCOS_LISTA}}"
+}
+
 # Servidor físico Dell (PowerEdge): o iDRAC é monitorado por SNMP junto com o
 # host. O IP vem do ipmitool (canal 1, o da rede do iDRAC), sem credencial;
 # sem ipmitool, o técnico digita. VM em hipervisor Dell não entra.
@@ -752,6 +804,13 @@ show_detection() {
   fi
   if [[ -n "$VIRT_DETECTADA" ]]; then
     ok "Hipervisor detectado: $(virt_rotulo "$VIRT_DETECTADA") (VMs, armazenamento e snapshots sem senha)."
+  fi
+  if (( DISCOS_FISICOS > 0 )) && [[ "$EM_VIRTUAL" == "0" ]]; then
+    ok "Discos físicos para SMART: $(discos_resumo)."
+  elif (( DISCOS_FISICOS > 0 )); then
+    info "Servidor virtual com $(discos_resumo) visível(is); saúde dos discos fica desligada por padrão."
+  else
+    info "Nenhum disco físico (servidor virtual): saúde dos discos não se aplica."
   fi
   if [[ "${IDRAC_DETECTADO:-0}" == "1" ]]; then
     if [[ -n "$IDRAC_ENDERECO" ]]; then
@@ -1037,7 +1096,8 @@ append_env_var() {
 coleta_enabled() {
   [[ "${ENABLE_INTERNET:-0}" == "1" || "${ENABLE_LINKS:-0}" == "1" || \
      "${ENABLE_VELOCIDADE:-0}" == "1" || "${ENABLE_DOCKER:-0}" == "1" || \
-     "${ENABLE_ACESSOS:-0}" == "1" || "${ENABLE_VIRT:-0}" == "1" ]] || [[ -n "$(bancos_motores)" ]]
+     "${ENABLE_ACESSOS:-0}" == "1" || "${ENABLE_VIRT:-0}" == "1" || \
+     "${ENABLE_DISCOS:-0}" == "1" ]] || [[ -n "$(bancos_motores)" ]]
 }
 
 # Fonte local da virtualização no .ini: proxmox, libvirt ou nao.
@@ -1851,7 +1911,7 @@ write_coleta_config() {
     # Reconfiguração sem links novos: preserva os links e limites já ajustados
     # e só atualiza quais módulos estão ligados.
     cp -a "$COLETA_CONFIG" "${COLETA_CONFIG}.$(date +%Y%m%d-%H%M%S).bak"
-    VIRT_REMOTOS="$(virt_remotos)" python3 - "$COLETA_CONFIG" "$ENABLE_INTERNET" "$ENABLE_DOCKER" "$ENABLE_VELOCIDADE" "${ENABLE_ACESSOS:-0}" "$(bancos_motores)" "$(bancos_arquivos)" "${ENABLE_VIRT:-0}" "$(virt_local)" <<'PY'
+    DISCOS="${ENABLE_DISCOS:-0}" VIRT_REMOTOS="$(virt_remotos)" python3 - "$COLETA_CONFIG" "$ENABLE_INTERNET" "$ENABLE_DOCKER" "$ENABLE_VELOCIDADE" "${ENABLE_ACESSOS:-0}" "$(bancos_motores)" "$(bancos_arquivos)" "${ENABLE_VIRT:-0}" "$(virt_local)" <<'PY'
 import configparser, os, sys
 caminho, internet, docker, velocidade, acessos, motores, arquivos, virt, virt_local = sys.argv[1:10]
 config = configparser.ConfigParser(interpolation=None)
@@ -1874,6 +1934,10 @@ if not config.has_section("virtualizacao"):
     config.add_section("virtualizacao")
 config["virtualizacao"]["ativo"] = "sim" if virt == "1" else "nao"
 config["virtualizacao"]["local"] = virt_local
+if not config.has_section("discos"):
+    config.add_section("discos")
+    config["discos"]["intervalo_minutos"] = "10"
+config["discos"]["ativo"] = "sim" if os.environ.get("DISCOS") == "1" else "nao"
 for secao in [s for s in config.sections() if s.startswith("hipervisor:")]:
     config.remove_section(secao)
 for linha in os.environ.get("VIRT_REMOTOS", "").splitlines():
@@ -1947,6 +2011,12 @@ arquivos = $(bancos_arquivos | sed 's/,/, /g')
 ; servidor (sem senha), nao para só os hipervisores da rede ([hipervisor:...]).
 ativo = $([[ "${ENABLE_VIRT:-0}" == 1 ]] && echo sim || echo nao)
 local = $(virt_local)
+
+[discos]
+; Saúde dos discos físicos pelo SMART (smartctl, pacote smartmontools):
+; NVMe e SATA/SAS. Disco virtual fica de fora. Mínimo de 5 minutos.
+ativo = $([[ "${ENABLE_DISCOS:-0}" == 1 ]] && echo sim || echo nao)
+intervalo_minutos = 10
 EOF
     local hv_nome hv_tipo hv_endereco hv_usuario hv_verificar
     while IFS='|' read -r hv_nome hv_tipo hv_endereco hv_usuario hv_verificar; do
@@ -2015,6 +2085,45 @@ install_speedtest_cli() {
   rm -rf "$tmp"
 }
 
+# smartctl para o módulo discos. Só instala quando falta; nesse caso o smartd
+# do pacote fica desligado (quem alerta é o NOC) e sem MTA (sem recommends).
+smartctl_instalado() {
+  command -v smartctl >/dev/null 2>&1 || [[ -x /usr/sbin/smartctl ]]
+}
+
+install_smartmontools() {
+  [[ "${ENABLE_DISCOS:-0}" == "1" ]] || return 0
+  if smartctl_instalado; then
+    info "smartmontools já instalado."
+    return 0
+  fi
+  info "Instalando smartmontools (leitura do SMART dos discos)..."
+  local instalado=0
+  case "$PKG_FAMILY" in
+    apt)
+      if apt-get install -y -q --no-install-recommends smartmontools >/dev/null 2>&1; then instalado=1; fi ;;
+    dnf|yum)
+      if "$PKG_FAMILY" install -y -q smartmontools >/dev/null 2>&1; then instalado=1; fi ;;
+    zypper)
+      if zypper -q -n install --no-recommends smartmontools >/dev/null 2>&1; then instalado=1; fi ;;
+  esac
+  if [[ "$instalado" == "1" ]]; then
+    local unidade
+    for unidade in smartmontools.service smartd.service; do
+      systemctl disable --now "$unidade" >/dev/null 2>&1 || true
+    done
+    ok "smartmontools instalado."
+  elif [[ "$MODO_ATUALIZACAO" == "1" ]]; then
+    # Falha passageira não pode desligar o módulo de vez (a resposta fica
+    # gravada): a coleta fica sem o módulo e a próxima atualização tenta de novo.
+    warn "Não foi possível instalar o smartmontools agora; nova tentativa na próxima atualização."
+  else
+    warn "Não foi possível instalar o smartmontools; saúde dos discos desligada."
+    ENABLE_DISCOS=0
+  fi
+  return 0
+}
+
 install_coleta_complementar() {
   coleta_enabled || return 0
   step "Instalando a Coleta Complementar Nextec"
@@ -2037,6 +2146,7 @@ install_coleta_complementar() {
   fi
 
   install_speedtest_cli
+  install_smartmontools
 
   local tmp
   tmp="$(mktemp)"
@@ -3435,8 +3545,8 @@ resource_checklist() {
   (( ${#DETECTED_DATABASES[@]} > 0 )) && db_available=1
 
   # Estado inicial recomendado.
-  local -a selected=(0 0 0 0 0 0 1 1 1 0)
-  local -a disabled=(0 0 0 0 0 0 0 0 0 0)
+  local -a selected=(0 0 0 0 0 0 1 1 1 0 0)
+  local -a disabled=(0 0 0 0 0 0 0 0 0 0 0)
   local -a labels=(
     "Docker / containers"
     "Logs do sistema, warning/error/critical"
@@ -3448,8 +3558,9 @@ resource_checklist() {
     "Teste de velocidade (Speedtest, a cada 30 min)"
     "Acessos ao servidor (logins com origem, alerta de acesso privilegiado)"
     "Virtualização (VMs, armazenamento, snapshots: Proxmox, KVM, VMware, XCP-ng)"
+    "Saúde dos discos (SMART: NVMe e SATA/SAS, a cada 10 min)"
   )
-  local -a details=("" "" "" "" "" "" "recomendado" "recomendado" "recomendado" "")
+  local -a details=("" "" "" "" "" "" "recomendado" "recomendado" "recomendado" "" "")
   if [[ "${IDRAC_DETECTADO:-0}" == "1" ]]; then
     selected[3]=1
     details[3]="iDRAC deste servidor Dell"
@@ -3468,7 +3579,7 @@ resource_checklist() {
   if [[ "$do_estado" == "1" ]]; then
     selected=("${ENABLE_DOCKER:-0}" "${ENABLE_LOGS:-0}" "${ENABLE_DATABASES:-0}" "${ENABLE_SNMP:-0}"
               "${ENABLE_BLACKBOX:-0}" "${ENABLE_EXPORTERS:-0}" "${ENABLE_INTERNET:-0}"
-              "${ENABLE_VELOCIDADE:-0}" "${ENABLE_ACESSOS:-0}" "${ENABLE_VIRT:-0}")
+              "${ENABLE_VELOCIDADE:-0}" "${ENABLE_ACESSOS:-0}" "${ENABLE_VIRT:-0}" "${ENABLE_DISCOS:-0}")
     details[6]=""; details[7]=""; details[8]=""
     local item_exp chave_exp
     for item_exp in "${CUSTOM_EXPORTERS[@]}"; do
@@ -3504,6 +3615,17 @@ resource_checklist() {
     details[9]="$(virt_rotulo "$VIRT_DETECTADA") detectado"
   else
     details[9]="marque para consultar hipervisores pela rede"
+  fi
+
+  if (( DISCOS_FISICOS == 0 )); then
+    disabled[10]=1
+    selected[10]=0
+    details[10]="nenhum disco físico"
+  elif [[ "$EM_VIRTUAL" == "1" ]]; then
+    details[10]="servidor virtual: $(discos_resumo)"
+  else
+    [[ "$do_estado" == "1" ]] || selected[10]=1
+    details[10]="$(discos_resumo)"
   fi
 
   # Marca do pai: segue os filhos.
@@ -3760,6 +3882,7 @@ resource_checklist() {
   ENABLE_VELOCIDADE="${selected[7]}"
   ENABLE_ACESSOS="${selected[8]}"
   ENABLE_VIRT="${selected[9]}"
+  ENABLE_DISCOS="${selected[10]}"
 
   EXPORTERS_MARCADOS=()
   for j in "${!filho_sel[@]}"; do
@@ -4065,6 +4188,7 @@ collect_inputs() {
   ENABLE_VELOCIDADE=0
   ENABLE_ACESSOS=0
   ENABLE_VIRT=0
+  ENABLE_DISCOS=0
   HIPERVISORES=()
   LINKS=()
   BLACKBOX_TARGETS=()
@@ -4154,6 +4278,7 @@ show_plan() {
     (( ${#HIPERVISORES[@]} > 0 )) && virt_resumo+=" + ${#HIPERVISORES[@]} pela rede"
   fi
   summary_row "Virtualização:" "$virt_resumo"
+  summary_row "Saúde dos discos:" "$([[ "${ENABLE_DISCOS:-0}" == 1 ]] && echo "sim ($(discos_resumo))" || echo não)"
 
   echo
   [[ "$confirmacao" == "--resumo" ]] && return 0
@@ -4199,6 +4324,7 @@ final_summary() {
   [[ "$ENABLE_LINKS" == 1 ]] && campo "Links de internet" "${#LINKS[@]}" "$GREEN"
   [[ "$ENABLE_VELOCIDADE" == 1 ]] && campo "Teste de velocidade" "a cada 30 min" "$GREEN"
   [[ "${ENABLE_ACESSOS:-0}" == 1 ]] && campo "Acessos" "logins com origem e alerta de privilegiado" "$GREEN"
+  [[ "${ENABLE_DISCOS:-0}" == 1 ]] && campo "Saúde dos discos" "$(discos_resumo), SMART a cada 10 min" "$GREEN"
   [[ "$ENABLE_BLACKBOX" == 1 ]] && campo "Conectividade" "${#BLACKBOX_TARGETS[@]} alvo(s)" "$GREEN"
   [[ "$ENABLE_SNMP" == 1 ]] && campo "SNMP" "${#SNMP_TARGETS[@]} equipamento(s)" "$GREEN"
   if [[ -n "$(syslog_origens)" ]]; then
@@ -4278,6 +4404,7 @@ salvar_estado_instalacao() {
     for item in "${DATABASE_TARGETS[@]}"; do echo "BANCO=${item%%|*}"; done
     echo "BANCOS_SQLITE=${BANCOS_SQLITE}"
     echo "ENABLE_VIRT=${ENABLE_VIRT:-0}"
+    echo "ENABLE_DISCOS=${ENABLE_DISCOS:-0}"
     # Sem senha: o segredo de cada hipervisor fica em ${COLETA_SEGREDOS}.
     for item in "${HIPERVISORES[@]}"; do echo "HIPERVISOR=${item}"; done
   } > "$tmp"
@@ -4294,6 +4421,8 @@ carregar_estado_instalacao() {
   ENABLE_ACESSOS=1
   # Virtualização: sem resposta gravada, liga se este servidor é hipervisor.
   ENABLE_VIRT=""
+  # Discos: sem resposta gravada, liga se o servidor tem disco físico.
+  ENABLE_DISCOS=""
   HIPERVISORES=()
   while IFS= read -r linha || [[ -n "$linha" ]]; do
     [[ -z "$linha" || "$linha" == \#* ]] && continue
@@ -4337,6 +4466,9 @@ carregar_estado_instalacao() {
       ENABLE_VIRT)
         [[ "$valor" =~ ^[01]$ ]] || { err "Valor inválido de ENABLE_VIRT."; return 1; }
         ENABLE_VIRT="$valor" ;;
+      ENABLE_DISCOS)
+        [[ "$valor" =~ ^[01]$ ]] || { err "Valor inválido de ENABLE_DISCOS."; return 1; }
+        ENABLE_DISCOS="$valor" ;;
       HIPERVISOR)
         [[ "$valor" =~ ^[a-z0-9_.-]+\|(vmware|proxmox|xcpng)\|[A-Za-z0-9.:-]+\|[^|]+\|[01]$ ]] || { err "HIPERVISOR inválido."; return 1; }
         HIPERVISORES+=("$valor") ;;
@@ -4349,6 +4481,8 @@ carregar_estado_instalacao() {
     ENABLE_VIRT=0
     [[ -n "$VIRT_DETECTADA" ]] && ENABLE_VIRT=1
   fi
+  detect_discos
+  [[ -n "$ENABLE_DISCOS" ]] || ENABLE_DISCOS="$(discos_padrao)"
   RW_URL="https://${NOC_HOST}/api/v1/write"
   LOKI_URL="https://${NOC_HOST}/loki/api/v1/push"
   return 0
@@ -4540,6 +4674,7 @@ mostrar_status_instalacao() {
     [[ "${ENABLE_LINKS:-0}" == 1 ]] && ligados+=("links")
     [[ "${ENABLE_VELOCIDADE:-0}" == 1 ]] && ligados+=("velocidade")
     [[ "${ENABLE_ACESSOS:-0}" == 1 ]] && ligados+=("acessos")
+    [[ "${ENABLE_DISCOS:-0}" == 1 ]] && ligados+=("discos")
     local IFS=','
     summary_row "Coletas ligadas:" "$(printf '%s' "${ligados[*]:-nenhuma}" | sed 's/,/, /g')"
   fi
@@ -4908,6 +5043,7 @@ main_atualizar() {
   detect_os
 
   if [[ "$MODO_INSTALACAO" == "somente_coleta" ]]; then
+    [[ "${ENABLE_DISCOS:-0}" == "1" ]] && info "Saúde dos discos: $(discos_resumo)."
     install_coleta_complementar
     install_atualizador
     salvar_estado_instalacao somente_coleta
@@ -4915,6 +5051,7 @@ main_atualizar() {
     return 0
   fi
 
+  [[ "${ENABLE_DISCOS:-0}" == "1" ]] && info "Saúde dos discos: $(discos_resumo)."
   install_alloy
   install_coleta_complementar
   install_atualizador
@@ -4947,9 +5084,11 @@ main_somente_coleta() {
     info "Respostas atuais carregadas: ENTER mantém cada uma."
   fi
   sn() { [[ "$tem_estado" == "1" ]] && { [[ "${1:-0}" == "1" ]] && echo s || echo n; } || echo "$2"; }
-  local p_internet p_velocidade p_docker p_acessos p_virt
+  local p_internet p_velocidade p_docker p_acessos p_virt p_discos
   detect_virtualizacao
   detect_idrac
+  detect_discos
+  p_discos="$(sn "${ENABLE_DISCOS:-0}" "$([[ "$(discos_padrao)" == 1 ]] && echo s || echo n)")"
   p_virt="$(sn "${ENABLE_VIRT:-0}" "$([[ -n "$VIRT_DETECTADA" ]] && echo s || echo n)")"
   p_internet="$(sn "${ENABLE_INTERNET:-0}" s)"
   p_velocidade="$(sn "${ENABLE_VELOCIDADE:-0}" s)"
@@ -4971,6 +5110,7 @@ main_somente_coleta() {
   ENABLE_DOCKER=0
   ENABLE_ACESSOS=0
   ENABLE_VIRT=0
+  ENABLE_DISCOS=0
 
   ask_yes_no "Medir a internet e os links (status, DNS e IP público)?" "$p_internet" && ENABLE_INTERNET=1
   dica "Recomendado: a cada 30 min. Cada teste satura o link por alguns segundos."
@@ -4988,6 +5128,9 @@ main_somente_coleta() {
     fi
   else
     ENABLE_VIRT=0
+  fi
+  if (( DISCOS_FISICOS > 0 )); then
+    ask_yes_no "Monitorar a saúde dos discos pelo SMART ($(discos_resumo))?" "$p_discos" && ENABLE_DISCOS=1
   fi
 
   if ! coleta_enabled; then
@@ -5022,6 +5165,7 @@ main() {
   detect_databases
   detect_virtualizacao
   detect_idrac
+  detect_discos
   show_detection
   collect_inputs
   show_plan
@@ -5047,8 +5191,12 @@ main() {
   final_summary
 }
 
-case "${1:-}" in
-  --somente-coleta) main_somente_coleta ;;
-  --atualizar) main_atualizar ;;
-  *) main "$@" ;;
-esac
+# Carregado com "source" (testes), só define as funções. Por "curl | bash"
+# BASH_SOURCE vem vazio e o instalador roda normalmente.
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+  case "${1:-}" in
+    --somente-coleta) main_somente_coleta ;;
+    --atualizar) main_atualizar ;;
+    *) main "$@" ;;
+  esac
+fi

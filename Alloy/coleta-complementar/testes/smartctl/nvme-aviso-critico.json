@@ -1,0 +1,114 @@
+{
+ "json_format_version": [
+  1,
+  0
+ ],
+ "smartctl": {
+  "version": [
+   7,
+   4
+  ],
+  "svn_revision": "5530",
+  "platform_info": "x86_64-linux-6.8.12-4-pve",
+  "build_info": "(local build)",
+  "argv": [
+   "smartctl",
+   "-j",
+   "-a",
+   "-n",
+   "standby",
+   "/dev/nvme1n1"
+  ],
+  "messages": [],
+  "exit_status": 8
+ },
+ "local_time": {
+  "time_t": 1793784000,
+  "asctime": "Wed Nov  4 06:00:00 2026 -03"
+ },
+ "device": {
+  "name": "/dev/nvme1n1",
+  "info_name": "/dev/nvme1n1",
+  "type": "nvme",
+  "protocol": "NVMe"
+ },
+ "model_name": "Lexar NM790 SSD 1TB",
+ "serial_number": "RC9381Z000882P2202",
+ "firmware_version": "12237",
+ "nvme_pci_vendor": {
+  "id": 7586,
+  "subsystem_id": 7586
+ },
+ "nvme_ieee_oui_identifier": 13328,
+ "nvme_total_capacity": 1024209543168,
+ "nvme_unallocated_capacity": 0,
+ "nvme_controller_id": 0,
+ "nvme_version": {
+  "string": "2.0",
+  "value": 131072
+ },
+ "nvme_number_of_namespaces": 1,
+ "nvme_namespaces": [
+  {
+   "id": 1,
+   "size": {
+    "blocks": 2000409264,
+    "bytes": 1024209543168
+   },
+   "capacity": {
+    "blocks": 2000409264,
+    "bytes": 1024209543168
+   },
+   "utilization": {
+    "blocks": 2000409264,
+    "bytes": 1024209543168
+   },
+   "formatted_lba_size": 512,
+   "eui64": {
+    "oui": 13328,
+    "ext_id": 1
+   }
+  }
+ ],
+ "user_capacity": {
+  "blocks": 2000409264,
+  "bytes": 1024209543168
+ },
+ "logical_block_size": 512,
+ "smart_support": {
+  "available": true,
+  "enabled": true
+ },
+ "smart_status": {
+  "passed": false,
+  "nvme": {
+   "value": 1
+  }
+ },
+ "nvme_smart_health_information_log": {
+  "critical_warning": 1,
+  "temperature": 41,
+  "available_spare": 4,
+  "available_spare_threshold": 10,
+  "percentage_used": 87,
+  "data_units_read": 19567432,
+  "data_units_written": 34128775,
+  "host_reads": 187654321,
+  "host_writes": 412345678,
+  "controller_busy_time": 1234,
+  "power_cycles": 21,
+  "power_on_hours": 6123,
+  "unsafe_shutdowns": 9,
+  "media_errors": 12,
+  "num_err_log_entries": 0,
+  "warning_temp_time": 0,
+  "critical_comp_time": 0
+ },
+ "temperature": {
+  "current": 41
+ },
+ "power_cycle_count": 21,
+ "power_on_time": {
+  "hours": 6123
+ }
+}

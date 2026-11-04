@@ -1,0 +1,48 @@
+{
+ "json_format_version": [
+  1,
+  0
+ ],
+ "smartctl": {
+  "version": [
+   7,
+   4
+  ],
+  "svn_revision": "5530",
+  "platform_info": "x86_64-linux-6.8.12-4-pve",
+  "build_info": "(local build)",
+  "argv": [
+   "smartctl",
+   "-j",
+   "-a",
+   "-n",
+   "standby",
+   "/dev/sdb"
+  ],
+  "messages": [],
+  "exit_status": 4
+ },
+ "device": {
+  "name": "/dev/sdb",
+  "info_name": "/dev/sdb",
+  "type": "scsi",
+  "protocol": "SCSI"
+ },
+ "scsi_vendor": "QEMU",
+ "scsi_product": "QEMU HARDDISK",
+ "scsi_model_name": "QEMU QEMU HARDDISK",
+ "scsi_revision": "2.5+",
+ "user_capacity": {
+  "blocks": 67108864,
+  "bytes": 34359738368
+ },
+ "logical_block_size": 512,
+ "device_type": {
+  "scsi_terminology": "Peripheral Device Type [PDT]",
+  "scsi_value": 0,
+  "name": "disk"
+ },
+ "smart_support": {
+  "available": false
+ }
+}

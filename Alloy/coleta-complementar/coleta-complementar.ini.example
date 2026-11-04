@@ -61,6 +61,13 @@ ativo = nao
 local = auto
 intervalo_segundos = 120
 
+; Só Linux: saúde dos discos físicos pelo SMART (NVMe e SATA/SAS), pacote smartmontools.
+; Disco virtual fica de fora. Sem smartctl o módulo fica desligado.
+; smartctl: caminho do binário, quando não está no PATH.
+[discos]
+ativo = nao
+intervalo_minutos = 10
+
 ; Hipervisores consultados pela rede, um bloco por hipervisor, com usuário só leitura.
 ; tipo: vmware (ESXi ou vCenter), proxmox ou xcpng. endereco: host[:porta].
 ; proxmox: usuario é o ID do token (monitor@pve!nextec), papel PVEAuditor em /.

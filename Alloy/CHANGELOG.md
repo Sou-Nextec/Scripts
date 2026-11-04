@@ -10,10 +10,22 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.15.0 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.16.0 |
 | Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.28.0 |
-| Coleta Complementar | `coleta-complementar/` | 1.5.0 |
+| Coleta Complementar | `coleta-complementar/` | 1.6.0 (Linux), 1.5.0 (Windows) |
 | Atualizador automático | `atualizador/` | 1.0.0 |
+
+## 2026-11-04
+
+### Instalador Linux 2.16.0 e Coleta Complementar 1.6.0, saúde dos discos
+
+- **Módulo `discos`.** A Coleta Complementar lê o SMART dos discos físicos (NVMe e SATA/SAS) com o `smartctl` a cada 10 minutos e grava `nextec_disco_*{disco, modelo, serie}` em `textfile/coleta_complementar_discos.prom`. Alimenta a regra "Disco NVMe com problema" em todos os servidores Linux, não só no `nxt-srv-hv01`.
+- **SATA.** Setores realocados, pendentes e incorrigíveis (atributos 5, 197 e 198) somados em `nextec_disco_erros_midia`; vida útil pelo atributo 177, 231 ou 233. SAS: lista de defeitos crescida e indicador de desgaste.
+- **Sem falso alarme de VM.** Disco virtual, lógico, removível e volume de RAID ficam de fora. Um disco sem resposta vira evento `disco_evento` (`disco_sem_resposta`, `disco_voltou`) e `nextec_disco_leitura_ok = 0`, sem apagar os outros. HD em espera não é acordado.
+- **Instalador.** Item novo "Saúde dos discos" no checklist (e pergunta no `--somente-coleta`), marcado quando há disco físico e desmarcado em VM ou container. Instala o `smartmontools` sem pacotes recomendados e desliga o `smartd` que vem com ele. O resumo final mostra quantos discos foram encontrados.
+- **Atualização.** Grava `ENABLE_DISCOS` em `/etc/nextec/instalacao.conf`. Instalação antiga, sem a chave, liga sozinha quando o servidor tem disco físico; a resposta gravada é respeitada. Falha passageira ao instalar o pacote não desliga o módulo.
+- **Coleta avulsa (`nxt-srv-hv01`).** Enquanto `textfile/smart.prom` existir, o módulo não grava (evita série duplicada no Alloy) e o `verificar` avisa. Depois de receber a versão, remover `nextec-smart.timer`, `/usr/local/sbin/nextec-smart.py` e `textfile/smart.prom`; o módulo assume na rodada seguinte.
+- **Testes.** `python3 -m unittest discover -s Alloy/coleta-complementar/testes` e `bash Alloy/testes/instalador-linux-discos.testes.sh`.
 
 ## 2026-10-21
 

@@ -1,0 +1,35 @@
+{
+ "json_format_version": [
+  1,
+  0
+ ],
+ "smartctl": {
+  "version": [
+   7,
+   4
+  ],
+  "pre_release": false,
+  "svn_revision": "5530",
+  "platform_info": "x86_64-linux-6.8.0-48-generic",
+  "build_info": "(local build)",
+  "argv": [
+   "smartctl",
+   "-j",
+   "-a",
+   "-n",
+   "standby",
+   "/dev/sdb"
+  ],
+  "messages": [
+   {
+    "string": "Smartctl open device: /dev/sdb [megaraid_disk_00] failed: DELL or MegaRaid controller, please try adding '-d megaraid,N'",
+    "severity": "error"
+   }
+  ],
+  "exit_status": 2
+ },
+ "local_time": {
+  "time_t": 1793784000,
+  "asctime": "Wed Nov  4 06:00:00 2026 -03"
+ }
+}
