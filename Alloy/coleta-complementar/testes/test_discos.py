@@ -181,9 +181,15 @@ class TesteInterpretacao(unittest.TestCase):
         self.assertIn("ilegível", leitura.erro)
 
     def test_hd_em_espera_nao_e_erro(self):
-        leitura = cc.interpretar_smartctl(2, saida("hd-em-espera.json"))
-        self.assertTrue(leitura.espera)
-        self.assertEqual(leitura.erro, "")
+        for arquivo in ("hd-em-espera.json", "hd-em-sleep.json"):
+            leitura = cc.interpretar_smartctl(3, saida(arquivo))
+            self.assertTrue(leitura.espera, arquivo)
+            self.assertEqual(leitura.erro, "", arquivo)
+
+    def test_sleep_em_smartctl_sem_codigo_proprio(self):
+        # smartctl que devolve 2 em vez do código configurado: vale a mensagem.
+        texto = json.dumps({"smartctl": {"messages": [{"string": "Device is in SLEEP mode, exit(2)"}]}})
+        self.assertTrue(cc.interpretar_smartctl(2, texto).espera)
 
 
 class TesteDescoberta(unittest.TestCase):
@@ -332,11 +338,32 @@ class TesteRodada(unittest.TestCase):
     def test_hd_em_espera_repete_ultima_leitura(self):
         modulo = self.modulo()
         modulo.rodada()
-        self.respostas["sda"] = (2, "hd-em-espera.json")
+        self.respostas["sda"] = (3, "hd-em-sleep.json")
         modulo.rodada()
         amostras = ler_prom(os.path.join(self.textfile, "coleta_complementar_discos.prom"))
         self.assertEqual(valor(amostras, "nextec_disco_erros_midia", "sda"), 11)
         self.assertEqual(valor(amostras, "nextec_disco_leitura_ok", "sda"), 1)
+
+    def test_codigo_4_sem_dados_vira_falha(self):
+        self.respostas["sda"] = (4, "sata-sem-dados.json")
+        modulo = self.modulo()
+        modulo.rodada()
+        amostras = ler_prom(os.path.join(self.textfile, "coleta_complementar_discos.prom"))
+        self.assertEqual(valor(amostras, "nextec_disco_leitura_ok", "sda"), 0)
+        self.assertIsNone(valor(amostras, "nextec_disco_smart_ok", "sda"))
+        falha = next(e for e in self.eventos.registros if e["evento"] == "disco_sem_resposta" and e["disco"] == "sda")
+        self.assertIn("código 4", falha["detalhe"])
+        self.assertIn("SMART Status command failed", falha["detalhe"])
+
+    def test_codigo_4_com_dados_parciais_mantem_o_que_veio(self):
+        self.respostas["sda"] = (4, "sata-status-falhou.json")
+        modulo = self.modulo()
+        modulo.rodada()
+        amostras = ler_prom(os.path.join(self.textfile, "coleta_complementar_discos.prom"))
+        self.assertEqual(valor(amostras, "nextec_disco_leitura_ok", "sda"), 1)
+        self.assertIsNone(valor(amostras, "nextec_disco_smart_ok", "sda"))
+        self.assertEqual(valor(amostras, "nextec_disco_erros_midia", "sda"), 11)
+        self.assertEqual(valor(amostras, "nextec_disco_temperatura_celsius", "sda"), 35)
 
     def test_volume_de_raid_nao_vira_falha(self):
         self.respostas["sdc"] = (2, "raid-megaraid.json")
@@ -367,14 +394,19 @@ class TesteRodada(unittest.TestCase):
         self.respostas["megaraid_disk_01"] = (2, "falha-abrir.json")
         varredura = cc.interpretar_varredura(saida("varredura-megaraid.json"))
         modulo = self.modulo(varredura)
-        self.assertEqual(modulo.rodada(), 6)
+        self.assertEqual(modulo.rodada(), 7)
         self.assertNotIn("sde", self.chamados)
         amostras = ler_prom(os.path.join(self.textfile, "coleta_complementar_discos.prom"))
         self.assertEqual(valor(amostras, "nextec_disco_erros_midia", "megaraid_disk_00"), 11)
         self.assertEqual(rotulos_de(amostras, "nextec_disco_smart_ok", "megaraid_disk_00")["modelo"],
                          "Samsung SSD 870 EVO 500GB")
         self.assertEqual(valor(amostras, "nextec_disco_leitura_ok", "megaraid_disk_01"), 0)
-        self.assertEqual(modulo.alvos["megaraid_disk_00"], ("/dev/bus/0", "megaraid,0"))
+        self.assertEqual(modulo.alvos["megaraid_disk_00"], ("/dev/bus/0", "megaraid,0", ""))
+        # Disco que a varredura não abriu: falha visível, sem chamar o smartctl.
+        self.assertEqual(valor(amostras, "nextec_disco_leitura_ok", "megaraid_disk_02"), 0)
+        self.assertNotIn("megaraid_disk_02", self.chamados)
+        falhas = [e for e in self.eventos.registros if e["evento"] == "disco_sem_resposta"]
+        self.assertIn("INQUIRY failed", next(e["detalhe"] for e in falhas if e["disco"] == "megaraid_disk_02"))
 
     def test_vm_sem_disco_fisico(self):
         vazio = SysFalso()
@@ -392,9 +424,14 @@ class TesteRodada(unittest.TestCase):
 class TesteControladora(unittest.TestCase):
     def test_varredura_megaraid(self):
         self.assertEqual(cc.interpretar_varredura(saida("varredura-megaraid.json")), [
-            ("megaraid_disk_00", "/dev/bus/0", "megaraid,0"),
-            ("megaraid_disk_01", "/dev/bus/0", "megaraid,1"),
+            ("megaraid_disk_00", "/dev/bus/0", "megaraid,0", ""),
+            ("megaraid_disk_01", "/dev/bus/0", "megaraid,1", ""),
+            ("megaraid_disk_02", "/dev/bus/0", "megaraid,2", "/dev/bus/0 [megaraid_disk_02]: INQUIRY failed"),
         ])
+
+    def test_varredura_real_do_hv01_sem_controladora(self):
+        # Saída real do nxt-srv-hv01 (smartctl 7.5): só NVMe direto, que já vem do /sys/block.
+        self.assertEqual(cc.interpretar_varredura(saida("varredura-hv01.json")), [])
 
     def test_varredura_com_duas_controladoras(self):
         texto = json.dumps({"devices": [
@@ -402,7 +439,7 @@ class TesteControladora(unittest.TestCase):
             {"name": "/dev/bus/1", "info_name": "/dev/bus/1 [megaraid_disk_00]", "type": "megaraid,0"},
             {"name": "/dev/sg1", "info_name": "/dev/sg1", "type": "cciss,3"},
         ]})
-        self.assertEqual([r for r, _, _ in cc.interpretar_varredura(texto)],
+        self.assertEqual([r for r, _, _, _ in cc.interpretar_varredura(texto)],
                          ["megaraid_disk_00_0", "megaraid_disk_00_1", "sg1_cciss_3"])
 
     def test_varredura_ilegivel(self):
@@ -424,8 +461,8 @@ class TesteControladora(unittest.TestCase):
         finally:
             cc.subprocess.run = original
         self.assertEqual(chamadas, [
-            ["/usr/sbin/smartctl", "-j", "-a", "-n", "standby", "-d", "megaraid,0", "/dev/bus/0"],
-            ["/usr/sbin/smartctl", "-j", "-a", "-n", "standby", "/dev/sda"],
+            ["/usr/sbin/smartctl", "-j", "-a", "-n", "standby,3", "-d", "megaraid,0", "/dev/bus/0"],
+            ["/usr/sbin/smartctl", "-j", "-a", "-n", "standby,3", "/dev/sda"],
         ])
 
 

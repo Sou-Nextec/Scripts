@@ -142,7 +142,7 @@ Causas de queda: `rede local: firewall sem resposta`, `operadora: gateway sem re
 
 VMs e hosts a cada `intervalo_segundos` (padrão 120); snapshots, discos e saúde do ZFS a cada 30 minutos. Senhas e tokens ficam em `segredos.ini` (Linux `/etc/coleta-complementar/segredos.ini`, 0600 root; Windows na pasta da coleta, só SYSTEM e Administradores), nunca no .ini. Proxmox local roda `pvesh` como root; KVM/libvirt usa `virsh` em `qemu:///system`.
 
-**Discos** (só Linux). SMART dos discos físicos lido com `smartctl -j -a -n standby` a cada `intervalo_minutos` (padrão 10, mínimo 5). Rótulos: `disco` (nome do dispositivo: `nvme0n1`, `sda`), `modelo` e `serie`. Os nomes e os rótulos alimentam a regra "Disco NVMe com problema" (`nx-disco-nvme-problema`): não mudar.
+**Discos** (só Linux). SMART dos discos físicos lido com `smartctl -j -a -n standby,3` a cada `intervalo_minutos` (padrão 10, mínimo 5). Rótulos: `disco` (nome do dispositivo: `nvme0n1`, `sda`), `modelo` e `serie`. Os nomes e os rótulos alimentam a regra "Disco NVMe com problema" (`nx-disco-nvme-problema`): não mudar.
 
 | Métrica | Rótulos | Significado |
 | --- | --- | --- |
@@ -155,7 +155,7 @@ VMs e hosts a cada `intervalo_segundos` (padrão 120); snapshots, discos e saúd
 | `nextec_disco_leitura_ok` | disco | 1 com o SMART lido (ou HD em espera), 0 sem resposta do smartctl |
 | `nextec_discos_encontrados`, `nextec_discos_coletor_ultima_execucao_segundos` | | Discos físicos na rodada e saúde do módulo |
 
-Discos atrás de controladora RAID (Dell PERC, LSI/Broadcom MegaRAID e o que mais o `smartctl --scan-open` listar com `-d tipo,N`) são lidos um a um, com `disco` igual ao nome que o smartctl dá (`megaraid_disk_00`); o volume lógico da controladora não entra, porque não tem SMART. Ficam de fora os discos virtuais (VirtIO, QEMU, VMware, Hyper-V, Xen), os lógicos (`dm-`, `loop`, `zram`, `md`, zvol `zd`) e os removíveis. HD em espera não é acordado: a rodada repete a última leitura. Enquanto existir `textfile/smart.prom` (coleta avulsa antiga), o módulo não grava, para não duplicar as séries. Sem `smartctl` o módulo fica desligado e o `verificar` mostra como instalar.
+Discos atrás de controladora RAID (Dell PERC, LSI/Broadcom MegaRAID e o que mais o `smartctl --scan-open` listar com `-d tipo,N`) são lidos um a um, com `disco` igual ao nome que o smartctl dá (`megaraid_disk_00`); o volume lógico da controladora não entra, porque não tem SMART. Ficam de fora os discos virtuais (VirtIO, QEMU, VMware, Hyper-V, Xen), os lógicos (`dm-`, `loop`, `zram`, `md`, zvol `zd`) e os removíveis. HD em espera (SLEEP ou STANDBY) não é acordado: a rodada repete a última leitura. Disco que a varredura da controladora não abre aparece como falha (`leitura_ok = 0`). Enquanto existir `textfile/smart.prom` (coleta avulsa antiga), o módulo não grava, para não duplicar as séries. Sem `smartctl` o módulo fica desligado e o `verificar` mostra como instalar.
 
 **A própria coleta**: `nextec_coleta_complementar_info{versao, modulos}` e `nextec_coleta_complementar_modulo_ok{modulo}`.
 

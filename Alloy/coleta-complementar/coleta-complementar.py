@@ -2492,6 +2492,11 @@ ATRIBUTOS_VIDA_UTIL = (177, 231, 233)
 # ela existir, o módulo não grava, para o Alloy não receber série duplicada.
 ARQUIVO_SMART_AVULSO = "smart.prom"
 TIMEOUT_SMARTCTL = 60
+# Código de saída próprio do "-n standby,N": disco em SLEEP ou STANDBY, que o
+# smartctl pulou sem acordar. 3 não ocorre como erro real (bits 0 e 1 juntos:
+# linha de comando inválida e falha ao abrir o dispositivo na mesma execução).
+CODIGO_ESPERA = 3
+RE_ESPERA = re.compile(r"\b(standby|sleep)\b", re.IGNORECASE)
 
 
 def binario_smartctl(config):
@@ -2568,15 +2573,19 @@ def largura_link_nvme(raiz_sys, controlador):
 class LeituraSmart:
     """Resultado do smartctl para um disco: dados, em espera ou erro."""
 
-    def __init__(self, dados=None, espera=False, erro=""):
+    def __init__(self, dados=None, espera=False, erro="", codigo=0):
         self.dados = dados or {}
         self.espera = espera
         self.erro = erro
+        self.codigo = codigo
+
+    def mensagens(self):
+        return " ".join(m.get("string", "") for m in (self.dados.get("smartctl") or {}).get("messages", []))
 
 
 def rodar_smartctl(binario, caminho, tipo=None):
     """smartctl -j -a; -n standby não acorda HD parado (volta com espera=True)."""
-    comando = [binario, "-j", "-a", "-n", "standby"] + (["-d", tipo] if tipo else []) + [caminho]
+    comando = [binario, "-j", "-a", "-n", f"standby,{CODIGO_ESPERA}"] + (["-d", tipo] if tipo else []) + [caminho]
     try:
         saida = subprocess.run(comando, capture_output=True, text=True, timeout=TIMEOUT_SMARTCTL)
     except subprocess.TimeoutExpired:
@@ -2593,20 +2602,25 @@ def interpretar_smartctl(codigo, texto):
     except ValueError:
         return LeituraSmart(erro=f"saída do smartctl ilegível (código {codigo})")
     mensagens = " ".join(m.get("string", "") for m in (dados.get("smartctl") or {}).get("messages", []))
+    if codigo == CODIGO_ESPERA:
+        return LeituraSmart(dados, espera=True, codigo=codigo)
     if codigo & 0b11:
-        if "standby" in mensagens.lower():
-            return LeituraSmart(dados, espera=True)
-        return LeituraSmart(dados, erro=(mensagens or f"smartctl terminou com código {codigo}")[:300])
-    return LeituraSmart(dados)
+        # smartctl antigo, sem o código próprio: a mensagem diz SLEEP ou STANDBY.
+        if RE_ESPERA.search(mensagens):
+            return LeituraSmart(dados, espera=True, codigo=codigo)
+        return LeituraSmart(dados, erro=(mensagens or f"smartctl terminou com código {codigo}")[:300], codigo=codigo)
+    return LeituraSmart(dados, codigo=codigo)
 
 
 def interpretar_varredura(texto):
-    """Discos atrás de controladora no "smartctl --scan-open -j": [(rótulo, caminho, tipo)].
+    """Discos atrás de controladora no "smartctl --scan-open -j": [(rótulo, caminho, tipo, erro)].
 
     Só entram os tipos com número do disco na controladora (megaraid,0;
     cciss,1; areca,1/1): os discos comuns já vêm do /sys/block. O rótulo é o
     nome que o próprio smartctl dá (megaraid_disk_00); com mais de uma
-    controladora, o rótulo repetido ganha o barramento no fim.
+    controladora, o rótulo repetido ganha o barramento no fim. Disco que a
+    varredura não conseguiu abrir continua na lista, com o erro, para virar
+    falha e não sumir do monitoramento.
     """
     try:
         dispositivos = (json.loads(texto) or {}).get("devices") or []
@@ -2615,11 +2629,12 @@ def interpretar_varredura(texto):
     achados = []
     for item in dispositivos:
         caminho, tipo = str(item.get("name", "")), str(item.get("type", ""))
-        if not caminho or "," not in tipo or item.get("open_error"):
+        if not caminho or "," not in tipo:
             continue
         casamento = re.search(r"\[([^\]]+)\]", str(item.get("info_name", "")))
         base = casamento.group(1) if casamento else f"{os.path.basename(caminho)}_{tipo}"
-        achados.append([re.sub(r"[^A-Za-z0-9_.-]+", "_", base).strip("_"), caminho, tipo])
+        erro = str(item.get("open_error") or "")[:300]
+        achados.append([re.sub(r"[^A-Za-z0-9_.-]+", "_", base).strip("_"), caminho, tipo, erro])
     vistos = {}
     for item in achados:
         vistos[item[0]] = vistos.get(item[0], 0) + 1
@@ -2696,8 +2711,7 @@ def disco_virtual_smart(dados):
 
 def atras_de_controladora(leitura):
     """smartctl pedindo "-d megaraid,N" (ou cciss, areca): é volume de RAID, não disco."""
-    mensagens = " ".join(m.get("string", "") for m in (leitura.dados.get("smartctl") or {}).get("messages", []))
-    return "please try adding '-d" in mensagens.lower()
+    return "please try adding '-d" in leitura.mensagens().lower()
 
 
 class ModuloDiscos:
@@ -2718,9 +2732,9 @@ class ModuloDiscos:
         self.binario = binario_smartctl(config)
         self.eventos = eventos
         self.raiz_sys = raiz_sys
-        # Disco atrás de controladora: rótulo -> (caminho, tipo do -d).
+        # Disco atrás de controladora: rótulo -> (caminho, tipo do -d, erro da varredura).
         self.alvos = {}
-        self.ler = smartctl or (lambda nome: rodar_smartctl(self.binario, *self.alvos.get(nome, (f"/dev/{nome}", None))))
+        self.ler = smartctl or (lambda nome: rodar_smartctl(self.binario, *self.alvos.get(nome, (f"/dev/{nome}", None, ""))[:2]))
         self.varrer = varrer or (lambda: discos_controladora(self.binario))
         self.arquivo = os.path.join(dir_textfile, "coleta_complementar_discos.prom")
         self.avulso = os.path.join(dir_textfile, ARQUIVO_SMART_AVULSO)
@@ -2741,6 +2755,10 @@ class ModuloDiscos:
 
     def ler_disco(self, nome):
         """(situação, leitura): ok, espera (HD parado: repete a última), virtual ou erro."""
+        erro_varredura = self.alvos.get(nome, ("", "", ""))[2]
+        if erro_varredura:
+            self._avisar_falha(nome, f"varredura da controladora: {erro_varredura}")
+            return "erro", None
         leitura = self.ler(nome)
         if leitura.espera:
             self._avisar_volta(nome)
@@ -2760,6 +2778,12 @@ class ModuloDiscos:
             "serie": str(dados.get("serial_number") or ""),
         }
         valores = valores_disco(dados)
+        # Bit 2 (código 4): comando SMART falhou. Com dados parciais, vale o que
+        # veio; sem nenhum dado de saúde, é falha e não leitura vazia como "ok".
+        if all(v is None for v in valores.values()):
+            motivo = leitura.mensagens() or "sem dados de saúde"
+            self._avisar_falha(nome, f"smartctl sem dados SMART (código {leitura.codigo}): {motivo}"[:300])
+            return "erro", None
         if "nvme_smart_health_information_log" in dados:
             atual, maxima = largura_link_nvme(self.raiz_sys, controlador_nvme(self.raiz_sys, nome))
             valores["link_largura"] = atual
@@ -2778,7 +2802,7 @@ class ModuloDiscos:
             return 0
         metricas = Metricas()
         nomes = discos_fisicos(self.raiz_sys)
-        self.alvos = {rotulo: (caminho, tipo) for rotulo, caminho, tipo in self.varrer()}
+        self.alvos = {rotulo: (caminho, tipo, erro) for rotulo, caminho, tipo, erro in self.varrer()}
         nomes += [rotulo for rotulo in self.alvos if rotulo not in nomes]
         encontrados = 0
         for nome in nomes:
@@ -2976,7 +3000,7 @@ def verificar():
                              "smartmontools (apt install smartmontools, dnf install smartmontools ou "
                              "zypper install smartmontools) e reinicie o serviço")
         else:
-            nomes = discos_fisicos() + [r for r, _, _ in discos_controladora(binario_smartctl(config))]
+            nomes = discos_fisicos() + [r for r, _, _, _ in discos_controladora(binario_smartctl(config))]
             avulso = os.path.join(preparar_caminhos(config)[0], ARQUIVO_SMART_AVULSO)
             if os.path.exists(avulso):
                 print(f"Aviso: coleta SMART avulsa ainda ativa ({avulso}); o módulo discos só grava depois que ela sair.")

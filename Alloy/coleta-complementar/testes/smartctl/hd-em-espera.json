@@ -16,16 +16,16 @@
    "-j",
    "-a",
    "-n",
-   "standby",
+   "standby,3",
    "/dev/sdd"
   ],
   "messages": [
    {
-    "string": "Device is in STANDBY mode, exit(2)",
+    "string": "Device is in STANDBY mode, exit(3)",
     "severity": "information"
    }
   ],
-  "exit_status": 2
+  "exit_status": 3
  },
  "device": {
   "name": "/dev/sdd",

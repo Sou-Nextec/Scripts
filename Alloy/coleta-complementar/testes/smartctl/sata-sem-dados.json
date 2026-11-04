@@ -1,0 +1,69 @@
+{
+ "json_format_version": [
+  1,
+  0
+ ],
+ "smartctl": {
+  "version": [
+   7,
+   4
+  ],
+  "svn_revision": "5530",
+  "platform_info": "x86_64-linux-6.8.12-4-pve",
+  "build_info": "(local build)",
+  "argv": [
+   "smartctl",
+   "-j",
+   "-a",
+   "-n",
+   "standby,3",
+   "/dev/sda"
+  ],
+  "messages": [
+   {
+    "string": "SMART Status command failed: scsi error badly formed scsi parameters",
+    "severity": "error"
+   },
+   {
+    "string": "Read SMART Data failed: scsi error badly formed scsi parameters",
+    "severity": "error"
+   }
+  ],
+  "exit_status": 4
+ },
+ "device": {
+  "name": "/dev/sda",
+  "info_name": "/dev/sda [SAT]",
+  "type": "sat",
+  "protocol": "ATA"
+ },
+ "model_family": "Samsung based SSDs",
+ "model_name": "Samsung SSD 870 EVO 500GB",
+ "serial_number": "S62ANZFR123456X",
+ "wwn": {
+  "naa": 5,
+  "oui": 9528,
+  "id": 1
+ },
+ "firmware_version": "SVT02B6Q",
+ "user_capacity": {
+  "blocks": 976773168,
+  "bytes": 500107862016
+ },
+ "logical_block_size": 512,
+ "physical_block_size": 512,
+ "rotation_rate": 0,
+ "ata_version": {
+  "string": "ACS-4 T13/BSR INCITS 529 revision 5",
+  "major_value": 4092,
+  "minor_value": 94
+ },
+ "sata_version": {
+  "string": "SATA 3.3",
+  "value": 511
+ },
+ "smart_support": {
+  "available": true,
+  "enabled": true
+ }
+}

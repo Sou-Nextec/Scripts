@@ -43,7 +43,7 @@
    "info_name": "/dev/bus/0 [megaraid_disk_02]",
    "type": "megaraid,2",
    "protocol": "SCSI",
-   "open_error": "DELL or MegaRaid controller, please try adding '-d megaraid,N'"
+   "open_error": "/dev/bus/0 [megaraid_disk_02]: INQUIRY failed"
   }
  ]
 }
