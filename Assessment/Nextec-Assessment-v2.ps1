@@ -360,9 +360,37 @@ function Invoke-Etapa {
     }
 }
 
+function Test-CelulaPerigosa {
+    # Excel executa célula que começa com = + - @, inclusive depois de espaço, tabulação ou quebra de linha. Número negativo e traço sozinho não são fórmula.
+    param($Valor)
+    if ($null -eq $Valor -or $Valor -is [ValueType]) { return $false }
+    $texto = "$Valor"
+    ($texto -match '^\s*[=+\-@＝＋－＠]') -and ($texto -notmatch '^\s*[-+]?\d+([.,]\d+)*\s*$') -and ($texto -notmatch '^\s*-+\s*$')
+}
+
+function ConvertTo-LinhaCsvSegura {
+    # O apóstrofo faz a planilha tratar como texto. Nome de coluna também conta: as colunas da estação vêm do JSON dela.
+    param($Linha)
+    $propriedades = @($Linha.PSObject.Properties)
+    $valores = @{}
+    $perigosa = $false
+    foreach ($p in $propriedades) {
+        try { $valores[$p.Name] = $p.Value } catch { $valores[$p.Name] = $null }
+        if ((Test-CelulaPerigosa $p.Name) -or (Test-CelulaPerigosa $valores[$p.Name])) { $perigosa = $true }
+    }
+    if (-not $perigosa) { return $Linha }
+    $nova = [ordered]@{}
+    foreach ($p in $propriedades) {
+        $valor = $valores[$p.Name]
+        $nome = if (Test-CelulaPerigosa $p.Name) { "'$($p.Name)" } else { $p.Name }
+        $nova[$nome] = if (Test-CelulaPerigosa $valor) { "'$valor" } else { $valor }
+    }
+    [pscustomobject]$nova
+}
+
 function Save-Dados {
     param([string]$Nome, $Dados, [string]$Descricao)
-    $lista = @($Dados | Where-Object { $null -ne $_ })
+    $lista = @($Dados | Where-Object { $null -ne $_ } | ForEach-Object { ConvertTo-LinhaCsvSegura $_ })
     if ($lista.Count -gt 0) {
         $lista | Export-Csv -Path (Join-Path $script:PastaSaida "$Nome.csv") -NoTypeInformation -Encoding UTF8 -Delimiter ';'
     }
@@ -606,7 +634,7 @@ function New-EstacoesHtml {
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.Append('<p class="legenda">Dados da coleta local (coletor 2.0). Máquinas só com a consulta remota não aparecem aqui.</p>')
     $tabelas = @(
-        @{ Titulo = 'Licenças'; Colunas = 'Computador', 'WindowsAtivacao', 'WindowsCanal', 'WindowsChaveFinal', 'OfficeEdicao', 'OfficeAtivacao', 'OfficeConta', 'BiosVersao' }
+        @{ Titulo = 'Licenças'; Colunas = 'Computador', 'WindowsAtivacao', 'WindowsCanal', 'WindowsChaveFinal', 'OfficeEdicao', 'OfficeLicenca', 'OfficeAtivacao', 'OfficeConta', 'BiosVersao' }
         @{ Titulo = 'Segurança'; Colunas = 'Computador', 'Firewall', 'AcessoEntrada', 'WinRM', 'SMBv1', 'AdministradorLocal', 'LAPS', 'USB', 'BloqueioTela' }
         @{ Titulo = 'Rede e saúde'; Colunas = 'Computador', 'IpTipo', 'IpLocal', 'UsaWiFi', 'SaudeDiscos', 'TelasAzuis30d', 'LogonsFalha7d', 'DadosLocaisGB' }
     )

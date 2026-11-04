@@ -8,7 +8,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($arquivo, [ref]
 $nomes = 'Get-ExecutavelDoComando', 'Test-CaminhoDoWindows', 'ConvertTo-CanalLicenca', 'ConvertTo-StatusLicenca',
     'Format-DataEstacao', 'ConvertTo-LinhaCertificado', 'Format-AcessoEntrada', 'Format-PoliticaSenha',
     'Format-BloqueioTela', 'Get-TamanhoPasta', 'Get-ResumoEventos', 'Format-SaudeDiscos', 'Test-PortaCoberta', 'Get-SituacaoPortaFirewall',
-    'Test-ItemLocal', 'Resolve-PastaUsuario', 'Test-CaminhoNaRede', 'Test-CaminhoDentroDe', 'Get-PastasConhecidas', 'Get-PastasUsuarios'
+    'Test-ItemLocal', 'Get-SituacaoOffice', 'Resolve-PastaUsuario', 'Test-CaminhoNaRede', 'Test-CaminhoDentroDe', 'Get-PastasConhecidas', 'Get-PastasUsuarios'
 $achadas = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $nomes }, $true))
 foreach ($f in $achadas) {
     . ([scriptblock]::Create($f.Extent.Text))
@@ -187,6 +187,17 @@ Describe 'Get-TamanhoPasta' {
             $r.Arquivos | Should Be 0
         } finally { Remove-Item -LiteralPath $raiz -Recurse -Force -ErrorAction SilentlyContinue }
     }
+    It 'prazo que vence no meio de uma pasta só para a varredura e marca Parcial' {
+        $raiz = New-PastaTemp
+        try {
+            1..3 | ForEach-Object { New-ArquivoComBytes (Join-Path $raiz "$_.bin") 10 }
+            # Cada item leva mais que o prazo inteiro: o segundo já encontra o relógio vencido.
+            function Test-ItemLocal { Start-Sleep -Milliseconds 1200; $true }
+            $r = Get-TamanhoPasta $raiz ([Diagnostics.Stopwatch]::StartNew()) 1
+            $r.Parcial | Should Be $true
+            $r.Arquivos | Should Be 1
+        } finally { Remove-Item -LiteralPath $raiz -Recurse -Force -ErrorAction SilentlyContinue }
+    }
     It 'com relógio já vencido devolve Parcial verdadeiro rapidamente' {
         $raiz = New-PastaTemp
         try {
@@ -263,6 +274,24 @@ Describe 'Format-AcessoEntrada' {
         $aberto = @(New-PerfilTeste 'Public' $true $true)
         Format-AcessoEntrada @() $aberto | Should Match 'SMB 445: liberada'
         Format-AcessoEntrada @(New-RegraTeste '445' 'Any' 'Block') $aberto | Should Match 'SMB 445: bloqueada'
+    }
+}
+
+Describe 'Get-SituacaoOffice' {
+    It 'Microsoft 365 sem dado de licença não é dado como ativo' {
+        $s = Get-SituacaoOffice $null 'O365BusinessRetail'
+        $s.Ativacao | Should Be 'Não identificada'
+        $s.Licenca | Should Be 'Assinatura Microsoft 365'
+    }
+    It 'Microsoft 365 com licença consultada mostra o estado real' {
+        $s = Get-SituacaoOffice ([pscustomobject]@{ LicenseStatus = 0; ProductKeyChannel = 'Retail' }) 'Microsoft365Retail'
+        $s.Licenca | Should Be 'Assinatura Microsoft 365'
+        $s.Ativacao | Should Match ([regex]::Escape((ConvertTo-StatusLicenca 0)))
+    }
+    It 'Office perpétuo sem dado de licença fica sem tipo e sem estado' {
+        $s = Get-SituacaoOffice $null 'ProPlus2021Volume'
+        $s.Licenca | Should Be ''
+        $s.Ativacao | Should Be 'Não identificada'
     }
 }
 

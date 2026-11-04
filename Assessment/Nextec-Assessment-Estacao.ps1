@@ -130,6 +130,15 @@ function Get-AtivacaoLicenca {
     $itens | Sort-Object @{ e = { [int]$_.LicenseStatus -eq 1 } } -Descending | Select-Object -First 1
 }
 
+function Get-SituacaoOffice {
+    # Tipo de licença e estado são coisas distintas: a edição diz que é assinatura, não que está ativa. Sem consulta de licença, o estado fica em aberto.
+    param($Licenca, [string]$Edicao)
+    [pscustomobject]@{
+        Licenca  = if ($Edicao -match '(?i)O365|Microsoft365') { 'Assinatura Microsoft 365' } elseif ($Licenca) { ConvertTo-CanalLicenca $Licenca.ProductKeyChannel } else { '' }
+        Ativacao = if ($Licenca) { "$(ConvertTo-StatusLicenca $Licenca.LicenseStatus) ($(ConvertTo-CanalLicenca $Licenca.ProductKeyChannel))" } else { 'Não identificada' }
+    }
+}
+
 function Get-OfficeEstacao {
     param($Softwares, $Perfis)
     $canais = @{
@@ -152,11 +161,9 @@ function Get-OfficeEstacao {
         $msi = @($Softwares | Where-Object { $_.Nome -match '(?i)^Microsoft (Office|365)\b' -and $_.Nome -notmatch '(?i)MUI|Proofing|Revis|Click-to-Run|Shared|Language|Idioma' }) | Select-Object -First 1
         if ($msi) { $edicao = "$($msi.Nome)"; $versao = "$($msi.Versao)"; $canal = 'MSI (sem canal)' }
     }
-    if (-not $edicao) { return [pscustomobject]@{ Edicao = ''; Versao = ''; Canal = ''; Ativacao = ''; Conta = '' } }
+    if (-not $edicao) { return [pscustomobject]@{ Edicao = ''; Versao = ''; Canal = ''; Licenca = ''; Ativacao = ''; Conta = '' } }
     $lic = Get-AtivacaoLicenca '0ff1ce15-a989-479d-af46-f275c6370663' 'Ativação do Office'
-    $ativacao = if ($lic) { "$(ConvertTo-StatusLicenca $lic.LicenseStatus) ($(ConvertTo-CanalLicenca $lic.ProductKeyChannel))" }
-                elseif ($edicao -match '(?i)O365|Microsoft365') { 'Assinatura Microsoft 365 (ativa por conta)' }
-                else { 'Não identificada' }
+    $situacao = Get-SituacaoOffice $lic $edicao
     # Conta conectada: só de quem está logado agora.
     $contas = @(foreach ($p in @($Perfis | Where-Object { $_.Carregado })) {
         foreach ($i in Get-ChildItem -LiteralPath "$($p.Raiz)\Software\Microsoft\Office\16.0\Common\Identity\Identities" -ErrorAction SilentlyContinue) {
@@ -164,7 +171,7 @@ function Get-OfficeEstacao {
             if ($email) { $email }
         }
     })
-    [pscustomobject]@{ Edicao = $edicao; Versao = $versao; Canal = $canal; Ativacao = $ativacao; Conta = (@($contas | Select-Object -Unique) -join '; ') }
+    [pscustomobject]@{ Edicao = $edicao; Versao = $versao; Canal = $canal; Licenca = $situacao.Licenca; Ativacao = $situacao.Ativacao; Conta = (@($contas | Select-Object -Unique) -join '; ') }
 }
 
 function ConvertTo-LinhaCertificado {
@@ -388,11 +395,12 @@ function Get-TamanhoPasta {
     if ($disponivel) {
         $pilha = New-Object System.Collections.Generic.Stack[string]
         $pilha.Push($Caminho)
-        while ($pilha.Count -gt 0) {
-            if ($Relogio.Elapsed.TotalSeconds -gt $PrazoSeg) { $parcial = $true; break }
+        while ($pilha.Count -gt 0 -and -not $parcial) {
             $pasta = $pilha.Pop()
             try {
                 foreach ($i in (New-Object IO.DirectoryInfo $pasta).EnumerateFileSystemInfos()) {
+                    # Dentro do laço: uma pasta só, com muitos arquivos, também tem que respeitar o prazo.
+                    if ($Relogio.Elapsed.TotalSeconds -gt $PrazoSeg) { $parcial = $true; break }
                     $ehPasta = $i -is [IO.DirectoryInfo]
                     $vinculo = if ($ehPasta -and ($i.Attributes -band [IO.FileAttributes]::ReparsePoint)) { "$($i.LinkType)" } else { '' }
                     if (-not (Test-ItemLocal ([int]$i.Attributes) $vinculo)) { continue }
@@ -862,6 +870,7 @@ try {
         OfficeEdicao          = $office.Edicao
         OfficeVersao          = $office.Versao
         OfficeCanal           = $office.Canal
+        OfficeLicenca         = $office.Licenca
         OfficeAtivacao        = $office.Ativacao
         OfficeConta           = $office.Conta
         QtdCertificados       = $certificados.Count

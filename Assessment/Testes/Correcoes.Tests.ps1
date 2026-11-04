@@ -11,7 +11,7 @@ $script:TextoV2 = [System.IO.File]::ReadAllText($arquivo, [System.Text.Encoding]
 $nomes = 'Get-SituacaoSuporte', 'Get-NomeNetBios', 'Stop-TrabalhosVencidos', 'Get-MembrosAdministradores',
     'Format-SituacaoTpm', 'Test-ServicoBackupReal', 'ConvertTo-NumeroOuNulo', 'New-ComputadoresHtml',
     'ConvertTo-HtmlSeguro', 'ConvertFrom-TxtCymru', 'Get-ResumoOfficeClickToRun', 'Add-DetalhesEstacao',
-    'Get-ListaEstacao', 'Add-AlertasColetaLocal', 'Add-Alerta', 'Add-AlertaPorMaquinas'
+    'Get-ListaEstacao', 'Save-DetalhesEstacoes', 'Save-Dados', 'ConvertTo-LinhaCsvSegura', 'Test-CelulaPerigosa', 'Add-AlertasColetaLocal', 'Add-Alerta', 'Add-AlertaPorMaquinas'
 $funcoesCarregadas = New-Object System.Collections.Generic.List[string]
 foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $nomes }, $true)) {
     . ([scriptblock]::Create($f.Extent.Text))
@@ -438,5 +438,66 @@ Describe 'Add-AlertasColetaLocal' {
         $v.Count | Should Be 1
         $v[0].Detalhe | Should Match 'PC01'
         $v[0].Detalhe | Should Not Match 'PC02'
+    }
+}
+
+Describe 'CSV gerado a partir do JSON da estação (fórmulas neutralizadas)' {
+    function Invoke-ExportacaoTeste {
+        # Caminho real: JSON, Add-DetalhesEstacao, Save-DetalhesEstacoes, arquivo.
+        param([string]$Json, [string]$Lista)
+        $script:DetalhesEstacoes = @{}
+        $script:Arquivos = New-Object System.Collections.Generic.List[object]
+        $script:PastaSaida = Join-Path $env:TEMP ('NxtCsv_' + [guid]::NewGuid().ToString('N'))
+        [void](New-Item -ItemType Directory -Path $script:PastaSaida)
+        try {
+            Add-DetalhesEstacao ($Json | ConvertFrom-Json) 'PC01'
+            Save-DetalhesEstacoes
+            @(Import-Csv -LiteralPath (Join-Path $script:PastaSaida "$($script:ListasEstacao[$Lista][0]).csv") -Delimiter ';')
+        } finally { Remove-Item -LiteralPath $script:PastaSaida -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    It 'valor iniciado por = sai como texto' {
+        $l = Invoke-ExportacaoTeste '{"Certificados":[{"Titular":"=1+1"}]}' 'Certificados'
+        $l[0].Titular | Should Be "'=1+1"
+        $l[0].Computador | Should Be 'PC01'
+    }
+    It 'cobre + - @, tabulação e espaço antes do sinal' {
+        $l = Invoke-ExportacaoTeste '{"Impressoras":[{"A":"+1+1","B":"-2+3","C":"@SUM(A1)","D":"\t=1+1","E":"  =1+1"}]}' 'Impressoras'
+        $l[0].A | Should Be "'+1+1"
+        $l[0].B | Should Be "'-2+3"
+        $l[0].C | Should Be "'@SUM(A1)"
+        $l[0].D | Should Be "'`t=1+1"
+        $l[0].E | Should Be "'  =1+1"
+    }
+    It 'nome de coluna vindo do JSON também é neutralizado' {
+        $l = Invoke-ExportacaoTeste '{"Impressoras":[{"=HYPERLINK(1)":"x"}]}' 'Impressoras'
+        $l[0].PSObject.Properties.Name -contains "'=HYPERLINK(1)" | Should Be $true
+        $l[0].PSObject.Properties.Name -contains '=HYPERLINK(1)' | Should Be $false
+    }
+    It 'objeto aninhado, que o CSV escreveria como @{...}, sai como texto' {
+        $l = Invoke-ExportacaoTeste '{"Impressoras":[{"Nome":{"a":"b"}}]}' 'Impressoras'
+        $l[0].Nome | Should Be "'@{a=b}"
+    }
+    It 'valor comum, número negativo e traço ficam como estão' {
+        $l = Invoke-ExportacaoTeste '{"Impressoras":[{"Nome":"HP 1020","Saldo":-5,"Texto":"-5,5","Vazio":"-","Mail":"a@b.com"}]}' 'Impressoras'
+        $l[0].Nome | Should Be 'HP 1020'
+        $l[0].Saldo | Should Be '-5'
+        $l[0].Texto | Should Be '-5,5'
+        $l[0].Vazio | Should Be '-'
+        $l[0].Mail | Should Be 'a@b.com'
+    }
+    It 'Save-Dados protege também os demais CSVs, como o inventário' {
+        $script:Arquivos = New-Object System.Collections.Generic.List[object]
+        $script:PastaSaida = Join-Path $env:TEMP ('NxtCsv_' + [guid]::NewGuid().ToString('N'))
+        [void](New-Item -ItemType Directory -Path $script:PastaSaida)
+        try {
+            Save-Dados 'inventario_computadores' @([pscustomobject]@{ Computador = 'PC01'; OfficeConta = '=1+1' }) 'teste'
+            $l = @(Import-Csv -LiteralPath (Join-Path $script:PastaSaida 'inventario_computadores.csv') -Delimiter ';')
+            $l[0].OfficeConta | Should Be "'=1+1"
+            $script:Arquivos[0].Registros | Should Be 1
+        } finally { Remove-Item -LiteralPath $script:PastaSaida -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    It 'linha sem nada perigoso passa intacta' {
+        $o = [pscustomobject]@{ A = 'x'; B = 1 }
+        [object]::ReferenceEquals((ConvertTo-LinhaCsvSegura $o), $o) | Should Be $true
     }
 }
