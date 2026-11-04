@@ -2771,7 +2771,6 @@ class ModuloDiscos:
         dados = leitura.dados
         if disco_virtual_smart(dados):
             return "virtual", None
-        self._avisar_volta(nome)
         rotulos = {
             "disco": nome,
             "modelo": str(dados.get("model_name") or dados.get("scsi_model_name") or dados.get("scsi_product") or ""),
@@ -2784,6 +2783,8 @@ class ModuloDiscos:
             motivo = leitura.mensagens() or "sem dados de saúde"
             self._avisar_falha(nome, f"smartctl sem dados SMART (código {leitura.codigo}): {motivo}"[:300])
             return "erro", None
+        # Só depois de validar os dados: falha contínua não vira recuperação falsa.
+        self._avisar_volta(nome)
         if "nvme_smart_health_information_log" in dados:
             atual, maxima = largura_link_nvme(self.raiz_sys, controlador_nvme(self.raiz_sys, nome))
             valores["link_largura"] = atual

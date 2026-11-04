@@ -355,6 +355,16 @@ class TesteRodada(unittest.TestCase):
         self.assertIn("código 4", falha["detalhe"])
         self.assertIn("SMART Status command failed", falha["detalhe"])
 
+    def test_codigo_4_seguido_nao_gera_recuperacao_falsa(self):
+        self.respostas["sda"] = (4, "sata-sem-dados.json")
+        modulo = self.modulo()
+        modulo.rodada()
+        modulo.rodada()
+        self.respostas["sda"] = (64, "sata-realocados.json")
+        modulo.rodada()
+        eventos_sda = [e["evento"] for e in self.eventos.registros if e.get("disco") == "sda"]
+        self.assertEqual(eventos_sda, ["disco_sem_resposta", "disco_voltou"])
+
     def test_codigo_4_com_dados_parciais_mantem_o_que_veio(self):
         self.respostas["sda"] = (4, "sata-status-falhou.json")
         modulo = self.modulo()
