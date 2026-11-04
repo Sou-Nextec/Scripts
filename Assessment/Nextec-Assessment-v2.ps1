@@ -27,6 +27,10 @@
     Saída: em C:\Temp (mude com -Saida), um .zip com CSVs (separador ';', UTF-8), textos, resumo.json e Resumo-Assessment.html. A pasta de trabalho é removida depois que o .zip é gerado.
     A varredura de rede abre conexões TCP nas portas listadas; se houver IPS/antivírus de rede, avise o cliente.
 
+    Por padrão o script não abre net.exe nem vssadmin e não acessa API web, para não acionar bloqueio por comportamento:
+      -ComandosExternos  liga net view (compartilhamentos dos equipamentos da rede), net accounts e vssadmin.
+      -ConsultasWeb      liga ipinfo.io (cidade do IP público), api.macvendors.com e o download da base IEEE.
+
 .EXAMPLE
     .\Nextec-Assessment-v2.ps1 -Automatico
 
@@ -34,13 +38,13 @@
     .\Nextec-Assessment-v2.ps1 -SoValidar
 
 .EXAMPLE
-    .\Nextec-Assessment.ps1 -Cliente "Cartorio Maria Jose Rabelo Costa"
+    .\Nextec-Assessment-v2.ps1 -Cliente "Cartorio Maria Jose Rabelo Costa"
 
 .EXAMPLE
-    .\Nextec-Assessment.ps1 -Cliente "CMJRC" -Subredes 192.168.0.0/24,192.168.10.0/24
+    .\Nextec-Assessment-v2.ps1 -Cliente "CMJRC" -Subredes 192.168.0.0/24,192.168.10.0/24
 
 .EXAMPLE
-    .\Nextec-Assessment.ps1 -Cliente "CMJRC" -SemVarreduraRede -SemInventarioRemoto
+    .\Nextec-Assessment-v2.ps1 -Cliente "CMJRC" -SemVarreduraRede -SemInventarioRemoto
 #>
 [CmdletBinding()]
 param(
@@ -60,6 +64,8 @@ param(
     [switch]$SemInventarioRemoto,
     [switch]$SemAD,
     [switch]$SemConsultaInternet,
+    [switch]$ComandosExternos,
+    [switch]$ConsultasWeb,
     [switch]$PortasCompletas,
     [switch]$IncluirRedesVirtuais,
     [switch]$SoftwareEstacoes,
@@ -114,6 +120,7 @@ $script:Certificados = @()
 $script:DominioEmailAD = ''
 $script:UpnSuffixesForest = @()
 $script:SoftwaresEstacoes = New-Object System.Collections.Generic.List[object]
+$script:DetalhesEstacoes = @{}
 $script:CredencialRemota = $null
 $script:DiscosSemSmart = @()
 
@@ -353,10 +360,78 @@ function Invoke-Etapa {
     }
 }
 
+function Test-CelulaPerigosa {
+    # Excel executa célula que começa com = + - @, inclusive depois de espaço, tabulação ou quebra de linha. Número negativo e traço sozinho não são fórmula.
+    param($Valor)
+    if ($null -eq $Valor -or $Valor -is [ValueType]) { return $false }
+    $texto = "$Valor"
+    ($texto -match '^\s*[=+\-@＝＋－＠]') -and ($texto -notmatch '^\s*[-+]?\d+([.,]\d+)*\s*$') -and ($texto -notmatch '^\s*-+\s*$')
+}
+
+function Get-MapaColunasCsv {
+    # Um mapeamento por arquivo: nome original -> nome seguro, igual em todas as linhas.
+    # Nome que já é seguro nunca muda; o que precisa de apóstrofo cede se o nome resultante já existir, ganhando " (2)", " (3)"...
+    param($Linhas)
+    $originais = New-Object System.Collections.Generic.List[string]
+    $vistos = New-Object System.Collections.Generic.HashSet[string]
+    $menor = [int]::MaxValue
+    foreach ($linha in @($Linhas)) {
+        $qtd = 0
+        foreach ($p in $linha.PSObject.Properties) { $qtd++; if ($vistos.Add("$($p.Name)")) { $originais.Add("$($p.Name)") } }
+        if ($qtd -lt $menor) { $menor = $qtd }
+    }
+    $usados = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+    $seguro = New-Object 'System.Collections.Generic.Dictionary[string,string]'
+    $mudou = $false
+    # Primeiro os que ficam como estão, para que o literal "'=A" não seja tomado pela versão neutralizada de "=A".
+    foreach ($n in $originais) {
+        if (Test-CelulaPerigosa $n) { continue }
+        $final = $n; $i = 2
+        while (-not $usados.Add($final)) { $final = "$n ($i)"; $i++ }
+        $seguro[$n] = $final
+        if ($final -ne $n) { $mudou = $true }
+    }
+    foreach ($n in $originais) {
+        if (-not (Test-CelulaPerigosa $n)) { continue }
+        $base = "'$n"; $final = $base; $i = 2
+        while (-not $usados.Add($final)) { $final = "$base ($i)"; $i++ }
+        $seguro[$n] = $final
+        $mudou = $true
+    }
+    # Heterogêneo: alguma linha tem menos colunas que o conjunto todo. O Export-Csv do 5.1 usaria só as da primeira.
+    [pscustomobject]@{ Originais = $originais.ToArray(); Seguro = $seguro; Mudou = $mudou; Heterogeneo = ($originais.Count -gt 0 -and $menor -lt $originais.Count) }
+}
+
+function ConvertTo-LinhaCsvSegura {
+    # Valor perigoso ganha apóstrofo, que faz a planilha tratar como texto. Os nomes de coluna vêm do mapeamento do arquivo.
+    # Sem $Mapa (uma linha avulsa), o mapeamento é calculado só com ela.
+    param($Linha, $Mapa = $null)
+    if (-not $Mapa) { $Mapa = Get-MapaColunasCsv @($Linha) }
+    # Dictionary ordinal, como o mapa: um @{} comum ignora maiúscula e juntaria "Campo" e "campo" no mesmo valor.
+    $valores = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+    $perigosa = $Mapa.Mudou -or $Mapa.Heterogeneo
+    foreach ($p in $Linha.PSObject.Properties) {
+        $v = $null
+        try { $v = $p.Value } catch { }
+        $valores["$($p.Name)"] = $v
+        if (Test-CelulaPerigosa $v) { $perigosa = $true }
+    }
+    if (-not $perigosa) { return $Linha }
+    $nova = [ordered]@{}
+    foreach ($n in $Mapa.Originais) {
+        $v = $null
+        [void]$valores.TryGetValue($n, [ref]$v)
+        $nova[$Mapa.Seguro[$n]] = if (Test-CelulaPerigosa $v) { "'$v" } else { $v }
+    }
+    [pscustomobject]$nova
+}
+
 function Save-Dados {
     param([string]$Nome, $Dados, [string]$Descricao)
     $lista = @($Dados | Where-Object { $null -ne $_ })
     if ($lista.Count -gt 0) {
+        $mapa = Get-MapaColunasCsv $lista
+        $lista = @($lista | ForEach-Object { ConvertTo-LinhaCsvSegura $_ $mapa })
         $lista | Export-Csv -Path (Join-Path $script:PastaSaida "$Nome.csv") -NoTypeInformation -Encoding UTF8 -Delimiter ';'
     }
     $script:Arquivos.Add([pscustomobject]@{ Arquivo = "$Nome.csv"; Registros = $lista.Count; Descricao = $Descricao })
@@ -401,17 +476,28 @@ function Format-Data {
 }
 
 function Get-SituacaoSuporte {
-    # Datas de fim de suporte (edições Home/Pro para clientes, estendido para servidores). Conferir em caso de dúvida.
+    # Datas de fim de suporte por edição (LTSC, Enterprise/Education, Home/Pro; estendido para servidores). Conferir em caso de dúvida.
     param([string]$Caption, [int]$Build)
     if (-not $Build) { return 'Verificar' }
     if ($Caption -match 'Server') {
         $mapa = @{ 6002 = '2020-01-14'; 7601 = '2020-01-14'; 9200 = '2023-10-10'; 9600 = '2023-10-10'
                    14393 = '2027-01-12'; 17763 = '2029-01-09'; 20348 = '2031-10-14'; 26100 = '2034-10-10' }
+    } elseif ($Caption -match 'LTSC|LTSB') {
+        $iot = $Caption -match 'IoT'
+        $mapa = @{ 10240 = '2025-10-14'; 14393 = '2026-10-13'; 17763 = '2029-01-09'
+                   19044 = $(if ($iot) { '2032-01-13' } else { '2027-01-12' })
+                   26100 = $(if ($iot) { '2034-10-10' } else { '2029-10-09' }) }
+    } elseif ($Caption -match 'Enterprise|Education|Educa') {
+        $mapa = @{ 17763 = '2021-05-11'; 18363 = '2022-05-10'; 19041 = '2021-12-14'; 19042 = '2023-05-09'
+                   19043 = '2022-12-13'; 19044 = '2024-06-11'; 19045 = '2025-10-14'; 22000 = '2024-10-08'
+                   22621 = '2025-10-14'; 22631 = '2026-11-10'; 26100 = '2027-10-12'; 26200 = '2028-10-10'
+                   26300 = '2029-10-09'; 28000 = '2029-03-13' }
     } else {
         $mapa = @{ 7601 = '2020-01-14'; 9600 = '2023-01-10'; 10240 = '2017-05-09'; 17763 = '2020-11-10'
                    18363 = '2022-05-10'; 19041 = '2021-12-14'; 19042 = '2022-05-10'; 19043 = '2022-12-13'
                    19044 = '2023-06-13'; 19045 = '2025-10-14'; 22000 = '2023-10-10'; 22621 = '2024-10-08'
-                   22631 = '2025-11-11'; 26100 = '2026-10-13'; 26200 = '2027-10-12' }
+                   22631 = '2025-11-11'; 26100 = '2026-10-13'; 26200 = '2027-10-12'
+                   26300 = '2028-10-10'; 28000 = '2028-03-14' }
     }
     if (-not $mapa.ContainsKey($Build)) { return 'Verificar (build não mapeado)' }
     $fim = [datetime]::ParseExact($mapa[$Build], 'yyyy-MM-dd', $null)
@@ -419,6 +505,194 @@ function Get-SituacaoSuporte {
     if ($dias -lt 0) { return "Fora de suporte desde $($fim.ToString('dd/MM/yyyy'))" }
     if ($dias -le 180) { return "Suporte até $($fim.ToString('dd/MM/yyyy')) (encerra em $dias dias)" }
     "Suportado até $($fim.ToString('dd/MM/yyyy'))"
+}
+
+function Test-ServicoBackupReal {
+    # O filtro por "Backup" também casa serviços que vêm com o Windows, e aí o alerta de "nenhum backup" nunca disparava.
+    param($Servico)
+    $Servico.Name -notmatch '^(SDRSVC|wbengine|fhsvc|VSS|swprv|CloudBackupRestoreSvc(_[0-9a-f]+)?)$'
+}
+
+function Format-SituacaoTpm {
+    param($Tpm)
+    if (-not $Tpm) { return 'Não identificado' }
+    "Presente: $($Tpm.TpmPresent) | Pronto: $($Tpm.TpmReady)"
+}
+
+function Get-MembrosAdministradores {
+    # Get-LocalGroupMember aborta inteiro quando o grupo tem SID órfão (conta de domínio apagada); nesse caso lê por CIM.
+    try {
+        @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | Select-Object Name, ObjectClass, PrincipalSource)
+    } catch {
+        $grupo = Get-CimInstance Win32_Group -Filter "SID='S-1-5-32-544'" -ErrorAction Stop
+        @(Get-CimAssociatedInstance -InputObject $grupo -Association Win32_GroupUser -ErrorAction Stop | ForEach-Object {
+            [pscustomobject]@{ Name = "$($_.Domain)\$($_.Name)"; ObjectClass = $_.CimClass.CimClassName -replace '^Win32_', ''; PrincipalSource = 'N/D' }
+        })
+    }
+}
+
+function Get-ResumoOfficeClickToRun {
+    # Microsoft 365 e Office por conta não aparecem em SoftwareLicensingProduct: sem isto o Office ficava invisível.
+    param($Config)
+    if (-not $Config -or -not $Config.ProductReleaseIds) { return $null }
+    "$($Config.ProductReleaseIds) $($Config.VersionToReport) (Click-to-Run; ativação pela conta ou assinatura, confirmar no portal)"
+}
+
+function ConvertTo-NumeroOuNulo {
+    # O arquivo da estação vem de uma pasta que qualquer máquina grava: coluna numérica só aceita número.
+    param($Valor)
+    if ($null -eq $Valor -or $Valor -is [bool]) { return $null }
+    $numero = 0.0
+    if ([double]::TryParse("$Valor", [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$numero)) { return $numero }
+    $null
+}
+
+function ConvertFrom-TxtCymru {
+    # Resposta TXT do Team Cymru: campos separados por '|'.
+    param([string]$Texto)
+    @($Texto.Trim('"', ' ') -split '\s*\|\s*')
+}
+
+function Get-IpPublicoDns {
+    # IP público e operadora por consulta DNS, sem processo externo nem API web. Não traz a cidade.
+    $servidor = @(Resolve-DnsName 'ns1.google.com' -Type A -DnsOnly -ErrorAction Stop | Where-Object { $_.IPAddress } | ForEach-Object { $_.IPAddress }) | Select-Object -First 1
+    $ip = @(Resolve-DnsName 'o-o.myaddr.l.google.com' -Server $servidor -Type TXT -DnsOnly -ErrorAction Stop | ForEach-Object { $_.Strings }) |
+        Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } | Select-Object -First 1
+    if (-not $ip) { throw 'O DNS não devolveu o IP público' }
+    $octetos = $ip -split '\.'
+    [array]::Reverse($octetos)
+    $origem = ConvertFrom-TxtCymru (@(Resolve-DnsName "$($octetos -join '.').origin.asn.cymru.com" -Type TXT -DnsOnly -ErrorAction Stop | ForEach-Object { $_.Strings }) | Select-Object -First 1)
+    $asn = "$($origem[0])".Split(' ')[0]
+    $dados = ConvertFrom-TxtCymru (@(Resolve-DnsName "AS$asn.asn.cymru.com" -Type TXT -DnsOnly -ErrorAction Stop | ForEach-Object { $_.Strings }) | Select-Object -First 1)
+    [pscustomobject]@{ IP = $ip; Asn = $asn; Operadora = "$($dados[4])" -replace ',\s*[A-Z]{2}$', '' }
+}
+
+function Stop-TrabalhosVencidos {
+    # Estação que trava depois de conectar segurava a coleta inteira: passado o prazo, abandona e segue.
+    param($Trabalhos, $Resultados, [datetime]$Inicio, [int]$PrazoSeg)
+    if (((Get-Date) - $Inicio).TotalSeconds -lt $PrazoSeg) { return 0 }
+    $abandonados = 0
+    foreach ($t in @($Trabalhos | Where-Object { -not $_.Lido })) {
+        [void]$t.PS.BeginStop($null, $null)
+        $Resultados[$t.Nome] = [pscustomobject]@{ Computador = $t.Nome; Status = "Sem resposta em $PrazoSeg s (consulta abandonada)" }
+        $t.Lido = $true
+        $abandonados++
+    }
+    $abandonados
+}
+
+# Lista branca: o nome da lista vira nome de arquivo, e o JSON da estação não é confiável.
+$script:ListasEstacao = [ordered]@{
+    Certificados      = 'estacoes_certificados', 'Certificados ICP-Brasil nas estações'
+    ContasLocais      = 'estacoes_contas_locais', 'Contas locais das estações'
+    Compartilhamentos = 'estacoes_compartilhamentos', 'Pastas compartilhadas nas estações'
+    Tarefas           = 'estacoes_tarefas', 'Tarefas agendadas fora do padrão do Windows'
+    Servicos          = 'estacoes_servicos', 'Serviços fora do padrão do Windows'
+    Inicializacao     = 'estacoes_inicializacao', 'Programas de inicialização'
+    LogonsFalha       = 'estacoes_logons_falha', 'Logons com falha nos últimos 7 dias'
+    Rede              = 'estacoes_rede', 'Placas de rede: IP, DNS, MAC e Wi-Fi'
+    Impressoras       = 'estacoes_impressoras', 'Impressoras instaladas'
+    Scanners          = 'estacoes_scanners', 'Scanners instalados'
+    Unidades          = 'estacoes_unidades', 'Unidades mapeadas'
+    Discos            = 'estacoes_discos', 'Discos físicos e saúde'
+    Eventos           = 'estacoes_eventos', 'Eventos críticos e erros de sistema mais frequentes (30 dias)'
+    PastasUsuario     = 'estacoes_dados_locais', 'Volume em Área de Trabalho, Documentos e Downloads'
+}
+
+function Add-DetalhesEstacao {
+    param($Detalhes, [string]$Computador)
+    if (-not $Detalhes) { return }
+    foreach ($lista in $script:ListasEstacao.Keys) {
+        foreach ($item in @($Detalhes.$lista)) {
+            if ($null -eq $item) { continue }
+            $linha = [ordered]@{ Computador = $Computador }
+            foreach ($prop in $item.PSObject.Properties) { if ($prop.Name -ne 'Computador') { $linha[$prop.Name] = $prop.Value } }
+            if (-not $script:DetalhesEstacoes.ContainsKey($lista)) { $script:DetalhesEstacoes[$lista] = New-Object System.Collections.Generic.List[object] }
+            $script:DetalhesEstacoes[$lista].Add([pscustomobject]$linha)
+        }
+    }
+}
+
+function Get-ListaEstacao {
+    param([string]$Lista)
+    if ($script:DetalhesEstacoes.ContainsKey($Lista)) { $script:DetalhesEstacoes[$Lista].ToArray() }
+}
+
+function Save-DetalhesEstacoes {
+    foreach ($lista in $script:ListasEstacao.Keys) {
+        $linhas = @(Get-ListaEstacao $lista)
+        if ($linhas.Count -eq 0) { continue }
+        # O Save-Dados completa as colunas que faltam em cada linha (mapa único por arquivo).
+        Save-Dados $script:ListasEstacao[$lista][0] $linhas $script:ListasEstacao[$lista][1]
+    }
+}
+
+function Add-AlertaPorMaquinas {
+    # Um alerta por tipo, com os nomes juntos: em parque grande, um por máquina afogaria o relatório.
+    param($Maquinas, [string]$Severidade, [string]$Area, [string]$Titulo, [string]$Explicacao)
+    $nomes = @($Maquinas | ForEach-Object { $_.Computador } | Select-Object -Unique)
+    if ($nomes.Count -eq 0) { return }
+    $texto = ($nomes | Select-Object -First 15) -join ', '
+    if ($nomes.Count -gt 15) { $texto += " e mais $($nomes.Count - 15)" }
+    Add-Alerta $Severidade $Area "$Titulo ($($nomes.Count))" "$Explicacao | $texto"
+}
+
+function Add-AlertasColetaLocal {
+    param($Estacoes)
+    # Só as máquinas com o coletor 2.0 trazem estes campos.
+    $doColetor = @($Estacoes | Where-Object { $_.AcessoEntrada })
+    if ($doColetor.Count -eq 0) { return }
+    Add-AlertaPorMaquinas @($doColetor | Where-Object { $_.Firewall -match 'DESLIGADO' }) 'Média' 'Segurança' 'Estações com firewall do Windows desligado' 'Religar o perfil e liberar só o necessário.'
+    Add-AlertaPorMaquinas @($doColetor | Where-Object { $_.SMBv1 -eq 'Ligado' }) 'Alta' 'Segurança' 'Estações com SMBv1 ligado' 'Protocolo obsoleto, explorado por ransomware. Desligar.'
+    Add-AlertaPorMaquinas @($doColetor | Where-Object { $_.AcessoEntrada -match 'WinRM[^|]*bloqueada' -and $_.AcessoEntrada -match 'WMI[^|]*bloqueada' }) 'Info' 'Estações' 'Estações com WinRM e WMI bloqueados no firewall' 'Explica por que a consulta remota não alcança estas máquinas.'
+    Add-AlertaPorMaquinas @($doColetor | Where-Object { $_.AdministradorLocal -like 'Habilitada*' -and $_.LAPS -eq 'Não configurado' }) 'Média' 'Segurança' 'Administrador local habilitado sem LAPS' 'A mesma senha pode valer em várias máquinas. Desabilitar a conta ou adotar LAPS.'
+    Add-AlertaPorMaquinas @($doColetor | Where-Object { $_.LAPS -eq 'Não configurado' }) 'Baixa' 'Segurança' 'Estações sem LAPS' 'Senha do administrador local sem rotação automática.'
+    Add-AlertaPorMaquinas @($doColetor | Where-Object { $_.ContasSemSenhaObrigatoria }) 'Baixa' 'Segurança' 'Estações com conta local ativa sem senha obrigatória' 'A conta aceita senha em branco, o que não prova que esteja em branco; comum em conta criada na instalação do Windows. Ver estacoes_contas_locais.csv.'
+    Add-AlertaPorMaquinas @($doColetor | Where-Object { $_.USB -eq 'Liberado' }) 'Baixa' 'Segurança' 'Estações com armazenamento USB liberado' 'Avaliar bloqueio por política.'
+    Add-AlertaPorMaquinas @($doColetor | Where-Object { $_.BloqueioTela -eq 'Não configurado' }) 'Média' 'Segurança' 'Estações sem bloqueio de tela por inatividade' 'Definir por GPO.'
+    Add-AlertaPorMaquinas @($doColetor | Where-Object { $_.WindowsAtivacao -and $_.WindowsAtivacao -notin 'Licenciado', 'N/D' }) 'Média' 'Licenciamento' 'Estações com Windows não licenciado' 'Conferir a ativação e o comprovante.'
+    Add-AlertaPorMaquinas @($doColetor | Where-Object { $_.WindowsCanal -eq 'Volume (KMS)' }) 'Info' 'Licenciamento' 'Estações com Windows ativado por KMS' 'Confirmar se o KMS é legítimo do cliente e não ativador irregular.'
+    Add-AlertaPorMaquinas @($doColetor | Where-Object { $_.OfficeAtivacao -match 'Não licenciado|Notificação|carência' }) 'Média' 'Licenciamento' 'Estações com Office sem ativação confirmada' 'Conferir a ativação e o comprovante de licença.'
+    Add-AlertaPorMaquinas @($doColetor | Where-Object { $_.SaudeDiscos -match 'ATENÇÃO' }) 'Alta' 'Estações' 'Estações com disco em risco' 'Fazer backup e programar a troca. Ver estacoes_discos.csv.'
+    Add-AlertaPorMaquinas @($doColetor | Where-Object { $_.TelasAzuis30d -gt 0 }) 'Média' 'Estações' 'Estações com tela azul nos últimos 30 dias' 'Ver estacoes_eventos.csv.'
+    Add-AlertaPorMaquinas @($doColetor | Where-Object { $_.DesligamentosInesperados30d -ge 3 }) 'Baixa' 'Estações' 'Estações com desligamentos inesperados recorrentes' 'Três ou mais em 30 dias: verificar energia e hardware.'
+    Add-AlertaPorMaquinas @($doColetor | Where-Object { $_.LogonsFalha7d -ge 50 }) 'Média' 'Segurança' 'Estações com muitos logons com falha' 'Cinquenta ou mais em 7 dias. Ver estacoes_logons_falha.csv.'
+    $certificados = @(Get-ListaEstacao 'Certificados')
+    Add-AlertaPorMaquinas @($certificados | Where-Object { $dias = ConvertTo-NumeroOuNulo $_.DiasRestantes; $null -ne $dias -and $dias -lt 0 }) 'Média' 'Certificados' 'Estações com certificado ICP-Brasil vencido' 'Remover ou renovar. Ver estacoes_certificados.csv.'
+    Add-AlertaPorMaquinas @($certificados | Where-Object { $dias = ConvertTo-NumeroOuNulo $_.DiasRestantes; $null -ne $dias -and $dias -ge 0 -and $dias -le 30 }) 'Média' 'Certificados' 'Estações com certificado ICP-Brasil vencendo em até 30 dias' 'Programar a renovação. Ver estacoes_certificados.csv.'
+    Add-AlertaPorMaquinas @(Get-ListaEstacao 'PastasUsuario' | Where-Object { (ConvertTo-NumeroOuNulo $_.TotalGB) -ge 5 }) 'Média' 'Backup' 'Estações com muitos dados locais' 'Cinco GB ou mais em Área de Trabalho, Documentos e Downloads, possivelmente fora do backup. Ver estacoes_dados_locais.csv.'
+    $compartilhamentos = @(Get-ListaEstacao 'Compartilhamentos')
+    Add-AlertaPorMaquinas @($compartilhamentos | Where-Object { $_.AcessoTodos -match 'Full' }) 'Média' 'Arquivos' 'Estações com pasta compartilhada com controle total para Todos' 'Restringir o acesso. Ver estacoes_compartilhamentos.csv.'
+    Add-AlertaPorMaquinas @($compartilhamentos | Where-Object { $_.AcessoTodos -notmatch 'Full' }) 'Baixa' 'Arquivos' 'Estações com pasta compartilhada' 'Dado em estação costuma ficar fora do backup. Ver estacoes_compartilhamentos.csv.'
+    Add-AlertaPorMaquinas @($doColetor | Where-Object { $_.QtdTarefasForaPadrao -gt 0 -or $_.QtdServicosForaPadrao -gt 0 }) 'Info' 'Estações' 'Estações com tarefas ou serviços fora do padrão do Windows' 'Levantamento para conferência, não indica problema por si só. Ver estacoes_tarefas.csv e estacoes_servicos.csv.'
+}
+
+function New-EstacoesHtml {
+    param($Estacoes)
+    $doColetor = @($Estacoes | Where-Object { $_.AcessoEntrada })
+    if ($doColetor.Count -eq 0) { return '' }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<p class="legenda">Dados da coleta local (coletor 2.0). Máquinas só com a consulta remota não aparecem aqui.</p>')
+    $tabelas = @(
+        @{ Titulo = 'Licenças'; Colunas = 'Computador', 'WindowsAtivacao', 'WindowsCanal', 'WindowsChaveFinal', 'OfficeEdicao', 'OfficeLicenca', 'OfficeAtivacao', 'OfficeConta', 'BiosVersao' }
+        @{ Titulo = 'Segurança'; Colunas = 'Computador', 'Firewall', 'AcessoEntrada', 'WinRM', 'SMBv1', 'AdministradorLocal', 'LAPS', 'USB', 'BloqueioTela' }
+        @{ Titulo = 'Rede e saúde'; Colunas = 'Computador', 'IpTipo', 'IpLocal', 'UsaWiFi', 'SaudeDiscos', 'TelasAzuis30d', 'LogonsFalha7d', 'DadosLocaisGB' }
+    )
+    foreach ($t in $tabelas) { [void]$sb.Append("<h3>$(ConvertTo-HtmlSeguro $t.Titulo)</h3>$(New-TabelaHtml $doColetor $t.Colunas)") }
+    $listas = @(
+        @{ Titulo = 'Certificados nas estações'; Lista = 'Certificados'; Colunas = 'Computador', 'Titular', 'Tipo', 'ValidoAte', 'DiasRestantes', 'Usuario' }
+        @{ Titulo = 'Pastas compartilhadas nas estações'; Lista = 'Compartilhamentos'; Colunas = 'Computador', 'Compartilhamento', 'Caminho', 'AcessoTodos' }
+        @{ Titulo = 'Dados locais por usuário'; Lista = 'PastasUsuario'; Colunas = 'Computador', 'Usuario', 'AreaTrabalhoGB', 'DocumentosGB', 'DownloadsGB', 'TotalGB', 'OneDriveNoPerfil', 'Observacao' }
+        @{ Titulo = 'Discos'; Lista = 'Discos'; Colunas = @($null) }
+        @{ Titulo = 'Eventos mais frequentes (30 dias)'; Lista = 'Eventos'; Colunas = 'Computador', 'Origem', 'Id', 'Nivel', 'Quantidade', 'Ultimo', 'Mensagem' }
+    )
+    foreach ($l in $listas) {
+        $linhas = @(Get-ListaEstacao $l.Lista)
+        if ($linhas.Count -eq 0) { continue }
+        $colunas = if ($null -ne $l.Colunas[0]) { $l.Colunas } else { @($linhas | ForEach-Object { $_.PSObject.Properties.Name } | Select-Object -Unique) }
+        [void]$sb.Append("<h3>$(ConvertTo-HtmlSeguro $l.Titulo)</h3>$(New-TabelaHtml $linhas $colunas)")
+    }
+    $sb.ToString()
 }
 
 function Get-SuporteSql {
@@ -658,7 +932,7 @@ function Get-NomeNetBios {
     # Mesmo resultado do nbtstat -A: devolve o nome único <00> do equipamento.
     param([string]$Ip, [int]$TimeoutMs = 1500)
     # A própria máquina de coleta nem sempre responde à consulta feita para o próprio IP.
-    if ($null -eq $script:IpsLocais) {
+    if (-not $script:IpsLocais) {
         $script:IpsLocais = @(try { [System.Net.Dns]::GetHostAddresses($env:COMPUTERNAME) | ForEach-Object { $_.IPAddressToString } } catch { })
     }
     if ($script:IpsLocais -contains $Ip) { return $env:COMPUTERNAME.ToUpper() }
@@ -873,9 +1147,14113 @@ $script:OuiLocal = @{
 }
 $script:CacheOui = @{}
 # Definida aqui, antes da varredura de rede: o carregamento da base acontece na primeira consulta de fabricante.
-# Recorte da base IEEE de fabricantes (11 mil prefixos dos fabricantes comuns em cliente), gzip em base64.
+# Recorte da base IEEE de fabricantes (11 mil prefixos dos fabricantes comuns em cliente).
+# Em texto puro de propósito: blob em base64 com gzip é padrão que antivírus trata como carga escondida.
 # Garante nome de fabricante offline em qualquer maquina, sem depender de oui.csv ao lado nem de internet.
-$script:OuiEmbutidoGz = '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'
+$script:OuiEmbutido = @'
+000000|XEROX CORPORATION
+000001|XEROX CORPORATION
+000002|XEROX CORPORATION
+000003|XEROX CORPORATION
+000004|XEROX CORPORATION
+000005|XEROX CORPORATION
+000006|XEROX CORPORATION
+000007|XEROX CORPORATION
+000008|XEROX CORPORATION
+000009|XEROX CORPORATION
+00000C|Cisco Systems, Inc
+00000E|FUJITSU LIMITED
+000039|TOSHIBA CORPORATION
+000048|Seiko Epson Corporation
+000054|Schneider Electric
+00006C|Schneider Electric
+000074|RICOH COMPANY LTD.
+000085|CANON INC.
+000095|SONY TEKTRONIX CORP.
+000097|Dell EMC
+0000AA|XEROX CORPORATION
+0000DD|TCL INCORPORATED
+0000E2|ACER TECHNOLOGIES CORP.
+0000F0|Samsung Electronics Co.,Ltd
+000121|WatchGuard Technologies, Inc.
+000123|Schneider Electric Japan Holdings Ltd.
+000124|Acer Incorporated
+000130|Extreme Networks, Inc.
+000142|Cisco Systems, Inc
+000143|Cisco Systems, Inc
+000144|Dell EMC
+00014A|Sony Corporation
+000163|Cisco Systems, Inc
+000164|Cisco Systems, Inc
+00016C|FOXCONN
+000196|Cisco Systems, Inc
+000197|Cisco Systems, Inc
+0001C7|Cisco Systems, Inc
+0001C9|Cisco Systems, Inc
+0001D3|PAXCOMM, Inc.
+0001E6|Hewlett Packard
+0001E7|Hewlett Packard
+000209|Shenzhen SED Information Technology Co., Ltd.
+000216|Cisco Systems, Inc
+000217|Cisco Systems, Inc
+000220|CANON FINETECH INC.
+00023D|Cisco Systems, Inc
+00023F|Compal Electronics INC.
+00024A|Cisco Systems, Inc
+00024B|Cisco Systems, Inc
+00026C|Philips CFT
+000278|SAMSUNG ELECTRO MECHANICS CO., LTD.
+00027D|Cisco Systems, Inc
+00027E|Cisco Systems, Inc
+000285|Riverstone Networks
+000287|Adapcom
+0002A5|Hewlett Packard
+0002B9|Cisco Systems, Inc
+0002BA|Cisco Systems, Inc
+0002EE|Nokia Danmark A/S
+0002FC|Cisco Systems, Inc
+0002FD|Cisco Systems, Inc
+000331|Cisco Systems, Inc
+000332|Cisco Systems, Inc
+00036B|Cisco Systems, Inc
+00036C|Cisco Systems, Inc
+000374|Schneider Electric
+00037F|Atheros Communications, Inc.
+000381|Ingenico International
+000393|Apple, Inc.
+00039F|Cisco Systems, Inc
+0003A0|Cisco Systems, Inc
+0003E3|Cisco Systems, Inc
+0003E4|Cisco Systems, Inc
+0003FD|Cisco Systems, Inc
+0003FE|Cisco Systems, Inc
+0003FF|Microsoft Corporation
+000400|LEXMARK INTERNATIONAL, INC.
+00040D|Avaya Inc
+00040F|Asus Network Technologies, Inc.
+000417|Schneider Electric
+00041F|Sony Interactive Entertainment Inc.
+000427|Cisco Systems, Inc
+000428|Cisco Systems, Inc
+00043C|SONOS Co., Ltd.
+00044B|NVIDIA
+00044D|Cisco Systems, Inc
+00044E|Cisco Systems, Inc
+000456|Cambium Networks Limited
+00045A|The Linksys Group, Inc.
+00046D|Cisco Systems, Inc
+00046E|Cisco Systems, Inc
+00047D|Motorola Solutions Inc.
+000496|Extreme Networks, Inc.
+00049A|Cisco Systems, Inc
+00049B|Cisco Systems, Inc
+0004C0|Cisco Systems, Inc
+0004C1|Cisco Systems, Inc
+0004DD|Cisco Systems, Inc
+0004DE|Cisco Systems, Inc
+0004EA|Hewlett Packard
+0004EB|Paxonet Communications, Inc.
+0004F2|Polycom
+000500|Cisco Systems, Inc
+000501|Cisco Systems, Inc
+000502|Apple, Inc.
+000512|Zebra Technologies Inc
+000521|Schneider Electric
+000531|Cisco Systems, Inc
+000532|Cisco Systems, Inc
+00054B|Eaton Automation AG
+00054E|Philips
+00055D|D-LINK SYSTEMS, INC.
+00055E|Cisco Systems, Inc
+00055F|Cisco Systems, Inc
+000569|VMware, Inc.
+000573|Cisco Systems, Inc
+000574|Cisco Systems, Inc
+000585|Juniper Networks
+00059A|Cisco Systems, Inc
+00059B|Cisco Systems, Inc
+0005B5|Broadcom Technologies
+0005DC|Cisco Systems, Inc
+0005DD|Cisco Systems, Inc
+0005FC|Schenck Pegasus Corp.
+000600|Toshiba Teli Corporation
+00061B|Notebook Development Lab. Lenovo Japan Ltd.
+000625|The Linksys Group, Inc.
+000628|Cisco Systems, Inc
+00062A|Cisco Systems, Inc
+000633|Crossmatch Technologies/HID Global
+000637|Toptrend-Meta Information (ShenZhen) Inc.
+000646|ShenZhen XunBao Network Technology Co Ltd
+00064A|Honeywell Co., Ltd. (KOREA)
+000652|Cisco Systems, Inc
+000653|Cisco Systems, Inc
+00065B|Dell Inc.
+00067C|Cisco Systems, Inc
+0006B1|Sonicwall
+0006C1|Cisco Systems, Inc
+0006D6|Cisco Systems, Inc
+0006D7|Cisco Systems, Inc
+0006F6|Cisco Systems, Inc
+00070D|Cisco Systems, Inc
+00070E|Cisco Systems, Inc
+000725|Bematech International Corp.
+000726|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+00073E|China Great-Wall Computer Shenzhen Co., Ltd.
+00074D|Zebra Technologies Corp.
+00074F|Cisco Systems, Inc
+000750|Cisco Systems, Inc
+00077D|Cisco Systems, Inc
+000784|Cisco Systems, Inc
+000785|Cisco Systems, Inc
+0007AB|Samsung Electronics Co.,Ltd
+0007B3|Cisco Systems, Inc
+0007B4|Cisco Systems, Inc
+0007BE|DataLogic SpA
+0007EB|Cisco Systems, Inc
+0007EC|Cisco Systems, Inc
+000802|Hewlett Packard
+00080D|Toshiba
+000820|Cisco Systems, Inc
+000821|Cisco Systems, Inc
+00082F|Cisco Systems, Inc
+000830|Cisco Systems, Inc
+000831|Cisco Systems, Inc
+000832|Cisco Systems, Inc
+000859|ShenZhen Unitone Electronics Co., Ltd.
+000874|Dell Inc.
+00087C|Cisco Systems, Inc
+00087D|Cisco Systems, Inc
+000883|Hewlett Packard
+00088C|Quanta Network Systems Inc.
+0008A3|Cisco Systems, Inc
+0008A4|Cisco Systems, Inc
+0008B2|SHENZHEN COMPASS TECHNOLOGY DEVELOPMENT CO.,LTD
+0008C2|Cisco Systems, Inc
+0008C6|Philips Consumer Communications
+0008C7|Hewlett Packard
+0008E2|Cisco Systems, Inc
+0008E3|Cisco Systems, Inc
+0008FB|SonoSite, Inc.
+000901|Shenzhen Shixuntong Information & Technoligy Co
+00090F|Fortinet, Inc.
+000911|Cisco Systems, Inc
+000912|Cisco Systems, Inc
+000918|SAMSUNG TECHWIN CO.,LTD
+000937|Inventec Appliance Corp
+000943|Cisco Systems, Inc
+000944|Cisco Systems, Inc
+000947|Aztek, Inc.
+00095B|NETGEAR
+00095C|Philips Medical Systems - Cardiac and Monitoring Systems (CM
+00097B|Cisco Systems, Inc
+00097C|Cisco Systems, Inc
+0009B6|Cisco Systems, Inc
+0009B7|Cisco Systems, Inc
+0009CA|iMaxNetworks(Shenzhen)Limited.
+0009DC|Galaxis Technology AG
+0009E8|Cisco Systems, Inc
+0009E9|Cisco Systems, Inc
+0009F6|Shenzhen Eastern Digital Tech Ltd.
+0009FB|Philips Patient Monitoring
+000A00|MediaTek Inc
+000A13|Honeywell Video Systems
+000A27|Apple, Inc.
+000A28|Motorola
+000A41|Cisco Systems, Inc
+000A42|Cisco Systems, Inc
+000A57|Hewlett Packard
+000A5D|FingerTec Worldwide Sdn Bhd
+000A8A|Cisco Systems, Inc
+000A8B|Cisco Systems, Inc
+000A95|Apple, Inc.
+000AB7|Cisco Systems, Inc
+000AB8|Cisco Systems, Inc
+000AC2|Wuhan FiberHome Digital Technology Co.,Ltd.
+000AD9|Sony Corporation
+000AE0|Fujitsu Softek
+000AE4|Wistron Corporation
+000AEB|TP-LINK TECHNOLOGIES CO.,LTD.
+000AF3|Cisco Systems, Inc
+000AF4|Cisco Systems, Inc
+000AF7|Broadcom
+000B45|Cisco Systems, Inc
+000B46|Cisco Systems, Inc
+000B4F|Verifone, Inc.
+000B5D|FUJITSU LIMITED
+000B5F|Cisco Systems, Inc
+000B60|Cisco Systems, Inc
+000B66|Teralink Communications
+000B7D|SOLOMON EXTREME INTERNATIONAL LTD.
+000B82|Grandstream Networks, Inc.
+000B85|Cisco Systems, Inc
+000B86|Hewlett Packard Enterprise
+000BBE|Cisco Systems, Inc
+000BBF|Cisco Systems, Inc
+000BCD|Hewlett Packard
+000BD6|Paxton Access Ltd
+000BDB|Dell Inc.
+000BDD|TOHOKU RICOH Co., LTD.
+000BDF|Shenzhen RouterD Networks Limited
+000BE1|Nokia NET Product Operations
+000BF9|Gemstone Communications, Inc.
+000BFC|Cisco Systems, Inc
+000BFD|Cisco Systems, Inc
+000C29|VMware, Inc.
+000C2E|Openet information technology(shenzhen) Co., Ltd.
+000C30|Cisco Systems, Inc
+000C31|Cisco Systems, Inc
+000C41|Cisco-Linksys, LLC
+000C42|Routerboard.com
+000C43|MediaTek Inc
+000C6E|ASUSTek COMPUTER INC.
+000C76|MICRO-STAR INTERNATIONAL CO., LTD.
+000C81|Schneider Electric (Australia)
+000C85|Cisco Systems, Inc
+000C86|Cisco Systems, Inc
+000C87|AMD
+000CBF|Holy Stone Ent. Co., Ltd.
+000CC1|Eaton Corporation
+000CCE|Cisco Systems, Inc
+000CCF|Cisco Systems, Inc
+000CE6|Fortinet, Inc.
+000CE7|MediaTek Inc
+000D28|Cisco Systems, Inc
+000D29|Cisco Systems, Inc
+000D3A|Microsoft Corp.
+000D4B|Roku, Inc.
+000D56|Dell Inc.
+000D57|Fujitsu I-Network Systems Limited.
+000D61|Giga-Byte Technology Co., Ltd.
+000D65|Cisco Systems, Inc
+000D66|Cisco Systems, Inc
+000D88|D-Link Corporation
+000D93|Apple, Inc.
+000D9D|Hewlett Packard
+000DAE|SAMSUNG HEAVY INDUSTRIES CO., LTD.
+000DB6|Broadcom
+000DBC|Cisco Systems, Inc
+000DBD|Cisco Systems, Inc
+000DE5|Samsung Thales
+000DEC|Cisco Systems, Inc
+000DED|Cisco Systems, Inc
+000E07|Sony Corporation
+000E08|Cisco-Linksys, LLC
+000E09|Shenzhen Coship Software Co.,LTD.
+000E1F|TCL Networks Equipment Co., Ltd.
+000E38|Cisco Systems, Inc
+000E39|Cisco Systems, Inc
+000E58|Sonos, Inc.
+000E59|Sagemcom Broadband SAS
+000E7B|Toshiba
+000E7F|Hewlett Packard
+000E83|Cisco Systems, Inc
+000E84|Cisco Systems, Inc
+000EA6|ASUSTek COMPUTER INC.
+000EB3|Hewlett Packard
+000EC7|Motorola Korea
+000ED6|Cisco Systems, Inc
+000ED7|Cisco Systems, Inc
+000EE1|ExtremeSpeed Inc.
+000EE8|Zioncom Electronics (Shenzhen) Ltd.
+000EED|Nokia Danmark A/S
+000F12|Panasonic Europe Ltd.
+000F1F|Dell Inc.
+000F20|Hewlett Packard
+000F23|Cisco Systems, Inc
+000F24|Cisco Systems, Inc
+000F34|Cisco Systems, Inc
+000F35|Cisco Systems, Inc
+000F3A|HISHARP
+000F3D|D-Link Corporation
+000F61|Hewlett Packard
+000F66|Cisco-Linksys, LLC
+000F76|Digital Keystone, Inc.
+000F8F|Cisco Systems, Inc
+000F90|Cisco Systems, Inc
+000FA0|Canon Korea Inc.
+000FB0|Compal Electronics INC.
+000FB5|NETGEAR
+000FBB|Nokia Siemens Networks GmbH & Co. KG.
+000FDE|Sony Corporation
+000FEA|GIGA-BYTE TECHNOLOGY CO.,LTD.
+000FF7|Cisco Systems, Inc
+000FF8|Cisco Systems, Inc
+001007|Cisco Systems, Inc
+00100B|Cisco Systems, Inc
+00100D|Cisco Systems, Inc
+001011|Cisco Systems, Inc
+001014|Cisco Systems, Inc
+001018|Broadcom
+00101F|Cisco Systems, Inc
+001029|Cisco Systems, Inc
+00102F|Cisco Systems, Inc
+001054|Cisco Systems, Inc
+001055|FUJITSU MICROELECTRONICS, INC.
+001079|Cisco Systems, Inc
+00107B|Cisco Systems, Inc
+001083|Hewlett Packard
+00108C|Fujitsu Services Ltd
+0010A6|Cisco Systems, Inc
+0010B3|NOKIA MULTIMEDIA TERMINALS
+0010DB|Juniper Networks
+0010DC|MICRO-STAR INTERNATIONAL CO., LTD.
+0010E3|Hewlett Packard
+0010F6|Cisco Systems, Inc
+0010FA|Apple, Inc.
+0010FF|Cisco Systems, Inc
+001100|Schneider Electric
+001109|Micro-Star International
+00110A|Hewlett Packard
+001112|Honeywell CMSS
+001120|Cisco Systems, Inc
+001121|Cisco Systems, Inc
+001124|Apple, Inc.
+00112F|ASUSTek COMPUTER INC.
+001132|Synology Incorporated
+001143|Dell Inc.
+00115C|Cisco Systems, Inc
+00115D|Cisco Systems, Inc
+001183|Datalogic ADC, Inc.
+001185|Hewlett Packard
+001192|Cisco Systems, Inc
+001193|Cisco Systems, Inc
+001195|D-Link Corporation
+00119F|Nokia Danmark A/S
+0011B5|Shenzhen Powercom Co.,Ltd
+0011BB|Cisco Systems, Inc
+0011BC|Cisco Systems, Inc
+0011D8|ASUSTek COMPUTER INC.
+0011F7|Shenzhen Forward Industry Co., Ltd
+001200|Cisco Systems, Inc
+001201|Cisco Systems, Inc
+001217|Cisco-Linksys, LLC
+00121E|Juniper Networks
+00123F|Dell Inc.
+001243|Cisco Systems, Inc
+001244|Cisco Systems, Inc
+001247|Samsung Electronics Co.,Ltd
+001248|Dell EMC
+001257|LeapComm Communication Technologies Inc.
+00125A|Microsoft Corporation
+001262|Nokia Danmark A/S
+001267|Panasonic Corporation
+001279|Hewlett Packard
+00127F|Cisco Systems, Inc
+001280|Cisco Systems, Inc
+001298|MICO ELECTRIC(SHENZHEN) LIMITED
+0012D9|Cisco Systems, Inc
+0012DA|Cisco Systems, Inc
+0012EE|Sony Corporation
+0012F0|Intel Corporate
+0012FB|Samsung Electronics Co.,Ltd
+0012FE|Lenovo Mobile Communication Technology Ltd.
+001302|Intel Corporate
+001310|Cisco-Linksys, LLC
+001315|Sony Interactive Entertainment Inc.
+001319|Cisco Systems, Inc
+00131A|Cisco Systems, Inc
+001320|Intel Corporate
+001321|Hewlett Packard
+001324|Schneider Electric Ultra Terminal
+001345|Eaton Corporation
+001346|D-Link Corporation
+001349|Zyxel Communications Corporation
+001352|Naztec, Inc.
+00135F|Cisco Systems, Inc
+001360|Cisco Systems, Inc
+001370|Nokia Danmark A/S
+001372|Dell Inc.
+001374|Atheros Communications, Inc.
+001377|Samsung Electronics Co.,Ltd
+00137F|Cisco Systems, Inc
+001380|Cisco Systems, Inc
+001389|Redes de Telefonía Móvil S.A.
+001392|Ruckus Wireless
+0013A9|Sony Corporation
+0013C3|Cisco Systems, Inc
+0013C4|Cisco Systems, Inc
+0013CE|Intel Corporate
+0013D3|MICRO-STAR INTERNATIONAL CO., LTD.
+0013D4|ASUSTek COMPUTER INC.
+0013E8|Intel Corporate
+0013F3|Giga-byte Communications Inc.
+0013FD|Nokia Danmark A/S
+00141B|Cisco Systems, Inc
+00141C|Cisco Systems, Inc
+001422|Dell Inc.
+001438|Hewlett Packard Enterprise
+001448|Inventec Multimedia & Telecom Corporation
+001451|Apple, Inc.
+001460|Kyocera Wireless Corp.
+001469|Cisco Systems, Inc
+00146A|Cisco Systems, Inc
+00146C|NETGEAR
+001478|TP-LINK TECHNOLOGIES CO.,LTD.
+001485|Giga-Byte
+001492|Liteon, Mobile Media Solution SBU
+0014A4|Hon Hai Precision Ind. Co.,Ltd.
+0014A7|Nokia Danmark A/S
+0014A8|Cisco Systems, Inc
+0014A9|Cisco Systems, Inc
+0014BF|Cisco-Linksys, LLC
+0014C2|Hewlett Packard
+0014F1|Cisco Systems, Inc
+0014F2|Cisco Systems, Inc
+0014F6|Juniper Networks
+001500|Intel Corporate
+001517|Intel Corporate
+001518|Shenzhen 10MOONS Technology Development CO.,Ltd
+00152A|Nokia Corporation
+00152B|Cisco Systems, Inc
+00152C|Cisco Systems, Inc
+001530|Dell EMC
+00153A|Shenzhen Syscan Technology Co.,Ltd.
+001556|Sagemcom Broadband SAS
+001558|FOXCONN
+00155D|Microsoft Corporation
+001560|Hewlett Packard
+001562|Cisco Systems, Inc
+001563|Cisco Systems, Inc
+001565|XIAMEN YEALINK NETWORK TECHNOLOGY CO.,LTD
+00156D|Ubiquiti Inc
+001570|Zebra Technologies Inc
+001599|Samsung Electronics Co.,Ltd
+0015A0|Nokia Danmark A/S
+0015AF|AzureWave Technology Inc.
+0015B7|Toshiba
+0015B9|Samsung Electronics Co.,Ltd
+0015C1|Sony Interactive Entertainment Inc.
+0015C5|Dell Inc.
+0015C6|Cisco Systems, Inc
+0015C7|Cisco Systems, Inc
+0015DE|Nokia Danmark A/S
+0015E9|D-Link Corporation
+0015EB|zte corporation
+0015F2|ASUSTek COMPUTER INC.
+0015F9|Cisco Systems, Inc
+0015FA|Cisco Systems, Inc
+001620|Sony Corporation
+001632|Samsung Electronics Co.,Ltd
+001635|Hewlett Packard
+001636|Quanta Computer Inc.
+001645|Eaton Corporation
+001646|Cisco Systems, Inc
+001647|Cisco Systems, Inc
+00164E|Nokia Danmark A/S
+00166B|Samsung Electronics Co.,Ltd
+00166C|Samsung Electronics Co.,Ltd
+00166D|Yulong Computer Telecommunication Scientific (Shenzhen) Co.,Ltd
+00166F|Intel Corporate
+001676|Intel Corporate
+001678|SHENZHEN BAOAN GAOKE ELECTRONICS CO., LTD
+00169C|Cisco Systems, Inc
+00169D|Cisco Systems, Inc
+0016AF|Shenzhen Union Networks Equipment Co.,Ltd.
+0016B6|Cisco-Linksys, LLC
+0016B8|Sony Corporation
+0016BC|Nokia Danmark A/S
+0016C5|Shenzhen Xing Feng Industry Co.,Ltd
+0016C7|Cisco Systems, Inc
+0016C8|Cisco Systems, Inc
+0016CB|Apple, Inc.
+0016CE|Hon Hai Precision Ind. Co.,Ltd.
+0016CF|Hon Hai Precision Ind. Co.,Ltd.
+0016D3|Wistron Corporation
+0016D4|Compal Communications, Inc.
+0016DB|Samsung Electronics Co.,Ltd
+0016E6|GIGA-BYTE TECHNOLOGY CO.,LTD.
+0016EA|Intel Corporate
+0016EB|Intel Corporate
+0016F0|Dell
+0016FB|SHENZHEN MTC CO LTD
+001708|Hewlett Packard
+00170E|Cisco Systems, Inc
+00170F|Cisco Systems, Inc
+001731|ASUSTek COMPUTER INC.
+00173B|Cisco Systems, Inc
+00173C|Extreme Engineering Solutions
+001742|FUJITSU LIMITED
+00174B|Nokia Danmark A/S
+001759|Cisco Systems, Inc
+00175A|Cisco Systems, Inc
+00175C|SHARP CORPORATION
+00176F|PAX Computer Technology(Shenzhen) Ltd.
+001781|Greystone Data System, Inc.
+001787|Brother, Brother & Sons ApS
+001788|Philips Lighting BV
+001794|Cisco Systems, Inc
+001795|Cisco Systems, Inc
+00179A|D-Link Corporation
+0017A4|Hewlett Packard
+0017A5|MediaTek Inc
+0017B0|Nokia Danmark A/S
+0017B6|Aquantia Corporation
+0017C4|Quanta Microsystems, INC.
+0017C5|SonicWALL
+0017C8|KYOCERA Display Corporation
+0017C9|Samsung Electronics Co.,Ltd
+0017CB|Juniper Networks
+0017D5|Samsung Electronics Co.,Ltd
+0017DF|Cisco Systems, Inc
+0017E0|Cisco Systems, Inc
+0017F2|Apple, Inc.
+0017FA|Microsoft Corporation
+00180A|Cisco Meraki
+00180F|Nokia Danmark A/S
+001813|Sony Corporation
+001818|Cisco Systems, Inc
+001819|Cisco Systems, Inc
+001821|SINDORICOH
+001839|Cisco-Linksys, LLC
+001842|Nokia Danmark A/S
+00184D|NETGEAR
+001864|Eaton Corporation
+001867|Datalogic ADC
+001868|Cisco SPVTG
+001871|Hewlett Packard
+001873|Cisco Systems, Inc
+001874|Cisco Systems, Inc
+001882|HUAWEI TECHNOLOGIES CO.,LTD
+001885|Motorola Solutions Inc.
+00188B|Dell Inc.
+00188D|Nokia Danmark A/S
+001893|SHENZHEN PHOTON BROADBAND TECHNOLOGY CO.,LTD
+001899|ShenZhen jieshun Science&Technology Industry CO,LTD.
+0018AF|Samsung Electronics Co.,Ltd
+0018B9|Cisco Systems, Inc
+0018BA|Cisco Systems, Inc
+0018BD|SHENZHEN DVBWORLD TECHNOLOGY CO., LTD.
+0018C5|Nokia Danmark A/S
+0018DE|Intel Corporate
+0018F3|ASUSTek COMPUTER INC.
+0018F5|Shenzhen Streaming Video Technology Company Limited
+0018F8|Cisco-Linksys, LLC
+0018FE|Hewlett Packard
+001906|Cisco Systems, Inc
+001907|Cisco Systems, Inc
+00192D|Nokia Corporation
+00192F|Cisco Systems, Inc
+001930|Cisco Systems, Inc
+00193F|RDI technology(Shenzhen) Co.,LTD
+001947|Cisco SPVTG
+00194B|Sagemcom Broadband SAS
+00194F|Nokia Danmark A/S
+001955|Cisco Systems, Inc
+001956|Cisco Systems, Inc
+00195B|D-Link Corporation
+00195D|ShenZhen XinHuaTong Opto Electronics Co.,Ltd
+001963|Sony Corporation
+001977|Extreme Networks, Inc.
+001979|Nokia Danmark A/S
+00197D|Hon Hai Precision Ind. Co.,Ltd.
+00197E|Hon Hai Precision Ind. Co.,Ltd.
+001987|Panasonic Mobile Communications Co.,Ltd.
+00198F|Nokia Bell N.V.
+001999|Fujitsu Technology Solutions GmbH
+0019A9|Cisco Systems, Inc
+0019AA|Cisco Systems, Inc
+0019B7|Nokia Danmark A/S
+0019B9|Dell Inc.
+0019BB|Hewlett Packard
+0019C5|Sony Interactive Entertainment Inc.
+0019C6|zte corporation
+0019CB|Zyxel Communications Corporation
+0019D1|Intel Corporate
+0019D2|Intel Corporate
+0019DB|MICRO-STAR INTERNATIONAL CO., LTD.
+0019E0|TP-LINK TECHNOLOGIES CO.,LTD.
+0019E2|Juniper Networks
+0019E3|Apple, Inc.
+0019E7|Cisco Systems, Inc
+0019E8|Cisco Systems, Inc
+0019EF|SHENZHEN LINNKING ELECTRONICS CO.,LTD
+0019FE|SHENZHEN SEECOMM TECHNOLOGY CO.,LTD.
+001A11|Google, Inc.
+001A16|Nokia Danmark A/S
+001A1E|Hewlett Packard Enterprise
+001A2F|Cisco Systems, Inc
+001A30|Cisco Systems, Inc
+001A3F|Intelbras
+001A4B|Hewlett Packard
+001A4D|GIGA-BYTE TECHNOLOGY CO.,LTD.
+001A6C|Cisco Systems, Inc
+001A6D|Cisco Systems, Inc
+001A70|Cisco-Linksys, LLC
+001A75|Sony Corporation
+001A80|Sony Corporation
+001A83|Pegasus Technologies Inc.
+001A89|Nokia Danmark A/S
+001A8A|Samsung Electronics Co.,Ltd
+001A8C|Sophos Ltd
+001A92|ASUSTek COMPUTER INC.
+001A9A|Skyworth Digital Technology(Shenzhen) Co.,Ltd
+001AA0|Dell Inc.
+001AA1|Cisco Systems, Inc
+001AA2|Cisco Systems, Inc
+001ADC|Nokia Danmark A/S
+001AE2|Cisco Systems, Inc
+001AE3|Cisco Systems, Inc
+001AE7|Aztek Networks, Inc.
+001AEE|Shenztech Ltd
+001B0C|Cisco Systems, Inc
+001B0D|Cisco Systems, Inc
+001B10|ShenZhen Kang Hui Technology Co.,ltd
+001B11|D-Link Corporation
+001B17|Palo Alto Networks
+001B21|Intel Corporate
+001B24|Quanta Computer Inc.
+001B2A|Cisco Systems, Inc
+001B2B|Cisco Systems, Inc
+001B2F|NETGEAR
+001B33|Nokia Danmark A/S
+001B38|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+001B48|Shenzhen Lantech Electronics Co., Ltd.
+001B4F|Avaya Inc
+001B53|Cisco Systems, Inc
+001B54|Cisco Systems, Inc
+001B59|Sony Corporation
+001B63|Apple, Inc.
+001B67|Cisco Systems Inc
+001B74|MiraLink Corporation
+001B77|Intel Corporate
+001B78|Hewlett Packard
+001B8F|Cisco Systems, Inc
+001B90|Cisco Systems, Inc
+001B98|Samsung Electronics Co.,Ltd
+001BA9|Brother industries, LTD.
+001BAF|Nokia Danmark A/S
+001BBF|Sagemcom Broadband SAS
+001BC0|Juniper Networks
+001BD3|Panasonic Corporation AVC Networks Company
+001BD4|Cisco Systems, Inc
+001BD5|Cisco Systems, Inc
+001BD7|Cisco SPVTG
+001BE9|Broadcom
+001BEE|Nokia Danmark A/S
+001BFC|ASUSTek COMPUTER INC.
+001C0A|Shenzhen AEE Technology Co.,Ltd.
+001C0E|Cisco Systems, Inc
+001C0F|Cisco Systems, Inc
+001C10|Cisco-Linksys, LLC
+001C14|VMware, Inc.
+001C1B|Hyperstone GmbH
+001C23|Dell Inc.
+001C25|Hon Hai Precision Ind. Co.,Ltd.
+001C26|Hon Hai Precision Ind. Co.,Ltd.
+001C35|Nokia Danmark A/S
+001C43|Samsung Electronics Co.,Ltd
+001C50|TCL Technoly Electronics (Huizhou) Co., Ltd.
+001C54|Hillstone Networks Inc
+001C55|Shenzhen Kaifa Technology Co.
+001C57|Cisco Systems, Inc
+001C58|Cisco Systems, Inc
+001C62|LG Electronics (Mobile Communications)
+001C7E|Toshiba
+001C9A|Nokia Danmark A/S
+001CA4|Sony Corporation
+001CB0|Cisco Systems, Inc
+001CB1|Cisco Systems, Inc
+001CB3|Apple, Inc.
+001CBF|Intel Corporate
+001CC0|Intel Corporate
+001CC4|Hewlett Packard
+001CD4|Nokia Danmark A/S
+001CD6|Nokia Danmark A/S
+001CEE|SHARP Corporation
+001CF0|D-Link Corporation
+001CF6|Cisco Systems, Inc
+001CF9|Cisco Systems, Inc
+001D07|Shenzhen Sang Fei Consumer Communications Co.,Ltd
+001D09|Dell Inc.
+001D0D|Sony Interactive Entertainment Inc.
+001D0F|TP-LINK TECHNOLOGIES CO.,LTD.
+001D15|Shenzhen Dolphin Electronic Co., Ltd
+001D25|Samsung Electronics Co.,Ltd
+001D28|Sony Corporation
+001D2A|SHENZHEN BUL-TECH CO.,LTD.
+001D2E|Ruckus Wireless
+001D3B|Nokia Danmark A/S
+001D43|Shenzhen G-link Digital Technology Co., Ltd.
+001D45|Cisco Systems, Inc
+001D46|Cisco Systems, Inc
+001D4F|Apple, Inc.
+001D60|ASUSTek COMPUTER INC.
+001D6E|Nokia Danmark A/S
+001D70|Cisco Systems, Inc
+001D71|Cisco Systems, Inc
+001D72|Wistron Corporation
+001D7D|GIGA-BYTE TECHNOLOGY CO.,LTD.
+001D7E|Cisco-Linksys, LLC
+001D92|MICRO-STAR INT'L CO.,LTD.
+001D96|WatchGuard Video
+001D98|Nokia Danmark A/S
+001DA1|Cisco Systems, Inc
+001DA2|Cisco Systems, Inc
+001DB5|Juniper Networks
+001DBA|Sony Corporation
+001DD8|Microsoft Corporation
+001DD9|Hon Hai Precision Ind. Co.,Ltd.
+001DE0|Intel Corporate
+001DE1|Intel Corporate
+001DE5|Cisco Systems, Inc
+001DE6|Cisco Systems, Inc
+001DE9|Nokia Danmark A/S
+001DF6|Samsung Electronics Co.,Ltd
+001DFB|NETCLEUS Systems Corporation
+001DFD|Nokia Danmark A/S
+001E0B|Hewlett Packard
+001E10|HUAWEI TECHNOLOGIES CO.,LTD
+001E13|Cisco Systems, Inc
+001E14|Cisco Systems, Inc
+001E1E|Honeywell Life Safety
+001E2A|NETGEAR
+001E33|INVENTEC CORPORATION
+001E3A|Nokia Danmark A/S
+001E3B|Nokia Danmark A/S
+001E45|Sony Corporation
+001E49|Cisco Systems, Inc
+001E4A|Cisco Systems, Inc
+001E4C|Hon Hai Precision Ind. Co.,Ltd.
+001E4F|Dell Inc.
+001E52|Apple, Inc.
+001E58|D-Link Corporation
+001E64|Intel Corporate
+001E65|Intel Corporate
+001E67|Intel Corporate
+001E68|Quanta Computer Inc.
+001E6B|Cisco SPVTG
+001E6E|Shenzhen First Mile Communications Ltd
+001E73|zte corporation
+001E74|Sagemcom Broadband SAS
+001E75|LG Electronics (Mobile Communications)
+001E79|Cisco Systems, Inc
+001E7A|Cisco Systems, Inc
+001E7D|Samsung Electronics Co.,Ltd
+001E8C|ASUSTek COMPUTER INC.
+001E8F|CANON INC.
+001EA3|Nokia Danmark A/S
+001EA4|Nokia Danmark A/S
+001EBD|Cisco Systems, Inc
+001EBE|Cisco Systems, Inc
+001EC2|Apple, Inc.
+001EC9|Dell Inc.
+001ECF|PHILIPS ELECTRONICS UK LTD
+001EDC|Sony Corporation
+001EE1|Samsung Electronics Co.,Ltd
+001EE2|Samsung Electronics Co.,Ltd
+001EE3|T&W Electronics (ShenZhen) Co.,Ltd
+001EE5|Cisco-Linksys, LLC
+001EE6|Shenzhen Advanced Video Info-Tech Co., Ltd.
+001EE9|Stoneridge Electronics AB
+001EEC|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+001EF6|Cisco Systems, Inc
+001EF7|Cisco Systems, Inc
+001F00|Nokia Danmark A/S
+001F01|Nokia Danmark A/S
+001F07|AZTEQ Mobile
+001F12|Juniper Networks
+001F16|Wistron Corporation
+001F26|Cisco Systems, Inc
+001F27|Cisco Systems, Inc
+001F29|Hewlett Packard
+001F33|NETGEAR
+001F3A|Hon Hai Precision Ind. Co.,Ltd.
+001F3B|Intel Corporate
+001F3C|Intel Corporate
+001F41|Ruckus Wireless
+001F55|Honeywell Security (China) Co., Ltd.
+001F59|Kronback Tracers
+001F5B|Apple, Inc.
+001F5C|Nokia Danmark A/S
+001F5D|Nokia Danmark A/S
+001F6B|LG Electronics (Mobile Communications)
+001F6C|Cisco Systems, Inc
+001F6D|Cisco Systems, Inc
+001F92|Motorola Solutions Inc.
+001F95|Sagemcom Broadband SAS
+001F9D|Cisco Systems, Inc
+001F9E|Cisco Systems, Inc
+001FA3|T&W Electronics(Shenzhen)Co.,Ltd.
+001FA4|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+001FA7|Sony Interactive Entertainment Inc.
+001FBD|Kyocera Wireless Corp.
+001FBE|Shenzhen Mopnet Industrial Co.,Ltd
+001FC6|ASUSTek COMPUTER INC.
+001FC9|Cisco Systems, Inc
+001FCA|Cisco Systems, Inc
+001FCC|Samsung Electronics Co.,Ltd
+001FCD|Samsung Electronics Co.,Ltd
+001FD0|GIGA-BYTE TECHNOLOGY CO.,LTD.
+001FD6|Shenzhen Allywll
+001FDE|Nokia Danmark A/S
+001FDF|Nokia Danmark A/S
+001FE1|Hon Hai Precision Ind. Co.,Ltd.
+001FE2|Hon Hai Precision Ind. Co.,Ltd.
+001FE3|LG Electronics (Mobile Communications)
+001FE4|Sony Corporation
+001FF3|Apple, Inc.
+002000|LEXMARK INTERNATIONAL, INC.
+002004|YAMATAKE-HONEYWELL CO., LTD.
+00203D|Honeywell Environmental & Combustion Controls
+00206B|KONICA MINOLTA HOLDINGS, INC.
+002075|MOTOROLA COMMUNICATION ISRAEL
+002085|Eaton Corporation
+0020D9|PANASONIC TECHNOLOGIES, INC./MIECO-US
+0020ED|GIGA-BYTE TECHNOLOGY CO., LTD.
+0020F9|PARALINK NETWORKS, INC.
+002108|Nokia Danmark A/S
+002109|Nokia Danmark A/S
+002119|SAMSUNG ELECTRO MECHANICS CO., LTD.
+00211B|Cisco Systems, Inc
+00211C|Cisco Systems, Inc
+002126|Shenzhen Torch Equipment Co., Ltd.
+002127|TP-LINK TECHNOLOGIES CO.,LTD.
+002129|Cisco-Linksys, LLC
+00214B|Shenzhen HAMP Science & Technology Co.,Ltd
+00214C|Samsung Electronics Co.,Ltd
+002155|Cisco Systems, Inc
+002156|Cisco Systems, Inc
+002159|Juniper Networks
+00215A|Hewlett Packard
+00215C|Intel Corporate
+00215D|Intel Corporate
+00216A|Intel Corporate
+00216B|Intel Corporate
+002170|Dell Inc.
+002185|MICRO-STAR INT'L CO.,LTD.
+002191|D-Link Corporation
+00219B|Dell Inc.
+00219E|Sony Corporation
+0021A0|Cisco Systems, Inc
+0021A1|Cisco Systems, Inc
+0021AA|Nokia Danmark A/S
+0021AB|Nokia Danmark A/S
+0021B7|LEXMARK INTERNATIONAL, INC.
+0021BE|Cisco SPVTG
+0021CB|SMS TECNOLOGIA ELETRONICA LTDA
+0021D1|Samsung Electronics Co.,Ltd
+0021D2|Samsung Electronics Co.,Ltd
+0021D7|Cisco Systems, Inc
+0021D8|Cisco Systems, Inc
+0021DB|Santachi Video Technology (Shenzhen) Co., Ltd.
+0021E9|Apple, Inc.
+0021FB|LG Electronics (Mobile Communications)
+0021FC|Nokia Danmark A/S
+0021FE|Nokia Danmark A/S
+00220C|Cisco Systems, Inc
+00220D|Cisco Systems, Inc
+002215|ASUSTek COMPUTER INC.
+002219|Dell Inc.
+00223A|Cisco SPVTG
+00223F|NETGEAR
+002241|Apple, Inc.
+002243|AzureWave Technology Inc.
+002248|Microsoft Corporation
+002255|Cisco Systems, Inc
+002256|Cisco Systems, Inc
+00225F|Liteon Technology Corporation
+002264|Hewlett Packard
+002265|Nokia Danmark A/S
+002266|Nokia Danmark A/S
+002268|Hon Hai Precision Ind. Co.,Ltd.
+002269|Hon Hai Precision Ind. Co.,Ltd.
+00226A|Honeywell
+00226B|Cisco-Linksys, LLC
+00226D|Shenzhen GIEC Electronics Co., Ltd.
+002278|Shenzhen Tongfang Multimedia Technology Co.,Ltd.
+00227F|Ruckus Wireless
+002283|Juniper Networks
+002289|Vanderlande APC inc.
+002290|Cisco Systems, Inc
+002291|Cisco Systems, Inc
+002293|zte corporation
+002294|KYOCERA CORPORATION
+002298|Sony Corporation
+0022A1|Huawei Symantec Technologies Co.,Ltd.
+0022A6|Sony Computer Entertainment America
+0022A9|LG Electronics (Mobile Communications)
+0022AB|Shenzhen Turbosight Technology Ltd
+0022B0|D-Link Corporation
+0022BD|Cisco Systems, Inc
+0022BE|Cisco Systems, Inc
+0022C0|Shenzhen Forcelink Electronic Co, Ltd
+0022CE|Cisco SPVTG
+0022D5|Eaton Corp. Electrical Group Data Center Solutions - Pulizzi
+0022D8|Shenzhen GST Security and Safety Technology Limited
+0022F3|SHARP Corporation
+0022FA|Intel Corporate
+0022FB|Intel Corporate
+0022FC|Nokia Danmark A/S
+0022FD|Nokia Danmark A/S
+002304|Cisco Systems, Inc
+002305|Cisco Systems, Inc
+002312|Apple, Inc.
+002314|Intel Corporate
+002315|Intel Corporate
+002318|Toshiba
+002326|FUJITSU LIMITED
+002332|Apple, Inc.
+002333|Cisco Systems, Inc
+002334|Cisco Systems, Inc
+002339|Samsung Electronics Co.,Ltd
+00233A|Samsung Electronics Co.,Ltd
+002345|Sony Corporation
+002348|Sagemcom Broadband SAS
+00234D|Hon Hai Precision Ind. Co.,Ltd.
+00234E|Hon Hai Precision Ind. Co.,Ltd.
+002354|ASUSTek COMPUTER INC.
+00235A|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+00235D|Cisco Systems, Inc
+00235E|Cisco Systems, Inc
+002363|Zhuhai Raysharp Technology Co.,Ltd
+002368|Zebra Technologies Inc
+002369|Cisco-Linksys, LLC
+00236C|Apple, Inc.
+00237D|Hewlett Packard
+00238B|Quanta Computer Inc.
+002399|Samsung Electronics Co.,Ltd
+00239C|Juniper Networks
+0023AB|Cisco Systems, Inc
+0023AC|Cisco Systems, Inc
+0023AE|Dell Inc.
+0023B4|Nokia Danmark A/S
+0023B6|SECURITE COMMUNICATIONS / HONEYWELL
+0023BE|Cisco SPVTG
+0023C2|SAMSUNG Electronics. Co. LTD
+0023CB|Shenzhen Full-join Technology Co.,Ltd
+0023CD|TP-LINK TECHNOLOGIES CO.,LTD.
+0023D6|Samsung Electronics Co.,Ltd
+0023D7|Samsung Electronics Co.,Ltd
+0023DD|ELGIN S.A.
+0023DF|Apple, Inc.
+0023E5|IPaXiom Networks
+0023EA|Cisco Systems, Inc
+0023EB|Cisco Systems, Inc
+0023F1|Sony Corporation
+0023F8|Zyxel Communications Corporation
+002401|D-Link Corporation
+002403|Nokia Danmark A/S
+002404|Nokia Danmark A/S
+00240E|Inventec Besta Co., Ltd.
+002413|Cisco Systems, Inc
+002414|Cisco Systems, Inc
+00241D|GIGA-BYTE TECHNOLOGY CO.,LTD.
+002421|MICRO-STAR INT'L CO., LTD.
+002423|AzureWave Technologies (Shanghai) Inc.
+002424|Ace Axis Limited
+002425|Shenzhenshi chuangzhicheng Technology Co.,Ltd
+00242B|Hon Hai Precision Ind. Co.,Ltd.
+00242C|Hon Hai Precision Ind. Co.,Ltd.
+002436|Apple, Inc.
+002437|Motorola - BSG
+002447|Kaztek Systems
+002450|Cisco Systems, Inc
+002451|Cisco Systems, Inc
+002454|Samsung Electronics Co.,Ltd
+00246C|Hewlett Packard Enterprise
+00247C|Nokia Danmark A/S
+00247D|Nokia Danmark A/S
+002481|Hewlett Packard
+002482|Ruckus Wireless
+002483|LG Electronics (Mobile Communications)
+00248C|ASUSTek COMPUTER INC.
+00248D|Sony Interactive Entertainment Inc.
+002490|Samsung Electronics Co.,Ltd
+002491|Samsung Electronics Co.,Ltd
+002492|Motorola, Broadband Solutions Group
+002494|Shenzhen Baoxin Tech CO., Ltd.
+002497|Cisco Systems, Inc
+002498|Cisco Systems, Inc
+0024B2|NETGEAR
+0024BE|Sony Corporation
+0024C3|Cisco Systems, Inc
+0024C4|Cisco Systems, Inc
+0024D0|Shenzhen SOGOOD Industry CO.,LTD.
+0024D6|Intel Corporate
+0024D7|Intel Corporate
+0024DC|Juniper Networks
+0024E8|Dell Inc.
+0024E9|Samsung Electronics Co.,Ltd
+0024EF|Sony Corporation
+0024F1|Shenzhen Fanhai Sanjiang Electronics Co., Ltd.
+0024F7|Cisco Systems, Inc
+0024F9|Cisco Systems, Inc
+002500|Apple, Inc.
+002512|zte corporation
+00251B|Philips CareServant
+00252E|Cisco SPVTG
+002538|Samsung Electronics Co., Ltd., Memory Division
+002545|Cisco Systems, Inc
+002546|Cisco Systems, Inc
+002547|Nokia Danmark A/S
+002548|Nokia Danmark A/S
+00254B|Apple, Inc.
+002556|Hon Hai Precision Ind. Co.,Ltd.
+002564|Dell Inc.
+002566|Samsung Electronics Co.,Ltd
+002567|Samsung Electronics Co.,Ltd
+002568|HUAWEI TECHNOLOGIES CO.,LTD
+002569|Sagemcom Broadband SAS
+002583|Cisco Systems, Inc
+002584|Cisco Systems, Inc
+002586|TP-LINK TECHNOLOGIES CO.,LTD.
+00259C|Cisco-Linksys, LLC
+00259E|HUAWEI TECHNOLOGIES CO.,LTD
+0025AE|Microsoft Corporation
+0025B3|Hewlett Packard
+0025B4|Cisco Systems, Inc
+0025B5|Cisco Systems, Inc
+0025BC|Apple, Inc.
+0025BD|Italdata Ingegneria dell'Idea S.p.A.
+0025C4|Ruckus Wireless
+0025C9|SHENZHEN HUAPU DIGITAL CO., LTD
+0025CF|Nokia Danmark A/S
+0025D0|Nokia Danmark A/S
+0025D3|AzureWave Technology Inc.
+0025DB|ATI Electronics(Shenzhen) Co., LTD
+0025E5|LG Electronics (Mobile Communications)
+0025E7|Sony Corporation
+002603|Shenzhen Wistar Technology Co., Ltd
+002608|Apple, Inc.
+00260A|Cisco Systems, Inc
+00260B|Cisco Systems, Inc
+002618|ASUSTek COMPUTER INC.
+002622|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+00262D|Wistron Corporation
+002637|SAMSUNG ELECTRO MECHANICS CO., LTD.
+00264A|Apple, Inc.
+002651|Cisco Systems, Inc
+002652|Cisco Systems, Inc
+002655|Hewlett Packard
+00265A|D-Link Corporation
+00265C|Hon Hai Precision Ind. Co.,Ltd.
+00265D|Samsung Electronics Co.,Ltd
+00265E|Hon Hai Precision Ind. Co.,Ltd.
+00265F|Samsung Electronics Co.,Ltd
+002663|Shenzhen Huitaiwei Tech. Ltd, co.
+002668|Nokia Danmark A/S
+002669|Nokia Danmark A/S
+00266C|INVENTEC CORPORATION
+002673|RICOH COMPANY,LTD.
+002675|Aztech Electronics Pte Ltd
+002688|Juniper Networks
+002691|Sagemcom Broadband SAS
+002698|Cisco Systems, Inc
+002699|Cisco Systems, Inc
+00269E|Quanta Computer Inc.
+0026AB|Seiko Epson Corporation
+0026B0|Apple, Inc.
+0026B9|Dell Inc.
+0026BB|Apple, Inc.
+0026BF|ShenZhen Temobi Science&Tech Development Co.,Ltd
+0026C6|Intel Corporate
+0026C7|Intel Corporate
+0026CA|Cisco Systems, Inc
+0026CB|Cisco Systems, Inc
+0026CC|Nokia Danmark A/S
+0026E2|LG Electronics (Mobile Communications)
+0026ED|zte corporation
+0026F2|NETGEAR
+002700|Shenzhen Siglent Technology Co., Ltd.
+00270C|Cisco Systems, Inc
+00270D|Cisco Systems, Inc
+00270E|Intel Corporate
+002710|Intel Corporate
+002719|TP-LINK TECHNOLOGIES CO.,LTD.
+002721|Shenzhen Baoan Fenda Industrial Co., Ltd
+002722|Ubiquiti Inc
+002790|Cisco Systems, Inc
+0027E3|Cisco Systems, Inc
+0028F8|Intel Corporate
+0029C2|Cisco Systems, Inc
+002A10|Cisco Systems, Inc
+002A6A|Cisco Systems, Inc
+002B67|LCFC(Hefei) Electronics Technology co., ltd
+002B70|Samsung Electronics Co.,Ltd
+002B90|Zelus(Shenzhen) Technology Ltd.
+002CC8|Cisco Systems, Inc
+002EC7|HUAWEI TECHNOLOGIES CO.,LTD
+002F5C|Cisco Systems, Inc
+002FD9|Fiberhome Telecommunication Technologies Co.,LTD
+003005|Fujitsu Siemens Computers
+00300A|Aztech Electronics Pte Ltd
+003019|Cisco Systems, Inc
+003024|Cisco Systems, Inc
+003040|Cisco Systems, Inc
+003065|Apple, Inc.
+00306E|Hewlett Packard
+003071|Cisco Systems, Inc
+003078|Cisco Systems, Inc
+00307B|Cisco Systems, Inc
+003080|Cisco Systems, Inc
+003085|Cisco Systems, Inc
+00308E|Crossmatch Technologies/HID Global
+003094|Cisco Systems, Inc
+003096|Cisco Systems, Inc
+0030A3|Cisco Systems, Inc
+0030AF|Honeywell GmbH
+0030B6|Cisco Systems, Inc
+0030C1|Hewlett Packard
+0030C4|Canon Imaging Systems Inc.
+0030F2|Cisco Systems, Inc
+003126|Nokia
+003146|Juniper Networks
+003192|TP-Link Systems Inc
+003217|Cisco Systems, Inc
+003358|Ruckus Wireless
+00337A|Tuya Smart Inc.
+0034DA|LG Electronics (Mobile Communications)
+0034FE|HUAWEI TECHNOLOGIES CO.,LTD
+00351A|Cisco Systems, Inc
+0037B7|Sagemcom Broadband SAS
+0038DF|Cisco Systems, Inc
+003A7D|Cisco Systems, Inc
+003A98|Cisco Systems, Inc
+003A99|Cisco Systems, Inc
+003A9A|Cisco Systems, Inc
+003A9B|Cisco Systems, Inc
+003A9C|Cisco Systems, Inc
+003C10|Cisco Systems, Inc
+003CB7|AzureWave Technology Inc.
+003DE1|Huawei Device Co., Ltd.
+003DE8|LG Electronics (Mobile Communications)
+003EC4|Huawei Device Co., Ltd.
+003EE1|Apple, Inc.
+003F10|Shenzhen GainStrong Technology Co., Ltd.
+00400B|Cisco Systems, Inc
+004043|Nokia Siemens Networks GmbH & Co. KG.
+004084|Honeywell
+00408C|Axis Communications AB
+004093|PAXDATA NETWORKS LTD.
+004096|Cisco Systems, Inc
+0041D2|Cisco Systems, Inc
+004238|Intel Corporate
+00425A|Cisco Systems, Inc
+004268|Cisco Systems, Inc
+00451D|Cisco Systems, Inc
+00464B|HUAWEI TECHNOLOGIES CO.,LTD
+004A77|zte corporation
+004B0D|Huawei Device Co., Ltd.
+004B12|Espressif Inc.
+004BF3|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+004E01|Dell Inc.
+004E35|Hewlett Packard Enterprise
+004F1A|HUAWEI TECHNOLOGIES CO.,LTD
+005009|PHILIPS BROADBAND NETWORKS
+00500B|Cisco Systems, Inc
+00500F|Cisco Systems, Inc
+005014|Cisco Systems, Inc
+00502A|Cisco Systems, Inc
+00503E|Cisco Systems, Inc
+005040|Panasonic Electric Works Co., Ltd.
+005043|MARVELL SEMICONDUCTOR, INC.
+005050|Cisco Systems, Inc
+005053|Cisco Systems, Inc
+005054|Cisco Systems, Inc
+005056|VMware, Inc.
+005073|Cisco Systems, Inc
+005080|Cisco Systems, Inc
+00508B|Hewlett Packard
+0050A2|Cisco Systems, Inc
+0050A7|Cisco Systems, Inc
+0050AA|KONICA MINOLTA HOLDINGS, INC.
+0050BA|D-Link Corporation
+0050BD|Cisco Systems, Inc
+0050D1|Cisco Systems, Inc
+0050E2|Cisco Systems, Inc
+0050E4|Apple, Inc.
+0050F0|Cisco Systems, Inc
+0050F2|MICROSOFT CORP.
+00549F|Avaya Inc
+00562B|Cisco Systems, Inc
+00566D|Huawei Device Co., Ltd.
+0056CD|Apple, Inc.
+0056F1|zte corporation
+0057C1|LG Electronics (Mobile Communications)
+0057D2|Cisco Systems, Inc
+005907|LenovoEMC Products USA, LLC
+00596C|Cisco Systems, Inc
+0059DC|Cisco Systems, Inc
+005A13|HUAWEI TECHNOLOGIES CO.,LTD
+005A39|SHENZHEN FAST TECHNOLOGIES CO.,LTD
+005B94|Apple, Inc.
+005C86|SHENZHEN FAST TECHNOLOGIES CO.,LTD
+005CC2|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+005D73|Cisco Systems, Inc
+005F67|TP-Link Systems Inc
+005F86|Cisco Systems, Inc
+005FBF|Toshiba Corp.
+006009|Cisco Systems, Inc
+00602F|Cisco Systems, Inc
+00603E|Cisco Systems, Inc
+006047|Cisco Systems, Inc
+006048|Dell EMC
+00604C|Sagemcom Broadband SAS
+00605C|Cisco Systems, Inc
+006067|ACER NETXUS INC.
+006070|Cisco Systems, Inc
+006083|Cisco Systems, Inc
+0060B0|Hewlett Packard
+0060DE|Kayser-Threde GmbH
+006151|HUAWEI TECHNOLOGIES CO.,LTD
+006168|Nokia
+006171|Apple, Inc.
+006201|Motorola Mobility LLC, a Lenovo Company
+00620B|Broadcom Limited
+0062EC|Cisco Systems, Inc
+006440|Cisco Systems, Inc
+006619|Huawei Device Co., Ltd.
+00664B|HUAWEI TECHNOLOGIES CO.,LTD
+0066DC|Apple, Inc.
+006762|Fiberhome Telecommunication Technologies Co.,LTD
+00682B|Huawei Device Co., Ltd.
+0068EB|HP Inc.
+006B6F|HUAWEI TECHNOLOGIES CO.,LTD
+006BA0|SHENZHEN UNIVERSAL INTELLISYS PTE LTD
+006BF1|Cisco Systems, Inc
+006CBC|Cisco Systems, Inc
+006D52|Apple, Inc.
+006F64|Samsung Electronics Co.,Ltd
+007007|Espressif Inc.
+007147|Amazon Technologies Inc.
+0071C2|PEGATRON CORPORATION
+0071CC|Hon Hai Precision Ind. Co.,Ltd.
+007204|Samsung Electronics Co., Ltd. ARTIK
+007278|Cisco Systems, Inc
+0072EE|Intel Corporate
+00738D|Shenzhen TINNO Mobile Technology Corp.
+0073E0|Samsung Electronics Co.,Ltd
+007686|Cisco Systems, Inc
+00778D|Cisco Systems, Inc
+0077E4|Nokia Solutions and Networks GmbH & Co. KG
+007839|Nokia
+007888|Cisco Systems, Inc
+00789E|Sagemcom Broadband SAS
+007C2D|Samsung Electronics Co.,Ltd
+007D3B|Samsung Electronics Co.,Ltd
+007D60|Apple, Inc.
+007E95|Cisco Systems, Inc
+00805F|Hewlett Packard
+008077|Brother industries, LTD.
+008083|AMDAHL
+00808E|RADSTONE TECHNOLOGY
+008099|Eaton Industries GmbH
+0080A0|Hewlett Packard
+0080A7|Honeywell International Inc
+0080C8|D-LINK SYSTEMS, INC.
+0080F0|Panasonic Communications Co., Ltd.
+00812A|Apple, Inc.
+0081C4|Cisco Systems, Inc
+008320|Huawei Device Co., Ltd.
+00841E|Cisco Meraki
+008497|Shenzhen MiaoMing Intelligent Technology Co.,Ltd
+0084ED|LEXMARK INTERNATIONAL, INC.
+008621|Amazon Technologies Inc.
+00869C|Palo Alto Networks
+008701|Samsung Electronics Co.,Ltd
+008731|Cisco Systems, Inc
+008764|Cisco Systems, Inc
+008865|Apple, Inc.
+0089C9|Extreme Networks, Inc.
+008A55|Huawei Device Co., Ltd.
+008A76|Apple, Inc.
+008A96|Cisco Systems, Inc
+008CFA|INVENTEC CORPORATION
+008E73|Cisco Systems, Inc
+008EF2|NETGEAR
+00900C|Cisco Systems, Inc
+009020|PHILIPS ANALYTICAL X-RAY B.V.
+009021|Cisco Systems, Inc
+00902B|Cisco Systems, Inc
+009030|HONEYWELL-DATING
+00903E|N.V. PHILIPS INDUSTRIAL ACTIVITIES
+00905F|Cisco Systems, Inc
+009069|Juniper Networks
+00906A|TURNSTONE SYSTEMS, INC.
+00906D|Cisco Systems, Inc
+00906F|Cisco Systems, Inc
+00907A|Spectralink, Inc
+00907F|WatchGuard Technologies, Inc.
+009086|Cisco Systems, Inc
+009092|Cisco Systems, Inc
+0090A6|Cisco Systems, Inc
+0090AB|Cisco Systems, Inc
+0090B1|Cisco Systems, Inc
+0090BF|Cisco Systems, Inc
+0090D9|Cisco Systems, Inc
+0090F2|Cisco Systems, Inc
+00919E|Intel Corporate
+009235|Apple, Inc.
+0092FA|SHENZHEN WISKY TECHNOLOGY CO.,LTD
+009337|Intel Corporate
+0094EC|Huawei Device Co., Ltd.
+0097F1|Apple, Inc.
+00991D|HUAWEI TECHNOLOGIES CO.,LTD
+009ACD|HUAWEI TECHNOLOGIES CO.,LTD
+009AD2|Cisco Systems, Inc
+009C02|Hewlett Packard
+009E1E|Cisco Systems, Inc
+009EC8|Xiaomi Communications Co Ltd
+009EEE|Positivo Tecnologia S.A.
+00A040|Apple, Inc.
+00A060|ACER PERIPHERALS, INC.
+00A077|FUJITSU NEXION, INC.
+00A0BF|WIRELESS DATA GROUP MOTOROLA
+00A0C5|Zyxel Communications Corporation
+00A0C6|Qualcomm Inc.
+00A0CA|FUJITSU DENSO LTD.
+00A0D1|INVENTEC CORPORATION
+00A0F8|Zebra Technologies Inc
+00A159|LG Electronics
+00A1DE|ShenZhen ShiHua Technology CO.,LTD
+00A289|Cisco Systems, Inc
+00A2EE|Cisco Systems, Inc
+00A38E|Cisco Systems, Inc
+00A3D1|Cisco Systems, Inc
+00A45F|Huawei Device Co., Ltd.
+00A554|Intel Corporate
+00A5BF|Cisco Systems, Inc
+00A6CA|Cisco Systems, Inc
+00A742|Cisco Systems, Inc
+00A91D|HUAWEI TECHNOLOGIES CO.,LTD
+00AA6E|Cisco Systems, Inc
+00AA70|LG Electronics (Mobile Communications)
+00AD24|D-Link International
+00ADD5|Huawei Device Co., Ltd.
+00AF1F|Cisco Systems, Inc
+00B04A|Cisco Systems, Inc
+00B052|Atheros Communications
+00B064|Cisco Systems, Inc
+00B08E|Cisco Systems, Inc
+00B0C2|Cisco Systems, Inc
+00B0D0|Dell Inc.
+00B0E1|Cisco Systems, Inc
+00B1E3|Cisco Systems, Inc
+00B362|Apple, Inc.
+00B5D0|Samsung Electronics Co.,Ltd
+00B670|Cisco Systems, Inc
+00B771|Cisco Systems, Inc
+00B81D|Extreme Networks, Inc.
+00B8B3|Cisco Systems, Inc
+00B8B6|Motorola Mobility LLC, a Lenovo Company
+00B9F6|Shenzhen Super Rich Electronics Co.,Ltd
+00BB1C|Huawei Device Co., Ltd.
+00BB3A|Amazon Technologies Inc.
+00BB60|Intel Corporate
+00BBC1|CANON INC.
+00BC60|Cisco Systems, Inc
+00BC99|Hangzhou Hikvision Digital Technology Co.,Ltd.
+00BD3A|Nokia Corporation
+00BD82|Shenzhen YOUHUA Technology Co., Ltd
+00BE3B|HUAWEI TECHNOLOGIES CO.,LTD
+00BE43|Dell Inc.
+00BE75|Cisco Systems, Inc
+00BE9E|Fiberhome Telecommunication Technologies Co.,LTD
+00BF61|Samsung Electronics Co.,Ltd
+00BF77|Cisco Systems, Inc
+00C04F|Dell Inc.
+00C08F|Panasonic Electric Works Co., Ltd.
+00C09F|Quanta Computer Inc.
+00C0EE|KYOCERA Display Corporation
+00C164|Cisco Systems, Inc
+00C1B1|Cisco Systems, Inc
+00C2C6|Intel Corporate
+00C30A|Xiaomi Communications Co Ltd
+00C3F4|Samsung Electronics Co.,Ltd
+00C52C|Juniper Networks
+00C585|Apple, Inc.
+00C610|Apple, Inc.
+00C84E|Hewlett Packard Enterprise
+00C88B|Cisco Systems, Inc
+00CAE5|Cisco Systems, Inc
+00CB51|Sagemcom Broadband SAS
+00CBB4|SHENZHEN ATEKO PHOTOELECTRICITY CO.,LTD
+00CC05|HUAWEI TECHNOLOGIES CO.,LTD
+00CC34|Juniper Networks
+00CCFC|Cisco Systems, Inc
+00CDFE|Apple, Inc.
+00D006|Cisco Systems, Inc
+00D058|Cisco Systems, Inc
+00D060|Panasonic Europe Ltd.
+00D063|Cisco Systems, Inc
+00D079|Cisco Systems, Inc
+00D090|Cisco Systems, Inc
+00D097|Cisco Systems, Inc
+00D0BA|Cisco Systems, Inc
+00D0BB|Cisco Systems, Inc
+00D0BC|Cisco Systems, Inc
+00D0C0|Cisco Systems, Inc
+00D0D3|Cisco Systems, Inc
+00D0DE|PHILIPS MULTIMEDIA NETWORK
+00D0E4|Cisco Systems, Inc
+00D0F6|Nokia
+00D0FF|Cisco Systems, Inc
+00D49E|Intel Corporate
+00D6FE|Cisco Systems, Inc
+00D76D|Intel Corporate
+00D78F|Cisco Systems, Inc
+00D861|Micro-Star INTL CO., LTD.
+00D8A2|Huawei Device Co., Ltd.
+00D9D1|Sony Interactive Entertainment Inc.
+00DA27|Palo Alto Networks
+00DA55|Cisco Systems, Inc
+00DB70|Apple, Inc.
+00DBDF|Intel Corporate
+00DCB2|Extreme Networks, Inc.
+00DD25|Shenzhen hechengdong Technology Co., Ltd
+00DEFB|Cisco Systems, Inc
+00DF1D|Cisco Systems, Inc
+00E000|FUJITSU LIMITED
+00E003|NOKIA WIRELESS BUSINESS COMMUN
+00E007|Avaya ECS Ltd
+00E00C|MOTOROLA
+00E014|Cisco Systems, Inc
+00E018|ASUSTek COMPUTER INC.
+00E01E|Cisco Systems, Inc
+00E02B|Extreme Networks, Inc.
+00E034|Cisco Systems, Inc
+00E04C|REALTEK SEMICONDUCTOR CORP.
+00E04F|Cisco Systems, Inc
+00E064|SAMSUNG ELECTRONICS
+00E088|LTX-Credence CORPORATION
+00E08F|Cisco Systems, Inc
+00E091|LG Electronics
+00E0A3|Cisco Systems, Inc
+00E0B0|Cisco Systems, Inc
+00E0F7|Cisco Systems, Inc
+00E0F9|Cisco Systems, Inc
+00E0FC|HUAWEI TECHNOLOGIES CO.,LTD
+00E0FE|Cisco Systems, Inc
+00E12F|HUAWEI TECHNOLOGIES CO.,LTD
+00E16D|Cisco Systems, Inc
+00E18C|Intel Corporate
+00E3B2|Samsung Electronics Co.,Ltd
+00E406|HUAWEI TECHNOLOGIES CO.,LTD
+00E421|Sony Interactive Entertainment Inc.
+00E60E|Extreme Networks, Inc.
+00E63A|Ruckus Wireless
+00E7E3|zte corporation
+00E93A|AzureWave Technology Inc.
+00EABD|Cisco Systems, Inc
+00EB2D|Sony Corporation
+00EBD5|Cisco Systems, Inc
+00EBD8|MERCUSYS TECHNOLOGIES CO., LTD.
+00EC0A|Xiaomi Communications Co Ltd
+00EDB8|KYOCERA Corporation
+00EE01|Enablers Solucoes e Consultoria em Dispositivos
+00EEAB|Cisco Systems, Inc
+00F28B|Cisco Systems, Inc
+00F361|Amazon Technologies Inc.
+00F39F|Apple, Inc.
+00F46F|Samsung Electronics Co.,Ltd
+00F48D|Liteon Technology Corporation
+00F4B9|Apple, Inc.
+00F5FD|HUAWEI TECHNOLOGIES CO.,LTD
+00F620|Google, Inc.
+00F663|Cisco Systems, Inc
+00F76F|Apple, Inc.
+00F7AD|HUAWEI TECHNOLOGIES CO.,LTD
+00F81C|HUAWEI TECHNOLOGIES CO.,LTD
+00F82C|Cisco Systems, Inc
+00F8CC|Sagemcom Broadband SAS
+00F952|HUAWEI TECHNOLOGIES CO.,LTD
+00FA21|Samsung Electronics Co.,Ltd
+00FADE|Motorola Mobility LLC, a Lenovo Company
+00FB4A|Espressif Inc.
+00FC8B|Amazon Technologies Inc.
+00FCBA|Cisco Systems, Inc
+00FD22|Cisco Systems, Inc
+00FD45|Hewlett Packard Enterprise
+00FEC8|Cisco Systems, Inc
+04006E|Google, Inc.
+0401A1|Fortinet, Inc.
+04021F|HUAWEI TECHNOLOGIES CO.,LTD
+0402CA|Shenzhen Vtsonic Co.,ltd
+040312|Hangzhou Hikvision Digital Technology Co.,Ltd.
+0404B8|China Hualu Panasonic AVC Networks Co., LTD.
+0405DD|Shenzhen Cultraview Digital Technology Co., Ltd
+040973|Hewlett Packard Enterprise
+040CCE|Apple, Inc.
+040E3C|HP Inc.
+040F66|TP-Link Systems Inc.
+04106B|Xiaomi Communications Co Ltd
+04137A|Apple, Inc.
+041471|HUAWEI TECHNOLOGIES CO.,LTD
+041552|Apple, Inc.
+04180F|Samsung Electronics Co.,Ltd
+041892|HUAWEI TECHNOLOGIES CO.,LTD
+0418D6|Ubiquiti Inc
+041B6D|LG Electronics (Mobile Communications)
+041BBA|Samsung Electronics Co.,Ltd
+041C6C|Intel Corporate
+041DC7|zte corporation
+041E64|Apple, Inc.
+042084|zte corporation
+04209A|Panasonic Corporation AVC Networks Company
+0422E7|Fiberhome Telecommunication Technologies Co.,LTD
+042336|Zyxel Communications Corporation
+0425C5|HUAWEI TECHNOLOGIES CO.,LTD
+0425F0|Nokia
+042665|Apple, Inc.
+042728|Microsoft Corporation
+042758|HUAWEI TECHNOLOGIES CO.,LTD
+04292E|Samsung Electronics Co.,Ltd
+042AE2|Cisco Systems, Inc
+042B58|Shenzhen Hanzsung Technology Co.,Ltd
+042EC1|Apple, Inc.
+042F56|ATOCS (Shenzhen) LTD
+0430FA|Cisco Systems, Inc
+043201|Broadcom Limited
+04331F|Huawei Device Co., Ltd.
+043389|HUAWEI TECHNOLOGIES CO.,LTD
+0433C2|Intel Corporate
+0434CF|Apple, Inc.
+0434F6|Motorola (Wuhan) Mobility Technologies Communication Co., Ltd.
+043CE8|Shenzhen SuperElectron Technology Co.,Ltd.
+043D6E|Nokia
+0441A5|Apple, Inc.
+04421A|ASUSTek COMPUTER INC.
+04472A|Palo Alto Networks
+04489A|Apple, Inc.
+04495D|Huawei Device Co., Ltd.
+044A50|Ramaxel Technology (Shenzhen) limited company
+044A69|Shenzhen Phaten Tech. LTD
+044A6C|HUAWEI TECHNOLOGIES CO.,LTD
+044BA5|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+044BB1|Huawei Device Co., Ltd.
+044BED|Apple, Inc.
+044F4C|HUAWEI TECHNOLOGIES CO.,LTD
+044FAA|Ruckus Wireless
+0450DA|Qiku Internet Network Scientific (Shenzhen) Co., Ltd
+0452F3|Apple, Inc.
+045453|Apple, Inc.
+0455B8|HUAWEI TECHNOLOGIES CO.,LTD
+045665|Nokia Shanghai Bell Co., Ltd.
+0456E5|Intel Corporate
+045791|Shenzhenshi Xinzhongxin Technology Co.Ltd
+045A95|Nokia Corporation
+045C6C|Juniper Networks
+045D4B|Sony Corporation
+045E0A|SHENZHEN TRANSCHAN TECHNOLOGY LIMITED
+045FA6|Shenzhen SDMC Technology CP,.LTD
+045FA7|Shenzhen Yichen Technology Development Co.,LTD
+045FB9|Cisco Systems, Inc
+046273|Cisco Systems, Inc
+0463D0|Huawei Device Co., Ltd.
+0464FA|Dell Inc.
+046761|Beijing Xiaomi Mobile Software Co., Ltd
+046865|Apple, Inc.
+04698F|Juniper Networks
+0469F8|Apple, Inc.
+046C59|Intel Corporate
+046C9D|Cisco Systems, Inc
+046ECB|zte corporation
+046F00|LG Electronics
+047179|Hewlett Packard Enterprise
+047295|Apple, Inc.
+0472EF|Apple, Inc.
+04749E|HUAWEI TECHNOLOGIES CO.,LTD
+047503|HUAWEI TECHNOLOGIES CO.,LTD
+0476B0|Cisco Systems, Inc
+047970|HUAWEI TECHNOLOGIES CO.,LTD
+047A0B|Beijing Xiaomi Electronics Co., Ltd.
+047AAE|Huawei Device Co., Ltd.
+047C16|Micro-Star INTL CO., LTD.
+047D50|Shenzhen Kang Ying Technology Co.Ltd.
+047D7B|Quanta Computer Inc.
+04801A|Huawei Device Co., Ltd.
+0480A7|ShenZhen TianGang Micro Technology CO.LTD
+048308|Espressif Inc.
+04885F|HUAWEI TECHNOLOGIES CO.,LTD
+048A15|Avaya Inc
+048C03|ThinPAD Technology (Shenzhen)CO.,LTD
+048C16|HUAWEI TECHNOLOGIES CO.,LTD
+048C9A|Huawei Device Co., Ltd.
+049226|ASUSTek COMPUTER INC.
+049573|zte corporation
+0495E6|Tenda Technology Co.,Ltd.Dongguan branch
+0499B9|Apple, Inc.
+0499BB|Apple, Inc.
+0499E6|Shenzhen Yoostar Technology Co., Ltd
+049D05|Apple, Inc.
+049FCA|HUAWEI TECHNOLOGIES CO.,LTD
+04A151|NETGEAR
+04A2F3|Fiberhome Telecommunication Technologies Co.,LTD
+04A526|Nokia
+04A6C8|Intel Corporate
+04A741|Cisco Systems, Inc
+04A81C|HUAWEI TECHNOLOGIES CO.,LTD
+04A82A|Nokia Corporation
+04AB08|Shenzhen Skyworth Digital Technology CO., Ltd
+04AE47|Beijing Xiaomi Mobile Software Co., Ltd
+04B0E7|HUAWEI TECHNOLOGIES CO.,LTD
+04B167|Xiaomi Communications Co Ltd
+04B1A1|Samsung Electronics Co.,Ltd
+04B247|Espressif Inc.
+04B429|Samsung Electronics Co.,Ltd
+04B5B2|Apple, Inc.
+04B9E3|Samsung Electronics Co.,Ltd
+04BA1C|Huawei Device Co., Ltd.
+04BA8D|Samsung Electronics Co.,Ltd
+04BAD6|D-Link Corporation
+04BC6D|Apple, Inc.
+04BC87|Shenzhen JustLink Technology Co., LTD
+04BD70|HUAWEI TECHNOLOGIES CO.,LTD
+04BD88|Hewlett Packard Enterprise
+04BD97|Cisco Systems, Inc
+04BDBF|Samsung Electronics Co.,Ltd
+04BE58|HUAWEI TECHNOLOGIES CO.,LTD
+04BF1B|Dell Inc.
+04BF6D|Zyxel Communications Corporation
+04BFD5|Apple, Inc.
+04C06F|HUAWEI TECHNOLOGIES CO.,LTD
+04C1B9|Fiberhome Telecommunication Technologies Co.,LTD
+04C1D8|Huawei Device Co., Ltd.
+04C241|Nokia
+04C5A4|Cisco Systems, Inc
+04C807|Xiaomi Communications Co Ltd
+04C845|TP-Link Systems Inc.
+04C8B0|Google, Inc.
+04CAED|HUAWEI TECHNOLOGIES CO.,LTD
+04CB01|Samsung Electronics Co.,Ltd
+04CB88|Shenzhen Jingxun Software Telecommunication Technology Co.,Ltd
+04CCBC|HUAWEI TECHNOLOGIES CO.,LTD
+04CE09|Shenzhen Skyworth Digital Technology CO., Ltd
+04CF4B|Intel Corporate
+04CF8C|XIAOMI Electronics,CO.,LTD
+04D13A|Xiaomi Communications Co Ltd
+04D395|Motorola Mobility LLC, a Lenovo Company
+04D3B0|Intel Corporate
+04D3B5|Huawei Device Co., Ltd.
+04D3CF|Apple, Inc.
+04D4C4|ASUSTek COMPUTER INC.
+04D590|Fortinet, Inc.
+04D6AA|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+04D9C8|Hon Hai Precision Industry Co., Ltd.
+04D9F5|ASUSTek COMPUTER INC.
+04DAD2|Cisco Systems, Inc
+04DB56|Apple, Inc.
+04DEF2|Shenzhen ECOM Technology Co. Ltd
+04E0B0|Shenzhen YOUHUA Technology Co., Ltd
+04E31A|Sagemcom Broadband SAS
+04E387|Cisco Systems, Inc
+04E4B6|Samsung Electronics Co.,Ltd
+04E536|Apple, Inc.
+04E598|Xiaomi Communications Co Ltd
+04E795|HUAWEI TECHNOLOGIES CO.,LTD
+04E8B9|Intel Corporate
+04EA56|Intel Corporate
+04EB40|Cisco Systems, Inc
+04ECBB|Fiberhome Telecommunication Technologies Co.,LTD
+04ECD8|Intel Corporate
+04ED33|Intel Corporate
+04EECD|Hangzhou Hikvision Digital Technology Co.,Ltd.
+04EF61|Dell Inc.
+04F03E|Huawei Device Co., Ltd.
+04F0E4|ShenZhen Hosecom Electronic Technology Co.,LTD
+04F0EE|Intel Corporate
+04F13E|Apple, Inc.
+04F169|Huawei Device Co., Ltd.
+04F352|HUAWEI TECHNOLOGIES CO.,LTD
+04F41C|Routerboard.com
+04F778|Sony Interactive Entertainment Inc.
+04F7E4|Apple, Inc.
+04F938|HUAWEI TECHNOLOGIES CO.,LTD
+04F9F8|TP-LINK TECHNOLOGIES CO.,LTD.
+04FE31|Samsung Electronics Co.,Ltd
+04FE7F|Cisco Systems, Inc
+04FE8D|HUAWEI TECHNOLOGIES CO.,LTD
+04FF08|Huawei Device Co., Ltd.
+080007|Apple, Inc.
+080009|Hewlett Packard
+08001B|Dell EMC
+08001F|SHARP CORPORATION
+080023|Panasonic Communications Co., Ltd.
+080046|Sony Corporation
+08006F|PHILIPS APELDOORN B.V.
+080072|XEROX CORP UNIV GRANT PROGRAM
+080086|KONICA MINOLTA HOLDINGS, INC.
+080205|HUAWEI TECHNOLOGIES CO.,LTD
+08023C|Samsung Electronics Co.,Ltd
+08028E|NETGEAR
+080342|Palo Alto Networks
+080581|Roku, Inc.
+0805E2|Juniper Networks
+0808C2|Samsung Electronics Co.,Ltd
+080FE5|Cisco Systems, Inc
+081093|Samsung Electronics Co.,Ltd
+081196|Intel Corporate
+0812A5|Amazon Technologies Inc.
+08152F|Samsung Electronics Co., Ltd. ARTIK
+081651|SHENZHEN SEA STAR TECHNOLOGY CO.,LTD
+0816E3|HUAWEI TECHNOLOGIES CO.,LTD
+081735|Cisco Systems, Inc
+081814|Hewlett Packard Enterprise
+08181A|zte corporation
+0819A6|HUAWEI TECHNOLOGIES CO.,LTD
+081A1E|Shenzhen iComm Semiconductor CO.,LTD
+081AFD|Huawei Device Co., Ltd.
+081C6E|Xiaomi Communications Co Ltd
+081F71|TP-LINK TECHNOLOGIES CO.,LTD.
+081FF3|Cisco Systems, Inc
+0821EF|Samsung Electronics Co.,Ltd
+0823C6|HUAWEI TECHNOLOGIES CO.,LTD
+08240B|Apple, Inc.
+082525|Xiaomi Communications Co Ltd
+082573|Apple, Inc.
+082697|Zyxel Communications Corporation
+08276B|Huawei Device Co., Ltd.
+082802|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+082CB6|Apple, Inc.
+082E36|Huawei Device Co., Ltd.
+082E5F|Hewlett Packard
+082FE9|HUAWEI TECHNOLOGIES CO.,LTD
+08306B|Palo Alto Networks
+0830CE|Fiberhome Telecommunication Technologies Co.,LTD
+08318B|HUAWEI TECHNOLOGIES CO.,LTD
+0831A4|Huawei Device Co., Ltd.
+08351B|Shenzhen Jialihua Electronic Technology Co., Ltd
+08357D|Microsoft Corporation
+0836C9|NETGEAR
+08373D|Samsung Electronics Co.,Ltd
+0838E6|Motorola (Wuhan) Mobility Technologies Communication Co., Ltd.
+083A8D|Espressif Inc.
+083AF2|Espressif Inc.
+083BC1|Hangzhou Hikvision Digital Technology Co.,Ltd.
+083D88|Samsung Electronics Co.,Ltd
+083E5D|Sagemcom Broadband SAS
+083E8E|Hon Hai Precision Ind. Co.,Ltd.
+083F21|Motorola Mobility LLC, a Lenovo Company
+083FBC|zte corporation
+0840F3|Tenda Technology Co.,Ltd.Dongguan branch
+084473|zte corporation
+0845D1|Cisco Systems, Inc
+0846C7|Fiberhome Telecommunication Technologies Co.,LTD
+08474C|Nokia
+0847D0|Nokia Shanghai Bell Co., Ltd.
+084F0A|HUAWEI TECHNOLOGIES CO.,LTD
+084F66|Shenzhen Skyworth Digital Technology CO., Ltd
+084FA9|Cisco Systems, Inc
+084FF9|Cisco Systems, Inc
+085104|Huawei Device Co., Ltd.
+0851F2|Sagemcom Broadband SAS
+08524E|Shenzhen Fangcheng Baiyi Technology Co., Ltd.
+085411|Hangzhou Hikvision Digital Technology Co.,Ltd.
+0854BB|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+085531|Routerboard.com
+085700|TP-LINK TECHNOLOGIES CO.,LTD.
+0857FB|Amazon Technologies Inc.
+085A11|D-Link International
+085B0E|Fortinet, Inc.
+085BD6|Intel Corporate
+085C1B|HUAWEI TECHNOLOGIES CO.,LTD
+085D53|Apple, Inc.
+08606E|ASUSTek COMPUTER INC.
+086083|zte corporation
+086202|Apple, Inc.
+086266|ASUSTek COMPUTER INC.
+086361|HUAWEI TECHNOLOGIES CO.,LTD
+08638A|Cisco Systems, Inc
+086518|Apple, Inc.
+08661F|Palo Alto Networks
+086698|Apple, Inc.
+086A0B|Cisco Meraki
+086AC5|Intel Corporate
+086AE5|Amazon Technologies Inc.
+086BD1|Shenzhen SuperElectron Technology Co.,Ltd.
+086D41|Apple, Inc.
+086DF2|Shenzhen MIMOWAVE Technology Co.,Ltd
+086E9C|Huawei Device Co., Ltd.
+086F48|Shenzhen iComm Semiconductor CO.,LTD
+087045|Apple, Inc.
+087073|HUAWEI TECHNOLOGIES CO.,LTD
+08711C|Cisco Meraki
+087190|Intel Corporate
+087402|Apple, Inc.
+087458|Fiberhome Telecommunication Technologies Co.,LTD
+087671|Juniper Networks
+087808|Samsung Electronics Co.,Ltd
+08798C|HUAWEI TECHNOLOGIES CO.,LTD
+087A4C|HUAWEI TECHNOLOGIES CO.,LTD
+087B0F|Amazon Technologies Inc.
+087B12|Sagemcom Broadband SAS
+087B87|Cisco Systems, Inc
+087C39|Amazon Technologies Inc.
+087C43|Huawei Device Co., Ltd.
+088039|Cisco SPVTG
+0881F4|Juniper Networks
+08849D|Amazon Technologies Inc.
+0887C7|Apple, Inc.
+088AF1|MERCUSYS TECHNOLOGIES CO., LTD.
+088BC8|Google, Inc.
+088C2C|Samsung Electronics Co.,Ltd
+088E90|Intel Corporate
+088EDC|Apple, Inc.
+088FC3|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+089115|Amazon Technologies Inc.
+0891A3|Amazon Technologies Inc.
+089204|Dell Inc.
+089272|Espressif Inc.
+089356|HUAWEI TECHNOLOGIES CO.,LTD
+0894EC|Huawei Device Co., Ltd.
+0894EF|Wistron Infocomm (Zhongshan) Corporation
+089542|Apple, Inc.
+0896AD|Cisco Systems, Inc
+089707|Cisco Systems, Inc
+089734|Hewlett Packard Enterprise
+089758|Shenzhen Strong Rising Electronics Co.,Ltd DongGuan Subsidiary
+089798|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+0898EF|Shenzhen Taichi Technology Limited
+089AC7|zte corporation
+089BB9|Nokia Solutions and Networks GmbH & Co. KG
+089C86|Nokia Shanghai Bell Co., Ltd.
+089DF4|Intel Corporate
+089E01|Quanta Computer Inc.
+089E08|Google, Inc.
+089E84|HUAWEI TECHNOLOGIES CO.,LTD
+08A12B|ShenZhen EZL Technology Co., Ltd
+08A189|Hangzhou Hikvision Digital Technology Co.,Ltd.
+08A5DF|Samsung Electronics Co.,Ltd
+08A6BC|Amazon Technologies Inc.
+08A6F7|Espressif Inc.
+08A842|Huawei Device Co., Ltd.
+08A95A|AzureWave Technology Inc.
+08AA55|Motorola Mobility LLC, a Lenovo Company
+08AA89|zte corporation
+08AD0A|Espressif Inc.
+08AED6|Samsung Electronics Co.,Ltd
+08B258|Juniper Networks
+08B339|Xiaomi Communications Co Ltd
+08B3D6|Huawei Device Co., Ltd.
+08B4B1|Google, Inc.
+08B4D2|Intel Corporate
+08B61F|Espressif Inc.
+08B8D0|Chipsea Technologies (Shenzhen) Corp.
+08BD43|NETGEAR
+08BFA0|Samsung Electronics Co.,Ltd
+08BFB8|ASUSTek COMPUTER INC.
+08C021|HUAWEI TECHNOLOGIES CO.,LTD
+08C06C|Huawei Device Co., Ltd.
+08C224|Amazon Technologies Inc.
+08C3B3|TCL King Electrical Appliances(Huizhou)Co.,Ltd
+08C5E1|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+08C729|Apple, Inc.
+08C7B5|Apple, Inc.
+08CC27|Motorola Mobility LLC, a Lenovo Company
+08CC68|Cisco Systems, Inc
+08CC81|Hangzhou Hikvision Digital Technology Co.,Ltd.
+08CCA7|Cisco Systems, Inc
+08D01E|Juniper Networks
+08D09F|Cisco Systems, Inc
+08D1F9|Espressif Inc.
+08D23E|Intel Corporate
+08D40C|Intel Corporate
+08D42B|Samsung Electronics Co.,Ltd
+08D46A|LG Electronics (Mobile Communications)
+08D59D|Sagemcom Broadband SAS
+08D833|Shenzhen RF Technology Co., Ltd
+08D945|HUAWEI TECHNOLOGIES CO.,LTD
+08DD82|HUAWEI TECHNOLOGIES CO.,LTD
+08E4DF|Shenzhen Sande Dacom Electronics Co., Ltd
+08E5DA|NANJING FUJITSU COMPUTER PRODUCTS CO.,LTD.
+08E63B|zte corporation
+08E64B|Apple, Inc.
+08E689|Apple, Inc.
+08E7E5|Huawei Device Co., Ltd.
+08E84F|HUAWEI TECHNOLOGIES CO.,LTD
+08EA40|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+08EA44|Extreme Networks, Inc.
+08EB21|Intel Corporate
+08EBF6|HUAWEI TECHNOLOGIES CO.,LTD
+08ECA9|Samsung Electronics Co.,Ltd
+08ECF5|Cisco Systems, Inc
+08EDB9|Hon Hai Precision Ind. Co.,Ltd.
+08EDED|Zhejiang Dahua Technology Co., Ltd.
+08EE8B|Samsung Electronics Co.,Ltd
+08F1B3|Cisco Meraki
+08F1EA|Hewlett Packard Enterprise
+08F3FB|Cisco Systems, Inc
+08F458|Huawei Device Co., Ltd.
+08F4AB|Apple, Inc.
+08F4F0|Cisco Systems, Inc
+08F606|zte corporation
+08F69C|Apple, Inc.
+08F8BC|Apple, Inc.
+08F9E0|Espressif Inc.
+08FA28|HUAWEI TECHNOLOGIES CO.,LTD
+08FC88|Samsung Electronics Co.,Ltd
+08FD0E|Samsung Electronics Co.,Ltd
+08FD58|HUAWEI TECHNOLOGIES CO.,LTD
+08FF24|Shenzhen Skyworth Digital Technology CO., Ltd
+08FF44|Apple, Inc.
+0C014B|zte corporation
+0C01A5|zte corporation
+0C02BD|Samsung Electronics Co.,Ltd
+0C0535|Juniper Systems
+0C07DF|Xiaomi Communications Co Ltd
+0C07F3|HUAWEI TECHNOLOGIES CO.,LTD
+0C0E76|D-Link International
+0C0ECB|Huawei Device Co., Ltd.
+0C1167|Cisco Systems, Inc
+0C1262|zte corporation
+0C12AD|Hewlett Packard Enterprise
+0C1420|Samsung Electronics Co.,Ltd
+0C1539|Apple, Inc.
+0C1563|Apple, Inc.
+0C1773|Huawei Device Co., Ltd.
+0C184E|HUAWEI TECHNOLOGIES CO.,LTD
+0C19F8|Apple, Inc.
+0C1B7B|Microsoft Corporation
+0C1C19|LONGCONN ELECTRONICS(SHENZHEN) CO.,LTD
+0C1C31|MERCUSYS TECHNOLOGIES CO., LTD.
+0C1DAF|Xiaomi Communications Co Ltd
+0C2369|Honeywell SPS
+0C238D|HUAWEI TECHNOLOGIES CO.,LTD
+0C2643|Cisco Systems, Inc
+0C2724|Cisco Systems, Inc
+0C29EF|Dell Inc.
+0C2A86|Fiberhome Telecommunication Technologies Co.,LTD
+0C2C54|HUAWEI TECHNOLOGIES CO.,LTD
+0C2C7C|Shenzhen Skyworth Digital Technology CO., Ltd
+0C2D71|Apple, Inc.
+0C2E57|HUAWEI TECHNOLOGIES CO.,LTD
+0C2FB0|Samsung Electronics Co.,Ltd
+0C3021|Apple, Inc.
+0C31DC|HUAWEI TECHNOLOGIES CO.,LTD
+0C323A|Samsung Electronics Co.,Ltd
+0C3526|Microsoft Corporation
+0C354F|Nokia
+0C35FE|Fiberhome Telecommunication Technologies Co.,LTD
+0C3623|Nokia Shanghai Bell Co., Ltd.
+0C3747|zte corporation
+0C37DC|HUAWEI TECHNOLOGIES CO.,LTD
+0C3B50|Apple, Inc.
+0C3E9F|Apple, Inc.
+0C413E|Microsoft Corporation
+0C41E9|HUAWEI TECHNOLOGIES CO.,LTD
+0C43F9|Amazon Technologies Inc.
+0C44C0|zte corporation
+0C45BA|HUAWEI TECHNOLOGIES CO.,LTD
+0C47C9|Amazon Technologies Inc.
+0C4885|LG Electronics (Mobile Communications)
+0C4B48|Nokia
+0C4B54|TP-LINK TECHNOLOGIES CO.,LTD.
+0C4DE9|Apple, Inc.
+0C4EA0|Espressif Inc.
+0C4F9B|HUAWEI TECHNOLOGIES CO.,LTD
+0C5101|Apple, Inc.
+0C517E|Apple, Inc.
+0C53B7|Apple, Inc.
+0C5415|Intel Corporate
+0C54A5|PEGATRON CORPORATION
+0C54B9|Nokia
+0C599C|Juniper Networks
+0C6076|Hon Hai Precision Ind. Co.,Ltd.
+0C659A|Panasonic Automotive Systems Company of America
+0C6743|HUAWEI TECHNOLOGIES CO.,LTD
+0C6803|Cisco Systems, Inc
+0C6ABC|Fiberhome Telecommunication Technologies Co.,LTD
+0C6AC4|Apple, Inc.
+0C6F8B|Apple, Inc.
+0C7043|Sony Interactive Entertainment Inc.
+0C704A|HUAWEI TECHNOLOGIES CO.,LTD
+0C715D|Samsung Electronics Co.,Ltd
+0C7165|Motorola Mobility LLC, a Lenovo Company
+0C722C|TP-LINK TECHNOLOGIES CO.,LTD.
+0C72D9|zte corporation
+0C7474|Fiberhome Telecommunication Technologies Co.,LTD
+0C74C2|Apple, Inc.
+0C7512|Shenzhen Kunlun TongTai Technology Co.,Ltd.
+0C75BD|Cisco Systems, Inc
+0C75D2|Hangzhou Hikvision Digital Technology Co.,Ltd.
+0C771A|Apple, Inc.
+0C7A15|Intel Corporate
+0C7BC8|Cisco Meraki
+0C7C28|Nokia Solutions and Networks GmbH & Co. KG
+0C7DB0|Motorola Mobility LLC, a Lenovo Company
+0C8063|TP-LINK TECHNOLOGIES CO.,LTD.
+0C8126|Juniper Networks
+0C8230|SHENZHEN MAGNUS TECHNOLOGIES CO.,LTD
+0C8268|TP-LINK TECHNOLOGIES CO.,LTD.
+0C8306|Huawei Device Co., Ltd.
+0C839A|Huawei Device Co., Ltd.
+0C8408|HUAWEI TECHNOLOGIES CO.,LTD
+0C8447|Fiberhome Telecommunication Technologies Co.,LTD
+0C84DC|Hon Hai Precision Ind. Co.,Ltd.
+0C8509|SHEN ZHEN TENDA TECHNOLOGY CO.,LTD
+0C8525|Cisco Systems, Inc
+0C85E1|Apple, Inc.
+0C8610|Juniper Networks
+0C8832|Nokia Solutions and Networks India Private Limited
+0C8910|Samsung Electronics Co.,Ltd
+0C8B95|Espressif Inc.
+0C8BA2|HUAWEI TECHNOLOGIES CO.,LTD
+0C8BFD|Intel Corporate
+0C8C24|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+0C8C69|Shenzhen elink smart Co., ltd
+0C8DCA|Samsung Electronics Co.,Ltd
+0C8DDB|Cisco Meraki
+0C8FFF|HUAWEI TECHNOLOGIES CO.,LTD
+0C9192|Intel Corporate
+0C9541|CHIPSEA TECHNOLOGIES (SHENZHEN) CORP.
+0C96BF|HUAWEI TECHNOLOGIES CO.,LTD
+0C975F|Hewlett Packard Enterprise
+0C9838|Xiaomi Communications Co Ltd
+0C9A3C|Intel Corporate
+0C9A42|FN-LINK TECHNOLOGY LIMITED
+0C9B78|Extreme Networks, Inc.
+0C9D92|ASUSTek COMPUTER INC.
+0CA280|FN-LINK TECHNOLOGY Ltd.
+0CA3B2|Apple, Inc.
+0CA8A7|Samsung Electronics Co.,Ltd
+0CA94A|Shenzhen Skyworth Digital Technology CO., Ltd
+0CAC8A|Sagemcom Broadband SAS
+0CAE39|Intel Corporate
+0CAF31|Cisco Systems, Inc
+0CB319|Samsung Electronics Co.,Ltd
+0CB34F|Shenzhen Xiaoqi Intelligent Technology Co., Ltd.
+0CB527|HUAWEI TECHNOLOGIES CO.,LTD
+0CB5B3|Huawei Device Co., Ltd.
+0CB6D2|D-Link International
+0CB787|HUAWEI TECHNOLOGIES CO.,LTD
+0CB78E|Huawei Device Co., Ltd.
+0CB7EC|HUAWEI TECHNOLOGIES CO.,LTD
+0CB815|Espressif Inc.
+0CBC9F|Apple, Inc.
+0CBEF1|Huawei Device Co., Ltd.
+0CBF3F|Shenzhen Lencotion Technology Co.,Ltd
+0CC119|Shenzhen Phaten Tech. LTD
+0CC3B8|Shenzhen Jiahua Zhongli Technology Co., LTD
+0CC413|Google, Inc.
+0CC56C|Apple, Inc.
+0CC66A|Nokia Corporation
+0CC6CC|HUAWEI TECHNOLOGIES CO.,LTD
+0CC6FD|Xiaomi Communications Co Ltd
+0CC98A|Intel Corporate
+0CCB85|Motorola Mobility LLC, a Lenovo Company
+0CCC5D|Apple, Inc.
+0CCF89|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+0CD0F8|Cisco Systems, Inc
+0CD292|Intel Corporate
+0CD5D3|Cisco Systems, Inc
+0CD6BD|HUAWEI TECHNOLOGIES CO.,LTD
+0CD746|Apple, Inc.
+0CD86C|SHENZHEN FAST TECHNOLOGIES CO.,LTD
+0CD996|Cisco Systems, Inc
+0CDBEA|Apple, Inc.
+0CDC7E|Espressif Inc.
+0CDC91|Amazon Technologies Inc.
+0CDD24|Intel Corporate
+0CDDEF|Nokia Corporation
+0CDFA4|Samsung Electronics Co.,Ltd
+0CE0DC|Samsung Electronics Co.,Ltd
+0CE159|Shenzhen iStartek Technology Co., Ltd.
+0CE441|Apple, Inc.
+0CE4A0|Huawei Device Co., Ltd.
+0CE5A1|Apple, Inc.
+0CE5B5|HUAWEI TECHNOLOGIES CO.,LTD
+0CE623|Huawei Device Co., Ltd.
+0CE725|Microsoft Corporation
+0CEA14|Ubiquiti Inc
+0CEC84|Shenzhen TINNO Mobile Technology Corp.
+0CEC8D|Motorola Mobility LLC, a Lenovo Company
+0CED71|Extreme Networks, Inc.
+0CEDC8|Xiaomi Communications Co Ltd
+0CEE99|Amazon Technologies Inc.
+0CEEE6|Hon Hai Precision Ind. Co.,Ltd.
+0CEF15|TP-Link Systems Inc.
+0CF07B|Shenzhen Skyworth Digital Technology CO., Ltd
+0CF346|Xiaomi Communications Co Ltd
+0CF4D5|Ruckus Wireless
+0CF5A4|Cisco Systems, Inc
+0CFC18|HUAWEI TECHNOLOGIES CO.,LTD
+0CFE45|Sony Interactive Entertainment Inc.
+100020|Apple, Inc.
+10003B|Espressif Inc.
+100177|HUAWEI TECHNOLOGIES CO.,LTD
+1002B5|Intel Corporate
+100501|PEGATRON CORPORATION
+1005CA|Cisco Systems, Inc
+1005E1|Nokia
+10061C|Espressif Inc.
+100645|Sagemcom Broadband SAS
+1006ED|Cisco Systems, Inc
+10071D|Fiberhome Telecommunication Technologies Co.,LTD
+1007B6|Samsung Electronics Co.,Ltd
+1008B1|Hon Hai Precision Ind. Co.,Ltd.
+1009F9|Amazon Technologies Inc.
+100BA9|Intel Corporate
+100C29|Shenzhen NORCO lntelligent Technology Co.,Ltd
+100C6B|NETGEAR
+100D7F|NETGEAR
+100D8C|Huawei Device Co., Ltd.
+100E7E|Juniper Networks
+101081|zte corporation
+1012D0|zte corporation
+1012FB|Hangzhou Hikvision Digital Technology Co.,Ltd.
+101B54|HUAWEI TECHNOLOGIES CO.,LTD
+101C0C|Apple, Inc.
+101D6E|Hewlett Packard Enterprise
+101DC0|Samsung Electronics Co.,Ltd
+101EDA|INGENICO TERMINALS SAS
+101F74|Hewlett Packard
+1020BA|Espressif Inc.
+102407|HUAWEI TECHNOLOGIES CO.,LTD
+1027F5|TP-Link Systems Inc
+102874|Shenzhen Jingxun Technology Co., Ltd.
+102959|Apple, Inc.
+1029AB|Samsung Electronics Co.,Ltd
+102AB3|Xiaomi Communications Co Ltd
+102B1C|Motorola Mobility LLC, a Lenovo Company
+102B41|Samsung Electronics Co.,Ltd
+102BAA|Sagemcom Broadband SAS
+102D31|Shenzhen Americas Trading Company LLC
+102E00|Intel Corporate
+102F6B|Microsoft Corporation
+102F6E|Shenzhen Sundray Technologies company Limited
+102FA3|Shenzhen Uvision-tech Technology Co.Ltd
+102FCA|Apple, Inc.
+103025|Apple, Inc.
+103047|Samsung Electronics Co.,Ltd
+10321D|HUAWEI TECHNOLOGIES CO.,LTD
+10327E|Huawei Device Co., Ltd.
+103917|Samsung Electronics Co.,Ltd
+1039E9|Juniper Networks
+103B54|HUAWEI TECHNOLOGIES CO.,LTD
+103B59|Samsung Electronics Co.,Ltd
+103C59|zte corporation
+103D1C|Intel Corporate
+103F44|Xiaomi Communications Co Ltd
+1040F3|Apple, Inc.
+10417F|Apple, Inc.
+104210|Apple, Inc.
+104400|HUAWEI TECHNOLOGIES CO.,LTD
+104738|Nokia Shanghai Bell Co., Ltd.
+104780|HUAWEI TECHNOLOGIES CO.,LTD
+1047E7|Shenzhen YOUHUA Technology Co., Ltd
+10490E|HUAWEI TECHNOLOGIES CO.,LTD
+104A7D|Intel Corporate
+104C43|Fiberhome Telecommunication Technologies Co.,LTD
+104F58|Hewlett Packard Enterprise
+104FA8|Sony Corporation
+105107|Intel Corporate
+105172|HUAWEI TECHNOLOGIES CO.,LTD
+1051DB|Espressif Inc.
+10521C|Espressif Inc.
+1052BD|HUAWEI TECHNOLOGIES CO.,LTD
+1055E4|Shenzhen Skyworth Digital Technology CO., Ltd
+105725|Cisco Systems, Inc
+105887|Fiberhome Telecommunication Technologies Co.,LTD
+105932|Roku, Inc
+105A17|Tuya Smart Inc.
+105A95|TP-Link Systems Inc.
+105DDC|Huawei Device Co., Ltd.
+105F49|Cisco SPVTG
+105FAD|Intel Corporate
+10604B|Hewlett Packard
+1062E5|Hewlett Packard
+1062EB|D-Link International
+10634B|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+1063C8|Liteon Technology Corporation
+106519|Shenzhen iComm Semiconductor CO.,LTD
+106530|Dell Inc.
+1067A3|HUAWEI TECHNOLOGIES CO.,LTD
+106838|AzureWave Technology Inc.
+10683F|LG Electronics (Mobile Communications)
+107100|Huawei Device Co., Ltd.
+1071B3|Zyxel Communications Corporation
+10746F|MOTOROLA SOLUTIONS MALAYSIA SDN. BHD.
+107717|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+1077B0|Fiberhome Telecommunication Technologies Co.,LTD
+1077B1|Samsung Electronics Co.,Ltd
+107873|Shenzhen Jinkeyi Communication Co., Ltd.
+107A2A|Microsoft Corporation
+107B44|ASUSTek COMPUTER INC.
+107BCE|Nokia
+107BEF|Zyxel Communications Corporation
+107C61|ASUSTek COMPUTER INC.
+107D1A|Dell Inc.
+107DC8|Apple, Inc.
+1086F4|Huawei Device Co., Ltd.
+1088CE|Fiberhome Telecommunication Technologies Co.,LTD
+1088D3|HUAWEI TECHNOLOGIES CO.,LTD
+1089FB|Samsung Electronics Co.,Ltd
+108A7B|Nokia
+108CCF|Cisco Systems, Inc
+108EE0|Samsung Electronics Co.,Ltd
+108FFE|HUAWEI TECHNOLOGIES CO.,LTD
+1090FC|Shenzhen DOOGEE Hengtong Technology CO.,LTD
+109166|Shenzhen Yinwang Intelligent Technologies Co.,Ltd.
+1091A8|Espressif Inc.
+1091D1|Intel Corporate
+109266|Samsung Electronics Co.,Ltd
+109327|GIGA-BYTE TECHNOLOGY CO. , Ltd.
+1093E9|Apple, Inc.
+1094BB|Apple, Inc.
+1094EF|HUAWEI TECHNOLOGIES CO.,LTD
+10961A|CHIPSEA TECHNOLOGIES (SHENZHEN) CORP.
+109693|Amazon Technologies Inc.
+1096C6|Cisco Systems, Inc
+1097BD|Espressif Inc.
+109819|Dell Inc.
+109826|Nokia
+109836|Dell Inc.
+109ABA|Intel Corporate
+109ADD|Apple, Inc.
+109D7A|Huawei Device Co., Ltd.
+109E6B|Apple, Inc.
+109F41|Apple, Inc.
+109F47|Shenzhen Skyworth Digital Technology CO., Ltd
+10A1DA|Apple, Inc.
+10A2D3|Apple, Inc.
+10A30F|HUAWEI TECHNOLOGIES CO.,LTD
+10A4BE|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+10A4C9|Apple, Inc.
+10A4DA|HUAWEI TECHNOLOGIES CO.,LTD
+10A51D|Intel Corporate
+10A829|Cisco Systems, Inc
+10A85B|Espressif Systems (Singapore) Pte. Ltd
+10A879|Intel Corporate
+10ABC9|Samsung Electronics Co.,Ltd
+10AE60|Amazon Technologies Inc.
+10AF78|Shenzhen ATUE Technology Co., Ltd
+10B06E|Shenzhen Phaten Tech. LTD
+10B1F8|HUAWEI TECHNOLOGIES CO.,LTD
+10B3C6|Cisco Systems, Inc
+10B3D5|Cisco Systems, Inc
+10B3D6|Cisco Systems, Inc
+10B41D|Espressif Inc.
+10B588|Apple, Inc.
+10B676|HP Inc.
+10B9C4|Apple, Inc.
+10BA1A|SHENZHEN IK WORLD Technology Co., Ltd
+10BBF3|HUNAN FN-LINK TECHNOLOGY LIMITED
+10BC36|Huawei Device Co., Ltd.
+10BD18|Cisco Systems, Inc
+10BD3A|Apple, Inc.
+10BDA3|Espressif Inc.
+10BEF5|D-Link International
+10BF48|ASUSTek COMPUTER INC.
+10BF67|Amazon Technologies Inc.
+10C172|HUAWEI TECHNOLOGIES CO.,LTD
+10C197|Xiaomi Communications Co Ltd
+10C34D|SHENZHEN WATER WORLD CO.,LTD.
+10C37B|ASUSTek COMPUTER INC.
+10C3AB|HUAWEI TECHNOLOGIES CO.,LTD
+10C595|Lenovo
+10C5FA|Zyxel Communications Corporation
+10C61F|HUAWEI TECHNOLOGIES CO.,LTD
+10C67E|SHENZHEN JUCHIN TECHNOLOGY CO., LTD
+10C735|Microsoft Corporation
+10CD54|HUAWEI TECHNOLOGIES CO.,LTD
+10CDAE|Avaya Inc
+10CE02|Amazon Technologies Inc.
+10CEE9|Apple, Inc.
+10CF0F|Apple, Inc.
+10D0AB|zte corporation
+10D38A|Samsung Electronics Co.,Ltd
+10D542|Samsung Electronics Co.,Ltd
+10D561|Tuya Smart Inc.
+10D7B0|Sagemcom Broadband SAS
+10D9A2|Google, Inc.
+10DA43|NETGEAR
+10DA49|Huawei Device Co., Ltd.
+10DA63|Apple, Inc.
+10DC4A|Fiberhome Telecommunication Technologies Co.,LTD
+10DDB1|Apple, Inc.
+10DF8B|Shenzhen CareDear Communication Technology Co.,Ltd
+10E2C9|Apple, Inc.
+10E376|Cisco Systems, Inc
+10E4C2|Samsung Electronics Co.,Ltd
+10E676|Cisco Systems, Inc
+10E7C6|Hewlett Packard
+10E878|Nokia
+10E953|Huawei Device Co., Ltd.
+10EA59|Cisco SPVTG
+10EC81|Samsung Electronics Co.,Ltd
+10F005|Intel Corporate
+10F068|Ruckus Wireless
+10F1F2|LG Electronics (Mobile Communications)
+10F311|Cisco Systems, Inc
+10F60A|Intel Corporate
+10F920|Cisco Systems, Inc
+10F96F|LG Electronics (Mobile Communications)
+10F9EE|Nokia Corporation
+10FC33|Huawei Device Co., Ltd.
+10FEED|TP-LINK TECHNOLOGIES CO.,LTD.
+10FFE0|GIGA-BYTE TECHNOLOGY CO.,LTD.
+14007D|zte corporation
+140152|Samsung Electronics Co.,Ltd
+1402EC|Hewlett Packard Enterprise
+140338|HUAWEI TECHNOLOGIES CO.,LTD
+140498|Apple, Inc.
+140589|Motorola Mobility LLC, a Lenovo Company
+140808|Espressif Inc.
+1409B4|zte corporation
+1409DC|HUAWEI TECHNOLOGIES CO.,LTD
+140A02|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+140AC5|Amazon Technologies Inc.
+140B9E|Samsung Electronics Co.,Ltd
+140F42|Nokia
+14109F|Apple, Inc.
+14115D|Skyworth Digital Technology(Shenzhen) Co.,Ltd
+141333|AzureWave Technology Inc.
+141346|Skyworth Digital Technology(Shenzhen) Co.,Ltd
+1413FB|HUAWEI TECHNOLOGIES CO.,LTD
+14147D|Apple, Inc.
+14169D|Cisco Systems, Inc
+14172A|Fiberhome Telecommunication Technologies Co.,LTD
+141826|Nokia
+141877|Dell Inc.
+1418C3|Intel Corporate
+141923|Cisco Systems, Inc
+141A97|Apple, Inc.
+141AA3|Motorola Mobility LLC, a Lenovo Company
+141B30|Shenzhen Yipingfang Network Technology Co., Ltd.
+141BA0|Apple, Inc.
+141F78|Samsung Electronics Co.,Ltd
+142004|zte corporation
+14205E|Apple, Inc.
+142233|Fiberhome Telecommunication Technologies Co.,LTD
+14223B|Google, Inc.
+14230A|HUAWEI TECHNOLOGIES CO.,LTD
+1423F2|Broadcom Limited
+1423F3|Broadcom Limited
+142876|Apple, Inc.
+142A14|ShenZhen Selenview Digital Technology Co.,Ltd
+142B2F|Espressif Inc.
+142D27|Hon Hai Precision Ind. Co.,Ltd.
+142D4D|Apple, Inc.
+142D79|Fiberhome Telecommunication Technologies Co.,LTD
+143004|HUAWEI TECHNOLOGIES CO.,LTD
+1430C6|Motorola Mobility LLC, a Lenovo Company
+1432D1|Samsung Electronics Co.,Ltd
+14335C|Espressif Inc.
+143375|Zyxel Communications Corporation
+1435B7|Apple, Inc.
+143605|Nokia Corporation
+14360E|Zyxel Communications Corporation
+1436C6|Lenovo Mobile Communication Technology Ltd.
+1438FA|Motorola Mobility LLC, a Lenovo Company
+143A9A|Hon Hai Precision Industry Co.,LTD
+143B42|Realfit(Shenzhen) Intelligent Technology Co., Ltd
+143B51|Huawei Device Co., Ltd.
+143CC3|HUAWEI TECHNOLOGIES CO.,LTD
+143E60|Nokia
+143EBF|zte corporation
+143EC2|Intel Corporate
+143FA6|Sony Home Entertainment&Sound Products Inc
+144146|Honeywell (China) Co., LTD
+144658|HUAWEI TECHNOLOGIES CO.,LTD
+14488B|Shenzhen Doov Technology Co.,Ltd
+144920|HUAWEI TECHNOLOGIES CO.,LTD
+1449C5|Huawei Device Co., Ltd.
+1449D4|Xiaomi Communications Co Ltd
+1449E0|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+144CFF|Grandstream Networks, Inc.
+144D67|Zioncom Electronics (Shenzhen) Ltd.
+144F8A|Intel Corporate
+145051|SHARP Corporation
+145120|Huawei Device Co., Ltd.
+145594|Huawei Device Co., Ltd.
+1455B9|Nokia Solutions and Networks GmbH & Co. KG
+14563A|Huawei Device Co., Ltd.
+14568E|Samsung Electronics Co.,Ltd
+14579F|HUAWEI TECHNOLOGIES CO.,LTD
+1458D0|Hewlett Packard
+1459C0|NETGEAR
+145A05|Apple, Inc.
+145AFC|Liteon Technology Corporation
+145D34|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+145EBC|HUAWEI TECHNOLOGIES CO.,LTD
+145F94|HUAWEI TECHNOLOGIES CO.,LTD
+146080|zte corporation
+1460CB|Apple, Inc.
+14612F|Avaya Inc
+146393|Espressif Inc.
+14656A|HUAWEI TECHNOLOGIES CO.,LTD
+146B72|Shenzhen Fortune Ship Technology Co., Ltd.
+146B9A|zte corporation
+146B9C|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+14755B|Intel Corporate
+147590|TP-LINK TECHNOLOGIES CO.,LTD.
+147649|Hewlett Packard Enterprise
+147740|Huawei Device Co., Ltd.
+147830|NVIDIA Corporation
+147AE4|Apple, Inc.
+147BAC|Nokia
+147DDA|Apple, Inc.
+147E19|Hewlett Packard Enterprise
+147FCE|Apple, Inc.
+148473|Cisco Systems, Inc
+148509|Apple, Inc.
+14857F|Intel Corporate
+148692|TP-LINK TECHNOLOGIES CO.,LTD.
+14876A|Apple, Inc.
+1488E6|Apple, Inc.
+1489CB|HUAWEI TECHNOLOGIES CO.,LTD
+1489FD|Samsung Electronics Co.,Ltd
+148C4A|HUAWEI TECHNOLOGIES CO.,LTD
+148F79|Apple, Inc.
+148FC6|Apple, Inc.
+14907A|Beijing Xiaomi Mobile Software Co., Ltd
+149138|Amazon Technologies Inc.
+14946C|Apple, Inc.
+149569|Shenzhen iComm Semiconductor CO.,LTD
+1495CE|Apple, Inc.
+1496E5|Samsung Electronics Co.,Ltd
+149877|Apple, Inc.
+14993E|Xiaomi Communications Co Ltd
+1499E2|Apple, Inc.
+149A10|Microsoft Corporation
+149AA3|HUAWEI TECHNOLOGIES CO.,LTD
+149D09|HUAWEI TECHNOLOGIES CO.,LTD
+149D99|Apple, Inc.
+149ECF|Dell Inc.
+149F3C|Samsung Electronics Co.,Ltd
+149F43|Cisco Meraki
+149FE8|Lenovo Mobile Communication Technology Ltd.
+14A0F8|HUAWEI TECHNOLOGIES CO.,LTD
+14A2A0|Cisco Systems, Inc
+14A32F|Huawei Device Co., Ltd.
+14A364|Samsung Electronics Co.,Ltd
+14A3B4|Huawei Device Co., Ltd.
+14A417|Shenzhen Belon Technology CO.,LTD
+14A51A|HUAWEI TECHNOLOGIES CO.,LTD
+14A6B9|Samsung Electronics Co.,Ltd
+14A78B|Zhejiang Dahua Technology Co., Ltd.
+14A86B|ShenZhen Telacom Science&Technology Co., Ltd
+14AB02|HUAWEI TECHNOLOGIES CO.,LTD
+14ABC5|Intel Corporate
+14ABEC|Hewlett Packard Enterprise
+14B2E5|Shenzhen iComm Semiconductor CO.,LTD
+14B31F|Dell Inc.
+14B370|Gigaset Digital Technology (Shenzhen) Co., Ltd.
+14B3A1|Juniper Networks
+14B484|Samsung Electronics Co.,Ltd
+14B5CD|Liteon Technology Corporation
+14B653|Apple, Inc.
+14B837|Shenzhen YOUHUA Technology Co., Ltd
+14B903|HUAWEI TECHNOLOGIES CO.,LTD
+14B968|HUAWEI TECHNOLOGIES CO.,LTD
+14BAA2|Extreme Networks, Inc.
+14BB6E|Samsung Electronics Co.,Ltd
+14BC68|Cisco Systems, Inc
+14BD61|Apple, Inc.
+14C126|Nokia Corporation
+14C14E|Google, Inc.
+14C19F|Espressif Inc.
+14C1FF|ShenZhen QianHai Comlan communication Co.,LTD
+14C213|Apple, Inc.
+14C7C4|Zyxel Communications Corporation
+14C88B|Apple, Inc.
+14C913|LG Electronics
+14CA56|zte corporation
+14CB19|HP Inc.
+14CB65|Microsoft Corporation
+14CC20|TP-LINK TECHNOLOGIES CO.,LTD.
+14CF92|TP-LINK TECHNOLOGIES CO.,LTD.
+14D00D|Apple, Inc.
+14D11F|HUAWEI TECHNOLOGIES CO.,LTD
+14D169|HUAWEI TECHNOLOGIES CO.,LTD
+14D19E|Apple, Inc.
+14D1D4|Huawei Device Co., Ltd.
+14D424|AzureWave Technology Inc.
+14D55C|Apple, Inc.
+14D64D|D-Link International
+14D864|TP-LINK TECHNOLOGIES CO.,LTD.
+14D881|Beijing Xiaomi Mobile Software Co., Ltd
+14DAB9|Huawei Device Co., Ltd.
+14DAE9|ASUSTek COMPUTER INC.
+14DDA9|ASUSTek COMPUTER INC.
+14DE39|Huawei Device Co., Ltd.
+14E01D|Samsung Electronics Co.,Ltd
+14E22A|Cisco Systems, Inc
+14E602|Shenzhen EMTEK Storage Technology Co.,Ltd
+14E6E4|TP-LINK TECHNOLOGIES CO.,LTD.
+14E9B2|Fiberhome Telecommunication Technologies Co.,LTD
+14EB03|SHENZHEN IP-COM NETWORKS CO.,LTD.
+14EB08|HUAWEI TECHNOLOGIES CO.,LTD
+14EBB6|TP-Link Systems Inc
+14EFCF|SCHREDER
+14F287|Apple, Inc.
+14F42A|Samsung Electronics Co.,Ltd
+14F592|Shenzhen SDG DONZHI Technology Co., Ltd
+14F5F9|HUNAN FN-LINK TECHNOLOGY LIMITED
+14F65A|Xiaomi Communications Co Ltd
+14F6D8|Intel Corporate
+14F893|Wuhan FiberHome Digital Technology Co.,Ltd.
+14FB70|Huawei Device Co., Ltd.
+14FEB5|Dell Inc.
+18002D|Sony Corporation
+1801F1|Xiaomi Communications Co Ltd
+18022D|HUAWEI TECHNOLOGIES CO.,LTD
+180373|Dell Inc.
+1806FF|Acer Computer(Shanghai) Limited.
+180712|Shenzhen Dazoo Technologies CO.,Ltd
+180B1B|Amazon Technologies Inc.
+180BD0|HUAWEI TECHNOLOGIES CO.,LTD
+180C7A|Sagemcom Broadband SAS
+180CAC|CANON INC.
+180D2C|Intelbras
+180EAC|SHENZHEN FAST TECHNOLOGIES CO.,LTD
+180F76|D-Link International
+18120C|Zhouhai Intelligence(Shenzhen).,Ltd
+18132D|zte corporation
+181456|Nokia Corporation
+1814AE|Nokia
+1816C9|Samsung Electronics Co.,Ltd
+1819D6|Samsung Electronics Co.,Ltd
+181DEA|Intel Corporate
+181E78|Sagemcom Broadband SAS
+181EB0|Samsung Electronics Co.,Ltd
+182012|Aztech Associates Inc.
+182032|Apple, Inc.
+182195|Samsung Electronics Co.,Ltd
+18227E|Samsung Electronics Co.,Ltd
+182649|Intel Corporate
+182654|Samsung Electronics Co.,Ltd
+182666|Samsung Electronics Co.,Ltd
+182A57|HUAWEI TECHNOLOGIES CO.,LTD
+182AD3|Juniper Networks
+1831BF|ASUSTek COMPUTER INC.
+1832DE|Apple, Inc.
+183386|HUAWEI TECHNOLOGIES CO.,LTD
+18339D|Cisco Systems, Inc
+183451|Apple, Inc.
+183A2D|Samsung Electronics Co.,Ltd
+183C98|Shenzhen Hengyi Technology Co., LTD
+183CB7|Huawei Device Co., Ltd.
+183D2D|LCFC(Hefei) Electronics Technology co., ltd
+183D5E|HUAWEI TECHNOLOGIES CO.,LTD
+183DA2|Intel Corporate
+183EEF|Apple, Inc.
+183F47|Samsung Electronics Co.,Ltd
+183F70|Apple, Inc.
+1840A4|Shenzhen Trylong Smart Science and Technology Co., Ltd.
+1844E6|zte corporation
+184617|Samsung Electronics Co.,Ltd
+1848BE|Amazon Technologies Inc.
+1849F8|Extreme Networks, Inc.
+184A53|Apple, Inc.
+184B0D|Ruckus Wireless
+184E16|Samsung Electronics Co.,Ltd
+184ECB|Samsung Electronics Co.,Ltd
+184F32|Hon Hai Precision Ind. Co.,Ltd.
+185282|Fiberhome Telecommunication Technologies Co.,LTD
+185345|Nokia
+1854CF|Samsung Electronics Co.,Ltd
+18550F|Cisco SPVTG
+1855E3|Apple, Inc.
+185644|HUAWEI TECHNOLOGIES CO.,LTD
+185680|Intel Corporate
+1856C3|Apple, Inc.
+185933|Cisco SPVTG
+185936|Xiaomi Communications Co Ltd
+1859F5|Cisco Systems, Inc
+185A58|Dell Inc.
+185B00|Nokia
+185BB3|Samsung Electronics Co.,Ltd
+185E0B|zte corporation
+185E0F|Intel Corporate
+185F27|Motorola Mobility LLC, a Lenovo Company
+186024|Hewlett Packard
+18622C|Sagemcom Broadband SAS
+186472|Hewlett Packard Enterprise
+186590|Apple, Inc.
+1866C7|Shenzhen Libre Technology Co., Ltd
+1866DA|Dell Inc.
+1867B0|Samsung Electronics Co.,Ltd
+18686A|zte corporation
+1868CB|Hangzhou Hikvision Digital Technology Co.,Ltd.
+186945|TP-Link Systems Inc.
+1869D4|Samsung Electronics Co.,Ltd
+1869D8|Tuya Smart Inc.
+186A81|Sagemcom Broadband SAS
+186F2D|Shenzhen Sundray Technologies company Limited
+186FA7|SHEN ZHEN TENDA TECHNOLOGY CO.,LTD
+18703B|Huawei Device Co., Ltd.
+18742E|Amazon Technologies Inc.
+1879FD|zte corporation
+187A3B|Hewlett Packard Enterprise
+187C0B|Ruckus Wireless
+187EB9|Apple, Inc.
+187ED5|shenzhen kaism technology Co. Ltd
+188025|Hangzhou Hikvision Digital Technology Co.,Ltd.
+188090|Cisco Systems, Inc
+18810E|Apple, Inc.
+188331|Samsung Electronics Co.,Ltd
+1886AC|Nokia Danmark A/S
+1886C3|Nokia
+188740|Xiaomi Communications Co Ltd
+18895B|Samsung Electronics Co.,Ltd
+188B0E|Espressif Inc.
+188B15|ShenZhen ZhongRuiJing Technology co.,LTD
+188B45|Cisco Systems, Inc
+188B9D|Cisco Systems, Inc
+189067|Shenzhen Jingxun Technology Co., Ltd.
+1890D8|Sagemcom Broadband SAS
+189341|Intel Corporate
+1894A3|Wistron Service(Kunshan) Co., Ltd.
+1894C6|ShenZhen Chenyee Technology Co., Ltd.
+189C5D|Cisco Systems, Inc
+189E2C|Huawei Device Co., Ltd.
+189EAD|Shenzhen Chengqian Information Technology Co., Ltd
+189EFC|Apple, Inc.
+18A084|Apple, Inc.
+18A3E8|Fiberhome Telecommunication Technologies Co.,LTD
+18A6F7|TP-LINK TECHNOLOGIES CO.,LTD.
+18A788|Shenzhen MEK Intellisys Pte Ltd
+18A905|Hewlett Packard
+18A99B|Dell Inc.
+18AA0F|Huawei Device Co., Ltd.
+18AA1E|Shenzhen Skyworth Digital Technology CO., Ltd
+18AB1D|Samsung Electronics Co.,Ltd
+18ACC2|TCL King Electrical Appliances(Huizhou)Co.,Ltd
+18AF61|Apple, Inc.
+18AF8F|Apple, Inc.
+18AFA1|Shenzhen Yifang Network Technology Co., Ltd.
+18B0A4|zte corporation
+18B169|Sonicwall
+18B657|HUAWEI TECHNOLOGIES CO.,LTD
+18B83D|Samsung Electronics Co.,Ltd
+18B842|Apple, Inc.
+18BB1C|Huawei Device Co., Ltd.
+18BB26|FN-LINK TECHNOLOGY LIMITED
+18BB41|Huawei Device Co., Ltd.
+18BFB3|Samsung Electronics Co., Ltd., Memory Division
+18C007|Huawei Device Co., Ltd.
+18C04D|GIGA-BYTE TECHNOLOGY CO.,LTD.
+18C086|Broadcom
+18C241|SonicWall
+18C300|Nokia
+18C501|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+18C58A|HUAWEI TECHNOLOGIES CO.,LTD
+18C8E7|Shenzhen Hualistone Technology Co.,Ltd
+18CAA7|zte corporation
+18CC18|Intel Corporate
+18CE94|Samsung Electronics Co.,Ltd
+18CF24|HUAWEI TECHNOLOGIES CO.,LTD
+18CF5E|Liteon Technology Corporation
+18D225|Fiberhome Telecommunication Technologies Co.,LTD
+18D276|HUAWEI TECHNOLOGIES CO.,LTD
+18D3CF|Hewlett Packard Enterprise
+18D61C|Shenzhen TINNO Mobile Technology Corp.
+18D6C7|TP-LINK TECHNOLOGIES CO.,LTD.
+18D6DD|HUAWEI TECHNOLOGIES CO.,LTD
+18D98F|Huawei Device Co., Ltd.
+18DBF2|Dell Inc.
+18DC56|Yulong Computer Telecommunication Scientific (Shenzhen) Co.,Ltd
+18DE50|Tuya Smart Inc.
+18DED7|HUAWEI TECHNOLOGIES CO.,LTD
+18E215|Nokia
+18E2C2|Samsung Electronics Co.,Ltd
+18E671|Apple, Inc.
+18E728|Cisco Systems, Inc
+18E7B0|Apple, Inc.
+18E7F4|Apple, Inc.
+18E829|Ubiquiti Inc
+18E91D|HUAWEI TECHNOLOGIES CO.,LTD
+18EBD4|Shenzhen Skyworth Digital Technology CO., Ltd
+18EE69|Apple, Inc.
+18EF63|Cisco Systems, Inc
+18F0E4|Xiaomi Communications Co Ltd
+18F1D8|Apple, Inc.
+18F22C|TP-LINK TECHNOLOGIES CO.,LTD.
+18F46A|Hon Hai Precision Ind. Co.,Ltd.
+18F643|Apple, Inc.
+18F935|Cisco Systems, Inc
+18FAB7|Apple, Inc.
+18FB7B|Dell Inc.
+18FD74|Routerboard.com
+18FE34|Espressif Inc.
+18FF0F|Intel Corporate
+18FF2E|Shenzhen Rui Ying Da Technology Co., Ltd
+1C0B8B|Ubiquiti Inc
+1C0D7D|Apple, Inc.
+1C0EAF|Huawei Device Co., Ltd.
+1C0EC2|Apple, Inc.
+1C12B0|Amazon Technologies Inc.
+1C1386|Huawei Device Co., Ltd.
+1C13FA|Huawei Device Co., Ltd.
+1C151F|HUAWEI TECHNOLOGIES CO.,LTD
+1C17D3|Cisco Systems, Inc
+1C184A|ShenZhen RicherLink Technologies Co.,LTD
+1C1AC0|Apple, Inc.
+1C1ADF|Microsoft Corporation
+1C1B0D|GIGA-BYTE TECHNOLOGY CO.,LTD.
+1C1BB5|Intel Corporate
+1C1D67|HUAWEI TECHNOLOGIES CO.,LTD
+1C1D86|Cisco Systems, Inc
+1C1DD3|Apple, Inc.
+1C1FF1|Huawei Device Co., Ltd.
+1C20DB|HUAWEI TECHNOLOGIES CO.,LTD
+1C2226|Cisco Systems, Inc
+1C232C|Samsung Electronics Co.,Ltd
+1C2575|Xiaomi Communications Co Ltd
+1C2704|zte corporation
+1C28AF|Hewlett Packard Enterprise
+1C2904|Espressif Inc.
+1C2A8B|Nokia
+1C2AA3|Shenzhen HongRui Optical Technology Co., Ltd.
+1C2AB0|Beijing Xiaomi Electronics Co.,Ltd
+1C2D60|Extreme Networks, Inc.
+1C3003|Hewlett Packard Enterprise
+1C3283|COMTTI Intelligent Technology(Shenzhen) Co., Ltd.
+1C32AC|HUAWEI TECHNOLOGIES CO.,LTD
+1C3576|Samsung Electronics Co.,Ltd
+1C36BB|Apple, Inc.
+1C3947|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+1C398A|Fiberhome Telecommunication Technologies Co.,LTD
+1C3A60|Ruckus Wireless
+1C3ADE|Samsung Electronics Co.,Ltd
+1C3BF3|TP-LINK TECHNOLOGIES CO.,LTD.
+1C3C78|Apple, Inc.
+1C3CD4|HUAWEI TECHNOLOGIES CO.,LTD
+1C3D2F|HUAWEI TECHNOLOGIES CO.,LTD
+1C3E84|Hon Hai Precision Ind. Co.,Ltd.
+1C4024|Dell Inc.
+1C40E8|SHENZHEN PROGRESS&WIN TECHNOLOGY CO.,LTD
+1C42C2|Huawei Device Co., Ltd.
+1C4363|HUAWEI TECHNOLOGIES CO.,LTD
+1C4419|TP-LINK TECHNOLOGIES CO.,LTD.
+1C472F|Huawei Device Co., Ltd.
+1C47F6|Zhidao Network Technology(Shenzhen) Co.,Ltd
+1C4BD6|AzureWave Technology Inc.
+1C4D66|Amazon Technologies Inc.
+1C4D70|Intel Corporate
+1C4EA2|Shenzhen V-Link Technology CO., LTD.
+1C53F9|Google, Inc.
+1C54E6|Shenzhen Yisheng Technology Co.,Ltd
+1C568E|Zioncom Electronics (Shenzhen) Ltd.
+1C56FE|Motorola Mobility LLC, a Lenovo Company
+1C57DC|Apple, Inc.
+1C599B|HUAWEI TECHNOLOGIES CO.,LTD
+1C5A3E|Samsung Electronics Co.,Ltd
+1C5A6B|Philips Electronics Nederland BV
+1C5C60|Shenzhen Belzon Technology Co.,LTD.
+1C5CF2|Apple, Inc.
+1C5EE6|SHENZHEN TWOWING TECHNOLOGIES CO.,LTD.
+1C5F2B|D-Link International
+1C5FFF|Beijing Ereneben Information Technology Co.,Ltd Shenzhen Branch
+1C60D2|Fiberhome Telecommunication Technologies Co.,LTD
+1C61B4|TP-Link Systems Inc
+1C61BF|Apple, Inc.
+1C627E|HUAWEI TECHNOLOGIES CO.,LTD
+1C62B8|Samsung Electronics Co.,Ltd
+1C63BF|SHENZHEN BROADTEL TELECOM CO.,LTD
+1C64F0|Motorola Mobility LLC, a Lenovo Company
+1C659D|Liteon Technology Corporation
+1C666D|Hon Hai Precision Ind. Co.,Ltd.
+1C66AA|Samsung Electronics Co.,Ltd
+1C674A|zte corporation
+1C6758|HUAWEI TECHNOLOGIES CO.,LTD
+1C687E|Shenzhen Qihu Intelligent Technology Company Limited
+1C6920|Espressif Inc.
+1C6A1B|Ubiquiti Inc
+1C6A76|Apple, Inc.
+1C6A7A|Cisco Systems, Inc
+1C6F65|GIGA-BYTE TECHNOLOGY CO.,LTD.
+1C7055|HUAWEI TECHNOLOGIES CO.,LTD
+1C7125|Apple, Inc.
+1C721D|Dell Inc.
+1C73E2|HUAWEI TECHNOLOGIES CO.,LTD
+1C740D|Zyxel Communications Corporation
+1C7508|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+1C76F2|Samsung Electronics Co.,Ltd
+1C7754|Apple, Inc.
+1C7839|Shenzhen Tencent Computer System Co., Ltd.
+1C7B21|Sony Corporation
+1C7EE5|D-Link International
+1C7F2C|HUAWEI TECHNOLOGIES CO.,LTD
+1C84A6|Cisco Systems, Inc
+1C8682|Apple, Inc.
+1C869A|Samsung Electronics Co.,Ltd
+1C872C|ASUSTek COMPUTER INC.
+1C880C|Shenzhen Skyworth Digital Technology CO., Ltd
+1C8B84|Espressif Systems (Singapore) Pte. Ltd
+1C8BEF|Beijing Xiaomi Electronics Co.,Ltd
+1C8E2A|Apple, Inc.
+1C8E5C|HUAWEI TECHNOLOGIES CO.,LTD
+1C8F57|Espressif Inc.
+1C90FF|Tuya Smart Inc.
+1C9148|Apple, Inc.
+1C9180|Apple, Inc.
+1C93C4|Amazon Technologies Inc.
+1C984B|Extreme Networks, Inc.
+1C98EC|Hewlett Packard Enterprise
+1C9957|Intel Corporate
+1C99DB|HUAWEI TECHNOLOGIES CO.,LTD
+1C9C8C|Juniper Networks
+1C9DC2|Espressif Inc.
+1C9E46|Apple, Inc.
+1CA0B8|Hon Hai Precision Industry Co., Ltd.
+1CA532|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+1CA681|HUAWEI TECHNOLOGIES CO.,LTD
+1CA770|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+1CAA07|Cisco Systems, Inc
+1CABA7|Apple, Inc.
+1CAECB|HUAWEI TECHNOLOGIES CO.,LTD
+1CAF05|Samsung Electronics Co.,Ltd
+1CAF4A|Samsung Electronics Co.,Ltd
+1CAFF7|D-Link International
+1CB3C9|Apple, Inc.
+1CB3E9|Shenzhen Zhongke United Communication Technology
+1CB46C|HUAWEI TECHNOLOGIES CO.,LTD
+1CB72C|ASUSTek COMPUTER INC.
+1CB796|HUAWEI TECHNOLOGIES CO.,LTD
+1CB9C4|Ruckus Wireless
+1CBDB9|D-Link International
+1CBFCE|Shenzhen Century Xinyang Technology Co., Ltd
+1CC10C|Intel Corporate
+1CC1DE|Hewlett Packard
+1CC212|Fortinet, Inc.
+1CC3AB|Espressif Inc.
+1CC72D|Shenzhen Huapu Digital CO.,Ltd
+1CCCD6|Xiaomi Communications Co Ltd
+1CCE51|AzureWave Technology Inc.
+1CCF82|Palo Alto Networks
+1CD11A|Fortinet, Inc.
+1CD1BA|Fiberhome Telecommunication Technologies Co.,LTD
+1CD1E0|Cisco Systems, Inc
+1CD21E|Juniper Networks
+1CD5E2|Shenzhen YOUHUA Technology Co., Ltd
+1CDBD4|Espressif Inc.
+1CDE57|Fiberhome Telecommunication Technologies Co.,LTD
+1CDEA7|Cisco Systems, Inc
+1CDF0F|Cisco Systems, Inc
+1CE209|Apple, Inc.
+1CE4CB|Espressif Systems (Singapore) Pte. Ltd
+1CE4DD|Technicolor (China) Technology Co., Ltd.
+1CE504|HUAWEI TECHNOLOGIES CO.,LTD
+1CE57F|Samsung Electronics Co.,Ltd
+1CE587|Cisco Meraki
+1CE61D|Samsung Electronics Co.,Ltd
+1CE62B|Apple, Inc.
+1CE639|HUAWEI TECHNOLOGIES CO.,LTD
+1CE6AD|Huawei Device Co., Ltd.
+1CE6C7|Cisco Systems, Inc
+1CE85D|Cisco Systems, Inc
+1CEA1B|Nokia
+1CEAAC|Beijing Xiaomi Mobile Software Co., Ltd
+1CF29A|Google, Inc.
+1CF42B|Huawei Device Co., Ltd.
+1CF64C|Apple, Inc.
+1CF8D0|Samsung Electronics Co.,Ltd
+1CF9D5|Apple, Inc.
+1CFA68|TP-LINK TECHNOLOGIES CO.,LTD.
+1CFC17|Cisco Systems, Inc
+1CFC2A|HUAWEI TECHNOLOGIES CO.,LTD
+1CFE2B|Amazon Technologies Inc.
+1CFFAD|HUAWEI TECHNOLOGIES CO.,LTD
+20040F|Dell Inc.
+200484|Apple, Inc.
+200889|zte corporation
+2008ED|HUAWEI TECHNOLOGIES CO.,LTD
+200B74|AzureWave Technology Inc.
+200BC5|Cisco Systems, Inc
+200BC7|HUAWEI TECHNOLOGIES CO.,LTD
+200CC8|NETGEAR
+200DB0|Shenzhen Four Seas Global Link Network Technology Co., Ltd.
+200E0F|Panasonic Marketing Middle East & Africa FZE
+200E2B|Apple, Inc.
+20108A|zte corporation
+2010B1|Amazon Technologies Inc.
+2013E0|Samsung Electronics Co.,Ltd
+2014C4|HUAWEI TECHNOLOGIES CO.,LTD
+201582|Apple, Inc.
+2015DE|Samsung Electronics Co.,Ltd
+201642|Microsoft Corporation
+2016B9|Intel Corporate
+2016D8|Liteon Technology Corporation
+201742|LG Electronics
+20180E|Shenzhen Sunchip Technology Co., Ltd
+20185B|Shenzhen Jingxun Technology Co., Ltd.
+201A06|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+201A94|Apple, Inc.
+201BC9|Juniper Networks
+201E1D|HUAWEI TECHNOLOGIES CO.,LTD
+201E88|Intel Corporate
+201F3B|Google, Inc.
+202027|Shenzhen Sundray Technologies company Limited
+202051|zte corporation
+2021A5|LG Electronics (Mobile Communications)
+202351|TP-Link Systems Inc
+202564|PEGATRON CORPORATION
+202565|Espressif Inc.
+2025CC|Xiaomi Communications Co Ltd
+2025D2|Fiberhome Telecommunication Technologies Co.,LTD
+202680|Samsung Electronics Co.,Ltd
+20283E|HUAWEI TECHNOLOGIES CO.,LTD
+202BC1|HUAWEI TECHNOLOGIES CO.,LTD
+202C05|ZHEJIANG DAHUA ZHILIAN CO.,LTD
+202D07|Samsung Electronics Co.,Ltd
+202DF6|Apple, Inc.
+203233|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+20326C|Samsung Electronics Co.,Ltd
+2032C6|Apple, Inc.
+203389|Google, Inc.
+203462|Xiaomi Communications Co Ltd
+2034FB|Xiaomi Communications Co Ltd
+203543|Sagemcom Broadband SAS
+203626|TP-Link Systems Inc
+2036D0|Motorola Mobility LLC, a Lenovo Company
+203706|Cisco Systems, Inc
+2037A5|Apple, Inc.
+203A07|Cisco Systems, Inc
+203A43|Intel Corporate
+203AEB|zte corporation
+203B34|Xiaomi Communications Co Ltd
+203B67|Samsung Electronics Co.,Ltd
+203CAE|Apple, Inc.
+203DB2|HUAWEI TECHNOLOGIES CO.,LTD
+2043A8|Espressif Inc.
+20443A|Schneider Electric Asia Pacific Ltd
+20463A|Apple, Inc.
+204747|Dell Inc.
+2047B5|Sagemcom Broadband SAS
+2047DA|Xiaomi Communications Co Ltd
+204C03|Hewlett Packard Enterprise
+204C9E|Cisco Systems, Inc
+204E71|Juniper Networks
+204E7F|NETGEAR
+204EF6|AzureWave Technology Inc.
+20500D|Espressif Inc.
+20521D|Apple, Inc.
+205383|HUAWEI TECHNOLOGIES CO.,LTD
+20538D|Hon Hai Precision Industry Co., Ltd.
+205476|Sony Corporation
+2054FA|HUAWEI TECHNOLOGIES CO.,LTD
+205531|Samsung Electronics Co.,Ltd
+20579E|HUNAN FN-LINK TECHNOLOGY LIMITED
+2057AF|Shenzhen FH-NET OPTOELECTRONICS CO.,LTD
+205869|Ruckus Wireless
+205A1D|zte corporation
+205A8F|Shenzhen Hikeen Technology Co.,LTD
+205B5E|Shenzhen Wonhe Technology Co., Ltd
+205D0D|Fiberhome Telecommunication Technologies Co.,LTD
+205E64|Huawei Device Co., Ltd.
+205E97|Nokia
+205EF7|Samsung Electronics Co.,Ltd
+206274|Microsoft Corporation
+206296|Shenzhen Malio Technology Co.,Ltd
+206432|SAMSUNG ELECTRO MECHANICS CO., LTD.
+20658E|HUAWEI TECHNOLOGIES CO.,LTD
+20677C|Hewlett Packard Enterprise
+2067E0|Shenzhen iComm Semiconductor CO.,LTD
+20689D|Liteon Technology Corporation
+206980|Apple, Inc.
+206A8A|Wistron Infocomm (Zhongshan) Corporation
+206BE7|TP-LINK TECHNOLOGIES CO.,LTD.
+206BF4|Huawei Device Co., Ltd.
+206C8A|Extreme Networks, Inc.
+206E9C|Samsung Electronics Co.,Ltd
+206EF1|Espressif Inc.
+2072A9|Beijing Xiaomi Electronics Co.,Ltd
+2074CF|Shenzhen Voxtech Co.,Ltd
+20768F|Apple, Inc.
+207693|Lenovo (Beijing) Limited.
+207759|OPTICAL NETWORK VIDEO TECHNOLOGIES (SHENZHEN) CO., LTD.
+207852|Nokia Solutions and Networks GmbH & Co. KG
+2078CD|Apple, Inc.
+2078F0|Apple, Inc.
+207918|Intel Corporate
+207C8F|Quanta Microsystems,Inc.
+207D74|Apple, Inc.
+208097|Shenzhen OXO Technology limited
+2082C0|Xiaomi Communications Co Ltd
+20845F|Apple, Inc.
+2084F5|Yufei Innovation Software(Shenzhen) Co., Ltd.
+2087EC|HUAWEI TECHNOLOGIES CO.,LTD
+208810|Dell Inc.
+20896F|Fiberhome Telecommunication Technologies Co.,LTD
+208984|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+208986|zte corporation
+20898A|Shenzhen Skyworth Digital Technology CO., Ltd
+208B37|Skyworth Digital Technology(Shenzhen) Co.,Ltd
+208C0A|Apple, Inc.
+208C86|HUAWEI TECHNOLOGIES CO.,LTD
+20906F|Shenzhen Tencent Computer System Co., Ltd.
+2091DF|Apple, Inc.
+209339|Juniper Networks
+20988E|Shenzhen Feasycom Co., Ltd
+2098D8|Shenzhen Yingdakang Technology CO., LTD
+209952|Xiaomi Communications Co Ltd
+209A7D|Sagemcom Broadband SAS
+209BA9|Espressif Inc.
+209BCD|Apple, Inc.
+209BDD|HUAWEI TECHNOLOGIES CO.,LTD
+209CB4|Hewlett Packard Enterprise
+209EF7|Extreme Networks, Inc.
+20A171|Amazon Technologies Inc.
+20A200|HUAWEI TECHNOLOGIES CO.,LTD
+20A2E4|Apple, Inc.
+20A5CB|Apple, Inc.
+20A60C|Xiaomi Communications Co Ltd
+20A680|HUAWEI TECHNOLOGIES CO.,LTD
+20A6CD|Hewlett Packard Enterprise
+20A766|HUAWEI TECHNOLOGIES CO.,LTD
+20A7F9|SHENZHEN OLANBOA TECHNOLOGY CO., LTD
+20A8BF|HUAWEI TECHNOLOGIES CO.,LTD
+20A99B|Microsoft Corporation
+20AA4B|Cisco-Linksys, LLC
+20AB37|Apple, Inc.
+20AB48|HUAWEI TECHNOLOGIES CO.,LTD
+20AB53|Motorola Mobility LLC, a Lenovo Company
+20AEB6|Huawei Device Co., Ltd.
+20B780|Toshiba Visual Solutions Corporation Co.,Ltd
+20B82B|Sagemcom Broadband SAS
+20B868|Motorola Mobility LLC, a Lenovo Company
+20BBC0|Cisco Systems, Inc
+20BD1D|Intel Corporate
+20BEB8|Amazon Technologies Inc.
+20C06D|SHENZHEN SPACETEK TECHNOLOGY CO.,LTD
+20C19B|Intel Corporate
+20C2B0|HUAWEI TECHNOLOGIES CO.,LTD
+20C6EB|Panasonic Corporation AVC Networks Company
+20C8B3|SHENZHEN BUL-TECH CO.,LTD.
+20C9D0|Apple, Inc.
+20CC27|Cisco Systems, Inc
+20CC73|Samsung Electronics Co.,Ltd
+20CF30|ASUSTek COMPUTER INC.
+20CFAE|Cisco Systems, Inc
+20D390|Samsung Electronics Co.,Ltd
+20D476|Amazon Technologies Inc.
+20D5BF|Samsung Electronics Co.,Ltd
+20D5C2|Espressif Systems (Singapore) Pte. Ltd
+20D607|Nokia Corporation
+20D80B|Juniper Networks
+20DA22|HUAWEI TECHNOLOGIES CO.,LTD
+20DBAB|Samsung Electronics Co., Ltd.
+20DBEA|Cisco Systems, Inc
+20DCE6|TP-LINK TECHNOLOGIES CO.,LTD.
+20DCFD|Huawei Device Co., Ltd.
+20DE1E|Nokia
+20DF73|HUAWEI TECHNOLOGIES CO.,LTD
+20DFB9|Google, Inc.
+20E09C|Nokia
+20E15D|TP-Link Systems Inc.
+20E2A8|Apple, Inc.
+20E525|Huawei Device Co., Ltd.
+20E52A|NETGEAR
+20E59B|Panasonic Automotive Systems
+20E7C8|Espressif Inc.
+20E874|Apple, Inc.
+20E882|zte corporation
+20EAC7|SHENZHEN RIOPINE ELECTRONICS CO., LTD
+20ED47|Juniper Networks
+20EE28|Apple, Inc.
+20EFBD|Roku, Inc
+20F094|Google, Inc.
+20F120|Cisco Systems, Inc
+20F17C|HUAWEI TECHNOLOGIES CO.,LTD
+20F1B2|Tuya Smart Inc.
+20F307|zte corporation
+20F3A3|HUAWEI TECHNOLOGIES CO.,LTD
+20F41B|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+20F44F|Nokia
+20F478|Xiaomi Communications Co Ltd
+20F4D4|Apple, Inc.
+20FA85|Apple, Inc.
+20FE00|Amazon Technologies Inc.
+20FF0C|HUAWEI TECHNOLOGIES CO.,LTD
+2400BA|HUAWEI TECHNOLOGIES CO.,LTD
+24016F|Huawei Device Co., Ltd.
+2401C7|Cisco Systems, Inc
+240588|Google, Inc.
+240935|Samsung Electronics Co.,Ltd
+240995|HUAWEI TECHNOLOGIES CO.,LTD
+240A3F|Samsung Electronics Co.,Ltd
+240A64|AzureWave Technology Inc.
+240AC4|Espressif Inc.
+240B0A|Palo Alto Networks
+240D65|Shenzhen Vsun Communication Technology Co., Ltd.
+240F5E|Shenzhen z-router Technology Co., Ltd
+240F9B|Hangzhou Hikvision Digital Technology Co.,Ltd.
+241064|Shenzhen Ecsino Tecnical Co. Ltd
+241145|Xiaomi Communications Co Ltd
+241153|Samsung Electronics Co.,Ltd
+241551|Huawei Device Co., Ltd.
+24161B|Cisco Systems, Inc
+241651|Chipsea Technologies (Shenzhen) Corp.
+24166D|HUAWEI TECHNOLOGIES CO.,LTD
+24169D|Cisco Systems, Inc
+24181D|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+2418C6|HUNAN FN-LINK TECHNOLOGY LIMITED
+241AE6|Huawei Device Co., Ltd.
+241B7A|Apple, Inc.
+241C04|SHENZHEN JEHE TECHNOLOGY DEVELOPMENT CO., LTD.
+241EEB|Apple, Inc.
+241FA0|HUAWEI TECHNOLOGIES CO.,LTD
+241FBD|Extreme Networks, Inc.
+2420C7|Sagemcom Broadband SAS
+242124|Nokia
+2421AB|Sony Corporation
+24240E|Apple, Inc.
+2424B7|Samsung Electronics Co.,Ltd
+242642|SHARP Corporation.
+2426BA|Shenzhen Toptel Technology Co., Ltd.
+2426D6|HUAWEI TECHNOLOGIES CO.,LTD
+2427E5|Huawei Device Co., Ltd.
+2428FD|Hangzhou Hikvision Digital Technology Co.,Ltd.
+242934|Google, Inc.
+2429B0|HUAWEI TECHNOLOGIES CO.,LTD
+2429FE|KYOCERA Corporation
+242A04|Cisco Systems, Inc
+242AEA|Apple, Inc.
+242E02|HUAWEI TECHNOLOGIES CO.,LTD
+242FD0|TP-Link Systems Inc
+242FFA|Toshiba Global Commerce Solutions
+2430F8|Huawei Device Co., Ltd.
+243154|HUAWEI TECHNOLOGIES CO.,LTD
+243184|SHARP Corporation
+2432AE|Hangzhou Hikvision Digital Technology Co.,Ltd.
+2436DA|Cisco Systems, Inc
+24374C|Cisco SPVTG
+243FAA|Huawei Device Co., Ltd.
+24418C|Intel Corporate
+2442E3|Shenzhen Ai-Thinker Technology Co.,Ltd
+244427|HUAWEI TECHNOLOGIES CO.,LTD
+24456B|Huawei Device Co., Ltd.
+2446C8|Motorola Mobility LLC, a Lenovo Company
+2446E4|HUAWEI TECHNOLOGIES CO.,LTD
+244750|Sagemcom Broadband SAS
+244845|Hangzhou Hikvision Digital Technology Co.,Ltd.
+244885|Huawei Device Co., Ltd.
+244B03|Samsung Electronics Co.,Ltd
+244B81|Samsung Electronics Co.,Ltd
+244BF1|HUAWEI TECHNOLOGIES CO.,LTD
+244BFE|ASUSTek COMPUTER INC.
+244C07|HUAWEI TECHNOLOGIES CO.,LTD
+244CAB|Espressif Inc.
+244CE3|Amazon Technologies Inc.
+244ECD|Sagemcom Broadband SAS
+24526A|Zhejiang Dahua Technology Co., Ltd.
+2453ED|Dell Inc.
+24559A|Apple, Inc.
+24586E|zte corporation
+24587C|Espressif Inc.
+245A4C|Ubiquiti Inc
+245A5F|TP-LINK TECHNOLOGIES CO.,LTD.
+245AB5|Samsung Electronics Co.,Ltd
+245BA7|Apple, Inc.
+245BF0|Liteon, Inc.
+245CC5|Huawei Device Co., Ltd.
+245D92|Juniper Networks
+245E48|Apple, Inc.
+245EBE|QNAP Systems, Inc.
+245F9F|Huawei Device Co., Ltd.
+245FDF|KYOCERA CORPORATION
+246078|HUAWEI TECHNOLOGIES CO.,LTD
+2460B3|Samsung Electronics Co.,Ltd
+2462AB|Espressif Inc.
+2462C6|Huawei Device Co., Ltd.
+2462CE|Hewlett Packard Enterprise
+246477|Beijing Xiaomi Mobile Software Co., Ltd
+24649F|Huawei Device Co., Ltd.
+246800|Samsung Electronics Co.,Ltd
+246830|Shenzhen Shokzhear Co., Ltd
+2468B0|Samsung Electronics Co.,Ltd
+246968|TP-LINK TECHNOLOGIES CO.,LTD.
+24698E|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+2469A5|HUAWEI TECHNOLOGIES CO.,LTD
+246A0E|HP Inc.
+246C60|Huawei Device Co., Ltd.
+246C84|Cisco Systems, Inc
+246D10|Apple, Inc.
+246E96|Dell Inc.
+246F28|Espressif Inc.
+246F8C|Huawei Device Co., Ltd.
+247121|Cisco Systems, Inc
+247152|Dell Inc.
+2475FC|zte corporation
+247645|Huawei Device Co., Ltd.
+24767D|Cisco SPVTG
+247703|Intel Corporate
+247755|Huawei Device Co., Ltd.
+247823|Panasonic Entertainment & Communication Co., Ltd.
+2478EF|Nokia
+24792A|Ruckus Wireless
+247E12|Cisco Systems, Inc
+247E51|zte corporation
+247F20|Sagemcom Broadband SAS
+247F3C|HUAWEI TECHNOLOGIES CO.,LTD
+24813B|Cisco Systems, Inc
+24814E|AMD
+248185|Extreme Networks, Inc.
+2481C7|Huawei Device Co., Ltd.
+248894|shenzhen lensun Communication Technology LTD
+2491BB|HUAWEI TECHNOLOGIES CO.,LTD
+24920E|Samsung Electronics Co.,Ltd
+24952F|Google, Inc.
+249745|HUAWEI TECHNOLOGIES CO.,LTD
+249AC8|Shenzhen Skyworth Digital Technology CO., Ltd
+249AD8|YEALINK(XIAMEN) NETWORK TECHNOLOGY CO.,LTD.
+249EAB|HUAWEI TECHNOLOGIES CO.,LTD
+24A02D|shenzhen worldelite electronics co., LTD
+24A074|Apple, Inc.
+24A160|Espressif Inc.
+24A2E1|Apple, Inc.
+24A43C|Ubiquiti Inc
+24A452|Samsung Electronics Co.,Ltd
+24A487|Huawei Device Co., Ltd.
+24A52C|HUAWEI TECHNOLOGIES CO.,LTD
+24A65E|zte corporation
+24A799|Huawei Device Co., Ltd.
+24A87D|Panasonic Automotive Systems Asia Pacific(Thailand)Co.,Ltd.
+24AB81|Apple, Inc.
+24B105|Prama Hikvision India Private Limited
+24B209|Avaya Inc
+24B2B9|Liteon Technology Corporation
+24B2DE|Espressif Inc.
+24B339|Apple, Inc.
+24B5B9|Motorola Mobility LLC, a Lenovo Company
+24B657|Cisco Systems, Inc
+24B6FD|Dell Inc.
+24B7DA|Fiberhome Telecommunication Technologies Co.,LTD
+24BA23|Cisco Systems, Inc
+24BBC9|Shenzhen SuperElectron Technology Co.,Ltd.
+24BCF8|HUAWEI TECHNOLOGIES CO.,LTD
+24BE05|Hewlett Packard
+24C013|zte corporation
+24C42F|Philips Lifeline
+24C44A|zte corporation
+24C613|Samsung Electronics Co.,Ltd
+24C696|Samsung Electronics Co.,Ltd
+24C9A1|Ruckus Wireless
+24CACB|Fiberhome Telecommunication Technologies Co.,LTD
+24CE33|Amazon Technologies Inc.
+24CF21|Shenzhen State Micro Technology Co., Ltd
+24CF24|Beijing Xiaomi Mobile Software Co., Ltd
+24D0DF|Apple, Inc.
+24D1A1|Shenzhen Cultraview Digital Technology Co., Ltd
+24D337|Xiaomi Communications Co Ltd
+24D3F2|zte corporation
+24D53B|Motorola Mobility LLC, a Lenovo Company
+24D5E4|Cisco Systems, Inc
+24D79C|Cisco Systems, Inc
+24D7EB|Espressif Inc.
+24D921|Avaya Inc
+24DA33|HUAWEI TECHNOLOGIES CO.,LTD
+24DA9B|Motorola Mobility LLC, a Lenovo Company
+24DB94|Juniper Networks
+24DBAC|HUAWEI TECHNOLOGIES CO.,LTD
+24DBED|Samsung Electronics Co.,Ltd
+24DCC3|Espressif Inc.
+24DE8A|Nokia Solutions and Networks GmbH & Co. KG
+24DEC6|Hewlett Packard Enterprise
+24DEEB|HUAWEI TECHNOLOGIES CO.,LTD
+24DF17|Shenzhen Sande Dacom Electronics Co., Ltd
+24DF6A|HUAWEI TECHNOLOGIES CO.,LTD
+24E29D|Huawei Device Co., Ltd.
+24E314|Apple, Inc.
+24E3A4|Fiberhome Telecommunication Technologies Co.,LTD
+24E4C8|Fiberhome Telecommunication Technologies Co.,LTD
+24E50F|Google, Inc.
+24E5AA|Philips Oral Healthcare, Inc.
+24E8E5|Shenzhen Skyworth Digital Technology CO., Ltd
+24E9B3|Cisco Systems, Inc
+24E9CA|Huawei Device Co., Ltd.
+24EA9B|HUAWEI TECHNOLOGIES CO.,LTD
+24EB16|Intel Corporate
+24EBED|HUAWEI TECHNOLOGIES CO.,LTD
+24EC4A|Espressif Inc.
+24EE9A|Intel Corporate
+24F094|Apple, Inc.
+24F0D3|Samsung Electronics Co.,Ltd
+24F27F|Hewlett Packard Enterprise
+24F40A|Samsung Electronics Co.,Ltd
+24F5AA|Samsung Electronics Co.,Ltd
+24F603|HUAWEI TECHNOLOGIES CO.,LTD
+24F677|Apple, Inc.
+24F68D|Nokia
+24FAD4|ShenZhen More Star Technology Co.,LTD
+24FAD6|EMSTONE
+24FB65|HUAWEI TECHNOLOGIES CO.,LTD
+24FBE3|HP Inc.
+24FC4E|Juniper Networks
+24FCE5|Samsung Electronics Co.,Ltd
+24FD0D|Intelbras
+24FD52|Liteon Technology Corporation
+2800AF|Dell Inc.
+28011C|zte corporation
+28022E|Apple, Inc.
+280244|Apple, Inc.
+2802D8|Samsung Electronics Co.,Ltd
+2803E6|Nokia
+2805A5|Espressif Inc.
+280708|Samsung Electronics Co.,Ltd
+280B5C|Apple, Inc.
+280C50|Intel Corporate
+280DFC|Sony Interactive Entertainment Inc.
+28107B|D-Link International
+2811A8|Intel Corporate
+2811EC|HUAWEI TECHNOLOGIES CO.,LTD
+2812D0|Motorola Mobility LLC, a Lenovo Company
+2815A4|SHENZHEN PINSU ZHILIAN INFORMATION TECHNOLOGY CO.,LTD.
+28167F|Xiaomi Communications Co Ltd
+2816A8|Microsoft Corporation
+2816AD|Intel Corporate
+281709|HUAWEI TECHNOLOGIES CO.,LTD
+28172E|Fiberhome Telecommunication Technologies Co.,LTD
+281878|Microsoft Corporation
+281DFB|HUAWEI TECHNOLOGIES CO.,LTD
+28221E|HUAWEI TECHNOLOGIES CO.,LTD
+2824C9|Amazon Technologies Inc.
+282536|SHENZHEN HOLATEK CO.,LTD
+2827BF|Samsung Electronics Co.,Ltd
+28285D|Zyxel Communications Corporation
+282947|Chipsea Technologies (Shenzhen) Corp.
+282986|APC by Schneider Electric
+282B96|Huawei Device Co., Ltd.
+282BB9|Shenzhen Xiongxin Technology Co.,Ltd
+282CB2|TP-LINK TECHNOLOGIES CO.,LTD.
+282CC4|HUAWEI TECHNOLOGIES CO.,LTD
+282D7F|Apple, Inc.
+283152|HUAWEI TECHNOLOGIES CO.,LTD
+2831F8|HUAWEI TECHNOLOGIES CO.,LTD
+283334|Huawei Device Co., Ltd.
+2834A2|Cisco Systems, Inc
+2834FF|Apple, Inc.
+28353A|HUAWEI TECHNOLOGIES CO.,LTD
+283545|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+2836F0|Huawei Device Co., Ltd.
+283713|Shenzhen 3Nod Digital Technology Co., Ltd.
+28372F|Espressif Inc.
+283737|Apple, Inc.
+28395E|Samsung Electronics Co.,Ltd
+283B82|D-Link International
+283CE4|HUAWEI TECHNOLOGIES CO.,LTD
+283DC2|Samsung Electronics Co.,Ltd
+283F69|Sony Corporation
+2840DD|Sony Interactive Entertainment Inc.
+2841C6|HUAWEI TECHNOLOGIES CO.,LTD
+2841EC|HUAWEI TECHNOLOGIES CO.,LTD
+2845AC|Huawei Device Co., Ltd.
+2847AA|Nokia Corporation
+2848E7|Huawei Device Co., Ltd.
+2849E9|Apple, Inc.
+284B54|Apple, Inc.
+284D7D|zte corporation
+284E44|HUAWEI TECHNOLOGIES CO.,LTD
+285132|Shenzhen Prayfly Technology Co.,Ltd
+285261|Cisco Systems, Inc
+2852F9|Zhongxin Intelligent Times (Shenzhen) Co., Ltd.
+28534E|HUAWEI TECHNOLOGIES CO.,LTD
+285471|Huawei Device Co., Ltd.
+28562F|Espressif Inc.
+28563A|Fiberhome Telecommunication Technologies Co.,LTD
+28565A|Hon Hai Precision Ind. Co.,Ltd.
+28575D|Apple, Inc.
+2857BE|Hangzhou Hikvision Digital Technology Co.,Ltd.
+285923|Xiaomi Communications Co Ltd
+285AEB|Apple, Inc.
+285FDB|HUAWEI TECHNOLOGIES CO.,LTD
+2864B0|Huawei Device Co., Ltd.
+2864EF|Shenzhen Fsan Intelligent Technology Co.,Ltd
+28656B|Keystone Microtech Corporation
+2866E3|AzureWave Technology Inc.
+2868D2|HUAWEI TECHNOLOGIES CO.,LTD
+286AB8|Apple, Inc.
+286ABA|Apple, Inc.
+286B35|Intel Corporate
+286B5C|Cisco Systems, Inc
+286C07|XIAOMI Electronics,CO.,LTD
+286DDA|Fiberhome Telecommunication Technologies Co.,LTD
+286ED4|HUAWEI TECHNOLOGIES CO.,LTD
+286F7F|Cisco Systems, Inc
+286FB9|Nokia Shanghai Bell Co., Ltd.
+28704E|Ubiquiti Inc
+2872C6|Samsung Electronics Co.,Ltd
+2873F6|Amazon Technologies Inc.
+2874F5|Nokia Solutions and Networks GmbH & Co. KG
+287777|zte corporation
+2877F1|Apple, Inc.
+287994|Realplay Digital Technology(Shenzhen) Co.,Ltd
+287AB4|HUAWEI TECHNOLOGIES CO.,LTD
+287B09|zte corporation
+287FCF|Intel Corporate
+288023|Hewlett Packard
+288088|NETGEAR
+28808A|HUAWEI TECHNOLOGIES CO.,LTD
+288335|Samsung Electronics Co.,Ltd
+2883C9|Apple, Inc.
+288485|Espressif Inc.
+2884FA|SHARP Corporation
+2887BA|TP-Link Systems Inc
+288A1C|Juniper Networks
+288CB8|zte corporation
+288EEC|Apple, Inc.
+288FF6|Apple, Inc.
+289104|TP-Link Systems Inc.
+289200|Intel Corporate
+28924A|Hewlett Packard
+2893FE|Cisco Systems, Inc
+289401|NETGEAR
+28940F|Cisco Systems, Inc
+289529|Intel Corporate
+2896B0|HUAWEI TECHNOLOGIES CO.,LTD
+28987B|Samsung Electronics Co.,Ltd
+289E97|HUAWEI TECHNOLOGIES CO.,LTD
+289EFC|Sagemcom Broadband SAS
+289F04|Samsung Electronics Co.,Ltd
+28A02B|Apple, Inc.
+28A06B|Intel Corporate
+28A1EB|ETEK TECHNOLOGY (SHENZHEN) CO.,LTD
+28A24B|Juniper Networks
+28A44A|Intel Corporate
+28A5EE|Shenzhen SDGI CATV Co., Ltd
+28A6DB|HUAWEI TECHNOLOGIES CO.,LTD
+28A9AE|HUAWEI TECHNOLOGIES CO.,LTD
+28AC9E|Cisco Systems, Inc
+28AD3E|Shenzhen TONG BO WEI Technology CO.,LTD
+28AF21|zte corporation
+28AF42|Samsung Electronics Co.,Ltd
+28AFE5|Shenzhen C-Data Technology Co., Ltd.
+28AFFD|Cisco Systems, Inc
+28B133|SHINEMAN(SHENZHEN) Tech. Cor., Ltd.
+28B2BD|Intel Corporate
+28B371|Ruckus Wireless
+28B446|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+28B448|HUAWEI TECHNOLOGIES CO.,LTD
+28B591|Cisco Systems, Inc
+28B829|Juniper Networks
+28BAB5|Samsung Electronics Co.,Ltd
+28BD89|Google, Inc.
+28BF89|Fiberhome Telecommunication Technologies Co.,LTD
+28C01B|Shenzhen Skyworth Digital Technology CO., Ltd
+28C039|HUAWEI TECHNOLOGIES CO.,LTD
+28C0DA|Juniper Networks
+28C13C|Hon Hai Precision Industry Co., Ltd.
+28C1A0|Apple, Inc.
+28C21F|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+28C2DD|AzureWave Technology Inc.
+28C538|Apple, Inc.
+28C5C8|HP Inc.
+28C5D2|Intel Corporate
+28C63F|Intel Corporate
+28C68E|NETGEAR
+28C709|Apple, Inc.
+28C7CE|Cisco Systems, Inc
+28C825|DellKing Industrial Co., Ltd
+28C87C|zte corporation
+28CB5C|Shenzhen CPETEK Technology Co.,Ltd.
+28CC01|Samsung Electronics Co.,Ltd
+28CD9C|Shenzhen Dynamax Software Development Co.,Ltd.
+28CDC1|Raspberry Pi Trading Ltd
+28CE15|Shenzhen Xinwei Intelligent Co., Ltd
+28CFDA|Apple, Inc.
+28CFE9|Apple, Inc.
+28D043|AzureWave Technology Inc.
+28D044|Shenzhen Xinyin technology company
+28D0EA|Intel Corporate
+28D127|Beijing Xiaomi Mobile Software Co., Ltd
+28D1AF|Nokia Corporation
+28D1B7|Shenzhen YOUHUA Technology Co., Ltd
+28D244|LCFC(Hefei) Electronics Technology co., ltd
+28D3EA|Huawei Device Co., Ltd.
+28D5B1|Apple, Inc.
+28D6EC|HUAWEI TECHNOLOGIES CO.,LTD
+28DB02|zte corporation
+28DCC3|HUAWEI TECHNOLOGIES CO.,LTD
+28DE1C|Samsung Electronics Co.,Ltd
+28DE65|Hewlett Packard Enterprise
+28DEA8|zte corporation
+28DEE5|HUAWEI TECHNOLOGIES CO.,LTD
+28DFEB|Intel Corporate
+28E02C|Apple, Inc.
+28E14C|Apple, Inc.
+28E31F|Xiaomi Communications Co Ltd
+28E347|Liteon Technology Corporation
+28E34E|HUAWEI TECHNOLOGIES CO.,LTD
+28E5B0|HUAWEI TECHNOLOGIES CO.,LTD
+28E6A9|Samsung Electronics Co.,Ltd
+28E7CF|Apple, Inc.
+28EA0B|Microsoft Corporation
+28EA2D|Apple, Inc.
+28EC95|Apple, Inc.
+28ED6A|Apple, Inc.
+28EE52|TP-LINK TECHNOLOGIES CO.,LTD.
+28EED3|Shenzhen Super D Technology Co., Ltd
+28EF01|Amazon Technologies Inc.
+28F033|Apple, Inc.
+28F076|Apple, Inc.
+28F10E|Dell Inc.
+28F366|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+28F52B|FN-LINK TECHNOLOGY Ltd.
+28F7D6|Fiberhome Telecommunication Technologies Co.,LTD
+28FA19|Shenzhen Jingxun Software Telecommunication Technology Co.,Ltd
+28FBAE|HUAWEI TECHNOLOGIES CO.,LTD
+28FCF6|Shenzhen Xin KingBrand enterprises Co.,Ltd
+28FF3C|Apple, Inc.
+28FF3E|zte corporation
+28FFB2|Toshiba Corp.
+2C002A|Shenzhen TINNO Mobile Technology Corp.
+2C01B5|Cisco Systems, Inc
+2C0547|Shenzhen Phaten Tech. LTD
+2C0786|Huawei Device Co., Ltd.
+2C08B4|Huawei Device Co., Ltd.
+2C0B97|Xiaomi Communications Co Ltd
+2C0BAB|HUAWEI TECHNOLOGIES CO.,LTD
+2C0BE9|Cisco Systems, Inc
+2C0D27|Huawei Device Co., Ltd.
+2C0DA7|Intel Corporate
+2C0DCF|Xiaomi Communications Co Ltd
+2C0E3D|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+2C15BF|Samsung Electronics Co.,Ltd
+2C15D9|HUAWEI TECHNOLOGIES CO.,LTD
+2C1809|Apple, Inc.
+2C1875|Skyworth Digital Technology(Shenzhen) Co.,Ltd
+2C195C|Beijing Xiaomi Mobile Software Co., Ltd
+2C1A01|HUAWEI TECHNOLOGIES CO.,LTD
+2C1A05|Cisco Systems, Inc
+2C1CF7|Apple, Inc.
+2C1F23|Apple, Inc.
+2C200B|Apple, Inc.
+2C2080|Huawei Device Co., Ltd.
+2C2131|Juniper Networks
+2C2172|Juniper Networks
+2C233A|Hewlett Packard
+2C26C5|zte corporation
+2C2768|HUAWEI TECHNOLOGIES CO.,LTD
+2C27D7|Hewlett Packard
+2C2997|Microsoft Corporation
+2C2B86|Sagemcom Broadband SAS
+2C301A|Technicolor CH USA Inc for Telus
+2C3033|NETGEAR
+2C3124|Cisco Systems, Inc
+2C326A|Apple, Inc.
+2C3311|Cisco Systems, Inc
+2C3358|Intel Corporate
+2C3361|Apple, Inc.
+2C337A|Hon Hai Precision Ind. Co.,Ltd.
+2C347B|SHENZHEN JUNGE TECHNOLOGY CO.,LTD
+2C36F2|HUAWEI TECHNOLOGIES CO.,LTD
+2C36F8|Cisco Systems, Inc
+2C3731|SHENZHEN YIFANG DIGITAL TECHNOLOGY CO.,LTD.
+2C3996|Sagemcom Broadband SAS
+2C3A91|Huawei Device Co., Ltd.
+2C3AB1|Huawei Device Co., Ltd.
+2C3AE8|Espressif Inc.
+2C3B70|AzureWave Technology Inc.
+2C3ECF|Cisco Systems, Inc
+2C3F0B|Cisco Meraki
+2C3F38|Cisco Systems, Inc
+2C4053|Samsung Electronics Co.,Ltd
+2C4138|Hewlett Packard
+2C431A|Shenzhen YOUHUA Technology Co., Ltd
+2C4401|Samsung Electronics Co.,Ltd
+2C44FD|Hewlett Packard
+2C4C15|Juniper Networks
+2C4D54|ASUSTek COMPUTER INC.
+2C4F52|Cisco Systems, Inc
+2C5089|Shenzhen Kaixuan Visual Technology Co.,Limited
+2C52AF|HUAWEI TECHNOLOGIES CO.,LTD
+2C534A|Shenzhen Winyao Electronic Limited
+2C542D|Cisco Systems, Inc
+2C5491|Microsoft Corporation
+2C54CF|LG Electronics (Mobile Communications)
+2C557C|Shenzhen YOUHUA Technology Co., Ltd
+2C55D3|HUAWEI TECHNOLOGIES CO.,LTD
+2C56DC|ASUSTek COMPUTER INC.
+2C5741|Cisco Systems, Inc
+2C57CE|Apple, Inc.
+2C58B9|HP Inc.
+2C58E8|HUAWEI TECHNOLOGIES CO.,LTD
+2C598A|LG Electronics (Mobile Communications)
+2C59E5|Hewlett Packard
+2C5A05|Nokia Corporation
+2C5A0F|Cisco Systems, Inc
+2C5D93|Ruckus Wireless
+2C600C|Quanta Computer Inc.
+2C6104|SHENZHEN FENGLIAN TECHNOLOGY CO., LTD.
+2C61F6|Apple, Inc.
+2C63A1|Huawei Device Co., Ltd.
+2C658D|Cisco Systems, Inc
+2C66F5|SHENZHEN ELECTRICAL APPLIANCES CO.
+2C67FB|ShenZhen Zhengjili Electronics Co., LTD
+2C693E|HUAWEI TECHNOLOGIES CO.,LTD
+2C6BF5|Juniper Networks
+2C6DC1|Intel Corporate
+2C6E85|Intel Corporate
+2C6F37|Nokia
+2C6FC9|Hon Hai Precision Ind. Co.,Ltd.
+2C704F|zte corporation
+2C71FF|Amazon Technologies Inc.
+2C73A0|Cisco Systems, Inc
+2C7600|Apple, Inc.
+2C768A|Hewlett Packard
+2C780E|Huawei Device Co., Ltd.
+2C79BE|TP-LINK TECHNOLOGIES CO.,LTD.
+2C79D7|Sagemcom Broadband SAS
+2C7BA0|Intel Corporate
+2C7CF2|Apple, Inc.
+2C8158|Hon Hai Precision Ind. Co.,Ltd.
+2C81BF|Apple, Inc.
+2C8217|Apple, Inc.
+2C86D2|Cisco Systems, Inc
+2C8DB1|Intel Corporate
+2C9452|HUAWEI TECHNOLOGIES CO.,LTD
+2C9520|Apple, Inc.
+2C957F|zte corporation
+2C97B1|HUAWEI TECHNOLOGIES CO.,LTD
+2C97ED|Sony Imaging Products & Solutions Inc.
+2C9975|Samsung Electronics Co.,Ltd
+2C9D1E|HUAWEI TECHNOLOGIES CO.,LTD
+2C9E00|Sony Interactive Entertainment Inc.
+2C9EFC|CANON INC.
+2CA042|Huawei Device Co., Ltd.
+2CA2E5|Cisco Systems, Inc
+2CA59C|Hangzhou Hikvision Digital Technology Co.,Ltd.
+2CA797|HUAWEI TECHNOLOGIES CO.,LTD
+2CA79E|HUAWEI TECHNOLOGIES CO.,LTD
+2CA7EF|OnePlus Technology (Shenzhen) Co., Ltd
+2CAB00|HUAWEI TECHNOLOGIES CO.,LTD
+2CAB25|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+2CAB46|Ruckus Wireless
+2CABA4|Cisco SPVTG
+2CABEB|Cisco Systems, Inc
+2CAD13|SHENZHEN ZHILU TECHNOLOGY CO.,LTD
+2CAE2B|Samsung Electronics Co.,Ltd
+2CB05D|NETGEAR
+2CB0FD|Shenzhen MiaoMing Intelligent Technology Co.,Ltd
+2CB43A|Apple, Inc.
+2CB471|Tuya Smart Inc.
+2CB68F|HUAWEI TECHNOLOGIES CO.,LTD
+2CB6C2|zte corporation
+2CB7A1|Huawei Device Co., Ltd.
+2CB8ED|SonicWall
+2CBABA|Samsung Electronics Co.,Ltd
+2CBC87|Apple, Inc.
+2CBCBB|Espressif Inc.
+2CBE08|Apple, Inc.
+2CC1F4|Nokia Solutions and Networks India Private Limited
+2CC253|Apple, Inc.
+2CC3E6|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+2CC546|Huawei Device Co., Ltd.
+2CC5D3|Ruckus Wireless
+2CC81B|Routerboard.com
+2CC8F5|Huawei Device Co., Ltd.
+2CCA16|Apple, Inc.
+2CCC15|Nokia Corporation
+2CCC44|Sony Interactive Entertainment Inc.
+2CCCE6|Skyworth Digital Technology(Shenzhen) Co.,Ltd
+2CCF58|HUAWEI TECHNOLOGIES CO.,LTD
+2CCF67|Raspberry Pi (Trading) Ltd
+2CD02D|Cisco Systems, Inc
+2CD05A|Liteon Technology Corporation
+2CD066|Xiaomi Communications Co Ltd
+2CD26B|FN-LINK TECHNOLOGY LIMITED
+2CD2E7|Nokia Corporation
+2CD444|FUJITSU LIMITED
+2CD8AE|Shenzhen SEI Robotics Co.,Ltd
+2CDA46|Samsung Electronics Co.,Ltd
+2CDB07|Intel Corporate
+2CDCD7|AzureWave Technology Inc.
+2CDD5F|Shenzhen iComm Semiconductor CO.,LTD
+2CDF68|Apple, Inc.
+2CE032|TCL King Electrical Appliances(Huizhou)Co.,Ltd
+2CE2D9|Huawei Device Co., Ltd.
+2CE38E|Cisco Systems, Inc
+2CE412|Sagemcom Broadband SAS
+2CE5BD|Ubiquiti Inc
+2CE6CC|Ruckus Wireless
+2CEA7F|Dell Inc.
+2CEAFC|Intel Corporate
+2CECA6|HUAWEI TECHNOLOGIES CO.,LTD
+2CECF7|Shenzhen SDMC Technology CO.,Ltd.
+2CED89|HUAWEI TECHNOLOGIES CO.,LTD
+2CEDB0|HUAWEI TECHNOLOGIES CO.,LTD
+2CF05D|Micro-Star INTL CO., LTD.
+2CF0A2|Apple, Inc.
+2CF0EE|Apple, Inc.
+2CF1BB|zte corporation
+2CF295|Huawei Device Co., Ltd.
+2CF2A5|Sagemcom Broadband SAS
+2CF432|Espressif Inc.
+2CF4C5|Avaya Inc
+2CF814|Cisco Systems, Inc
+2CF89B|Cisco Systems, Inc
+2CFB0F|Sagemcom Broadband SAS
+2CFDA1|ASUSTek COMPUTER INC.
+2CFDAB|Motorola (Wuhan) Mobility Technologies Communication Co., Ltd.
+2CFDB4|Shenzhen Jingxun Software Telecommunication Technology Co.,Ltd
+2CFE4F|Xiaomi Communications Co Ltd
+3000FC|Nokia
+3001AF|Cisco Systems, Inc
+30045C|Shenzhen SuperElectron Technology Co.,Ltd.
+300505|Intel Corporate
+30055C|Brother industries, LTD.
+30074D|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+3007A3|Shenzhen Skyworth Digital Technology CO., Ltd
+300916|Apple, Inc.
+3009C0|Motorola Mobility LLC, a Lenovo Company
+300C23|zte corporation
+300D43|Microsoft Mobile Oy
+300E43|Apple, Inc.
+300EB8|LG Electronics
+300ED5|Hon Hai Precision Ind. Co.,Ltd.
+300EE3|Aquantia Corporation
+3010B3|Liteon Technology Corporation
+3010E4|Apple, Inc.
+30138B|HP Inc.
+301577|Zyxel Communications Corporation
+30169D|MERCUSYS TECHNOLOGIES CO., LTD.
+3017C8|Sony Corporation
+301966|Samsung Electronics Co.,Ltd
+301984|HUAWEI TECHNOLOGIES CO.,LTD
+301C22|Hewlett Packard Enterprise
+301F48|zte corporation
+30215B|Shenzhen Ostar Display Electronic Co.,Ltd
+302364|Nokia Shanghai Bell Co., Ltd.
+302432|Intel Corporate
+302478|Sagemcom Broadband SAS
+3024A9|HP Inc.
+30294B|HUAWEI TECHNOLOGIES CO.,LTD
+302952|Hillstone Networks Inc
+3030F9|Espressif Inc.
+303180|Shenzhen Skyworth Digital Technology CO., Ltd
+3035AD|Apple, Inc.
+3035C5|Huawei Device Co., Ltd.
+3037A6|Cisco Systems, Inc
+3037B3|HUAWEI TECHNOLOGIES CO.,LTD
+303855|Nokia Corporation
+303926|Sony Corporation
+303955|Shenzhen Jinhengjia Electronic Co., Ltd.
+303A64|Intel Corporate
+303B49|Cisco Meraki
+303B7C|Apple, Inc.
+303EA7|Intel Corporate
+303F7B|Shenzhen YOUHUA Technology Co., Ltd
+303FBB|Hewlett Packard Enterprise
+304074|zte corporation
+304240|zte corporation
+304596|HUAWEI TECHNOLOGIES CO.,LTD
+30469A|NETGEAR
+30487D|Tuya Smart Inc.
+30499E|HUAWEI TECHNOLOGIES CO.,LTD
+304A26|Shenzhen Trolink Technology CO, LTD
+304B07|Motorola Mobility LLC, a Lenovo Company
+304C7E|Panasonic Electric Works Automation Controls Techno Co.,Ltd.
+304D1F|Amazon Technologies Inc.
+304E1B|Huawei Device Co., Ltd.
+3050CE|Xiaomi Communications Co Ltd
+3050FD|Skyworth Digital Technology(Shenzhen) Co.,Ltd
+3052CB|Liteon Technology Corporation
+30535B|Shenzhen Comnect Technology Co.,LTD
+30560F|GIGA-BYTE TECHNOLOGY CO. , Ltd.
+305684|SHENZHEN YUNJI INTELLIGENT TECHNOLOGY CO.,LTD
+305714|Apple, Inc.
+3058EB|zte corporation
+3059B7|Microsoft
+305A3A|ASUSTek COMPUTER INC.
+3061A2|HUAWEI TECHNOLOGIES CO.,LTD
+306222|Samsung Electronics Co.,Ltd
+30636B|Apple, Inc.
+306371|Shenzhenshi Xinzhongxin Technology Co.Ltd
+3063EA|Juniper Networks
+3065EC|Wistron (ChongQing)
+3066D0|Huawei Device Co., Ltd.
+3067A1|Sagemcom Broadband SAS
+306893|TP-Link Systems Inc.
+306A4F|Roku, Inc
+306A85|Samsung Electronics Co.,Ltd
+307467|Samsung Electronics Co.,Ltd
+307496|HUAWEI TECHNOLOGIES CO.,LTD
+307512|Sony Corporation
+30766F|LG Electronics (Mobile Communications)
+3076F5|Espressif Inc.
+3077CB|Maike Industry(Shenzhen)CO.,LTD
+307A05|HUAWEI TECHNOLOGIES CO.,LTD
+307AD2|Apple, Inc.
+307BC9|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+307C4A|Huawei Device Co., Ltd.
+307C5E|Juniper Networks
+308216|Apple, Inc.
+308398|Espressif Inc.
+3083D2|Motorola Mobility LLC, a Lenovo Company
+3085A9|ASUSTek COMPUTER INC.
+3085EB|Fiberhome Telecommunication Technologies Co.,LTD
+3086F1|Fiberhome Telecommunication Technologies Co.,LTD
+308730|HUAWEI TECHNOLOGIES CO.,LTD
+3087D9|Ruckus Wireless
+30894A|Intel Corporate
+3089A6|HUAWEI TECHNOLOGIES CO.,LTD
+308AF7|Huawei Device Co., Ltd.
+308BB2|Cisco Systems, Inc
+308D99|Hewlett Packard
+308DD4|HUAWEI TECHNOLOGIES CO.,LTD
+308E7A|Shenzhen iComm Semiconductor CO.,LTD
+308ECF|HUAWEI TECHNOLOGIES CO.,LTD
+309048|Apple, Inc.
+3090AB|Apple, Inc.
+309176|Skyworth Digital Technology(Shenzhen) Co.,Ltd
+3093BC|Sagemcom Broadband SAS
+309587|HUNAN FN-LINK TECHNOLOGY LIMITED
+309610|Huawei Device Co., Ltd.
+30963B|Huawei Device Co., Ltd.
+3096FB|Samsung Electronics Co.,Ltd
+309935|zte corporation
+309C23|Micro-Star INTL CO., LTD.
+309E62|HUAWEI TECHNOLOGIES CO.,LTD
+30A033|Apple, Inc.
+30A176|Fiberhome Telecommunication Technologies Co.,LTD
+30A1FA|HUAWEI TECHNOLOGIES CO.,LTD
+30A243|Shenzhen Prifox Innovation Technology Co., Ltd.
+30A2C2|Huawei Device Co., Ltd.
+30A30F|HUAWEI TECHNOLOGIES CO.,LTD
+30A612|ShenZhen Hugsun Technology Co.,Ltd.
+30A7F5|Apple, Inc.
+30A8DB|Sony Corporation
+30A998|Huawei Device Co., Ltd.
+30AAE4|Huawei Device Co., Ltd.
+30AB6A|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+30AEA4|Espressif Inc.
+30B0EA|Shenzhen Chuangxin Internet Communication Technology Co., Ltd
+30B3A2|Shenzhen Heguang Measurement & Control Technology Co.,Ltd
+30B49E|TP-LINK TECHNOLOGIES CO.,LTD.
+30B4B8|LG Electronics
+30B5C2|TP-LINK TECHNOLOGIES CO.,LTD.
+30B64F|Juniper Networks
+30B930|zte corporation
+30BB7D|OnePlus Technology (Shenzhen) Co., Ltd
+30BD13|Zyxel Communications Corporation
+30C01B|Shenzhen Jingxun Software Telecommunication Technology Co.,Ltd
+30C0AE|Apple, Inc.
+30C50F|HUAWEI TECHNOLOGIES CO.,LTD
+30C599|ASUSTek COMPUTER INC.
+30C6AB|zte corporation
+30C6F7|Espressif Inc.
+30C7AE|Samsung Electronics Co.,Ltd
+30C8A2|SHENZHEN TRANSCHAN TECHNOLOGY LIMITED
+30C922|Espressif Inc.
+30C9CC|Samsung Electronics Co.,Ltd
+30CBC7|Cambium Networks Limited
+30CBF8|Samsung Electronics Co.,Ltd
+30CC21|zte corporation
+30CDA7|Samsung Electronics Co.,Ltd
+30D042|Dell Inc.
+30D16B|Liteon Technology Corporation
+30D17E|HUAWEI TECHNOLOGIES CO.,LTD
+30D386|zte corporation
+30D4E2|HUAWEI TECHNOLOGIES CO.,LTD
+30D53E|Apple, Inc.
+30D587|Samsung Electronics Co.,Ltd
+30D6C9|Samsung Electronics Co.,Ltd
+30D7A1|Apple, Inc.
+30D875|Apple, Inc.
+30D9D9|Apple, Inc.
+30DCE7|zte corporation
+30DDAA|ZHEJIANG DAHUA TECHNOLOGYCO.,LTD
+30DE4B|TP-Link Systems Inc
+30DE52|Samsung Electronics Co.,Ltd
+30DF8D|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+30E044|Google, Inc.
+30E04F|Apple, Inc.
+30E171|Hewlett Packard
+30E1F1|Intelbras
+30E226|Apple, Inc.
+30E37A|Intel Corporate
+30E396|Huawei Device Co., Ltd.
+30E3A4|Intel Corporate
+30E4D8|Huawei Device Co., Ltd.
+30E4DB|Cisco Systems, Inc
+30E98E|HUAWEI TECHNOLOGIES CO.,LTD
+30EB15|Huawei Device Co., Ltd.
+30EC7C|Shenzhen Along Electronics Co., Ltd
+30EDA0|Espressif Inc.
+30EFD1|Alstom Strongwish (Shenzhen) Co., Ltd.
+30F31D|zte corporation
+30F335|HUAWEI TECHNOLOGIES CO.,LTD
+30F600|Sagemcom Broadband SAS
+30F65D|Hewlett Packard Enterprise
+30F6EF|Intel Corporate
+30F70D|Cisco Systems, Inc
+30F772|Hon Hai Precision Ind. Co.,Ltd.
+30F7C5|Apple, Inc.
+30F856|Extreme Networks, Inc.
+30F947|Shenzhen Skyworth Digital Technology CO., Ltd
+30F9ED|Sony Corporation
+30FBB8|HUAWEI TECHNOLOGIES CO.,LTD
+30FC68|TP-LINK TECHNOLOGIES CO.,LTD.
+30FCEB|LG Electronics (Mobile Communications)
+30FD38|Google, Inc.
+30FD65|HUAWEI TECHNOLOGIES CO.,LTD
+30FE31|Nokia
+30FE6C|Apple, Inc.
+30FEFA|Cisco Systems, Inc
+30FFFD|HUAWEI TECHNOLOGIES CO.,LTD
+3400A3|HUAWEI TECHNOLOGIES CO.,LTD
+340286|Intel Corporate
+34029C|D-Link Corporation
+34033D|HP Inc.
+340804|D-Link Corporation
+3408BC|Apple, Inc.
+340962|Hangzhou Hikvision Digital Technology Co.,Ltd.
+340A33|D-Link International
+340A98|HUAWEI TECHNOLOGIES CO.,LTD
+340E22|Apple, Inc.
+3410BE|Apple, Inc.
+3410D0|HUAWEI TECHNOLOGIES CO.,LTD
+341298|Apple, Inc.
+3412F9|HUAWEI TECHNOLOGIES CO.,LTD
+3413E8|Intel Corporate
+34145F|Samsung Electronics Co.,Ltd
+341593|Ruckus Wireless
+34159E|Apple, Inc.
+341736|Shenzhen iComm Semiconductor CO.,LTD
+3417EB|Dell Inc.
+341A35|Fiberhome Telecommunication Technologies Co.,LTD
+341A4C|SHENZHEN WEIBU ELECTRONICS CO.,LTD.
+341B2D|Cisco Systems, Inc
+341CF0|Xiaomi Communications Co Ltd
+341E6B|HUAWEI TECHNOLOGIES CO.,LTD
+341FC4|Shenzhen V-Link Technology CO., LTD.
+342003|Shenzhen Feitengyun Technology Co.,LTD
+3420D3|SHENZHEN IP-COM NETWORKS CO.,LTD.
+3420E3|Ruckus Wireless
+342387|Hon Hai Precision Ind. Co.,Ltd.
+3423BA|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+34243E|zte corporation
+34255D|Shenzhen Loadcom Technology Co.,Ltd
+3425BE|Amazon Technologies Inc.
+342601|HUAWEI TECHNOLOGIES CO.,LTD
+342840|Apple, Inc.
+342865|Juniper Networks
+342912|HUAWEI TECHNOLOGIES CO.,LTD
+342B6E|Apple, Inc.
+342CC4|Compal Broadband Networks, Inc.
+342D0D|Samsung Electronics Co.,Ltd
+342D0F|zte corporation
+342DA3|Fiberhome Telecommunication Technologies Co.,LTD
+342EB6|HUAWEI TECHNOLOGIES CO.,LTD
+342EB7|Intel Corporate
+343111|Samsung Electronics Co.,Ltd
+34317F|Panasonic Appliances Company
+34318F|Apple, Inc.
+3432E6|Panasonic Industrial Devices Europe GmbH
+343638|HUAWEI TECHNOLOGIES CO.,LTD
+34363B|Apple, Inc.
+343654|zte corporation
+343759|zte corporation
+343916|Google, Inc.
+343A20|Hewlett Packard Enterprise
+343DA9|HUAWEI TECHNOLOGIES CO.,LTD
+34415D|Intel Corporate
+344262|Apple, Inc.
+3446EC|Huawei Device Co., Ltd.
+3448ED|Dell Inc.
+34495B|Sagemcom Broadband SAS
+344A1B|zte corporation
+344B3D|Fiberhome Telecommunication Technologies Co.,LTD
+344B50|zte corporation
+344DEA|zte corporation
+344DF7|LG Electronics (Mobile Communications)
+344EE2|Huawei Device Co., Ltd.
+34516F|Skychers Creations ShenZhen Limited
+345180|TCL King Electrical Appliances (Huizhou) Co., Ltd
+345184|Huawei Device Co., Ltd.
+3451C9|Apple, Inc.
+3453D2|Sagemcom Broadband SAS
+3454EF|Cisco Systems, Inc
+3456FE|Cisco Meraki
+345840|HUAWEI TECHNOLOGIES CO.,LTD
+34588A|Cisco Systems, Inc
+345A06|SHARP Corporation
+345A60|Micro-Star INTL CO., LTD.
+345ABA|tcloud intelligence
+345CF3|Chipsea Technologies (Shenzhen) Corp.
+345D9E|Sagemcom Broadband SAS
+345DA8|Cisco Systems, Inc
+345E08|Roku, Inc
+345F45|Espressif Inc.
+3460F9|TP-Link Systems Inc
+346288|Cisco Systems, Inc
+3464A9|Hewlett Packard
+346679|HUAWEI TECHNOLOGIES CO.,LTD
+346691|Apple, Inc.
+346895|Hon Hai Precision Ind. Co.,Ltd.
+346987|zte corporation
+346AC2|HUAWEI TECHNOLOGIES CO.,LTD
+346B46|Sagemcom Broadband SAS
+346BD3|HUAWEI TECHNOLOGIES CO.,LTD
+346E68|HUAWEI TECHNOLOGIES CO.,LTD
+346F24|AzureWave Technology Inc.
+346F3F|Hon Hai Precision Industry Co.,LTD
+346F90|Cisco Systems, Inc
+347069|Cisco Systems, Inc
+347146|Huawei Device Co., Ltd.
+34732D|Cisco Systems, Inc
+34735A|Dell Inc.
+347563|SHENZHEN RF-LINK TECHNOLOGY CO.,LTD.
+3475C7|Avaya Inc
+347839|zte corporation
+347877|O-Net Communications (Shenzhen) Limited
+347916|HUAWEI TECHNOLOGIES CO.,LTD
+347C25|Apple, Inc.
+347DE4|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+347DF6|Intel Corporate
+347E00|Huawei Device Co., Ltd.
+347E39|Nokia Danmark A/S
+347E5C|Sonos, Inc.
+34800D|Marvell Semiconductors
+3480B3|Xiaomi Communications Co Ltd
+348296|Apple, Inc.
+3482C5|Samsung Electronics Co.,Ltd
+3483D5|HUAWEI TECHNOLOGIES CO.,LTD
+348511|Shenzhen Skyworth Digital Technology CO., Ltd
+348518|Espressif Inc.
+348584|Extreme Networks, Inc.
+34865D|Espressif Inc.
+348818|Cisco Systems, Inc
+348A12|Hewlett Packard Enterprise
+348A3B|Huawei Device Co., Ltd.
+348A7B|Samsung Electronics Co.,Ltd
+348AAE|Sagemcom Broadband SAS
+348C5E|Apple, Inc.
+348F27|Ruckus Wireless
+34936F|Juniper Networks
+349454|Espressif Inc.
+349671|HUAWEI TECHNOLOGIES CO.,LTD
+349672|TP-LINK TECHNOLOGIES CO.,LTD.
+349677|zte corporation
+3497D7|YEALINK(XIAMEN) NETWORK TECHNOLOGY CO.,LTD.
+3497F6|ASUSTek COMPUTER INC.
+34987A|Espressif Inc.
+3498B5|NETGEAR
+349971|Quanta Storage Inc.
+349F7B|CANON INC.
+34A137|HUAWEI TECHNOLOGIES CO.,LTD
+34A2A2|HUAWEI TECHNOLOGIES CO.,LTD
+34A395|Apple, Inc.
+34A6EF|Shenzhen Phaten Tech. LTD
+34A843|KYOCERA Display Corporation
+34A84E|Cisco Systems, Inc
+34A8A0|HUAWEI TECHNOLOGIES CO.,LTD
+34A8EB|Apple, Inc.
+34AA31|Shenzhen Skyworth Digital Technology CO., Ltd
+34AA8B|Samsung Electronics Co.,Ltd
+34AA99|Nokia
+34AB37|Apple, Inc.
+34AB95|Espressif Inc.
+34AC2F|zte corporation
+34AFB3|Amazon Technologies Inc.
+34B1EB|Apple, Inc.
+34B20A|Huawei Device Co., Ltd.
+34B354|HUAWEI TECHNOLOGIES CO.,LTD
+34B472|Espressif Inc.
+34B4F0|Hasselblad (Shenzhen) Trading CompanyLimited
+34B7DA|Espressif Inc.
+34B883|Cisco Systems, Inc
+34B98D|Xiaomi Communications Co Ltd
+34BB26|Motorola Mobility LLC, a Lenovo Company
+34BDC8|Cisco Systems, Inc
+34BDFA|Cisco SPVTG
+34BE00|Samsung Electronics Co.,Ltd
+34BF90|Fiberhome Telecommunication Technologies Co.,LTD
+34C059|Apple, Inc.
+34C232|Samsung Electronics Co.,Ltd
+34C386|Apple, Inc.
+34C3AC|Samsung Electronics Co.,Ltd
+34C3D2|FN-LINK TECHNOLOGY LIMITED
+34C3FD|Cisco Systems, Inc
+34C515|Hewlett Packard Enterprise
+34C7E9|Google, Inc.
+34C803|Nokia Corporation
+34C93D|Intel Corporate
+34CDB0|Espressif Inc.
+34CDBE|HUAWEI TECHNOLOGIES CO.,LTD
+34CE00|XIAOMI Electronics,CO.,LTD
+34CE69|Nokia Solutions and Networks GmbH & Co. KG
+34CFF6|Intel Corporate
+34D270|Amazon Technologies Inc.
+34D693|Huawei Device Co., Ltd.
+34D72F|Shenzhen SuperElectron Technology Co.,Ltd.
+34D856|Shenzhen Skyworth Digital Technology CO., Ltd
+34D868|Broadcom Limited
+34DAA1|Apple, Inc.
+34DAB7|zte corporation
+34DB9C|Sagemcom Broadband SAS
+34DBFD|Cisco Systems, Inc
+34DDCC|Google, Inc.
+34DE1A|Intel Corporate
+34DE34|zte corporation
+34DF20|Shenzhen Comstar .Technology Co.,Ltd
+34E0CF|zte corporation
+34E12D|Intel Corporate
+34E2FD|Apple, Inc.
+34E3FB|Samsung Electronics Co.,Ltd
+34E5EC|Palo Alto Networks
+34E6AD|Intel Corporate
+34E6D7|Dell Inc.
+34E71C|Shenzhen YOUHUA Technology Co., Ltd
+34E894|TP-LINK TECHNOLOGIES CO.,LTD.
+34ED1B|Cisco Systems, Inc
+34EE16|Apple, Inc.
+34EFD7|HUAWEI TECHNOLOGIES CO.,LTD
+34F015|Beijing Xiaomi Mobile Software Co., Ltd
+34F043|Samsung Electronics Co.,Ltd
+34F084|Samsung Electronics Co.,Ltd
+34F0CA|Shenzhen Linghangyuan Digital Technology Co.,Ltd.
+34F39A|Intel Corporate
+34F5D7|Huawei Device Co., Ltd.
+34F62D|SHARP Corporation
+34F64B|Intel Corporate
+34F68D|Apple, Inc.
+34F6D2|Panasonic Taiwan Co.,Ltd.
+34F716|TP-LINK TECHNOLOGIES CO.,LTD.
+34F8DD|Apple, Inc.
+34F8E7|Cisco Systems, Inc
+34FA1C|Beijing Xiaomi Mobile Software Co., Ltd
+34FA9F|Ruckus Wireless
+34FCB9|Hewlett Packard Enterprise
+34FCEF|LG Electronics (Mobile Communications)
+34FD6A|Apple, Inc.
+34FD70|Intel Corporate
+34FE77|Apple, Inc.
+34FE9E|Fujitsu Limited
+34FEC5|Shenzhen Sunwoda intelligent hardware Co.,Ltd
+34FFF3|HUAWEI TECHNOLOGIES CO.,LTD
+380025|Intel Corporate
+380146|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+380195|Samsung Electronics Co.,Ltd
+38019F|SHENZHEN FAST TECHNOLOGIES CO.,LTD
+3802E3|YICHEN (SHENZHEN) TECHNOLOGY CO.,LTD
+380484|Apple, Inc.
+3809FB|Apple, Inc.
+380A94|Samsung Electronics Co.,Ltd
+380B40|Samsung Electronics Co.,Ltd
+380E4D|Cisco Systems, Inc
+380F4A|Apple, Inc.
+380FAD|HUAWEI TECHNOLOGIES CO.,LTD
+3810F0|Hewlett Packard Enterprise
+381428|Dell Inc.
+38144E|Fiberhome Telecommunication Technologies Co.,LTD
+38165A|zte corporation
+381672|Shenzhen SuperElectron Technology Co.,Ltd.
+3816B3|HP Inc.
+3816D1|Samsung Electronics Co.,Ltd
+3817B1|Sagemcom Broadband SAS
+3817C3|Hewlett Packard Enterprise
+38182B|Espressif Inc.
+38184C|Sony Home Entertainment&Sound Products Inc
+381868|Intel Corporate
+38192F|Nokia Corporation
+381A52|Seiko Epson Corporation
+381C1A|Cisco Systems, Inc
+381DD9|FN-LINK TECHNOLOGY LIMITED
+381EC7|Chipsea Technologies(Shenzhen) Corp.
+381F8D|Tuya Smart Inc.
+382028|HUAWEI TECHNOLOGIES CO.,LTD
+382056|Cisco Systems, Inc
+3821C7|Hewlett Packard Enterprise
+3822E2|HP Inc.
+3822F4|Huawei Device Co., Ltd.
+38256B|Microsoft Mobile Oy
+382656|TCL King Electrical Appliances(Huizhou)Co.,Ltd
+382835|zte corporation
+382C4A|ASUSTek COMPUTER INC.
+382CE5|Tuya Smart Inc.
+382DD1|Samsung Electronics Co.,Ltd
+382DE8|Samsung Electronics Co.,Ltd
+3830F9|LG Electronics (Mobile Communications)
+38327A|Routerboard.com
+3833C5|Microsoft Corporation
+3835FB|Sagemcom Broadband SAS
+38378B|HUAWEI TECHNOLOGIES CO.,LTD
+38396C|Huawei Device Co., Ltd.
+3839DD|Nokia
+383D5B|Fiberhome Telecommunication Technologies Co.,LTD
+383E51|Espressif Inc.
+383FE8|HUAWEI TECHNOLOGIES CO.,LTD
+38420B|Sonos, Inc.
+38437D|Compal Broadband Networks, Inc.
+3844BE|Espressif Inc.
+38453B|Ruckus Wireless
+384608|zte corporation
+3847BC|HUAWEI TECHNOLOGIES CO.,LTD
+38484C|Apple, Inc.
+384A80|Samsung Electronics Co.,Ltd
+384C4F|HUAWEI TECHNOLOGIES CO.,LTD
+384DD2|Huawei Device Co., Ltd.
+384F49|Juniper Networks
+384FF0|AzureWave Technology Inc.
+38521A|Nokia
+385247|Huawei Device Co., Ltd.
+38539C|Apple, Inc.
+38549B|zte corporation
+38563D|Microsoft Corporation
+3859F9|Hon Hai Precision Ind. Co.,Ltd.
+385F66|Cisco SPVTG
+386077|PEGATRON CORPORATION
+386233|Apple, Inc.
+38637F|Fiberhome Telecommunication Technologies Co.,LTD
+3863BB|Hewlett Packard
+3863F6|3NOD MULTIMEDIA(SHENZHEN)CO.,LTD
+3865B2|Apple, Inc.
+3866F0|Apple, Inc.
+386893|Intel Corporate
+3868A4|Samsung Electronics Co.,Ltd
+3868DD|INVENTEC CORPORATION
+386A77|Samsung Electronics Co.,Ltd
+386B1C|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+386DED|Juniper Networks
+386E88|zte corporation
+386EB2|HUAWEI TECHNOLOGIES CO.,LTD
+386FF4|Amazon Technologies Inc.
+3870F2|HUAWEI TECHNOLOGIES CO.,LTD
+3871DE|Apple, Inc.
+38736E|Huawei Device Co., Ltd.
+3876CA|Shenzhen Smart Intelligent Technology Co.Ltd
+387862|Sony Corporation
+387A0E|Intel Corporate
+387A3C|Fiberhome Telecommunication Technologies Co.,LTD
+387ACC|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+387B01|Shenzhen MiaoMing Intelligent Technology Co.,Ltd
+387F8B|Apple, Inc.
+3880DF|Motorola Mobility LLC, a Lenovo Company
+388345|TP-LINK TECHNOLOGIES CO.,LTD.
+38839A|SHENZHEN RF-LINK TECHNOLOGY CO.,LTD.
+388479|Cisco Meraki
+3886F7|Google, Inc.
+3887D5|Intel Corporate
+38881E|HUAWEI TECHNOLOGIES CO.,LTD
+3888A4|Apple, Inc.
+38892C|Apple, Inc.
+388A06|Samsung Electronics Co.,Ltd
+388B59|Google, Inc.
+388C50|LG Electronics
+388CEF|Samsung Electronics Co.,Ltd
+388F30|Samsung Electronics Co.,Ltd
+389052|HUAWEI TECHNOLOGIES CO.,LTD
+3890A5|Cisco Systems, Inc
+3890AF|zte corporation
+389148|zte corporation
+3891B7|Cisco Systems, Inc
+389496|Samsung Electronics Co.,Ltd
+3894ED|NETGEAR
+3898E9|Huawei Device Co., Ltd.
+389AF6|Samsung Electronics Co.,Ltd
+389CB2|Apple, Inc.
+389D92|Seiko Epson Corporation
+389E4C|Hewlett Packard Enterprise
+389E80|zte corporation
+38A067|Nokia Solutions and Networks GmbH & Co. KG
+38A28C|SHENZHEN RF-LINK TECHNOLOGY CO.,LTD.
+38A44B|Huawei Device Co., Ltd.
+38A4ED|Xiaomi Communications Co Ltd
+38A5B6|SHENZHEN MEGMEET ELECTRICAL CO.,LTD
+38A5C9|Tuya Smart Inc.
+38A659|Sagemcom Broadband SAS
+38A746|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+38A89B|Fiberhome Telecommunication Technologies Co.,LTD
+38AA09|Cisco Systems, Inc
+38AA20|zte corporation
+38AA3C|SAMSUNG ELECTRO MECHANICS CO., LTD.
+38AF29|Zhejiang Dahua Technology Co., Ltd.
+38AFD7|FUJITSU LIMITED
+38B1DB|Hon Hai Precision Ind. Co.,Ltd.
+38B3F7|Huawei Device Co., Ltd.
+38B54D|Apple, Inc.
+38B725|Wistron Infocomm (Zhongshan) Corporation
+38BAB0|Broadcom
+38BAF8|Intel Corporate
+38BB3C|Avaya Inc
+38BC01|HUAWEI TECHNOLOGIES CO.,LTD
+38BD7A|Hewlett Packard Enterprise
+38C0EA|Fortinet, Inc.
+38C1ED|Xiaomi Communications Co Ltd
+38C43A|Apple, Inc.
+38C6BD|Xiaomi Communications Co Ltd
+38C85C|Cisco SPVTG
+38C986|Apple, Inc.
+38C9B1|zte corporation
+38CA73|Shenzhen MiaoMing Intelligent Technology Co.,Ltd
+38CA84|HP Inc.
+38CADA|Apple, Inc.
+38D09C|HUAWEI TECHNOLOGIES CO.,LTD
+38D40B|Samsung Electronics Co.,Ltd
+38D547|ASUSTek COMPUTER INC.
+38D82F|zte corporation
+38DEAD|Intel Corporate
+38E13D|Apple, Inc.
+38E1AA|zte corporation
+38E1F4|Sagemcom Broadband SAS
+38E26E|ShenZhen Sweet Rain Electronics Co.,Ltd.
+38E2DD|zte corporation
+38E39F|Motorola Mobility LLC, a Lenovo Company
+38E595|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+38E60A|Xiaomi Communications Co Ltd
+38EAA7|Hewlett Packard
+38EADD|Juniper Networks
+38EB47|HUAWEI TECHNOLOGIES CO.,LTD
+38EC07|Motorola Mobility LLC, a Lenovo Company
+38EC0D|Apple, Inc.
+38ECE4|Samsung Electronics Co.,Ltd
+38ED18|Cisco Systems, Inc
+38EFE3|INGENICO TERMINALS SAS
+38F098|Vapor Stone Rail Systems
+38F18F|Technicolor (China) Technology Co., Ltd.
+38F195|HUAWEI TECHNOLOGIES CO.,LTD
+38F20D|Juniper Networks
+38F23E|Microsoft Mobile Oy
+38F3AB|LCFC(Hefei) Electronics Technology co., ltd
+38F6CF|zte corporation
+38F73D|Amazon Technologies Inc.
+38F7F1|Huawei Device Co., Ltd.
+38F889|HUAWEI TECHNOLOGIES CO.,LTD
+38F9D3|Apple, Inc.
+38FACA|Skyworth Digital Technology(Shenzhen) Co.,Ltd
+38FB14|HUAWEI TECHNOLOGIES CO.,LTD
+38FBA0|Shenzhen Baseus Technology CoLtd
+38FC34|Huawei Device Co., Ltd.
+38FC98|Intel Corporate
+38FDF8|Cisco Systems, Inc
+38FF36|Ruckus Wireless
+38FF59|Dell Inc.
+3C01EF|Sony Corporation
+3C0518|Samsung Electronics Co.,Ltd
+3C058E|HUAWEI TECHNOLOGIES CO.,LTD
+3C0630|Apple, Inc.
+3C06A7|TP-LINK TECHNOLOGIES CO.,LTD.
+3C0754|Apple, Inc.
+3C0771|Sony Corporation
+3C07D7|Apple, Inc.
+3C08CD|Juniper Networks
+3C08F6|Cisco Systems, Inc
+3C0A7A|Samsung Electronics Co.,Ltd
+3C0B59|Tuya Smart Inc.
+3C0D0D|Espressif Systems (Singapore) Pte. Ltd
+3C0E23|Cisco Systems, Inc
+3C0F02|Espressif Inc.
+3C1060|Fiberhome Telecommunication Technologies Co.,LTD
+3C135A|Xiaomi Communications Co Ltd
+3C13BB|HUAWEI TECHNOLOGIES CO.,LTD
+3C13CC|Cisco Systems, Inc
+3C1512|Shenzhen Huanhu Technology Co.,Ltd
+3C155A|Nokia
+3C15C2|Apple, Inc.
+3C15FB|HUAWEI TECHNOLOGIES CO.,LTD
+3C1710|Sagemcom Broadband SAS
+3C189F|Nokia Corporation
+3C195E|Samsung Electronics Co.,Ltd
+3C1A65|Nokia
+3C1BF8|Hangzhou Hikvision Digital Technology Co.,Ltd.
+3C1E04|D-Link International
+3C1EB5|Apple, Inc.
+3C20F6|Samsung Electronics Co.,Ltd
+3C219C|Intel Corporate
+3C22FB|Apple, Inc.
+3C240A|Huawei Device Co., Ltd.
+3C25D7|Nokia Corporation
+3C25F8|Dell Inc.
+3C26E4|Cisco Systems, Inc
+3C286D|Google, Inc.
+3C2983|Samsung Electronics Co.,Ltd
+3C2AF4|Brother Industries, LTD.
+3C2C30|Dell Inc.
+3C2CA6|Beijing Xiaomi Electronics Co.,Ltd
+3C2CCD|Apple, Inc.
+3C2EF9|Apple, Inc.
+3C2EFF|Apple, Inc.
+3C306F|HUAWEI TECHNOLOGIES CO.,LTD
+3C3174|Google, Inc.
+3C318A|Samsung Electronics Co.,Ltd
+3C3300|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+3C3332|D-Link Corporation
+3C3464|Apple, Inc.
+3C363D|Nokia Corporation
+3C366A|HUAWEI TECHNOLOGIES CO.,LTD
+3C3786|NETGEAR
+3C381F|Huawei Device Co., Ltd.
+3C3824|Xiaomi Communications Co Ltd
+3C38F4|Sony Corporation
+3C39A8|Shenzhen Taichi Technology Limited
+3C39C8|Apple, Inc.
+3C3A73|Avaya Inc
+3C3B77|Apple, Inc.
+3C410E|Cisco Systems, Inc
+3C46A1|Ruckus Wireless
+3C46D8|TP-LINK TECHNOLOGIES CO.,LTD.
+3C4711|HUAWEI TECHNOLOGIES CO.,LTD
+3C4A92|Hewlett Packard
+3C4AC9|Huawei Device Co., Ltd.
+3C4DBE|Apple, Inc.
+3C4E56|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+3C5002|Apple, Inc.
+3C510E|Cisco Systems, Inc
+3C5282|Hewlett Packard
+3C52A1|TP-Link Systems Inc
+3C5447|HUAWEI TECHNOLOGIES CO.,LTD
+3C55DB|Shenzhen Skyworth Digital Technology CO., Ltd
+3C5731|Cisco Systems, Inc
+3C576C|Samsung Electronics Co.,Ltd
+3C5836|Sagemcom Broadband SAS
+3C585D|Sagemcom Broadband SAS
+3C58C2|Intel Corporate
+3C591E|TCL King Electrical Appliances (Huizhou) Co., Ltd
+3C59C0|HUAWEI TECHNOLOGIES CO.,LTD
+3C5A37|Samsung Electronics Co.,Ltd
+3C5AB4|Google, Inc.
+3C5CC3|Shenzhen First Blue Chip Technology Ltd
+3C5CC4|Amazon Technologies Inc.
+3C5EC3|Cisco Systems, Inc
+3C6104|Juniper Networks
+3C6105|Espressif Inc.
+3C6200|Samsung Electronics Co.,Ltd
+3C6278|SHENZHEN JETNET TECHNOLOGY CO.,LTD.
+3C64CF|TP-Link Systems Inc
+3C65D1|HUAWEI TECHNOLOGIES CO.,LTD
+3C678C|HUAWEI TECHNOLOGIES CO.,LTD
+3C6A48|TP-LINK TECHNOLOGIES CO.,LTD.
+3C6AA7|Intel Corporate
+3C6AD2|TP-Link Systems Inc.
+3C6D66|NVIDIA Corporation
+3C6D89|Apple, Inc.
+3C6F9B|zte corporation
+3C6FEA|Panasonic India Pvt. Ltd.
+3C71BF|Espressif Inc.
+3C7625|zte corporation
+3C7787|Huawei Device Co., Ltd.
+3C77E6|Hon Hai Precision Ind. Co.,Ltd.
+3C7843|HUAWEI TECHNOLOGIES CO.,LTD
+3C7895|TP-Link Systems Inc.
+3C7C3F|ASUSTek COMPUTER INC.
+3C7D0A|Apple, Inc.
+3C7F6E|Xiaomi Communications Co Ltd
+3C81D8|Sagemcom Broadband SAS
+3C8375|Microsoft Corporation
+3C8427|Espressif Inc.
+3C846A|TP-LINK TECHNOLOGIES CO.,LTD.
+3C869A|HUAWEI TECHNOLOGIES CO.,LTD
+3C87CF|Quanta Computer Inc.
+3C8A1F|Espressif Inc.
+3C8AB0|Juniper Networks
+3C8B7F|Cisco Systems, Inc
+3C8BFE|Samsung Electronics Co.,Ltd
+3C8C93|Juniper Networks
+3C8D20|Google, Inc.
+3C8F06|Shenzhen Libtor Technology Co.,Ltd
+3C90E0|HUAWEI TECHNOLOGIES CO.,LTD
+3C9157|Yulong Computer Telecommunication Scientific (Shenzhen) Co.,Ltd
+3C9180|Liteon Technology Corporation
+3C93F4|HUAWEI TECHNOLOGIES CO.,LTD
+3C94D5|Juniper Networks
+3C9509|Liteon Technology Corporation
+3C970E|Wistron InfoComm(Kunshan)Co.,Ltd.
+3C9722|shenzhen worldelite electronics co., LTD
+3C9BC6|Huawei Device Co., Ltd.
+3C9C0F|Intel Corporate
+3C9D56|HUAWEI TECHNOLOGIES CO.,LTD
+3C9F81|Shenzhen CATIC Bit Communications Technology Co.,Ltd
+3C9FCD|Shenzhen Neoway Technology Co.,Ltd.
+3CA00E|Shenzhen Skyworth Digital Technology CO., Ltd
+3CA067|Liteon Technology Corporation
+3CA070|Blink by Amazon
+3CA10D|Samsung Electronics Co.,Ltd
+3CA161|HUAWEI TECHNOLOGIES CO.,LTD
+3CA37E|HUAWEI TECHNOLOGIES CO.,LTD
+3CA6F6|Apple, Inc.
+3CA7AE|zte corporation
+3CA82A|Hewlett Packard
+3CA916|Huawei Device Co., Ltd.
+3CA9F4|Intel Corporate
+3CAB8E|Apple, Inc.
+3CAFB7|Xiaomi Communications Co Ltd
+3CB15B|Avaya Inc
+3CB233|Huawei Device Co., Ltd.
+3CB922|HUAWEI TECHNOLOGIES CO.,LTD
+3CBB73|Shenzhen Xinguodu Technology Co., Ltd.
+3CBBFD|Samsung Electronics Co.,Ltd
+3CBCD0|zte corporation
+3CBD3E|Beijing Xiaomi Electronics Co., Ltd.
+3CBD69|Nokia Shanghai Bell Co., Ltd.
+3CBDD8|LG ELECTRONICS INC
+3CBF60|Apple, Inc.
+3CBFD7|Apple, Inc.
+3CC03E|HUAWEI TECHNOLOGIES CO.,LTD
+3CC079|Shenzhen One-Nine Intelligent Electronic Science and Technology Co., Ltd
+3CC243|Nokia Corporation
+3CC5C7|HUAWEI TECHNOLOGIES CO.,LTD
+3CC801|Shenzhen Sundray Technologies company Limited
+3CCD36|Apple, Inc.
+3CCD40|Apple, Inc.
+3CCD57|Beijing Xiaomi Mobile Software Co., Ltd
+3CCD5D|HUAWEI TECHNOLOGIES CO.,LTD
+3CCD93|LG ELECTRONICS INC
+3CCE0D|Shenzhen juduoping Technology Co.,Ltd
+3CCE73|Cisco Systems, Inc
+3CD0F8|Apple, Inc.
+3CD7DA|SK Mtek microelectronics(shenzhen)limited
+3CD92B|Hewlett Packard
+3CDA2A|zte corporation
+3CDC75|Espressif Inc.
+3CDCBC|Samsung Electronics Co.,Ltd
+3CDD57|Apple, Inc.
+3CDF1E|Cisco Systems, Inc
+3CDFBD|HUAWEI TECHNOLOGIES CO.,LTD
+3CE072|Apple, Inc.
+3CE36B|Zhejiang Dahua Technology Co., Ltd.
+3CE441|Amazon Technologies Inc.
+3CE824|HUAWEI TECHNOLOGIES CO.,LTD
+3CE86E|Hewlett Packard Enterprise
+3CE90E|Espressif Inc.
+3CE9F7|Intel Corporate
+3CEF8C|Zhejiang Dahua Technology Co., Ltd.
+3CF011|Intel Corporate
+3CF652|zte corporation
+3CF692|Huawei Device Co., Ltd.
+3CF72A|Nokia Corporation
+3CF748|Shenzhen Linsn Technology Development Co.,Ltd
+3CF75D|Zyxel Communications Corporation
+3CF7A4|Samsung Electronics Co.,Ltd
+3CF808|HUAWEI TECHNOLOGIES CO.,LTD
+3CF862|Intel Corporate
+3CF9F0|zte corporation
+3CFA06|Microsoft Corporation
+3CFA30|Palo Alto Networks
+3CFA43|HUAWEI TECHNOLOGIES CO.,LTD
+3CFA80|HUAWEI TECHNOLOGIES CO.,LTD
+3CFB02|Apple, Inc.
+3CFB5C|Fiberhome Telecommunication Technologies Co.,LTD
+3CFDFE|Intel Corporate
+3CFEAC|Cisco Systems, Inc
+3CFFD8|HUAWEI TECHNOLOGIES CO.,LTD
+40017A|Cisco Systems, Inc
+400634|Huawei Device Co., Ltd.
+4006D5|Cisco Systems, Inc
+400877|Xiaomi Communications Co Ltd
+400E85|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+400EB9|HUAWEI TECHNOLOGIES CO.,LTD
+400EF3|zte corporation
+4011C3|Samsung Electronics Co.,Ltd
+401277|Microsoft Corporation
+401482|Cisco Systems, Inc
+4014AD|Huawei Device Co., Ltd.
+40163B|Samsung Electronics Co.,Ltd
+40167E|ASUSTek COMPUTER INC.
+40169F|TP-LINK TECHNOLOGIES CO.,LTD.
+4018B1|Extreme Networks, Inc.
+401C83|Intel Corporate
+401CD4|Huawei Device Co., Ltd.
+402230|Shenzhen SuperElectron Technology Co.,Ltd.
+4022D8|Espressif Inc.
+4024D2|Huawei Device Co., Ltd.
+4025C2|Intel Corporate
+402619|Apple, Inc.
+402641|HUAWEI TECHNOLOGIES CO.,LTD
+40268E|Shenzhen Photon Leap Technology Co., Ltd.
+4027A8|Cisco Meraki
+402BA1|Sony Corporation
+402BD6|Espressif Inc.
+403004|Apple, Inc.
+40313C|XIAOMI Electronics,CO.,LTD
+40331A|Apple, Inc.
+4035E6|Samsung Electronics Co.,Ltd
+4036B7|Juniper Networks
+403B7B|Huawei Device Co., Ltd.
+403CFC|Apple, Inc.
+403F43|Extreme Networks, Inc.
+403F8C|TP-LINK TECHNOLOGIES CO.,LTD.
+4040A7|Sony Corporation
+40410D|HUAWEI TECHNOLOGIES CO.,LTD
+404244|Cisco Systems, Inc
+4044CE|HUAWEI TECHNOLOGIES CO.,LTD
+4045C4|HUAWEI TECHNOLOGIES CO.,LTD
+40486E|Nokia Solutions and Networks GmbH & Co. KG
+40490F|Hon Hai Precision Ind. Co.,Ltd.
+404A03|Zyxel Communications Corporation
+404CCA|Espressif Inc.
+404D7F|Apple, Inc.
+404D8E|HUAWEI TECHNOLOGIES CO.,LTD
+404F42|HUAWEI TECHNOLOGIES CO.,LTD
+4050B5|Shenzhen New Species Technology Co., Ltd.
+40538C|LG Electronics
+405493|zte corporation
+405539|Cisco Systems, Inc
+405582|Nokia
+405B7F|Broadcom Limited
+405CFD|Dell Inc.
+405D82|NETGEAR
+405EE1|Shenzhen H&T Intelligent Control Co.,Ltd.
+405EF6|Samsung Electronics Co.,Ltd
+406186|MICRO-STAR INT'L CO.,LTD
+4065A3|Sagemcom Broadband SAS
+406768|Huawei Device Co., Ltd.
+406792|Cisco Systems, Inc
+40679B|Shenzhen Skyworth Digital Technology CO., Ltd
+4068F9|Shenzhen SuperElectron Technology Co.,Ltd.
+406C8F|Apple, Inc.
+406F27|HUAWEI TECHNOLOGIES CO.,LTD
+4070F5|Apple, Inc.
+407183|Juniper Networks
+4074E0|Intel Corporate
+4076A9|Huawei Device Co., Ltd.
+40786A|Motorola Mobility LLC, a Lenovo Company
+407911|Apple, Inc.
+407A80|Nokia Corporation
+407AA4|ZHEJIANG DAHUA TECHNOLOGYCO.,LTD
+407C7D|Nokia
+407D0F|HUAWEI TECHNOLOGIES CO.,LTD
+407F5F|Juniper Networks
+407FE0|Glory Star Technics (ShenZhen) Limited
+4080E1|FN-LINK TECHNOLOGY Ltd.
+40831D|Apple, Inc.
+4083DE|Zebra Technologies Inc
+4086CB|D-Link Corporation
+408805|Motorola Mobility LLC, a Lenovo Company
+40882F|Extreme Networks, Inc.
+4088E0|Beijing Ereneben Information Technology Limited Shenzhen Branch
+4089C2|Apple, Inc.
+4089C6|Amazon Technologies Inc.
+408BF6|Shenzhen TCL New Technology Co., Ltd
+408C4C|Shenzhen MiaoMing Intelligent Technology Co.,Ltd
+408D5C|GIGA-BYTE TECHNOLOGY CO.,LTD.
+408E2C|Microsoft Corporation
+408EDF|Huawei Device Co., Ltd.
+408F9D|Juniper Networks
+409151|Espressif Inc.
+40921A|Apple, Inc.
+409595|TP-Link Systems Inc.
+4098AD|Apple, Inc.
+409922|AzureWave Technology Inc.
+409B0D|Shenzhen Yourf Kwan Industrial Co., Ltd
+409B21|Nokia
+409BCD|D-Link International
+409C28|Apple, Inc.
+409EA4|Juniper Networks
+409F38|AzureWave Technology Inc.
+40A108|Motorola (Wuhan) Mobility Technologies Communication Co., Ltd.
+40A2DB|Amazon Technologies Inc.
+40A3CC|Intel Corporate
+40A44A|Google, Inc.
+40A53B|Nokia
+40A5EF|Shenzhen Four Seas Global Link Network Technology Co., Ltd.
+40A654|HUAWEI TECHNOLOGIES CO.,LTD
+40A677|Juniper Networks
+40A6B7|Intel Corporate
+40A6D9|Apple, Inc.
+40A6E8|Cisco Systems, Inc
+40A746|Broadcom Limited
+40A8F0|Hewlett Packard
+40A9CF|Amazon Technologies Inc.
+40ACBF|Hangzhou Hikvision Digital Technology Co.,Ltd.
+40AE30|TP-Link Systems Inc
+40B034|Hewlett Packard
+40B076|ASUSTek COMPUTER INC.
+40B0FA|LG Electronics (Mobile Communications)
+40B15C|HUAWEI TECHNOLOGIES CO.,LTD
+40B215|Extreme Networks, Inc.
+40B395|Apple, Inc.
+40B3FA|Apple, Inc.
+40B4CD|Amazon Technologies Inc.
+40B4F0|Juniper Networks
+40B570|Hangzhou Hikvision Digital Technology Co.,Ltd.
+40B5C1|Cisco Systems, Inc
+40B6E7|Huawei Device Co., Ltd.
+40B70E|Huawei Device Co., Ltd.
+40B82D|Ruckus Wireless
+40B837|Sony Corporation
+40B89A|Hon Hai Precision Ind. Co.,Ltd.
+40B93C|Hewlett Packard Enterprise
+40BA09|Dell Inc.
+40BC60|Apple, Inc.
+40BEEE|Shenzhen Yunding Information Technology Co.,Ltd
+40C1F6|Shenzhen Jingxun Technology Co., Ltd.
+40C245|Shenzhen Hexicom Technology Co., Ltd.
+40C2BA|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+40C3BC|Huawei Device Co., Ltd.
+40C711|Apple, Inc.
+40C729|Sagemcom Broadband SAS
+40C73C|Intel Corporate
+40C81F|Shenzhen Xinguodu Technology Co., Ltd.
+40CBA8|HUAWEI TECHNOLOGIES CO.,LTD
+40CBC0|Apple, Inc.
+40CE24|Cisco Systems, Inc
+40D133|Intel Corporate
+40D160|Apple, Inc.
+40D32D|Apple, Inc.
+40D3AE|Samsung Electronics Co.,Ltd
+40DA5C|Apple, Inc.
+40DCA5|Huawei Device Co., Ltd.
+40DE17|Shenzhen Lanfeng Times Industrial Co.,Ltd.
+40DE24|Samsung Electronics Co.,Ltd
+40DEAD|Juniper Networks
+40E11C|shenzhen Cloud High Communication Technology Co.,Ltd
+40E1E4|Nokia Solutions and Networks GmbH & Co. KG
+40E230|AzureWave Technology Inc.
+40E317|Extreme Networks, Inc.
+40E3D6|Hewlett Packard Enterprise
+40E4C6|Nokia
+40E64B|Apple, Inc.
+40E767|Extreme Networks, Inc.
+40E793|Shenzhen Siviton Technology Co.,Ltd
+40E99B|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+40EB21|HUAWEI TECHNOLOGIES CO.,LTD
+40EC99|Intel Corporate
+40ECBD|Intel Corporate
+40ED00|TP-Link Systems Inc
+40EDCF|Apple, Inc.
+40EE15|Zioncom Electronics (Shenzhen) Ltd.
+40EE6D|HUAWEI TECHNOLOGIES CO.,LTD
+40EEDD|HUAWEI TECHNOLOGIES CO.,LTD
+40F02F|Liteon Technology Corporation
+40F078|Cisco Systems, Inc
+40F201|Sagemcom Broadband SAS
+40F49F|Cisco Systems, Inc
+40F4C9|FN-LINK TECHNOLOGY Ltd.
+40F4EC|Cisco Systems, Inc
+40F520|Espressif Inc.
+40F6BC|Amazon Technologies Inc.
+40F8DF|CANON INC.
+40F946|Apple, Inc.
+40FAFE|Motorola Mobility LLC, a Lenovo Company
+440010|Apple, Inc.
+440049|Amazon Technologies Inc.
+44004D|HUAWEI TECHNOLOGIES CO.,LTD
+4401BB|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+44032C|Intel Corporate
+4403A7|Cisco Systems, Inc
+44053F|Sagemcom Broadband SAS
+4405B8|Huawei Device Co., Ltd.
+44070B|Google, Inc.
+4409B8|Salcomp (Shenzhen) CO., LTD.
+4409C6|HUAWEI TECHNOLOGIES CO.,LTD
+4409DA|Apple, Inc.
+440BAB|Positivo Tecnologia S.A.
+440C4B|HUAWEI TECHNOLOGIES CO.,LTD
+441030|Google, Inc.
+441244|Hewlett Packard Enterprise
+4413D0|zte corporation
+441524|Sagemcom Broadband SAS
+441622|Microsoft Corporation
+4416FA|Samsung Electronics Co.,Ltd
+441793|Espressif Inc.
+4418FD|Apple, Inc.
+4419B6|Hangzhou Hikvision Digital Technology Co.,Ltd.
+441A5C|Cisco Systems, Inc
+441B88|Apple, Inc.
+441BF6|Espressif Inc.
+441C7F|Motorola Mobility LLC, a Lenovo Company
+441CA8|Hon Hai Precision Ind. Co.,Ltd.
+441D64|Espressif Inc.
+441E98|Ruckus Wireless
+441EA1|Hewlett Packard
+44227C|HUAWEI TECHNOLOGIES CO.,LTD
+44237C|Beijing Xiaomi Mobile Software Co., Ltd
+4425F4|Apple, Inc.
+44272E|Huawei Device Co., Ltd.
+442A60|Apple, Inc.
+442B03|Cisco Systems, Inc
+442D49|Extreme Networks, Inc.
+44303F|HUAWEI TECHNOLOGIES CO.,LTD
+443192|Hewlett Packard
+44321D|HUAWEI TECHNOLOGIES CO.,LTD
+44322A|Avaya Inc
+443262|zte corporation
+44334C|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+443583|Apple, Inc.
+44365D|Shenzhen HippStor Technology Co., Ltd
+4437E6|Hon Hai Precision Ind. Co.,Ltd.
+4438E8|Intel Corporate
+443B32|Intelbras
+443D54|Amazon Technologies Inc.
+4441F0|zte corporation
+444201|Amazon Technologies Inc.
+44456F|SHENZHEN ONEGA TECHNOLOGY CO.,LTD
+444648|Hon Hai Precision Industry Co.,LTD
+4447CC|Hangzhou Hikvision Digital Technology Co.,Ltd.
+4448C1|Hewlett Packard Enterprise
+444988|Intel Corporate
+4449C0|NVIDIA Corporation
+444A37|Xiaomi Communications Co Ltd
+444AD6|Shenzhen Rinocloud Technology Co.,Ltd.
+444ADB|Apple, Inc.
+444B7E|Fiberhome Telecommunication Technologies Co.,LTD
+444C0C|Apple, Inc.
+444E1A|Samsung Electronics Co.,Ltd
+44552B|Samsung Electronics Co.,Ltd
+4455B1|HUAWEI TECHNOLOGIES CO.,LTD
+4455C4|Huawei Device Co., Ltd.
+44579F|Beijing Xiaomi Mobile Software Co., Ltd
+445829|Cisco SPVTG
+445943|zte corporation
+4459E3|HUAWEI TECHNOLOGIES CO.,LTD
+445BED|Hewlett Packard Enterprise
+445CE9|Samsung Electronics Co.,Ltd
+445D5E|SHENZHEN Coolkit Technology CO.,LTD
+445E82|Zyxel Communications Corporation
+446370|LCFC(Hefei) Electronics Technology co., ltd
+4463B6|Apple, Inc.
+4463C2|Zyxel Communications Corporation
+44643C|Cisco Systems, Inc
+44650D|Amazon Technologies Inc.
+4465E0|Merlion Consulting Services (Shenzhen) Co., Ltd
+446690|TP-LINK TECHNOLOGIES CO.,LTD.
+446747|HUAWEI TECHNOLOGIES CO.,LTD
+446752|Wistron INFOCOMM (Zhongshan) CORPORATION
+446A2E|HUAWEI TECHNOLOGIES CO.,LTD
+446D57|Liteon Technology Corporation
+446D6C|Samsung Electronics Co.,Ltd
+446D7F|Amazon Technologies Inc.
+446EE5|HUAWEI TECHNOLOGIES CO.,LTD
+447147|Beijing Xiaomi Electronics Co.,Ltd
+44746C|Sony Corporation
+447654|HUAWEI TECHNOLOGIES CO.,LTD
+447831|HUAWEI TECHNOLOGIES CO.,LTD
+44783E|Samsung Electronics Co.,Ltd
+447B30|Espressif Inc.
+447B45|Amazon Technologies Inc.
+447BBB|Shenzhen YOUHUA Technology Co., Ltd
+4480EB|Motorola Mobility LLC, a Lenovo Company
+4482E5|HUAWEI TECHNOLOGIES CO.,LTD
+448500|Intel Corporate
+448502|Shenzhen SuperElectron Technology Co.,Ltd.
+4485DA|Shenzhen Skyworth Digital Technology CO., Ltd
+448763|FN-LINK TECHNOLOGY Ltd.
+448816|Cisco Systems, Inc
+448A5B|Micro-Star INT'L CO., LTD.
+448DD5|Cisco Systems, Inc
+448F17|Samsung Electronics Co., Ltd. ARTIK
+4490BB|Apple, Inc.
+4494FC|NETGEAR
+44975A|SHENZHEN FAST TECHNOLOGIES CO.,LTD
+449A52|zte corporation
+449BC1|HUAWEI TECHNOLOGIES CO.,LTD
+449E8B|Apple, Inc.
+449F46|Huawei Device Co., Ltd.
+44A038|Huawei Device Co., Ltd.
+44A10E|Apple, Inc.
+44A191|HUAWEI TECHNOLOGIES CO.,LTD
+44A3BB|Intel Corporate
+44A3C7|zte corporation
+44A56E|NETGEAR
+44A642|Hangzhou Hikvision Digital Technology Co.,Ltd.
+44A7F4|Apple, Inc.
+44A842|Dell Inc.
+44A8FC|Apple, Inc.
+44AA50|Juniper Networks
+44ADB1|Sagemcom Broadband SAS
+44ADD9|Cisco Systems, Inc
+44AE25|Cisco Systems, Inc
+44AE44|Huawei Device Co., Ltd.
+44AF28|Intel Corporate
+44B176|Espressif Inc.
+44B32D|TP-LINK TECHNOLOGIES CO.,LTD.
+44B3C5|Huawei Device Co., Ltd.
+44B4B2|Amazon Technologies Inc.
+44B6BE|Cisco Systems, Inc
+44BB3B|Google, Inc.
+44BD8D|Espressif Inc.
+44BDC8|Xiaomi Communications Co Ltd
+44BE0B|HUAWEI TECHNOLOGIES CO.,LTD
+44BE23|PEGATRON CORPORATION
+44BFE3|Shenzhen Longtech Electronics Co.,Ltd
+44C20C|Cisco Systems, Inc
+44C277|Shenzhen Kingspec Electronics Technology Co., Ltd.
+44C346|HUAWEI TECHNOLOGIES CO.,LTD
+44C3B6|HUAWEI TECHNOLOGIES CO.,LTD
+44C532|HUAWEI TECHNOLOGIES CO.,LTD
+44C63C|Samsung Electronics Co.,Ltd
+44C65D|Apple, Inc.
+44C7FC|Huawei Device Co., Ltd.
+44CBAD|Xiaomi Communications Co Ltd
+44CE1D|Nokia
+44D1FA|Shenzhen Yunlink Technology Co., Ltd
+44D244|Seiko Epson Corporation
+44D3AD|Shenzhen TINNO Mobile Technology Corp.
+44D3CA|Cisco Systems, Inc
+44D453|Sagemcom Broadband SAS
+44D454|Sagemcom Broadband SAS
+44D47F|INGENICO TERMINALS SAS
+44D4E0|Sony Corporation
+44D5CC|Amazon Technologies Inc.
+44D791|HUAWEI TECHNOLOGIES CO.,LTD
+44D832|AzureWave Technology Inc.
+44D884|Apple, Inc.
+44D9E7|Ubiquiti Inc
+44DA30|Apple, Inc.
+44DBBE|HUAWEI TECHNOLOGIES CO.,LTD
+44DBD2|YEALINK(XIAMEN) NETWORK TECHNOLOGY CO.,LTD.
+44DF65|Beijing Xiaomi Mobile Software Co., Ltd
+44E08E|Cisco SPVTG
+44E213|Beijing Xiaomi Mobile Software Co., Ltd
+44E4D9|Cisco Systems, Inc
+44E4E6|Extreme Networks, Inc.
+44E517|Intel Corporate
+44E59B|HUAWEI TECHNOLOGIES CO.,LTD
+44E64A|Shenzhen iComm Semiconductor CO.,LTD
+44E66E|Apple, Inc.
+44E853|Apple, Inc.
+44E968|HUAWEI TECHNOLOGIES CO.,LTD
+44E9DD|Sagemcom Broadband SAS
+44EA30|Samsung Electronics Co.,Ltd
+44ECCE|Juniper Networks
+44F09E|Apple, Inc.
+44F21B|Apple, Inc.
+44F436|zte corporation
+44F459|Samsung Electronics Co.,Ltd
+44F477|Juniper Networks
+44F770|Beijing Xiaomi Mobile Software Co., Ltd
+44F971|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+44FB42|Apple, Inc.
+44FB5A|zte corporation
+44FFBA|zte corporation
+480020|Hewlett Packard Enterprise
+480031|HUAWEI TECHNOLOGIES CO.,LTD
+4800B3|Cisco Systems, Inc
+4801C5|OnePlus Technology (Shenzhen) Co., Ltd
+480234|HUAWEI TECHNOLOGIES CO.,LTD
+4805E2|Huawei Device Co., Ltd.
+480A28|Apple, Inc.
+480EEC|TP-LINK TECHNOLOGIES CO.,LTD.
+480FCF|Hewlett Packard
+481258|HUAWEI TECHNOLOGIES CO.,LTD
+48128F|HUAWEI TECHNOLOGIES CO.,LTD
+48137E|Samsung Electronics Co.,Ltd
+481BA4|Cisco Systems, Inc
+481D70|Cisco SPVTG
+481F2D|Shenzhen Jie Shi Lian Industrial Co.,LTD
+48210B|PEGATRON CORPORATION
+482218|Shenzhen Yipingfang Network Technology Co., Ltd.
+482254|TP-Link Systems Inc
+4825F3|Huawei Device Co., Ltd.
+48262C|Apple, Inc.
+4827C5|HUAWEI TECHNOLOGIES CO.,LTD
+4827E2|Espressif Inc.
+4827EA|Samsung Electronics Co.,Ltd
+48282F|zte corporation
+482952|Sagemcom Broadband SAS
+482AE3|Wistron InfoComm(Kunshan)Co.,Ltd.
+482CA0|Xiaomi Communications Co Ltd
+482CD0|HUAWEI TECHNOLOGIES CO.,LTD
+482CEA|Motorola Inc Business Light Radios
+482E72|Cisco Systems, Inc
+482F6B|Hewlett Packard Enterprise
+482FD7|HUAWEI TECHNOLOGIES CO.,LTD
+483106|NVIDIA Corporation
+4831B7|Espressif Inc.
+4831DB|Huawei Device Co., Ltd.
+48352B|Apple, Inc.
+48352E|Shenzhen Wolck Network Product Co.,LTD
+483584|Huawei Device Co., Ltd.
+4835AB|Apple, Inc.
+483871|Huawei Device Co., Ltd.
+483A02|Fortinet, Inc.
+483B38|Apple, Inc.
+483C0C|HUAWEI TECHNOLOGIES CO.,LTD
+483F72|Samsung Electronics Co.,Ltd
+483FDA|Espressif Inc.
+483FE9|HUAWEI TECHNOLOGIES CO.,LTD
+4840D5|Intel Corporate
+48417B|Nokia Solutions and Networks GmbH & Co. KG
+48435A|HUAWEI TECHNOLOGIES CO.,LTD
+48437C|Apple, Inc.
+4843DD|Amazon Technologies Inc.
+484487|Cisco SPVTG
+4844F7|Samsung Electronics Co.,Ltd
+484520|Intel Corporate
+4846C1|FN-LINK TECHNOLOGY LIMITED
+4846FB|HUAWEI TECHNOLOGIES CO.,LTD
+48474B|Huawei Device Co., Ltd.
+484982|Huawei Device Co., Ltd.
+484996|Huawei Device Co., Ltd.
+4849C7|Samsung Electronics Co.,Ltd
+484AE9|Hewlett Packard Enterprise
+484BAA|Apple, Inc.
+484C29|HUAWEI TECHNOLOGIES CO.,LTD
+484C86|Huawei Device Co., Ltd.
+484D7E|Dell Inc.
+485073|Microsoft Corporation
+485169|Samsung Electronics Co.,Ltd
+4851B7|Intel Corporate
+4851C5|Intel Corporate
+4851CF|Intelbras
+485519|Espressif Inc.
+48555E|Shenzhen Skyworth Digital Technology CO., Ltd
+48555F|Fiberhome Telecommunication Technologies Co.,LTD
+485702|HUAWEI TECHNOLOGIES CO.,LTD
+4857D2|Broadcom Limited
+485929|LG Electronics (Mobile Communications)
+4859A4|zte corporation
+485A0D|Juniper Networks
+485AB6|Hon Hai Precision Ind. Co.,Ltd.
+485AEA|Fiberhome Telecommunication Technologies Co.,LTD
+485B39|ASUSTek COMPUTER INC.
+485D60|AzureWave Technology Inc.
+485F08|TP-LINK TECHNOLOGIES CO.,LTD.
+485F2D|Amazon Technologies Inc.
+485FDF|zte corporation
+48605F|LG Electronics (Mobile Communications)
+4860BC|Apple, Inc.
+4861EE|Samsung Electronics Co.,Ltd
+486276|HUAWEI TECHNOLOGIES CO.,LTD
+486345|Huawei Device Co., Ltd.
+48684A|Intel Corporate
+48706F|HUAWEI TECHNOLOGIES CO.,LTD
+4870D4|Cisco Meraki
+487310|Juniper Networks
+487410|Cisco Systems, Inc
+487412|OnePlus Technology (Shenzhen) Co., Ltd
+48746E|Apple, Inc.
+48785B|Hangzhou Hikvision Digital Technology Co.,Ltd.
+48785E|Amazon Technologies Inc.
+48794D|Samsung Electronics Co.,Ltd
+487B2F|Microsoft Corporation
+487B6B|HUAWEI TECHNOLOGIES CO.,LTD
+487D2E|TP-LINK TECHNOLOGIES CO.,LTD.
+488002|Cisco Systems, Inc
+4882DF|Huawei Device Co., Ltd.
+4883C7|Sagemcom Broadband SAS
+4886E8|Microsoft Corporation
+488759|Xiaomi Communications Co Ltd
+4887B8|TCL King Electrical Appliances(Huizhou)Co.,Ltd
+488899|Shenzhen SuperElectron Technology Co.,Ltd.
+4888CA|Motorola (Wuhan) Mobility Technologies Communication Co., Ltd.
+4889E7|Intel Corporate
+488B0A|Cisco Systems, Inc
+488C63|Huawei Device Co., Ltd.
+488EB7|Zebra Technologies Inc.
+488EEF|HUAWEI TECHNOLOGIES CO.,LTD
+488F4C|shenzhen trolink Technology Co.,Ltd
+488F5A|Routerboard.com
+48902F|LG Electronics (Mobile Communications)
+4890F0|Dell Inc.
+4891D5|Cisco Systems, Inc
+4891F6|Shenzhen Reach software technology CO.,LTD
+4896D9|zte corporation
+4898AB|Wistron InfoComm(Chongqing)Co.,Ltd.
+489A58|Samsung Electronics Co.,Ltd
+489A5B|Shenzhen iComm Semiconductor CO.,LTD
+489BD5|Extreme Networks, Inc.
+489D31|Espressif Inc.
+489DD1|Samsung Electronics Co.,Ltd
+489EBD|HP Inc.
+489ECB|Hewlett Packard Enterprise
+48A0F8|Fiberhome Telecommunication Technologies Co.,LTD
+48A170|Cisco Systems, Inc
+48A195|Apple, Inc.
+48A22D|Shenzhen Huaxuchang Telecom Technology Co.,Ltd
+48A472|Intel Corporate
+48A516|Huawei Device Co., Ltd.
+48A6B8|Sonos, Inc.
+48A74E|zte corporation
+48A91C|Apple, Inc.
+48A98A|Routerboard.com
+48AABB|Sagemcom Broadband SAS
+48AD08|HUAWEI TECHNOLOGIES CO.,LTD
+48AD9A|Intel Corporate
+48AFF3|Espressif Inc.
+48B02D|NVIDIA Corporation
+48B25D|HUAWEI TECHNOLOGIES CO.,LTD
+48B423|Amazon Technologies Inc.
+48B4C3|Hewlett Packard Enterprise
+48B8A3|Apple, Inc.
+48BA4E|Hewlett Packard
+48BCE1|Samsung Electronics Co.,Ltd
+48BD0E|Quanta Storage Inc.
+48BD4A|HUAWEI TECHNOLOGIES CO.,LTD
+48BF6B|Apple, Inc.
+48C35A|LENOVO(BEIJING)CO., LTD.
+48C381|TP-Link Systems Inc.
+48C796|Samsung Electronics Co.,Ltd
+48CA43|Espressif Inc.
+48CA68|Apple, Inc.
+48CDD3|HUAWEI TECHNOLOGIES CO.,LTD
+48CFA9|HUAWEI TECHNOLOGIES CO.,LTD
+48D224|Liteon Technology Corporation
+48D24F|Sagemcom Broadband SAS
+48D539|HUAWEI TECHNOLOGIES CO.,LTD
+48D682|zte corporation
+48D6D5|Google, Inc.
+48D705|Apple, Inc.
+48D845|Shenzhen Mainuoke Electronics Co., Ltd
+48D890|FN-LINK TECHNOLOGY LIMITED
+48DB50|HUAWEI TECHNOLOGIES CO.,LTD
+48DC2D|HUAWEI TECHNOLOGIES CO.,LTD
+48DCFB|Nokia Corporation
+48DF37|Hewlett Packard Enterprise
+48E150|Intel Corporate
+48E15C|Apple, Inc.
+48E1CA|Apple, Inc.
+48E244|Hon Hai Precision Ind. Co.,Ltd.
+48E27E|Sagemcom Broadband SAS
+48E729|Espressif Inc.
+48E7DA|AzureWave Technology Inc.
+48E9F1|Apple, Inc.
+48EA62|HP Inc.
+48EAA9|ShenZhen C&D Electronics CO.Ltd.
+48EC5B|Nokia Solutions and Networks GmbH & Co. KG
+48EDE6|Zyxel Communications Corporation
+48EE0C|D-Link International
+48EF1C|Samsung Electronics Co.,Ltd
+48EF61|Huawei Device Co., Ltd.
+48F17F|Intel Corporate
+48F6EE|Espressif Inc.
+48F7BC|HUAWEI TECHNOLOGIES CO.,LTD
+48F7F1|Nokia
+48F8B3|Cisco-Linksys, LLC
+48F8DB|HUAWEI TECHNOLOGIES CO.,LTD
+48F8E1|Nokia
+48F97C|Fiberhome Telecommunication Technologies Co.,LTD
+48FC07|Huawei Device Co., Ltd.
+48FC7C|Shenzhen Huidu Technology Co., Ltd.
+48FD8E|HUAWEI TECHNOLOGIES CO.,LTD
+48FDA3|Xiaomi Communications Co Ltd
+4C0082|Cisco Systems, Inc
+4C01F7|Cisco Systems, Inc
+4C0220|Xiaomi Communications Co Ltd
+4C034F|Intel Corporate
+4C09B4|zte corporation
+4C0A4E|Extreme Networks, Inc.
+4C0BBE|Microsoft
+4C0F3E|Intel Corporate
+4C0F6E|Hon Hai Precision Ind. Co.,Ltd.
+4C10D5|TP-LINK TECHNOLOGIES CO.,LTD.
+4C11AE|Espressif Inc.
+4C11BF|Zhejiang Dahua Technology Co., Ltd.
+4C14A3|TCL Technoly Electronics (Huizhou) Co., Ltd.
+4C1694|shenzhen sibituo Technology Co., Ltd
+4C16F1|zte corporation
+4C16FC|Juniper Networks
+4C1744|Amazon Technologies Inc.
+4C17EB|Sagemcom Broadband SAS
+4C195D|Sagemcom Broadband SAS
+4C1D96|Intel Corporate
+4C1F86|Hangzhou Hikvision Digital Technology Co.,Ltd.
+4C1FCC|HUAWEI TECHNOLOGIES CO.,LTD
+4C20B8|Apple, Inc.
+4C2113|Nokia Shanghai Bell Co., Ltd.
+4C218C|Panasonic India Private limited
+4C21D0|Sony Corporation
+4C22C9|zte corporation
+4C231A|Extreme Networks, Inc.
+4C2578|Nokia Corporation
+4C2B3B|Huawei Device Co., Ltd.
+4C2E5E|Samsung Electronics Co.,Ltd
+4C2EB4|Apple, Inc.
+4C2EFE|Shenzhen Comnect Technology Co.,LTD
+4C2FD7|Huawei Device Co., Ltd.
+4C3275|Apple, Inc.
+4C3488|Intel Corporate
+4C364E|Panasonic Connect Co., Ltd.
+4C3946|Samsung Electronics Co.,Ltd
+4C3BDF|Microsoft Corporation
+4C3C16|Samsung Electronics Co.,Ltd
+4C3C8F|Shenzhen Jingxun Technology Co., Ltd.
+4C3CE2|Huawei Device Co., Ltd.
+4C421E|Cisco Systems, Inc
+4C445B|Intel Corporate
+4C4929|TCL King Electrical Appliances(Huizhou)Co.,Ltd
+4C494F|zte corporation
+4C496C|Intel Corporate
+4C49E3|Xiaomi Communications Co Ltd
+4C4AB4|Juniper Networks
+4C4CD8|zte corporation
+4C4E35|Cisco Systems, Inc
+4C4FEE|OnePlus Technology (Shenzhen) Co., Ltd
+4C5077|Huawei Device Co., Ltd.
+4C5262|Fujitsu Technology Solutions GmbH
+4C53FD|Amazon Technologies Inc.
+4C5499|HUAWEI TECHNOLOGIES CO.,LTD
+4C55B2|Xiaomi Communications Co Ltd
+4C569D|Apple, Inc.
+4C5739|Samsung Electronics Co.,Ltd
+4C57CA|Apple, Inc.
+4C5D3C|Cisco Systems, Inc
+4C5D6A|Apple, Inc.
+4C5E0C|Routerboard.com
+4C5F70|Intel Corporate
+4C60AD|Amazon Technologies Inc.
+4C60DE|NETGEAR
+4C617E|Huawei Device Co., Ltd.
+4C62CD|Nokia
+4C62DF|Hangzhou Hikvision Digital Technology Co.,Ltd.
+4C631B|HUAWEI TECHNOLOGIES CO.,LTD
+4C6371|Xiaomi Communications Co Ltd
+4C63AD|Huawei Device Co., Ltd.
+4C6641|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+4C66A6|Samsung Electronics Co.,Ltd
+4C6BE8|Apple, Inc.
+4C6CA1|Chipsea Technologies (Shenzhen) Crop.
+4C6D58|Juniper Networks
+4C710C|Cisco Systems, Inc
+4C710D|Cisco Systems, Inc
+4C7274|Shenzhenshi Xinzhongxin Technology Co.Ltd
+4C72B9|PEGATRON CORPORATION
+4C734F|Juniper Networks
+4C74BF|Apple, Inc.
+4C7525|Espressif Inc.
+4C7625|Dell Inc.
+4C7766|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+4C776D|Cisco Systems, Inc
+4C77CB|Intel Corporate
+4C796E|Intel Corporate
+4C7975|Apple, Inc.
+4C79BA|Intel Corporate
+4C7A88|Cisco Systems, Inc
+4C7C5F|Apple, Inc.
+4C7CD9|Apple, Inc.
+4C7F62|Nokia Corporation
+4C8093|Intel Corporate
+4C80FB|Google, Inc.
+4C820C|Apple, Inc.
+4C83DE|Cisco SPVTG
+4C83FE|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+4C8421|Espressif Inc.
+4C889E|Huawei Device Co., Ltd.
+4C8BEF|HUAWEI TECHNOLOGIES CO.,LTD
+4C8D53|HUAWEI TECHNOLOGIES CO.,LTD
+4C8D79|Apple, Inc.
+4C8E19|Xiaomi Communications Co Ltd
+4C9614|Juniper Networks
+4C97CC|Apple, Inc.
+4C99E8|ZHEJIANG DAHUA TECHNOLOGYCO.,LTD
+4C9EFF|Zyxel Communications Corporation
+4C9FF1|Apple, Inc.
+4CA38F|shenzhen trolink Technology Co.,Ltd
+4CA56D|Samsung Electronics Co.,Ltd
+4CA64D|Cisco Systems, Inc
+4CA919|Tuya Smart Inc.
+4CA954|Intel Corporate
+4CAA16|AzureWave Technologies (Shanghai) Inc.
+4CAB4F|Apple, Inc.
+4CABFC|zte corporation
+4CAC0A|zte corporation
+4CAD35|Apple, Inc.
+4CAE13|HUAWEI TECHNOLOGIES CO.,LTD
+4CAE31|ShengHai Electronics (Shenzhen) Ltd
+4CAEA3|Hewlett Packard Enterprise
+4CB008|Shenzhen Gwelltimes Technology Co.,Ltd
+4CB04A|Intel Corporate
+4CB087|HUAWEI TECHNOLOGIES CO.,LTD
+4CB16C|HUAWEI TECHNOLOGIES CO.,LTD
+4CB199|Apple, Inc.
+4CB1CD|Ruckus Wireless
+4CB7E0|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+4CB8B5|Shenzhen YOUHUA Technology Co., Ltd
+4CB910|Apple, Inc.
+4CBB47|NVIDIA Corporation
+4CBC42|Shenzhen Hangsheng Electronics Co.,Ltd.
+4CBC48|Cisco Systems, Inc
+4CBCA5|Samsung Electronics Co.,Ltd
+4CBD8F|Hangzhou Hikvision Digital Technology Co.,Ltd.
+4CC096|Shenzhen SuperElectron Technology Co.,Ltd.
+4CC382|Espressif Inc.
+4CC53E|Zyxel Communications Corporation
+4CC5D9|Dell Inc.
+4CC64C|Beijing Xiaomi Mobile Software Co., Ltd
+4CC681|Shenzhen Aisat Electronic Co., Ltd.
+4CC8A1|Cisco Meraki
+4CC94F|Nokia
+4CC95E|Samsung Electronics Co.,Ltd
+4CCA95|Huawei Device Co., Ltd.
+4CCBEA|Huawei Device Co., Ltd.
+4CCBF5|zte corporation
+4CCC34|Motorola Solutions Inc.
+4CCC6A|Micro-Star INTL CO., LTD.
+4CCDB6|Apple, Inc.
+4CCF7C|HP Inc.
+4CD012|Apple, Inc.
+4CD0CB|HUAWEI TECHNOLOGIES CO.,LTD
+4CD0DD|HUAWEI TECHNOLOGIES CO.,LTD
+4CD0F9|Cisco Systems, Inc
+4CD1A1|HUAWEI TECHNOLOGIES CO.,LTD
+4CD546|Hewlett Packard Enterprise
+4CD587|Hewlett Packard Enterprise
+4CD629|HUAWEI TECHNOLOGIES CO.,LTD
+4CD717|Dell Inc.
+4CD73A|ShenZhen XinZhongXin Technology Co.， Ltd
+4CD98F|Dell Inc.
+4CDD31|Samsung Electronics Co.,Ltd
+4CDE48|Huawei Device Co., Ltd.
+4CE0DB|Xiaomi Communications Co Ltd
+4CE175|Cisco Systems, Inc
+4CE176|Cisco Systems, Inc
+4CE20F|Xiaomi Communications Co Ltd
+4CE4B6|Motorola Mobility LLC, a Lenovo Company
+4CE650|Apple, Inc.
+4CE65E|HUAWEI TECHNOLOGIES CO.,LTD
+4CE6C0|Apple, Inc.
+4CEA27|Shenzhen Skyworth Digital Technology CO., Ltd
+4CEB42|Intel Corporate
+4CEBB0|Samsung Electronics Co.,Ltd
+4CEBD6|Espressif Inc.
+4CEC0F|Cisco Systems, Inc
+4CECEE|Samsung Electronics Co.,Ltd
+4CEDFB|ASUSTek COMPUTER INC.
+4CEF56|Shenzhen Sundray Technologies company Limited
+4CEFC0|Amazon Technologies Inc.
+4CF202|Xiaomi Communications Co Ltd
+4CF475|Huawei Device Co., Ltd.
+4CF55B|HUAWEI TECHNOLOGIES CO.,LTD
+4CF5DC|Hangzhou Hikvision Digital Technology Co.,Ltd.
+4CF95D|HUAWEI TECHNOLOGIES CO.,LTD
+4CFA9A|Shenzhen Quanxing Technology Co., Ltd
+4CFB45|HUAWEI TECHNOLOGIES CO.,LTD
+5000E0|Cisco Systems, Inc
+50016B|HUAWEI TECHNOLOGIES CO.,LTD
+5001BB|Samsung Electronics Co.,Ltd
+5001D9|HUAWEI TECHNOLOGIES CO.,LTD
+500238|Nokia Shanghai Bell Co., Ltd.
+500291|Espressif Inc.
+5003CF|CANON INC.
+5004B8|HUAWEI TECHNOLOGIES CO.,LTD
+500604|Cisco Systems, Inc
+5006AB|Cisco Systems, Inc
+5006F5|Roku, Inc
+5007C3|Amazon Technologies Inc.
+500A9C|Extreme Networks, Inc.
+500B23|HUAWEI TECHNOLOGIES CO.,LTD
+500B26|HUAWEI TECHNOLOGIES CO.,LTD
+500B32|Foxda Technology Industrial(ShenZhen)Co.,LTD
+500F80|Cisco Systems, Inc
+500FF5|Tenda Technology Co.,Ltd.Dongguan branch
+50125C|Sony Corporation
+50131D|Motorola Mobility LLC, a Lenovo Company
+5014C1|HUAWEI TECHNOLOGIES CO.,LTD
+5016F4|Motorola Mobility LLC, a Lenovo Company
+5017FF|Cisco Systems, Inc
+501AC5|Microsoft
+501CB0|Cisco Systems, Inc
+501CBF|Cisco Systems, Inc
+501D93|HUAWEI TECHNOLOGIES CO.,LTD
+501FC6|Apple, Inc.
+5021EC|Huawei Device Co., Ltd.
+5023A2|Apple, Inc.
+502690|FUJITSU LIMITED
+5027E4|Marvell Semiconductors
+50284A|Intel Corporate
+502873|Huawei Device Co., Ltd.
+502B73|Tenda Technology Co.,Ltd.Dongguan branch
+502D1D|Nokia Corporation
+502DA2|Intel Corporate
+502E91|AzureWave Technology Inc.
+502F9B|Intel Corporate
+502FA8|Cisco Systems, Inc
+502FBB|Motorola Mobility LLC, a Lenovo Company
+503123|FN-LINK TECHNOLOGY Ltd.
+503237|Apple, Inc.
+503275|Samsung Electronics Co.,Ltd
+5033F0|YICHEN (SHENZHEN) TECHNOLOGY CO.LTD
+503955|Cisco SPVTG
+503AA0|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+503B70|Apple, Inc.
+503CC4|Lenovo Mobile Communication Technology Ltd.
+503D7F|Nokia Shanghai Bell Co., Ltd.
+503DA1|Samsung Electronics Co.,Ltd
+503DC6|Xiaomi Communications Co Ltd
+503DD1|TP-Link Systems Inc.
+503DE5|Cisco Systems, Inc
+503EAA|TP-LINK TECHNOLOGIES CO.,LTD.
+503F50|Huawei Device Co., Ltd.
+504061|Nokia
+504172|HUAWEI TECHNOLOGIES CO.,LTD
+504289|zte corporation
+504472|Motorola Mobility LLC, a Lenovo Company
+50464A|HUAWEI TECHNOLOGIES CO.,LTD
+50465D|ASUSTek COMPUTER INC.
+504921|Cisco Systems, Inc
+5049B0|Samsung Electronics Co.,Ltd
+504A6E|NETGEAR
+504B9E|Huawei Device Co., Ltd.
+504F3B|Beijing Xiaomi Mobile Software Co., Ltd
+5050A4|Samsung Electronics Co.,Ltd
+50523B|Nokia
+505527|LG Electronics (Mobile Communications)
+5056BF|Samsung Electronics Co.,Ltd
+50578A|Apple, Inc.
+50579C|Seiko Epson Corporation
+5057A8|Cisco Systems, Inc
+50586F|Huawei Device Co., Ltd.
+505A65|AzureWave Technology Inc.
+505B1D|Shenzhen C-Data Technology Co., Ltd.
+505BC2|Liteon Technology Corporation
+505C88|Cisco Systems, Inc
+505D7A|zte corporation
+505DAC|HUAWEI TECHNOLOGIES CO.,LTD
+505E24|zte corporation
+50613C|ShenZhen XinZhongXin Technology Co.， Ltd
+50617E|Shenzhen MiaoMing Intelligent Technology Co.,Ltd
+506184|Avaya Inc
+5061BF|Cisco Systems, Inc
+506313|Hon Hai Precision Ind. Co.,Ltd.
+506382|HUAWEI TECHNOLOGIES CO.,LTD
+506391|HUAWEI TECHNOLOGIES CO.,LTD
+50642B|XIAOMI Electronics,CO.,LTD
+5065F3|Hewlett Packard
+5066E5|Huawei Device Co., Ltd.
+5067AE|Cisco Systems, Inc
+5067F0|Zyxel Communications Corporation
+50680A|HUAWEI TECHNOLOGIES CO.,LTD
+5068AC|Huawei Device Co., Ltd.
+50695A|AiFamous（shenzhen）Technology Co.,Ltd
+506A03|NETGEAR
+506F0C|Sagemcom Broadband SAS
+506F77|HUAWEI TECHNOLOGIES CO.,LTD
+507164|Cisco Systems, Inc
+5076AF|Intel Corporate
+507705|Samsung Electronics Co.,Ltd
+50787D|Espressif Inc.
+5078B0|Huawei Device Co., Ltd.
+5078B3|zte corporation
+507A55|Apple, Inc.
+507AC5|Apple, Inc.
+507B9D|LCFC(Hefei) Electronics Technology co., ltd
+507C6F|Intel Corporate
+507C90|Huami (Shenzhen) Information Technology Co., Ltd
+508114|Apple, Inc.
+508140|HP Inc.
+5082D5|Apple, Inc.
+508492|Intel Corporate
+508569|Samsung Electronics Co.,Ltd
+508789|Cisco Systems, Inc
+508811|Beijing Xiaomi Mobile Software Co., Ltd
+508965|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+5089D1|Huawei Device Co., Ltd.
+508A06|Tuya Smart Inc.
+508A0F|SHENZHEN FISE TECHNOLOGY HOLDING CO.,LTD.
+508A7F|HUAWEI TECHNOLOGIES CO.,LTD
+508ACB|SHENZHEN MAXMADE TECHNOLOGY CO., LTD.
+508BB9|Tuya Smart Inc.
+508CC9|zte corporation
+508D62|HUAWEI TECHNOLOGIES CO.,LTD
+508D9E|HUAWEI TECHNOLOGIES CO.,LTD
+508E49|Xiaomi Communications Co Ltd
+508F4C|Xiaomi Communications Co Ltd
+5091E3|TP-Link Systems Inc
+50926A|Beijing Xiaomi Mobile Software Co., Ltd
+5092B9|Samsung Electronics Co.,Ltd
+5093CE|HUAWEI TECHNOLOGIES CO.,LTD
+509546|HUAWEI TECHNOLOGIES CO.,LTD
+509839|Xiaomi Communications Co Ltd
+50995A|Amazon Technologies Inc.
+509A4C|Dell Inc.
+509A88|HUAWEI TECHNOLOGIES CO.,LTD
+509B94|Shenzhen iComm Semiconductor CO.,LTD
+509EA7|Samsung Electronics Co.,Ltd
+509F27|HUAWEI TECHNOLOGIES CO.,LTD
+509FB9|Shenzhen Skyworth Digital Technology CO., Ltd
+50A009|Xiaomi Communications Co Ltd
+50A015|Shenzhen Yipingfang Network Technology Co., Ltd.
+50A0A4|Nokia
+50A132|Shenzhen MiaoMing Intelligent Technology Co.,Ltd
+50A1F3|Huawei Device Co., Ltd.
+50A4C8|Samsung Electronics Co.,Ltd
+50A67F|Apple, Inc.
+50A6D8|Apple, Inc.
+50A72B|HUAWEI TECHNOLOGIES CO.,LTD
+50A733|Ruckus Wireless
+50ACB9|HUAWEI TECHNOLOGIES CO.,LTD
+50AF4D|zte corporation
+50AF73|Shenzhen Bitland Information Technology Co., Ltd.
+50B03B|Sony Interactive Entertainment Inc.
+50B127|Apple, Inc.
+50B363|Digitron da Amazonia S/A
+50B3B4|Shenzhen Furuilian Electronic Co.,Ltd.
+50B7C3|Samsung Electronics Co.,Ltd
+50BA84|Cisco Systems, Inc
+50BBB5|AzureWave Technology Inc.
+50BC96|Apple, Inc.
+50BD5F|TP-LINK TECHNOLOGIES CO.,LTD.
+50C58D|Juniper Networks
+50C6AD|Fiberhome Telecommunication Technologies Co.,LTD
+50C709|Juniper Networks
+50C7BF|TP-LINK TECHNOLOGIES CO.,LTD.
+50C8E5|Samsung Electronics Co.,Ltd
+50CCF8|SAMSUNG ELECTRO MECHANICS CO., LTD.
+50CD22|Avaya Inc
+50D2F5|Beijing Xiaomi Mobile Software Co., Ltd
+50D45C|Amazon Technologies Inc.
+50D4F7|TP-LINK TECHNOLOGIES CO.,LTD.
+50DA9E|SHEN ZHEN TENDA TECHNOLOGY CO.,LTD
+50DAD6|Xiaomi Communications Co Ltd
+50DB3F|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+50DCE7|Amazon Technologies Inc.
+50DDAB|Samsung Electronics Co.,Ltd
+50DE06|Apple, Inc.
+50DE92|shenzhen worldelite electronics co., LTD
+50E039|Zyxel Communications Corporation
+50E085|Intel Corporate
+50E0EF|Nokia
+50E24E|zte corporation
+50E452|Chipsea Technologies (Shenzhen) Corp.
+50E4E0|Hewlett Packard Enterprise
+50E538|Hangzhou Hikvision Digital Technology Co.,Ltd.
+50E549|GIGA-BYTE TECHNOLOGY CO.,LTD.
+50E666|Shenzhen Techtion Electronics Co., Ltd.
+50EAD6|Apple, Inc.
+50EB71|Intel Corporate
+50EBF6|ASUSTek COMPUTER INC.
+50EC50|Beijing Xiaomi Mobile Software Co., Ltd
+50ED3C|Apple, Inc.
+50EE32|Hon Hai Precision Industry Co.,LTD
+50F0D3|Samsung Electronics Co.,Ltd
+50F265|Apple, Inc.
+50F351|Apple, Inc.
+50F4EB|Apple, Inc.
+50F520|Samsung Electronics Co.,Ltd
+50F5DA|Amazon Technologies Inc.
+50F722|Cisco Systems, Inc
+50F7ED|Huawei Device Co., Ltd.
+50F958|Huawei Device Co., Ltd.
+50FA84|TP-LINK TECHNOLOGIES CO.,LTD.
+50FB19|CHIPSEA TECHNOLOGIES (SHENZHEN) CORP.
+50FC9F|Samsung Electronics Co.,Ltd
+50FE0C|AzureWave Technology Inc.
+50FE39|Beijing Xiaomi Mobile Software Co., Ltd
+540295|HUAWEI TECHNOLOGIES CO.,LTD
+5404A6|ASUSTek COMPUTER INC.
+5405DB|LCFC(Hefei) Electronics Technology co., ltd
+540764|Huawei Device Co., Ltd.
+54077D|NETGEAR
+5408F1|SHENZHENLINGDECHUANGTECHNOLOGY CO.,LTD
+540910|Apple, Inc.
+540955|zte corporation
+540A77|Fiberhome Telecommunication Technologies Co.,LTD
+540A8A|Jlztlink Industry(ShenZhen)Co.,Ltd.
+540DF9|Huawei Device Co., Ltd.
+54102E|HUAWEI TECHNOLOGIES CO.,LTD
+54104F|Samsung Electronics Co.,Ltd
+5412CB|HUAWEI TECHNOLOGIES CO.,LTD
+541310|HUAWEI TECHNOLOGIES CO.,LTD
+541379|Hon Hai Precision Ind. Co.,Ltd.
+5414F3|Intel Corporate
+5416A5|Espressif Systems (Singapore) Pte. Ltd
+541E56|Juniper Networks
+541F8D|zte corporation
+54211D|Huawei Device Co., Ltd.
+54219D|Samsung Electronics Co.,Ltd
+542259|HUAWEI TECHNOLOGIES CO.,LTD
+5422F8|zte corporation
+542369|HUAWEI TECHNOLOGIES CO.,LTD
+5425EA|HUAWEI TECHNOLOGIES CO.,LTD
+542618|HUAWEI TECHNOLOGIES CO.,LTD
+54263D|Sony Corporation
+542696|Apple, Inc.
+54271E|AzureWave Technology Inc.
+542758|Motorola (Wuhan) Mobility Technologies Communication Co., Ltd.
+542906|Apple, Inc.
+542A1B|Sonos, Inc.
+542A43|Apple, Inc.
+542B1C|Amazon Technologies Inc.
+542B76|zte corporation
+542B8D|Apple, Inc.
+542F2B|HUAWEI TECHNOLOGIES CO.,LTD
+543204|Espressif Inc.
+5432C7|Apple, Inc.
+5433CB|Apple, Inc.
+5434EF|HUAWEI TECHNOLOGIES CO.,LTD
+543530|Hon Hai Precision Ind. Co.,Ltd.
+543631|Intel Corporate
+5439DF|HUAWEI TECHNOLOGIES CO.,LTD
+543AD6|Samsung Electronics Co.,Ltd
+543CED|Sagemcom Broadband SAS
+543D37|Ruckus Wireless
+543E64|Fiberhome Telecommunication Technologies Co.,LTD
+5440AD|Samsung Electronics Co.,Ltd
+544249|Sony Corporation
+5443B2|Espressif Inc.
+544408|Nokia Corporation
+54443B|HUAWEI TECHNOLOGIES CO.,LTD
+5444A3|Samsung Electronics Co.,Ltd
+544617|zte corporation
+54466B|Shenzhen CZTIC Electronic Technology Co., Ltd
+5447CC|Sagemcom Broadband SAS
+544810|Dell Inc.
+5448E6|Beijing Xiaomi Mobile Software Co., Ltd
+544A00|Cisco Systems, Inc
+544B8C|Juniper Networks
+544C8A|Microsoft Corporation
+544E90|Apple, Inc.
+544EF0|Roku, Inc
+54511B|HUAWEI TECHNOLOGIES CO.,LTD
+5451DE|Cisco Systems, Inc
+545284|Huawei Device Co., Ltd.
+5453ED|Sony Corporation
+5455D5|Huawei Device Co., Ltd.
+545618|Huawei Device Co., Ltd.
+545925|HUAWEI TECHNOLOGIES CO.,LTD
+545AA6|Espressif Inc.
+545B86|Panasonic Automotive Systems Co.,Ltd
+546009|Google, Inc.
+54606D|HUAWEI TECHNOLOGIES CO.,LTD
+5462E2|Apple, Inc.
+5464D9|Sagemcom Broadband SAS
+54666C|Shenzhen YOUHUA Technology Co., Ltd
+546749|Google, Inc.
+546751|Compal Broadband Networks, Inc.
+5467E6|SHENZHEN MTC CO LTD
+546990|HUAWEI TECHNOLOGIES CO.,LTD
+546CAC|Intelbras
+546CEB|Intel Corporate
+5471DD|Huawei Device Co., Ltd.
+54724F|Apple, Inc.
+54735A|Huawei Device Co., Ltd.
+547595|TP-LINK TECHNOLOGIES CO.,LTD.
+5475D0|Cisco Systems, Inc
+54778A|Hewlett Packard Enterprise
+54781A|Cisco Systems, Inc
+547885|SHENZHEN GIEC DIGITAL CO.,LTD
+5478F0|zte corporation
+547975|Nokia Corporation
+547C69|Cisco Systems, Inc
+547F54|INGENICO
+547FEE|Cisco Systems, Inc
+548028|Hewlett Packard Enterprise
+54812D|PAX Computer Technology(Shenzhen) Ltd.
+54833A|Zyxel Communications Corporation
+5484DC|zte corporation
+5486BC|Cisco Systems, Inc
+54880E|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+5488D5|zte corporation
+5488DE|Cisco Systems, Inc
+548998|HUAWEI TECHNOLOGIES CO.,LTD
+548ABA|Cisco Systems, Inc
+548C81|Hangzhou Hikvision Digital Technology Co.,Ltd.
+548CA0|Liteon Technology Corporation
+548D5A|Intel Corporate
+549209|HUAWEI TECHNOLOGIES CO.,LTD
+5492BE|Samsung Electronics Co.,Ltd
+549359|SHENZHEN TWOWING TECHNOLOGIES CO.,LTD.
+549963|Apple, Inc.
+549B12|Samsung Electronics Co.,Ltd
+549C6A|Shenzhen Bilian Electronic Co.,Ltd
+549DEA|Espressif Inc.
+549F06|Nokia Shanghai Bell Co., Ltd.
+549F13|Apple, Inc.
+549F35|Dell Inc.
+549FC6|Cisco Systems, Inc
+54A050|ASUSTek COMPUTER INC.
+54A274|Cisco Systems, Inc
+54A31B|Shenzhen Linkworld Technology Co,.LTD
+54A51B|HUAWEI TECHNOLOGIES CO.,LTD
+54A552|Shenzhen WeSing Interactive Entertainment Technology Co., Ltd
+54A637|HUAWEI TECHNOLOGIES CO.,LTD
+54A6DB|Huawei Device Co., Ltd.
+54A703|TP-LINK TECHNOLOGIES CO.,LTD.
+54AB3A|Quanta Computer Inc.
+54AE27|Apple, Inc.
+54AF97|TP-Link Systems Inc
+54B121|HUAWEI TECHNOLOGIES CO.,LTD
+54B203|PEGATRON CORPORATION
+54B27E|Sagemcom Broadband SAS
+54B29D|Shenzhen YOUHUA Technology Co., Ltd
+54B802|Samsung Electronics Co.,Ltd
+54B80A|D-Link International
+54B8DB|Apple, Inc.
+54BAD6|HUAWEI TECHNOLOGIES CO.,LTD
+54BAD9|Intelbras
+54BD79|Samsung Electronics Co.,Ltd
+54BE53|zte corporation
+54BEF7|PEGATRON CORPORATION
+54BF55|Juniper Networks
+54BF64|Dell Inc.
+54C415|Hangzhou Hikvision Digital Technology Co.,Ltd.
+54C480|HUAWEI TECHNOLOGIES CO.,LTD
+54C80F|TP-LINK TECHNOLOGIES CO.,LTD.
+54C8CC|Shenzhen SDG Telecom Equipment Co.,Ltd.
+54C9DF|FN-LINK TECHNOLOGY LIMITED
+54CD10|Panasonic Mobile Communications Co.,Ltd.
+54CDEE|ShenZhen Apexis Electronic Co.,Ltd
+54CE82|zte corporation
+54CF8D|HUAWEI TECHNOLOGIES CO.,LTD
+54D17D|Samsung Electronics Co.,Ltd
+54D299|TP-Link Systems Inc.
+54D46F|Cisco SPVTG
+54D7E3|Hewlett Packard Enterprise
+54D9C6|Huawei Device Co., Ltd.
+54DC1D|Yulong Computer Telecommunication Scientific (Shenzhen) Co.,Ltd
+54DD21|Huawei Device Co., Ltd.
+54DD4F|Samsung Electronics Co.,Ltd
+54DED3|zte corporation
+54DF24|Fiberhome Telecommunication Technologies Co.,LTD
+54E005|Fiberhome Telecommunication Technologies Co.,LTD
+54E032|Juniper Networks
+54E140|INGENICO
+54E15B|Huawei Device Co., Ltd.
+54E1AD|LCFC(Hefei) Electronics Technology co., ltd
+54E43A|Apple, Inc.
+54E4BD|FN-LINK TECHNOLOGY LIMITED
+54E4ED|Intel Corporate
+54E61B|Apple, Inc.
+54E63F|ShenZhen LingKeWeiEr Technology Co., Ltd.
+54E6FC|TP-LINK TECHNOLOGIES CO.,LTD.
+54E6FD|Sony Interactive Entertainment Inc.
+54EAA8|Apple, Inc.
+54EBE9|Apple, Inc.
+54EC2F|Ruckus Wireless
+54EE75|Wistron InfoComm(Kunshan)Co.,Ltd.
+54EF33|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+54EF43|HUAWEI TECHNOLOGIES CO.,LTD
+54EF92|Shenzhen Elink Technology Co., LTD
+54F0B1|Hewlett Packard Enterprise
+54F201|Samsung Electronics Co.,Ltd
+54F294|Huawei Device Co., Ltd.
+54F29F|HUNAN FN-LINK TECHNOLOGY LIMITED
+54F607|Huawei Device Co., Ltd.
+54F6E2|HUAWEI TECHNOLOGIES CO.,LTD
+54FA3E|Samsung Electronics Co.,Ltd
+54FA96|Nokia Solutions and Networks GmbH & Co. KG
+54FCF0|Samsung Electronics Co.,Ltd
+5800BB|Juniper Networks
+5800E3|Liteon Technology Corporation
+580205|AzureWave Technology Inc.
+5803FB|Hangzhou Hikvision Digital Technology Co.,Ltd.
+58044F|TP-Link Systems Inc.
+5805D9|Seiko Epson Corporation
+5807F8|Nokia Solutions and Networks GmbH & Co. KG
+580987|Amazon Technologies Inc.
+580A20|Cisco Systems, Inc
+580AD4|Apple, Inc.
+580E85|Sagemcom Broadband SAS
+580FA5|Apple, Inc.
+581031|Hon Hai Precision IND.CO.,LTD
+58108C|Intelbras
+581122|ASUSTek COMPUTER INC.
+581626|Avaya Inc
+58170C|Sony Corporation
+581862|Sony Corporation
+581CF8|Intel Corporate
+581DD8|Sagemcom Broadband SAS
+581F28|HUAWEI TECHNOLOGIES CO.,LTD
+581FAA|Apple, Inc.
+582059|Xiaomi Communications Co Ltd
+582071|Samsung Electronics Co.,Ltd
+5820B1|Hewlett Packard
+58239B|Fiberhome Telecommunication Technologies Co.,LTD
+582429|Google, Inc.
+582575|HUAWEI TECHNOLOGIES CO.,LTD
+582A93|Apple, Inc.
+582ABD|Espressif Inc.
+582AF7|HUAWEI TECHNOLOGIES CO.,LTD
+582BD3|Espressif Inc.
+582BDB|Pax AB
+582FF7|Sagemcom Broadband SAS
+58306E|Nokia
+58355D|Huawei Device Co., Ltd.
+5835D9|Cisco Systems, Inc
+583653|Apple, Inc.
+583879|RICOH COMPANY, LTD.
+583BD9|Fiberhome Telecommunication Technologies Co.,LTD
+583F54|LG Electronics (Mobile Communications)
+58404E|Apple, Inc.
+584120|TP-LINK TECHNOLOGIES CO.,LTD.
+584498|Xiaomi Communications Co Ltd
+584704|Shenzhen Webridge Technology Co.,Ltd
+584822|Sony Corporation
+58493B|Palo Alto Networks
+584BBC|zte corporation
+5850ED|Hangzhou Hikvision Digital Technology Co.,Ltd.
+5851A3|Apple, Inc.
+585595|Apple, Inc.
+5855CA|Apple, Inc.
+58569F|Cisco Systems, Inc
+5856AA|Apple, Inc.
+5856C2|HUAWEI TECHNOLOGIES CO.,LTD
+5858CD|Extreme Networks, Inc.
+5859C2|Extreme Networks, Inc.
+585FF6|zte corporation
+586010|shenzhen zovoton electronic co.,ltd
+58605F|HUAWEI TECHNOLOGIES CO.,LTD
+586356|FN-LINK TECHNOLOGY LIMITED
+5864C4|Apple, Inc.
+58666D|Apple, Inc.
+58687A|Sagemcom Broadband SAS
+586B14|Apple, Inc.
+586C25|Intel Corporate
+586D0C|Hewlett Packard Enterprise
+586D67|Intel Corporate
+586D8F|Cisco-Linksys, LLC
+5872C9|zte corporation
+5873D1|HUAWEI TECHNOLOGIES CO.,LTD
+5873D8|Apple, Inc.
+58769C|Palo Alto Networks
+587961|Microsoft Corporation
+5879E0|Samsung Electronics Co.,Ltd
+587A4D|Stonesoft Corporation
+587F57|Apple, Inc.
+587F66|HUAWEI TECHNOLOGIES CO.,LTD
+5882A8|Microsoft
+588336|HUAWEI TECHNOLOGIES CO.,LTD
+588670|Juniper Networks
+58879F|Huawei Device Co., Ltd.
+5887E2|Shenzhen Coship Electronics Co., Ltd.
+588A5A|Dell Inc.
+588B1C|Cisco Systems, Inc
+588BF3|Zyxel Communications Corporation
+588C81|Espressif Inc.
+588D09|Cisco Systems, Inc
+589043|Sagemcom Broadband SAS
+5891CF|Intel Corporate
+589204|zte corporation
+589351|Huawei Device Co., Ltd.
+589396|Ruckus Wireless
+5893E8|Apple, Inc.
+58946B|Intel Corporate
+5894AE|Huawei Device Co., Ltd.
+58957E|Huawei Device Co., Ltd.
+58960A|LG Electronics
+58961D|Intel Corporate
+58971E|Cisco Systems, Inc
+5897BD|Cisco Systems, Inc
+589A3E|Amazon Technologies Inc.
+58A023|Intel Corporate
+58A2B5|LG Electronics (Mobile Communications)
+58A639|Samsung Electronics Co.,Ltd
+58A839|Intel Corporate
+58A8E8|Amazon Technologies Inc.
+58ABFB|Huawei Device Co., Ltd.
+58AC78|Cisco Systems, Inc
+58AD12|Apple, Inc.
+58AE2B|Huawei Device Co., Ltd.
+58AEA8|HUAWEI TECHNOLOGIES CO.,LTD
+58AEF1|Fiberhome Telecommunication Technologies Co.,LTD
+58B035|Apple, Inc.
+58B10F|Samsung Electronics Co.,Ltd
+58B18F|Huawei Device Co., Ltd.
+58B3FC|SHENZHEN RF-LINK TECHNOLOGY CO.,LTD.
+58B623|Beijing Xiaomi Mobile Software Co., Ltd
+58B633|Ruckus Wireless
+58B965|Apple, Inc.
+58BAD4|HUAWEI TECHNOLOGIES CO.,LTD
+58BC27|Cisco Systems, Inc
+58BE72|HUAWEI TECHNOLOGIES CO.,LTD
+58BF25|Espressif Inc.
+58BFEA|Cisco Systems, Inc
+58C17A|Cambium Networks Limited
+58C38B|Samsung Electronics Co.,Ltd
+58C57E|Fiberhome Telecommunication Technologies Co.,LTD
+58C5CB|Samsung Electronics Co.,Ltd
+58CB52|Google, Inc.
+58CE2A|Intel Corporate
+58CF79|Espressif Inc.
+58D061|HUAWEI TECHNOLOGIES CO.,LTD
+58D312|zte corporation
+58D349|Apple, Inc.
+58D56E|D-Link International
+58D61F|Ubiquiti Inc
+58D759|HUAWEI TECHNOLOGIES CO.,LTD
+58D812|TP-Link Systems Inc.
+58D9C3|Motorola Mobility LLC, a Lenovo Company
+58D9D5|Tenda Technology Co.,Ltd.Dongguan branch
+58DF59|Cisco Systems, Inc
+58E28F|Apple, Inc.
+58E434|Juniper Networks
+58E488|Amazon Technologies Inc.
+58E4EB|FN-LINK TECHNOLOGY Ltd.
+58E6BA|Apple, Inc.
+58E6C5|Espressif Inc.
+58EA1F|Beijing Xiaomi Mobile Software Co., Ltd
+58ED99|zte corporation
+58F2FC|Huawei Device Co., Ltd.
+58F39C|Cisco Systems, Inc
+58F8D7|HUAWEI TECHNOLOGIES CO.,LTD
+58F987|HUAWEI TECHNOLOGIES CO.,LTD
+58FB3E|Huawei Device Co., Ltd.
+58FB84|Intel Corporate
+58FB96|Ruckus Wireless
+58FCC8|Honeywell
+58FDB1|LG Electronics
+58FDBE|Shenzhen Taikaida Technology Co., Ltd
+58FE7E|zte corporation
+58FFA1|zte corporation
+5C013B|Espressif Inc.
+5C0214|Beijing Xiaomi Mobile Software Co., Ltd
+5C0339|HUAWEI TECHNOLOGIES CO.,LTD
+5C0610|Cisco Meraki
+5C07A6|HUAWEI TECHNOLOGIES CO.,LTD
+5C0947|Apple, Inc.
+5C0979|HUAWEI TECHNOLOGIES CO.,LTD
+5C0A5B|SAMSUNG ELECTRO MECHANICS CO., LTD.
+5C0B3B|HUAWEI TECHNOLOGIES CO.,LTD
+5C0E8B|Extreme Networks, Inc.
+5C101E|zte corporation
+5C10C5|Samsung Electronics Co.,Ltd
+5C13AC|Apple, Inc.
+5C13CC|Apple, Inc.
+5C15C5|Shenzhen SSC Technology Co. Ltd
+5C167D|HUAWEI TECHNOLOGIES CO.,LTD
+5C1720|Huawei Device Co., Ltd.
+5C17CF|OnePlus Technology (Shenzhen) Co., Ltd
+5C1BF4|Apple, Inc.
+5C1DD9|Apple, Inc.
+5C23C2|Apple, Inc.
+5C260A|Dell Inc.
+5C27D4|Shenzhen Qihu Intelligent Technology Company Limited
+5C2886|Inventec(Chongqing) Corporation
+5C2E59|Samsung Electronics Co.,Ltd
+5C3192|Cisco Systems, Inc
+5C337B|Google, Inc.
+5C345B|Hangzhou Hikvision Digital Technology Co.,Ltd.
+5C353B|Compal Broadband Networks, Inc.
+5C36B8|TCL King Electrical Appliances (Huizhou) Co., Ltd
+5C3977|Juniper Networks
+5C3A3D|zte corporation
+5C3C27|Samsung Electronics Co.,Ltd
+5C3E06|Cisco Systems, Inc
+5C3E1B|Apple, Inc.
+5C4071|Xiaomi Communications Co Ltd
+5C415A|Amazon.com, LLC
+5C4527|Juniper Networks
+5C4546|Shenzhen Water World Information Co.,Ltd.
+5C4879|HUAWEI TECHNOLOGIES CO.,LTD
+5C497D|Samsung Electronics Co.,Ltd
+5C49FA|Shenzhen Guowei Shidai Communication Equipement Co., Ltd
+5C4CA9|HUAWEI TECHNOLOGIES CO.,LTD
+5C4DBF|zte corporation
+5C5015|Cisco Systems, Inc
+5C50D9|Apple, Inc.
+5C5136|Samsung Electronics Co.,Ltd
+5C514F|Intel Corporate
+5C5181|Samsung Electronics Co.,Ltd
+5C5188|Motorola Mobility LLC, a Lenovo Company
+5C5230|Apple, Inc.
+5C5284|Apple, Inc.
+5C546D|HUAWEI TECHNOLOGIES CO.,LTD
+5C57C8|Nokia Corporation
+5C58E6|Palo Alto Networks
+5C5948|Apple, Inc.
+5C5AC7|Cisco Systems, Inc
+5C5E0A|Samsung Electronics Co.,Ltd
+5C5EAB|Juniper Networks
+5C5EBB|HUAWEI TECHNOLOGIES CO.,LTD
+5C5F67|Intel Corporate
+5C60BA|HP Inc.
+5C6117|HUAWEI TECHNOLOGIES CO.,LTD
+5C625A|CANON INC.
+5C628B|TP-Link Systems Inc
+5C63B0|Fortinet, Inc.
+5C63BF|TP-LINK TECHNOLOGIES CO.,LTD.
+5C647A|HUAWEI TECHNOLOGIES CO.,LTD
+5C648E|Zyxel Communications Corporation
+5C64F1|Cisco Systems, Inc
+5C6783|Intel Corporate
+5C6A80|Zyxel Communications Corporation
+5C6D20|Hon Hai Precision Ind. Co.,Ltd.
+5C6F69|Broadcom Limited
+5C7017|Apple, Inc.
+5C7075|HUAWEI TECHNOLOGIES CO.,LTD
+5C70A3|LG Electronics (Mobile Communications)
+5C710D|Cisco Systems, Inc
+5C76D5|Nokia
+5C78F8|Huawei Device Co., Ltd.
+5C7B5C|Shenzhen SDMC Technology CO.,Ltd.
+5C7D5E|HUAWEI TECHNOLOGIES CO.,LTD
+5C7DAE|zte corporation
+5C7DF3|Fiberhome Telecommunication Technologies Co.,LTD
+5C80B6|Intel Corporate
+5C836C|Ruckus Wireless
+5C8382|Nokia
+5C838F|Cisco Systems, Inc
+5C843C|Sony Interactive Entertainment Inc.
+5C8505|Huawei Device Co., Ltd.
+5C85F8|SHENZHEN KAIFA TECHNOLOGY CO.,LTD.
+5C865C|Samsung Electronics Co.,Ltd
+5C8730|Apple, Inc.
+5C879C|Intel Corporate
+5C899A|TP-LINK TECHNOLOGIES CO.,LTD.
+5C89BC|Apple, Inc.
+5C8A38|Hewlett Packard
+5C8B6B|Amazon Technologies Inc.
+5C8D4E|Apple, Inc.
+5C8E8B|Shenzhen Linghai Electronics Co.,Ltd
+5C9157|HUAWEI TECHNOLOGIES CO.,LTD
+5C9175|Apple, Inc.
+5C925E|Zioncom Electronics (Shenzhen) Ltd.
+5C93A2|Liteon Technology Corporation
+5C9462|Shenzhen Jiuzhou Electric Co.,LTD
+5C95AE|Apple, Inc.
+5C9656|AzureWave Technology Inc.
+5C9666|Sony Interactive Entertainment Inc.
+5C969D|Apple, Inc.
+5C97F3|Apple, Inc.
+5C9960|Samsung Electronics Co.,Ltd
+5C9977|Apple, Inc.
+5C9AA1|Huawei Device Co., Ltd.
+5C9AD8|FUJITSU LIMITED
+5C9BA6|Apple, Inc.
+5CA39D|SAMSUNG ELECTRO MECHANICS CO., LTD.
+5CA436|Shenzhen G-world Technology Incorporated Company
+5CA47D|Hewlett Packard Enterprise
+5CA48A|Cisco Systems, Inc
+5CA4A4|Fiberhome Telecommunication Technologies Co.,LTD
+5CA4F4|zte corporation
+5CA62D|Cisco Systems, Inc
+5CA64F|TP-Link Systems Inc.
+5CA6E6|TP-Link Systems Inc
+5CA86A|HUAWEI TECHNOLOGIES CO.,LTD
+5CAAFD|Sonos, Inc.
+5CAC3D|Samsung Electronics Co.,Ltd
+5CAC4C|Hon Hai Precision Ind. Co.,Ltd.
+5CAD76|Shenzhen TCL New Technology Co., Ltd
+5CADBA|Apple, Inc.
+5CADCF|Apple, Inc.
+5CAF06|LG Electronics (Mobile Communications)
+5CB00A|HUAWEI TECHNOLOGIES CO.,LTD
+5CB12E|Cisco Systems, Inc
+5CB13E|Sagemcom Broadband SAS
+5CB26D|Intel Corporate
+5CB2DF|Shenzhen Powerleader Storage Technology Co., Ltd.
+5CB395|HUAWEI TECHNOLOGIES CO.,LTD
+5CB43E|HUAWEI TECHNOLOGIES CO.,LTD
+5CB47E|Intel Corporate
+5CB524|Sony Corporation
+5CB8B7|Apple, Inc.
+5CB901|Hewlett Packard
+5CBA2C|Hewlett Packard Enterprise
+5CBA37|Microsoft Corporation
+5CBBEE|zte corporation
+5CBD9A|Huawei Device Co., Ltd.
+5CC0A0|HUAWEI TECHNOLOGIES CO.,LTD
+5CC1D7|Samsung Electronics Co.,Ltd
+5CC1F2|HUAWEI TECHNOLOGIES CO.,LTD
+5CC307|HUAWEI TECHNOLOGIES CO.,LTD
+5CC41D|Stone Devices Sdn. Bhd.
+5CC563|HUNAN FN-LINK TECHNOLOGY LIMITED
+5CC5D4|Intel Corporate
+5CC6D0|Skyworth Digital Technology(Shenzhen) Co.,Ltd
+5CC786|ShenZhen Tengxin Electronics Manufacturing Co.,Ltd.
+5CC787|Huawei Device Co., Ltd.
+5CC9D3|PALLADIUM ENERGY ELETRONICA DA AMAZONIA LTDA
+5CCA1A|Microsoft Mobile Oy
+5CCAD3|CHIPSEA TECHNOLOGIES (SHENZHEN) CORP.
+5CCB99|Samsung Electronics Co.,Ltd
+5CCD5B|Intel Corporate
+5CCF7F|Espressif Inc.
+5CD06E|Xiaomi Communications Co Ltd
+5CD2E4|Intel Corporate
+5CD33D|Samsung Electronics Co.,Ltd
+5CD5B5|Shenzhen WiSiYiLink Technology Co.,Ltd
+5CD89E|Huawei Device Co., Ltd.
+5CD998|D-Link Corporation
+5CDC49|Samsung Electronics Co.,Ltd
+5CDE34|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+5CDF89|Ruckus Wireless
+5CDFB8|Shenzhen Unionmemory Information System Limited
+5CE0C5|Intel Corporate
+5CE176|Cisco Systems, Inc
+5CE28C|Zyxel Communications Corporation
+5CE3B6|Fiberhome Telecommunication Technologies Co.,LTD
+5CE42A|Intel Corporate
+5CE50C|Beijing Xiaomi Mobile Software Co., Ltd
+5CE747|HUAWEI TECHNOLOGIES CO.,LTD
+5CE753|Shenzhen Intellirocks Tech. Co. Ltd.
+5CE7A0|Nokia
+5CE883|HUAWEI TECHNOLOGIES CO.,LTD
+5CE8EB|Samsung Electronics Co.,Ltd
+5CE91E|Apple, Inc.
+5CE931|TP-Link Systems Inc
+5CEA1D|Hon Hai Precision Ind. Co.,Ltd.
+5CEB52|zte corporation
+5CED8C|Hewlett Packard Enterprise
+5CEDF4|Samsung Electronics Co.,Ltd
+5CF4AB|Zyxel Communications Corporation
+5CF51A|Zhejiang Dahua Technology Co., Ltd.
+5CF5DA|Apple, Inc.
+5CF6DC|Samsung Electronics Co.,Ltd
+5CF7E6|Apple, Inc.
+5CF938|Apple, Inc.
+5CF96A|HUAWEI TECHNOLOGIES CO.,LTD
+5CF9DD|Dell Inc.
+5CFA25|Sagemcom Broadband SAS
+5CFB7C|Shenzhen Jingxun Software Telecommunication Technology Co.,Ltd
+5CFC66|Cisco Systems, Inc
+5CFF35|Wistron Corporation
+5CFFA9|zte corporation
+5CFFFF|Shenzhen Kezhonglong Optoelectronic Technology Co., Ltd
+600194|Espressif Inc.
+6001B1|HUAWEI TECHNOLOGIES CO.,LTD
+600292|PEGATRON CORPORATION
+600308|Apple, Inc.
+60030C|Shenzhen YOUHUA Technology Co., Ltd
+6006E3|Apple, Inc.
+600810|HUAWEI TECHNOLOGIES CO.,LTD
+600A8C|Shenzhen Sundray Technologies company Limited
+600F6B|Apple, Inc.
+60109E|HUAWEI TECHNOLOGIES CO.,LTD
+60123C|HUAWEI TECHNOLOGIES CO.,LTD
+60128B|CANON INC.
+601466|zte corporation
+60152B|Palo Alto Networks
+60156F|TP-Link Systems Inc.
+60182E|ShenZhen Protruly Electronic Ltd co.
+60183A|Huawei Device Co., Ltd.
+601888|zte corporation
+601895|Dell Inc.
+601929|VOLTRONIC POWER TECHNOLOGY(SHENZHEN) CORP.
+601D56|Extreme Networks, Inc.
+601D91|Motorola Mobility LLC, a Lenovo Company
+601F56|HUAWEI TECHNOLOGIES CO.,LTD
+602232|Ubiquiti Inc
+6025ED|Hewlett Packard Enterprise
+6026AA|Cisco Systems, Inc
+6026EF|Hewlett Packard Enterprise
+60292B|TP-LINK TECHNOLOGIES CO.,LTD.
+602AD0|Cisco SPVTG
+602D74|Extreme Networks, Inc.
+602E20|HUAWEI TECHNOLOGIES CO.,LTD
+602ED5|Apple, Inc.
+6030B3|HUAWEI TECHNOLOGIES CO.,LTD
+6030D4|Apple, Inc.
+603197|Zyxel Communications Corporation
+6032B1|TP-LINK TECHNOLOGIES CO.,LTD.
+60334B|Apple, Inc.
+6036DD|Intel Corporate
+603A7C|TP-LINK TECHNOLOGIES CO.,LTD.
+603AAF|Samsung Electronics Co.,Ltd
+603CEE|LG Electronics (Mobile Communications)
+603D29|HUAWEI TECHNOLOGIES CO.,LTD
+603E5F|Apple, Inc.
+60427F|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+60452E|Intel Corporate
+6045BD|Microsoft
+6045CB|ASUSTek COMPUTER INC.
+6045CD|Sagemcom Broadband SAS
+60470A|Shenzhen Zenith Intelligent Technology Co., Ltd.
+604966|Shenzhen Dingsheng Technology Co., Ltd.
+6049C1|Avaya Inc
+604DE1|HUAWEI TECHNOLOGIES CO.,LTD
+604F5B|Huawei Device Co., Ltd.
+605317|Sandstone Technologies
+605355|HUAWEI TECHNOLOGIES CO.,LTD
+605375|HUAWEI TECHNOLOGIES CO.,LTD
+6055F9|Espressif Inc.
+6056B1|HUAWEI TECHNOLOGIES CO.,LTD
+605718|Intel Corporate
+6057C8|Apple, Inc.
+605B30|Dell Inc.
+605BB4|AzureWave Technology Inc.
+605E4F|Huawei Device Co., Ltd.
+605FAA|Huawei Device Co., Ltd.
+60629A|Juniper Networks
+60634C|D-Link International
+606525|Apple, Inc.
+6065F4|Chipsea Technologies (Shenzhen) Crop.
+606682|SHENZHEN ATEKO PHOTOELECTRICITY CO.,LTD
+606720|Intel Corporate
+60684E|Samsung Electronics Co.,Ltd
+606944|Apple, Inc.
+606BB3|zte corporation
+606BBD|Samsung Electronics Co.,Ltd
+606C66|Intel Corporate
+606DC7|Hon Hai Precision Ind. Co.,Ltd.
+606EE8|Xiaomi Communications Co Ltd
+60706C|Google, Inc.
+607072|SHENZHEN HONGDE SMART LINK TECHNOLOGY CO., LTD
+6070C0|Apple, Inc.
+60735C|Cisco Systems, Inc
+6073BC|zte corporation
+60756C|LG Electronics
+607623|Shenzhen E-Superlink Technology Co., Ltd
+6077E2|Samsung Electronics Co.,Ltd
+6079C9|HUAWEI TECHNOLOGIES CO.,LTD
+607DDD|Shenzhen Shichuangyi Electronics Co.,Ltd
+607EC9|Apple, Inc.
+607ECD|HUAWEI TECHNOLOGIES CO.,LTD
+607EDD|Microsoft Mobile Oy
+607FCB|Samsung Electronics Co.,Ltd
+608110|Apple, Inc.
+608246|Apple, Inc.
+608306|Huawei Device Co., Ltd.
+608334|HUAWEI TECHNOLOGIES CO.,LTD
+608373|Apple, Inc.
+6083E7|TP-Link Systems Inc
+608625|FN-LINK TECHNOLOGY Ltd.
+608B0E|Apple, Inc.
+608C4A|Apple, Inc.
+608E08|Samsung Electronics Co.,Ltd
+608F5C|Samsung Electronics Co.,Ltd
+608FA4|Nokia Solutions and Networks GmbH & Co. KG
+609217|Apple, Inc.
+6092C8|Roku, Inc
+609316|Apple, Inc.
+609532|Zebra Technologies Inc.
+609578|Samsung Electronics Co.,Ltd
+6095BD|Apple, Inc.
+6096A4|HUAWEI TECHNOLOGIES CO.,LTD
+609849|Nokia Solutions and Networks India Private Limited
+6099D1|Vuzix / Lenovo
+609AC1|Apple, Inc.
+609BB4|HUAWEI TECHNOLOGIES CO.,LTD
+60A10A|Samsung Electronics Co.,Ltd
+60A2C6|HUAWEI TECHNOLOGIES CO.,LTD
+60A37D|Apple, Inc.
+60A3E3|TP-LINK TECHNOLOGIES CO.,LTD.
+60A44C|ASUSTek COMPUTER INC.
+60A4B7|TP-Link Systems Inc
+60A4D0|Samsung Electronics Co.,Ltd
+60A5E2|Intel Corporate
+60A6C5|HUAWEI TECHNOLOGIES CO.,LTD
+60A730|Shenzhen Yipinfang Internet Technology Co.,Ltd
+60A751|Huawei Device Co., Ltd.
+60A8FE|Nokia Solutions and Networks GmbH & Co. KG
+60A954|Cisco Systems, Inc
+60AAEF|Huawei Device Co., Ltd.
+60AB67|Xiaomi Communications Co Ltd
+60AF6D|Samsung Electronics Co.,Ltd
+60B0E8|Huawei Device Co., Ltd.
+60B4A2|Samsung Electronics Co.,Ltd
+60B617|Fiberhome Telecommunication Technologies Co.,LTD
+60B705|Shenzhen Skyworth Digital Technology CO., Ltd
+60B76E|Google, Inc.
+60B9C0|Cisco Systems, Inc
+60BBEB|HUAWEI TECHNOLOGIES CO.,LTD
+60BD83|HUAWEI TECHNOLOGIES CO.,LTD
+60BEB5|Motorola Mobility LLC, a Lenovo Company
+60BEC4|Apple, Inc.
+60C547|Apple, Inc.
+60C5AD|Samsung Electronics Co.,Ltd
+60C727|Digiboard Eletronica da Amazonia Ltda
+60C78D|Juniper Networks
+60C798|Verifone, Inc.
+60C9AA|Nokia
+60CA3A|Apple, Inc.
+60CE41|HUAWEI TECHNOLOGIES CO.,LTD
+60CF84|ASUSTek COMPUTER INC.
+60D02C|Ruckus Wireless
+60D039|Apple, Inc.
+60D0A9|Samsung Electronics Co.,Ltd
+60D15F|Futurepath Technology(Shenzhen)Co.,Ltd.
+60D178|Cisco Systems, Inc
+60D2DD|Shenzhen Baitong Putian Technology Co.,Ltd.
+60D51B|Fujitsu Limited
+60D561|Shenzhen Glazero Technology Co., Ltd.
+60D755|HUAWEI TECHNOLOGIES CO.,LTD
+60D819|Hon Hai Precision Ind. Co.,Ltd.
+60D9A0|Lenovo Mobile Communication Technology Ltd.
+60D9C7|Apple, Inc.
+60DD10|Shenzhen Angxun Technology Co.,Ltd
+60DD70|Apple, Inc.
+60DD8E|Intel Corporate
+60DE18|Apple, Inc.
+60DE44|HUAWEI TECHNOLOGIES CO.,LTD
+60DE94|HUAWEI TECHNOLOGIES CO.,LTD
+60DEF3|HUAWEI TECHNOLOGIES CO.,LTD
+60DEF4|Shenzhen iComm Semiconductor CO.,LTD
+60E327|TP-LINK TECHNOLOGIES CO.,LTD.
+60E32B|Intel Corporate
+60E3AC|LG Electronics (Mobile Communications)
+60E5D8|zte corporation
+60E701|HUAWEI TECHNOLOGIES CO.,LTD
+60EB69|Quanta Computer Inc.
+60EE5C|SHENZHEN FAST TECHNOLOGIES CO.,LTD
+60EFC6|Shenzhen Chima Technologies Co Limited
+60F18A|HUAWEI TECHNOLOGIES CO.,LTD
+60F262|Intel Corporate
+60F445|Apple, Inc.
+60F494|Hon Hai Precision Ind. Co.,Ltd.
+60F549|Apple, Inc.
+60F620|Sonos Inc.
+60F677|Intel Corporate
+60F723|Beijing Xiaomi Mobile Software Co., Ltd
+60F81D|Apple, Inc.
+60FA9D|HUAWEI TECHNOLOGIES CO.,LTD
+60FAA7|SHENZHEN MTC CO LTD
+60FACD|Apple, Inc.
+60FB00|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+60FB42|Apple, Inc.
+60FDA6|Apple, Inc.
+60FEC5|Apple, Inc.
+60FF12|Samsung Electronics Co.,Ltd
+60FF9E|AzureWave Technology Inc.
+64006A|Dell Inc.
+6400F1|Cisco Systems, Inc
+64037F|Samsung Electronics Co.,Ltd
+6405E9|Shenzhen WayOS Technology Crop., Ltd.
+64078C|HUAWEI TECHNOLOGIES CO.,LTD
+6407F6|Samsung Electronics Co.,Ltd
+640864|Cisco Systems, Inc
+640980|Xiaomi Communications Co Ltd
+640BD7|Apple, Inc.
+640C91|Apple, Inc.
+640D22|LG Electronics (Mobile Communications)
+640DCE|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+6411A4|Motorola Mobility LLC, a Lenovo Company
+641225|Cisco Systems, Inc
+64136C|zte corporation
+6413AB|HUAWEI TECHNOLOGIES CO.,LTD
+64167F|Polycom
+64168D|Cisco Systems, Inc
+6416F0|HUAWEI TECHNOLOGIES CO.,LTD
+6417CD|Samsung Electronics Co.,Ltd
+6418DF|Sagemcom Broadband SAS
+641B2F|Samsung Electronics Co.,Ltd
+641CAE|Samsung Electronics Co.,Ltd
+641CB0|Samsung Electronics Co.,Ltd
+64200C|Apple, Inc.
+642315|Huawei Device Co., Ltd.
+642656|Shenzhen Fanweitai Technology Service Co.,Ltd
+642737|Hon Hai Precision Ind. Co.,Ltd.
+642753|Huawei Device Co., Ltd.
+642943|D-Link Corporation
+6429FF|HUAWEI TECHNOLOGIES CO.,LTD
+642CAC|HUAWEI TECHNOLOGIES CO.,LTD
+642E41|HUAWEI TECHNOLOGIES CO.,LTD
+642F1C|HUAWEI TECHNOLOGIES CO.,LTD
+643135|Apple, Inc.
+643150|Hewlett Packard
+6432A8|Intel Corporate
+643AEA|Cisco Systems, Inc
+643E0A|HUAWEI TECHNOLOGIES CO.,LTD
+643E8C|HUAWEI TECHNOLOGIES CO.,LTD
+6441E6|Apple, Inc.
+6441FF|Shenzhen Wolf Technology Co., Ltd.
+644212|Shenzhen Water World Information Co.,Ltd.
+644842|Apple, Inc.
+64497D|Intel Corporate
+644A7D|Intel Corporate
+644C36|Intel Corporate
+644ED7|HP Inc.
+644F56|YEALINK(XIAMEN) NETWORK TECHNOLOGY CO.,LTD.
+645106|Hewlett Packard
+6451F4|Huawei Device Co., Ltd.
+6453E0|HUAWEI TECHNOLOGIES CO.,LTD
+645601|TP-LINK TECHNOLOGIES CO.,LTD.
+6456B5|Samsung Electronics Co.,Ltd
+6457BA|Intel Corporate
+645A36|Apple, Inc.
+645AED|Apple, Inc.
+645D86|Intel Corporate
+645DD7|Shenzhen Lifesense Medical Electronics Co., Ltd.
+645DF4|Samsung Electronics Co.,Ltd
+645E10|HUAWEI TECHNOLOGIES CO.,LTD
+646140|Huawei Device Co., Ltd.
+646306|Xiaomi Communications Co Ltd
+64644A|Beijing Xiaomi Mobile Software Co., Ltd
+64649B|Juniper Networks
+646624|Sagemcom Broadband SAS
+6466B3|TP-LINK TECHNOLOGIES CO.,LTD.
+6466D8|Samsung Electronics Co.,Ltd
+6467CD|HUAWEI TECHNOLOGIES CO.,LTD
+646A52|Avaya Inc
+646CB2|Samsung Electronics Co.,Ltd
+646D2F|Apple, Inc.
+646D4E|HUAWEI TECHNOLOGIES CO.,LTD
+646D6C|HUAWEI TECHNOLOGIES CO.,LTD
+646E60|zte corporation
+646E69|Liteon Technology Corporation
+646E97|TP-LINK TECHNOLOGIES CO.,LTD.
+646EE0|Intel Corporate
+647002|TP-LINK TECHNOLOGIES CO.,LTD.
+647033|Apple, Inc.
+647366|Shenzhen Siera Technology Ltd
+647520|zte corporation
+6476BA|Apple, Inc.
+647791|Samsung Electronics Co.,Ltd
+647924|Huawei Device Co., Ltd.
+647999|Sagemcom Broadband SAS
+6479F0|Intel Corporate
+647B1E|Sagemcom Broadband SAS
+647BCE|Samsung Electronics Co.,Ltd
+647CE8|Palo Alto Networks
+648099|Intel Corporate
+648214|FN-LINK TECHNOLOGY Ltd.
+648505|zte corporation
+64876C|HUAWEI TECHNOLOGIES CO.,LTD
+648788|Juniper Networks
+648914|Espressif Inc.
+64899A|LG Electronics (Mobile Communications)
+6489F1|Samsung Electronics Co.,Ltd
+648F3E|Cisco Systems, Inc
+6490C1|Beijing Xiaomi Mobile Software Co., Ltd
+64956C|LG Electronics
+649746|AzureWave Technology Inc.
+649A08|Shenzhen SuperElectron Technology Co.,Ltd.
+649ABE|Apple, Inc.
+649C81|Qualcomm Inc.
+649CF3|Fiberhome Telecommunication Technologies Co.,LTD
+649D38|Google, Inc.
+649E31|Beijing Xiaomi Mobile Software Co., Ltd
+649EF3|Cisco Systems, Inc
+64A0E7|Cisco Systems, Inc
+64A198|Huawei Device Co., Ltd.
+64A200|Xiaomi Communications Co Ltd
+64A28A|Huawei Device Co., Ltd.
+64A2F9|OnePlus Technology (Shenzhen) Co., Ltd
+64A3CB|Apple, Inc.
+64A5C3|Apple, Inc.
+64A651|HUAWEI TECHNOLOGIES CO.,LTD
+64A7DD|Avaya Inc
+64A963|Huawei Device Co., Ltd.
+64AC2B|Juniper Networks
+64ACE0|Samsung Electronics Co.,Ltd
+64AE0C|Cisco Systems, Inc
+64B0A6|Apple, Inc.
+64B0E8|Huawei Device Co., Ltd.
+64B2B4|Fiberhome Telecommunication Technologies Co.,LTD
+64B2E4|Shenzhen Skyworth Digital Technology CO., Ltd
+64B310|Samsung Electronics Co.,Ltd
+64B473|Xiaomi Communications Co Ltd
+64B4E8|Shenzhen D-Robotics Co., Ltd.
+64B5F2|Samsung Electronics Co.,Ltd
+64B708|Espressif Inc.
+64B853|Samsung Electronics Co.,Ltd
+64B94E|Dell Technologies
+64B9E8|Apple, Inc.
+64BAA4|zte corporation
+64BC0C|LG Electronics (Mobile Communications)
+64BC43|HUAWEI TECHNOLOGIES CO.,LTD
+64BC58|Intel Corporate
+64BD6D|Apple, Inc.
+64BF6B|HUAWEI TECHNOLOGIES CO.,LTD
+64C045|Apple, Inc.
+64C2DE|LG Electronics (Mobile Communications)
+64C354|Avaya Inc
+64C394|HUAWEI TECHNOLOGIES CO.,LTD
+64C3D6|Juniper Networks
+64C5F9|SHENZHEN TECNO TECHNOLOGY
+64C6D2|Seiko Epson Corporation
+64C753|Apple, Inc.
+64C901|INVENTEC Corporation
+64C905|Apple, Inc.
+64C9F1|Amazon Technologies Inc.
+64CC2E|Xiaomi Communications Co Ltd
+64CDC2|Amazon Technologies Inc.
+64D0D6|Samsung Electronics Co.,Ltd
+64D154|Routerboard.com
+64D2C4|Apple, Inc.
+64D4DA|Intel Corporate
+64D562|Huawei Device Co., Ltd.
+64D608|Shenzhen Ailyworld Technology Co.,Ltd.
+64D69A|Intel Corporate
+64D7C0|Huawei Device Co., Ltd.
+64D814|Cisco Systems, Inc
+64D989|Cisco Systems, Inc
+64DB38|zte corporation
+64DB43|Motorola (Wuhan) Mobility Technologies Communication Co., Ltd.
+64DB8B|Hangzhou Hikvision Digital Technology Co.,Ltd.
+64DBF7|Nokia Shanghai Bell Co., Ltd.
+64DD68|Zyxel Communications Corporation
+64DDE9|Xiaomi Communications Co Ltd
+64DE6D|Intel Corporate
+64E172|Shenzhen Qihoo Intelligent Technology Co.,Ltd
+64E4A5|LG Electronics
+64E682|Apple, Inc.
+64E7D8|Samsung Electronics Co.,Ltd
+64E833|Espressif Inc.
+64E881|Hewlett Packard Enterprise
+64E950|Cisco Systems, Inc
+64EB8C|Seiko Epson Corporation
+64EB94|zte corporation
+64F69D|Cisco Systems, Inc
+64F705|Huawei Device Co., Ltd.
+64F81C|Huawei Technologies Co., Ltd.
+64FA2B|Sagemcom Broadband SAS
+64FD29|Zhejiang Dahua Technology Co., Ltd.
+64FD96|Sagemcom Broadband SAS
+680125|Amazon Technologies Inc.
+6802B8|Compal Broadband Networks, Inc.
+680489|Cisco Systems, Inc
+680571|Samsung Electronics Co.,Ltd
+6805CA|Intel Corporate
+680715|Intel Corporate
+68080D|Shenzhen Yingsheng Technology Co., LTD
+680927|Apple, Inc.
+680947|Espressif Inc.
+681324|Huawei Device Co., Ltd.
+6813F3|Amazon Technologies Inc.
+681401|Hon Hai Precision Ind. Co.,Ltd.
+681590|Sagemcom Broadband SAS
+681729|Intel Corporate
+681A47|Apple, Inc.
+681AA4|Shenzhen Skyworth Digital Technology CO., Ltd
+681AB2|zte corporation
+681BEF|HUAWEI TECHNOLOGIES CO.,LTD
+681C52|Cisco Systems, Inc
+681DEF|Shenzhen CYX Technology Co., Ltd.
+68228E|Juniper Networks
+6822E5|Huawei Device Co., Ltd.
+6823F4|Shenzhen Jinlangxin Technology Co., Ltd
+6825DD|Espressif Inc.
+682737|Samsung Electronics Co.,Ltd
+68275F|zte corporation
+68286C|Sony Interactive Entertainment Inc.
+6828CF|Hewlett Packard Enterprise
+682ADD|zte corporation
+682C7B|Cisco Systems, Inc
+682D83|SHENZHEN DINGHE COMMUNICATION COMPANY
+682E3C|Ubiquiti Inc
+682F67|Apple, Inc.
+683036|Apple, Inc.
+683045|HUAWEI TECHNOLOGIES CO.,LTD
+683421|Intel Corporate
+683563|SHENZHEN LIOWN ELECTRONICS CO.,LTD.
+6837E9|Amazon Technologies Inc.
+683A1E|Cisco Meraki
+683B09|Apple, Inc.
+683B78|Cisco Systems, Inc
+683E26|Intel Corporate
+683EC0|Apple, Inc.
+68403C|Fiberhome Telecommunication Technologies Co.,LTD
+684465|Apple, Inc.
+684571|Huawei Device Co., Ltd.
+6845CC|Apple, Inc.
+6845F1|TOSHIBA CLIENT SOLUTIONS CO., LTD.
+6847C5|Intel Corporate
+684898|Samsung Electronics Co.,Ltd
+684983|HUAWEI TECHNOLOGIES CO.,LTD
+684992|Cisco Meraki
+684A5F|Apple, Inc.
+684AAE|HUAWEI TECHNOLOGIES CO.,LTD
+684AE9|Samsung Electronics Co.,Ltd
+684C25|Huawei Device Co., Ltd.
+684CA8|Shenzhen Herotel Tech. Co., Ltd.
+684DB6|Xiaomi Communications Co Ltd
+684E05|HUNAN FN-LINK TECHNOLOGY LIMITED
+684F64|Dell Inc.
+685134|Hewlett Packard Enterprise
+68545A|Intel Corporate
+6854FD|Amazon Technologies Inc.
+6855D4|Seiko Epson Corporation
+68572D|Tuya Smart Inc.
+685811|Fiberhome Telecommunication Technologies Co.,LTD
+685ACF|Samsung Electronics Co.,Ltd
+685B35|Apple, Inc.
+685D43|Intel Corporate
+685EDD|Apple, Inc.
+686372|Huawei Device Co., Ltd.
+68644B|Apple, Inc.
+686725|Espressif Inc.
+6867C7|Sagemcom Broadband SAS
+686CE6|Microsoft Corporation
+686DBC|Hangzhou Hikvision Digital Technology Co.,Ltd.
+687161|Cisco Systems, Inc
+687251|Ubiquiti Inc
+6872C3|Samsung Electronics Co.,Ltd
+68764F|Sony Corporation
+687724|TP-LINK TECHNOLOGIES CO.,LTD.
+6877DA|zte corporation
+6878A8|Fiberhome Telecommunication Technologies Co.,LTD
+687909|Cisco Systems, Inc
+6879ED|SHARP Corporation
+687A64|Intel Corporate
+687BDC|Juniper Networks
+687D00|Shenzhen YOUHUA Technology Co., Ltd
+687D6B|Samsung Electronics Co.,Ltd
+687DAC|Samsung Electronics Co.,Ltd
+687DB4|Cisco Systems, Inc
+687F74|Cisco-Linksys, LLC
+687FF0|TP-Link Systems Inc
+6881E0|HUAWEI TECHNOLOGIES CO.,LTD
+6883CB|Apple, Inc.
+68847E|FUJITSU LIMITED
+6886A7|Cisco Systems, Inc
+68871C|Motorola Mobility LLC, a Lenovo Company
+6887BD|zte corporation
+6887C6|Cisco Systems, Inc
+6889C1|HUAWEI TECHNOLOGIES CO.,LTD
+688AF0|zte corporation
+688F84|HUAWEI TECHNOLOGIES CO.,LTD
+688FC9|Zhuolian (Shenzhen) Communication Co., Ltd
+689234|Ruckus Wireless
+689268|Motorola Mobility LLC, a Lenovo Company
+689423|Hon Hai Precision Ind. Co.,Ltd.
+68944A|zte corporation
+68951B|Huawei Device Co., Ltd.
+68962E|HUAWEI TECHNOLOGIES CO.,LTD
+68967B|Apple, Inc.
+68974B|Shenzhen Costar Electronics Co. Ltd.
+6899CD|Cisco Systems, Inc
+689A21|Fiberhome Telecommunication Technologies Co.,LTD
+689A87|Amazon Technologies Inc.
+689B43|Huawei Device Co., Ltd.
+689C70|Apple, Inc.
+689CE2|Cisco Systems, Inc
+689DD2|Espressif Inc.
+689E0B|Cisco Systems, Inc
+689E29|zte corporation
+689E67|SHENZHEN FOCUSCOM TECHNOLOGIES CO., LTD
+689E6A|Huawei Device Co., Ltd.
+689FD4|Amazon Technologies Inc.
+689FF0|zte corporation
+68A03E|HUAWEI TECHNOLOGIES CO.,LTD
+68A0F6|HUAWEI TECHNOLOGIES CO.,LTD
+68A34F|Nokia
+68A3C4|Liteon Technology Corporation
+68A46A|HUAWEI TECHNOLOGIES CO.,LTD
+68A593|Apple, Inc.
+68A682|Shenzhen YOUHUA Technology Co., Ltd
+68A729|Apple, Inc.
+68A828|HUAWEI TECHNOLOGIES CO.,LTD
+68A86D|Apple, Inc.
+68AB09|Nokia
+68AB1E|Apple, Inc.
+68ABA9|Sagemcom Broadband SAS
+68ABBC|Beijing Xiaomi Mobile Software Co., Ltd
+68AE04|Shenzhen SuperElectron Technology Co.,Ltd.
+68AE20|Apple, Inc.
+68B35E|Shenzhen Neostra Technology Co.Ltd
+68B599|Hewlett Packard
+68B5E3|HUAWEI TECHNOLOGIES CO.,LTD
+68B691|Amazon Technologies Inc.
+68B6B3|Espressif Inc.
+68B76B|Fiberhome Telecommunication Technologies Co.,LTD
+68B8BB|Beijing Xiaomi Electronics Co.,Ltd
+68B9D3|Shenzhen Trolink Technology CO, LTD
+68BC0C|Cisco Systems, Inc
+68BDAB|Cisco Systems, Inc
+68BFC4|Samsung Electronics Co.,Ltd
+68C44C|Xiaomi Communications Co Ltd
+68C44D|Motorola Mobility LLC, a Lenovo Company
+68C63A|Espressif Inc.
+68C6AC|Intel Corporate
+68CAC4|Apple, Inc.
+68CAE4|Cisco Systems, Inc
+68CC6E|HUAWEI TECHNOLOGIES CO.,LTD
+68CCAE|Fortinet, Inc.
+68D1BA|Shenzhen YOUHUA Technology Co., Ltd
+68D1FD|Shenzhen Trimax Technology Co.,Ltd
+68D482|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+68D79A|Ubiquiti Inc
+68D927|HUAWEI TECHNOLOGIES CO.,LTD
+68D93C|Apple, Inc.
+68D972|Cisco Systems, Inc
+68DBCA|Apple, Inc.
+68DBF5|Amazon Technologies Inc.
+68DDB7|TP-LINK TECHNOLOGIES CO.,LTD.
+68DECE|Fiberhome Telecommunication Technologies Co.,LTD
+68DFDD|Xiaomi Communications Co Ltd
+68DFE4|Samsung Electronics Co.,Ltd
+68E209|HUAWEI TECHNOLOGIES CO.,LTD
+68E580|Apple, Inc.
+68E59E|Cisco Systems, Inc
+68E5D9|Fiberhome Telecommunication Technologies Co.,LTD
+68E7C2|Samsung Electronics Co.,Ltd
+68E905|Fiberhome Telecommunication Technologies Co.,LTD
+68EBAE|Samsung Electronics Co.,Ltd
+68ECC5|Intel Corporate
+68ED57|Juniper Networks
+68EDA4|Shenzhen Seavo Technology Co.,Ltd
+68EE88|Shenzhen TINNO Mobile Technology Corp.
+68EE8F|Espressif Inc.
+68EE96|Cisco SPVTG
+68EF43|Apple, Inc.
+68EFBD|Cisco Systems, Inc
+68EFDC|Apple, Inc.
+68F0BC|Shenzhen LiWiFi Technology Co., Ltd
+68F38E|Juniper Networks
+68F543|HUAWEI TECHNOLOGIES CO.,LTD
+68F63B|Amazon Technologies Inc.
+68F728|LCFC(Hefei) Electronics Technology co., ltd
+68F7D8|Microsoft Corporation
+68F90F|Intel Corporate
+68FB7E|Apple, Inc.
+68FCCA|Samsung Electronics Co.,Ltd
+68FDE8|Ruckus Wireless
+68FE71|Espressif Inc.
+68FEDA|Fiberhome Telecommunication Technologies Co.,LTD
+68FEF7|Apple, Inc.
+68FF7B|TP-LINK TECHNOLOGIES CO.,LTD.
+6C006B|Samsung Electronics Co.,Ltd
+6C0273|Shenzhen Jin Yun Video Equipment Co., Ltd.
+6C028C|HUAWEI TECHNOLOGIES CO.,LTD
+6C02E0|HP Inc.
+6C0309|Cisco Systems, Inc
+6C0370|Extreme Networks, Inc.
+6C03B5|Cisco Systems, Inc
+6C047A|HUAWEI TECHNOLOGIES CO.,LTD
+6C0699|Beijing Xiaomi Mobile Software Co., Ltd
+6C06D6|Huawei Device Co., Ltd.
+6C09BF|Fiberhome Telecommunication Technologies Co.,LTD
+6C0B5E|HP Inc.
+6C0C9A|Amazon Technologies Inc.
+6C0D34|Nokia
+6C0DC4|Beijing Xiaomi Electronics Co., Ltd.
+6C0E0D|Sony Corporation
+6C1041|Shenzhen Skyworth Digital Technology CO., Ltd
+6C11BA|zte corporation
+6C1270|Apple, Inc.
+6C13D5|Cisco Systems, Inc
+6C146E|HUAWEI TECHNOLOGIES CO.,LTD
+6C1544|Microsoft Corporation
+6C1632|HUAWEI TECHNOLOGIES CO.,LTD
+6C198F|D-Link International
+6C19C0|Apple, Inc.
+6C1A75|Huawei Device Co., Ltd.
+6C1C71|Zhejiang Dahua Technology Co., Ltd.
+6C1D2C|HUAWEI TECHNOLOGIES CO.,LTD
+6C1F8A|Apple, Inc.
+6C2056|Cisco Systems, Inc
+6C22F7|Nokia Shanghai Bell Co., Ltd.
+6C23B9|Sony Corporation
+6C2408|LCFC(Hefei) Electronics Technology co., ltd
+6C2483|Microsoft Mobile Oy
+6C2636|HUAWEI TECHNOLOGIES CO.,LTD
+6C2779|Microsoft Mobile Oy
+6C2995|Intel Corporate
+6C29D2|Cisco Systems, Inc
+6C2ACB|Paxton Access Ltd
+6C2B59|Dell Inc.
+6C2CDC|Skyworth Digital Technology(Shenzhen) Co.,Ltd
+6C2E85|Sagemcom Broadband SAS
+6C2F2C|Samsung Electronics Co.,Ltd
+6C2F80|Intel Corporate
+6C2F8A|Samsung Electronics Co.,Ltd
+6C310E|Cisco Systems, Inc
+6C3491|HUAWEI TECHNOLOGIES CO.,LTD
+6C3845|Fiberhome Telecommunication Technologies Co.,LTD
+6C3A84|Shenzhen Aero-Startech. Co.Ltd
+6C3AFF|Apple, Inc.
+6C3B6B|Routerboard.com
+6C3BE5|Hewlett Packard
+6C3C7C|CANON INC.
+6C3C8C|Dell Inc.
+6C3DD8|Espressif Systems (Singapore) Pte. Ltd
+6C3E6D|Apple, Inc.
+6C4008|Apple, Inc.
+6C410E|Cisco Systems, Inc
+6C416A|Cisco Systems, Inc
+6C41DE|HUAWEI TECHNOLOGIES CO.,LTD
+6C442A|HUAWEI TECHNOLOGIES CO.,LTD
+6C483F|Xiaomi Communications Co Ltd
+6C48A6|Fiberhome Telecommunication Technologies Co.,LTD
+6C4A85|Apple, Inc.
+6C4B90|LiteON
+6C4CBC|TP-Link Systems Inc.
+6C4CE2|Intel Corporate
+6C4D51|Shenzhen Ceres Technology Co., Ltd.
+6C4D73|Apple, Inc.
+6C4EF6|Cisco Systems, Inc
+6C4F89|Zyxel Communications Corporation
+6C4FA1|Cisco Systems, Inc
+6C504D|Cisco Systems, Inc
+6C51BF|Huawei Device Co., Ltd.
+6C51E4|Huawei Device Co., Ltd.
+6C5563|Samsung Electronics Co.,Ltd
+6C558D|HUAWEI TECHNOLOGIES CO.,LTD
+6C55B1|Amazon Technologies Inc.
+6C5697|Amazon Technologies Inc.
+6C5A34|Shenzhen Haitianxiong Electronic Co., Ltd.
+6C5AB0|TP-Link Systems Inc
+6C5AB5|TCL Technoly Electronics (Huizhou) Co., Ltd.
+6C5D3A|Microsoft Corporation
+6C5D63|ShenZhen Rapoo Technology Co., Ltd.
+6C5E3B|Cisco Systems, Inc
+6C5F1C|Lenovo Mobile Communication Technology Ltd.
+6C6016|OnePlus Technology (Shenzhen) Co., Ltd
+6C60D0|Huawei Device Co., Ltd.
+6C626D|Micro-Star INT'L CO., LTD
+6C6286|Nokia
+6C62FE|Juniper Networks
+6C63F8|Ubiquiti Inc
+6C67EF|HUAWEI TECHNOLOGIES CO.,LTD
+6C688A|Amazon Technologies Inc.
+6C6A77|Intel Corporate
+6C6C0F|HUAWEI TECHNOLOGIES CO.,LTD
+6C6CD3|Cisco Systems, Inc
+6C6F18|Stereotaxis, Inc.
+6C709F|Apple, Inc.
+6C70CB|Samsung Electronics Co.,Ltd
+6C710D|Cisco Systems, Inc
+6C71D2|HUAWEI TECHNOLOGIES CO.,LTD
+6C71D9|AzureWave Technology Inc.
+6C7220|D-Link International
+6C72B8|LCFC(Hefei) Electronics Technology co., ltd
+6C72E7|Apple, Inc.
+6C7637|Huawei Device Co., Ltd.
+6C7660|KYOCERA CORPORATION
+6C7742|zte corporation
+6C77F0|Huawei Device Co., Ltd.
+6C78C1|Juniper Networks
+6C7DB7|Cisco Meraki
+6C7E67|Apple, Inc.
+6C7F0C|Cisco Meraki
+6C7F49|Huawei Device Co., Ltd.
+6C8243|Huawei Device Co., Ltd.
+6C8336|Samsung Electronics Co.,Ltd
+6C8375|Broadcom Limited
+6C8814|Intel Corporate
+6C8B2F|zte corporation
+6C8BD3|Cisco Systems, Inc
+6C8D77|Cisco Systems, Inc
+6C8DC1|Apple, Inc.
+6C8FB5|Microsoft Mobile Oy
+6C9188|Nokia
+6C92CF|Broadcom Limited
+6C9354|Yaojin Technology (Shenzhen) Co., LTD.
+6C9466|Intel Corporate
+6C94F8|Apple, Inc.
+6C96CF|Apple, Inc.
+6C976D|Motorola Mobility LLC, a Lenovo Company
+6C9961|Sagemcom Broadband SAS
+6C9989|Cisco Systems, Inc
+6C999D|Amazon Technologies Inc.
+6C9B02|Nokia Corporation
+6C9CED|Cisco Systems, Inc
+6C9E7C|Fiberhome Telecommunication Technologies Co.,LTD
+6CA100|Intel Corporate
+6CA4D1|Fiberhome Telecommunication Technologies Co.,LTD
+6CA75F|zte corporation
+6CA780|Nokia Corporation
+6CA849|Avaya Inc
+6CA858|Fiberhome Telecommunication Technologies Co.,LTD
+6CAAB3|Ruckus Wireless
+6CAB05|Cisco Systems, Inc
+6CAB31|Apple, Inc.
+6CACC2|Samsung Electronics Co.,Ltd
+6CADF8|AzureWave Technology Inc.
+6CAEE3|Nokia
+6CB0CE|NETGEAR
+6CB0FD|Shenzhen Xinghai Iot Technology Co.,Ltd
+6CB133|Apple, Inc.
+6CB158|TP-LINK TECHNOLOGIES CO.,LTD.
+6CB227|Sony Video & Sound Products Inc.
+6CB2AE|Cisco Systems, Inc
+6CB311|Shenzhen Lianrui Electronics Co.,Ltd
+6CB456|Espressif Inc.
+6CB4FD|Huawei Device Co., Ltd.
+6CB749|HUAWEI TECHNOLOGIES CO.,LTD
+6CB7E2|HUAWEI TECHNOLOGIES CO.,LTD
+6CB7F4|Samsung Electronics Co.,Ltd
+6CB881|zte corporation
+6CBAB8|Sagemcom Broadband SAS
+6CC217|Hewlett Packard
+6CC242|Shenzhen Skyworth Digital Technology CO., Ltd
+6CC26B|Apple, Inc.
+6CC3B2|Cisco Meraki
+6CC49F|Hewlett Packard Enterprise
+6CC7EC|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+6CC840|Espressif Inc.
+6CCDD6|NETGEAR
+6CD008|zte corporation
+6CD032|LG Electronics
+6CD1E5|HUAWEI TECHNOLOGIES CO.,LTD
+6CD2BA|zte corporation
+6CD552|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+6CD63F|HUAWEI TECHNOLOGIES CO.,LTD
+6CD68A|LG Electronics (Mobile Communications)
+6CD6E3|Cisco Systems, Inc
+6CD704|HUAWEI TECHNOLOGIES CO.,LTD
+6CD719|Fiberhome Telecommunication Technologies Co.,LTD
+6CDD30|Cisco Systems, Inc
+6CDDBC|Samsung Electronics Co.,Ltd
+6CDEA9|Cisco Meraki
+6CE210|Espressif Systems (Singapore) Pte. Ltd
+6CE5C9|Apple, Inc.
+6CE85C|Apple, Inc.
+6CE873|TP-LINK TECHNOLOGIES CO.,LTD.
+6CE874|HUAWEI TECHNOLOGIES CO.,LTD
+6CE907|Nokia Corporation
+6CEBB6|HUAWEI TECHNOLOGIES CO.,LTD
+6CEC5A|Hon Hai Precision Ind. CO.,Ltd.
+6CECA1|SHENZHEN CLOU ELECTRONICS CO. LTD.
+6CEEF7|shenzhen scodeno technology co., Ltd.
+6CEFBD|Cisco Meraki
+6CEFC6|SHENZHEN TWOWING TECHNOLOGIES CO.,LTD.
+6CF049|GIGA-BYTE TECHNOLOGY CO.,LTD.
+6CF2D8|CANON INC.
+6CF373|Samsung Electronics Co.,Ltd
+6CF37F|Hewlett Packard Enterprise
+6CF6DA|Intel Corporate
+6CF712|Nokia Solutions and Networks GmbH & Co. KG
+6CF784|Xiaomi Communications Co Ltd
+6CFA58|Avaya Inc
+6CFA89|Cisco Systems, Inc
+6CFE54|Intel Corporate
+6CFFCE|Sagemcom Broadband SAS
+7001B5|Cisco Systems, Inc
+70039F|Espressif Inc.
+70041D|Espressif Inc.
+700514|LG Electronics (Mobile Communications)
+700810|Intel Corporate
+700894|Liteon Technology Corporation
+700971|Samsung Electronics Co.,Ltd
+700B01|Sagemcom Broadband SAS
+700B4F|Cisco Systems, Inc
+700F6A|Cisco Systems, Inc
+700FC7|SHENZHEN IKINLOOP TECHNOLOGY CO.,LTD.
+70105C|Cisco Systems, Inc
+70106F|Hewlett Packard Enterprise
+70110E|zte corporation
+701124|Apple, Inc.
+701384|Apple, Inc.
+7014A6|Apple, Inc.
+7015FB|Intel Corporate
+70188B|Hon Hai Precision Ind. Co.,Ltd.
+7018A7|Cisco Systems, Inc
+70192F|HUAWEI TECHNOLOGIES CO.,LTD
+701A04|Liteon Technology Corporation
+701AB8|Intel Corporate
+701CE7|Intel Corporate
+701D08|99IOT Shenzhen co.,ltd
+701F3C|Samsung Electronics Co.,Ltd
+701F53|Cisco Systems, Inc
+702084|Hon Hai Precision Industry Co., Ltd.
+70217F|Xiaomi Communications Co Ltd
+7022FE|Apple, Inc.
+702526|Nokia
+702605|SONY Visual Products Inc.
+70287D|Google, Inc.
+70288B|Samsung Electronics Co.,Ltd
+702900|Shenzhen ChipTrip Technology Co,Ltd
+702AD5|Samsung Electronics Co.,Ltd
+702E22|zte corporation
+702F35|HUAWEI TECHNOLOGIES CO.,LTD
+703018|Avaya Inc
+70317F|Apple, Inc.
+70320C|Ruckus Wireless
+703217|Intel Corporate
+703509|Cisco Systems, Inc
+7038EE|Avaya Inc
+703A0E|Hewlett Packard Enterprise
+703A2D|Shenzhen V-Link Technology CO., LTD.
+703A51|Xiaomi Communications Co Ltd
+703A73|Shenzhen Sundray Technologies company Limited
+703A8C|Shenzhen Skyworth Digital Technology CO., Ltd
+703ACB|Google, Inc.
+703AD8|Shenzhen Afoundry Electronic Co., Ltd
+703C69|Apple, Inc.
+703EAC|Apple, Inc.
+7040FF|Huawei Device Co., Ltd.
+70441C|SHENZHEN KAIFA TECHNOLOGY CO.,LTD.
+704698|HUAWEI TECHNOLOGIES CO.,LTD
+704777|Ruckus Wireless
+70480F|Apple, Inc.
+7049A2|Zyxel Communications Corporation
+704BCA|Espressif Inc.
+704CA2|Apple, Inc.
+704CA5|Fortinet, Inc.
+704CB6|Shenzhen SuperElectron Technology Co.,Ltd.
+704D7B|ASUSTek COMPUTER INC.
+704E66|SHENZHEN FAST TECHNOLOGIES CO.,LTD
+704E6B|HUAWEI TECHNOLOGIES CO.,LTD
+704EE0|Samsung Electronics Co.,Ltd
+704F08|Shenzhen Huisheng Information Technology Co., Ltd.
+704F57|TP-LINK TECHNOLOGIES CO.,LTD.
+7052C5|Avaya Inc
+7054D2|PEGATRON CORPORATION
+7054F5|HUAWEI TECHNOLOGIES CO.,LTD
+705681|Apple, Inc.
+705812|Panasonic Corporation AVC Networks Company
+705A0F|Hewlett Packard
+705AAC|Samsung Electronics Co.,Ltd
+705AB6|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+705FA3|Xiaomi Communications Co Ltd
+70617B|Cisco Systems, Inc
+7062B8|D-Link International
+7062CB|Apple, Inc.
+70662A|Sony Interactive Entertainment Inc.
+706655|AzureWave Technology Inc.
+7066B9|Huawei Device Co., Ltd.
+706871|FN-LINK TECHNOLOGY Ltd.
+70695A|Cisco Systems, Inc
+706AC9|zte corporation
+706BB9|Cisco Systems, Inc
+706D15|Cisco Systems, Inc
+706E10|HUAWEI TECHNOLOGIES CO.,LTD
+706E6D|Cisco Systems, Inc
+70700D|Apple, Inc.
+707013|HUAWEI TECHNOLOGIES CO.,LTD
+70708B|Cisco Systems, Inc
+7070AA|Amazon Technologies Inc.
+7070D5|HUAWEI TECHNOLOGIES CO.,LTD
+7071BC|PEGATRON CORPORATION
+70720D|Lenovo Mobile Communication Technology Ltd.
+70723C|HUAWEI TECHNOLOGIES CO.,LTD
+7072FE|Apple, Inc.
+707362|HUAWEI TECHNOLOGIES CO.,LTD
+7073CB|Apple, Inc.
+707781|Hon Hai Precision Ind. Co.,Ltd.
+707990|HUAWEI TECHNOLOGIES CO.,LTD
+7079B3|Cisco Systems, Inc
+707BE8|HUAWEI TECHNOLOGIES CO.,LTD
+707C69|Avaya Inc
+707CE3|HUAWEI TECHNOLOGIES CO.,LTD
+707D95|Shenzhen City LinwlanTechnology Co. Ltd.
+707DA1|Sagemcom Broadband SAS
+707DB9|Cisco Systems, Inc
+708105|Cisco Systems, Inc
+7081EB|Apple, Inc.
+708540|Skyworth Digital Technology(Shenzhen) Co.,Ltd
+708976|Tuya Smart Inc.
+708A09|HUAWEI TECHNOLOGIES CO.,LTD
+708BCD|ASUSTek COMPUTER INC.
+708CB6|HUAWEI TECHNOLOGIES CO.,LTD
+708CF2|Apple, Inc.
+708D09|Nokia Corporation
+7090B7|Huawei Device Co., Ltd.
+709684|Apple, Inc.
+709751|Beijing Xiaomi Mobile Software Co., Ltd
+709883|SHENZHEN KAYAN ELECTRONICS., LTD.
+70991C|Shenzhen Honesty Electronics Co.,Ltd
+709AC4|Huawei Device Co., Ltd.
+709BA5|Shenzhen Y&D Electronics Co.,LTD.
+709C45|HUAWEI TECHNOLOGIES CO.,LTD
+709CD1|Intel Corporate
+709E29|Sony Interactive Entertainment Inc.
+709F2D|zte corporation
+70A04B|Intel Corporate
+70A2B3|Apple, Inc.
+70A56A|Shenzhen C-Data Technology Co., Ltd.
+70A6CC|Intel Corporate
+70A741|Ubiquiti Inc
+70A8A5|Microsoft Corporation
+70A8D3|Intel Corporate
+70A8E3|HUAWEI TECHNOLOGIES CO.,LTD
+70A983|Cisco Systems, Inc
+70ACD7|Shenzhen YOUHUA Technology Co., Ltd
+70AD43|Blink by Amazon
+70AE2A|Apple, Inc.
+70AED5|Apple, Inc.
+70AF09|Espressif Inc.
+70AF6A|SHENZHEN FENGLIAN TECHNOLOGY CO., LTD.
+70B035|Shenzhen Zowee Technology Co., Ltd
+70B13D|Samsung Electronics Co.,Ltd
+70B258|Ruckus Wireless
+70B306|Apple, Inc.
+70B317|Cisco Systems, Inc
+70B51A|Huawei Device Co., Ltd.
+70B5E8|Dell Inc.
+70B7E4|Broadcom Limited
+70B8F6|Espressif Inc.
+70B921|Fiberhome Telecommunication Technologies Co.,LTD
+70B9BB|Shenzhen Hankvision Technology CO.,LTD
+70BB5B|Apple, Inc.
+70BBE9|Xiaomi Communications Co Ltd
+70BC10|Microsoft Corporation
+70BC48|Cisco Systems, Inc
+70BD96|Cisco Systems, Inc
+70C288|Intel Corporate
+70C7F2|HUAWEI TECHNOLOGIES CO.,LTD
+70C94E|Liteon Technology Corporation
+70C9C6|Cisco Systems, Inc
+70CA4D|Shenzhen lnovance Technology Co.,Ltd.
+70CA97|Ruckus Wireless
+70CA9B|Cisco Systems, Inc
+70CD0D|Intel Corporate
+70CD60|Apple, Inc.
+70CE8C|Samsung Electronics Co.,Ltd
+70CF49|Intel Corporate
+70D313|HUAWEI TECHNOLOGIES CO.,LTD
+70D379|Cisco Systems, Inc
+70D51E|Fiberhome Telecommunication Technologies Co.,LTD
+70D823|Intel Corporate
+70D8C2|Intel Corporate
+70DA48|Cisco Systems, Inc
+70DB98|Cisco Systems, Inc
+70DDEF|Huawei Device Co., Ltd.
+70DEE2|Apple, Inc.
+70DF2F|Cisco Systems, Inc
+70E284|Wistron Infocomm (Zhongshan) Corporation
+70E422|Cisco Systems, Inc
+70E72C|Apple, Inc.
+70E997|HUAWEI TECHNOLOGIES CO.,LTD
+70EA1A|Cisco Systems, Inc
+70EA5A|Apple, Inc.
+70EBA5|Huawei Device Co., Ltd.
+70ECE4|Apple, Inc.
+70EF00|Apple, Inc.
+70F087|Apple, Inc.
+70F096|Cisco Systems, Inc
+70F11C|Shenzhen Ogemray Technology Co.,Ltd
+70F1A1|Liteon Technology Corporation
+70F35A|Cisco Systems, Inc
+70F8AE|Microsoft Corporation
+70F927|Samsung Electronics Co.,Ltd
+70F94A|Apple, Inc.
+70FD45|HUAWEI TECHNOLOGIES CO.,LTD
+70FD46|Samsung Electronics Co.,Ltd
+7400E8|HUAWEI TECHNOLOGIES CO.,LTD
+74042B|Lenovo Mobile Communication (Wuhan) Company Limited
+7404F1|Intel Corporate
+7405A5|TP-LINK TECHNOLOGIES CO.,LTD.
+740AE1|Huawei Device Co., Ltd.
+740C2E|Cisco Systems, Inc
+740CEE|Huawei Device Co., Ltd.
+740EA4|Apple, Inc.
+7410E0|Broadcom Limited
+7411A0|Nokia
+7411B2|Cisco Systems, Inc
+741213|Linksys USA, Inc
+7412BB|Fiberhome Telecommunication Technologies Co.,LTD
+741348|Blink by Amazon
+74136A|Motorola Mobility LLC, a Lenovo Company
+7413EA|Intel Corporate
+7414D0|Apple, Inc.
+741575|Xiaomi Communications Co Ltd
+7415F5|Apple, Inc.
+74190A|Samsung Electronics Co.,Ltd
+741BB2|Apple, Inc.
+741E93|Fiberhome Telecommunication Technologies Co.,LTD
+741EB1|Samsung Electronics Co.,Ltd
+74205F|Shenzhen Zhongruixin Intelligent Technology Co., Ltd.
+7422BB|Huawei Device Co., Ltd.
+742344|Xiaomi Communications Co Ltd
+74238D|zte corporation
+742435|Huawei Device Co., Ltd.
+742554|NVIDIA Corporation
+7426AC|Cisco Systems, Inc
+7426FF|zte corporation
+742869|Huawei Device Co., Ltd.
+742917|Apple, Inc.
+742959|Apple, Inc.
+742972|Juniper Networks
+7429AF|Hon Hai Precision Ind. Co.,Ltd.
+742A8A|shenzhen worldelite electronics co., LTD
+742B62|FUJITSU LIMITED
+742F68|AzureWave Technology Inc.
+7430AF|Fiberhome Telecommunication Technologies Co.,LTD
+743174|Apple, Inc.
+74317E|Ruckus Wireless
+7433A6|Shenzhen SuperElectron Technology Co.,Ltd.
+7433E9|zte corporation
+74342B|HUAWEI TECHNOLOGIES CO.,LTD
+743491|Shenzhen Kings IoT Co., Ltd
+743675|Juniper Networks
+74372F|Tongfang Shenzhen Cloudcomputing Technology Co.,Ltd
+743822|Xiaomi Communications Co Ltd
+7438B7|CANON INC.
+743989|TP-LINK TECHNOLOGIES CO.,LTD.
+743AF4|Intel Corporate
+743C24|HUAWEI TECHNOLOGIES CO.,LTD
+743CDE|Hewlett Packard Enterprise
+743E2B|Ruckus Wireless
+743F8E|Apple, Inc.
+743FC2|Hangzhou Hikvision Digital Technology Co.,Ltd.
+7440BB|Hon Hai Precision Ind. Co.,Ltd.
+744218|Apple, Inc.
+74428B|Apple, Inc.
+744401|NETGEAR
+74452D|Huawei Device Co., Ltd.
+74458A|Samsung Electronics Co.,Ltd
+7446A0|Hewlett Packard
+744AA4|zte corporation
+744CA1|Liteon Technology Corporation
+744D28|Routerboard.com
+744D6D|HUAWEI TECHNOLOGIES CO.,LTD
+744DBD|Espressif Inc.
+744F80|shenzhen Amos Electronics Co.,Ltd
+7450CD|HUAWEI TECHNOLOGIES CO.,LTD
+7451BA|Xiaomi Communications Co Ltd
+745427|SHENZHEN FAST TECHNOLOGIES CO.,LTD
+74547D|Cisco SPVTG
+74563C|GIGA-BYTE TECHNOLOGY CO.,LTD.
+745889|Multilaser Industrial S.A.
+7458F3|Amazon Technologies Inc.
+745909|HUAWEI TECHNOLOGIES CO.,LTD
+745AAA|HUAWEI TECHNOLOGIES CO.,LTD
+745CFA|Shenzhen Shunrui Gaojie Technology Co., Ltd.
+745D22|LCFC(Hefei) Electronics Technology co., ltd
+745D68|Fiberhome Telecommunication Technologies Co.,LTD
+745EA5|shenzhen trolink Technology Co.,Ltd
+745F00|Samsung Semiconductor Inc.
+7460FA|HUAWEI TECHNOLOGIES CO.,LTD
+7463C2|Huawei Device Co., Ltd.
+74650C|Apple, Inc.
+74675F|COMPAL INFORMATION(KUNSHAN)CO.,LTD.
+7467F7|Extreme Networks, Inc.
+746DFA|Samsung Electronics Co.,Ltd
+746F19|ICARVISIONS (SHENZHEN) TECHNOLOGY CO., LTD.
+746F88|zte corporation
+747069|Huawei Device Co., Ltd.
+7470FD|Intel Corporate
+74718B|Apple, Inc.
+7473B4|Apple, Inc.
+7473E2|Hillstone Networks Corp.
+747446|Google, Inc.
+747548|Amazon Technologies Inc.
+74761F|Microsoft Corporation
+74767D|shenzhen kexint technology co.,ltd
+747786|Apple, Inc.
+747827|Dell Inc.
+7478A6|Fortinet, Inc.
+748114|Apple, Inc.
+7483A0|Shenzhen MiaoMing Intelligent Technology Co.,Ltd
+7483C2|Ubiquiti Inc
+74852A|PEGATRON CORPORATION
+74860B|Cisco Systems, Inc
+74866F|zte corporation
+74867A|Dell Inc.
+7486E2|Dell Inc.
+74872E|HUAWEI TECHNOLOGIES CO.,LTD
+74882A|HUAWEI TECHNOLOGIES CO.,LTD
+7488BB|Cisco Systems, Inc
+748927|Espressif Inc.
+748B23|Samsung Electronics Co.,Ltd
+748D08|Apple, Inc.
+748DAA|HUAWEI TECHNOLOGIES CO.,LTD
+748F3C|Apple, Inc.
+748FC2|Cisco Systems, Inc
+74911A|Ruckus Wireless
+7493A4|Zebra Technologies Corp.
+749781|zte corporation
+749B89|HUAWEI TECHNOLOGIES CO.,LTD
+749D8F|HUAWEI TECHNOLOGIES CO.,LTD
+749E75|Hewlett Packard Enterprise
+749EAF|Apple, Inc.
+749EF5|Samsung Electronics Co.,Ltd
+74A02F|Cisco Systems, Inc
+74A063|HUAWEI TECHNOLOGIES CO.,LTD
+74A2E6|Cisco Systems, Inc
+74A528|HUAWEI TECHNOLOGIES CO.,LTD
+74A57E|Panasonic Ecology Systems
+74A5C2|KYOCERA Corporation
+74A6CD|Apple, Inc.
+74A722|LG Electronics (Mobile Communications)
+74A78E|zte corporation
+74A7EA|Amazon Technologies Inc.
+74A981|HUAWEI TECHNOLOGIES CO.,LTD
+74AB93|Blink by Amazon
+74AC5F|Qiku Internet Network Scientific (Shenzhen) Co., Ltd.
+74ACB9|Ubiquiti Inc
+74AD98|Cisco Systems, Inc
+74B059|Motorola Mobility LLC, a Lenovo Company
+74B57E|zte corporation
+74B587|Apple, Inc.
+74B725|Huawei Device Co., Ltd.
+74B7B3|Shenzhen YOUHUA Technology Co., Ltd
+74B8A8|HUAWEI TECHNOLOGIES CO.,LTD
+74BADB|Longconn Electornics(shenzhen)Co.,Ltd
+74BBD3|Shenzhen xeme Communication Co., Ltd.
+74BC6B|Intel Corporate
+74BEF3|Motorola Mobility LLC, a Lenovo Company
+74BFC0|CANON INC.
+74C14F|HUAWEI TECHNOLOGIES CO.,LTD
+74C17E|LG Electronics
+74C246|Amazon Technologies Inc.
+74C330|SHENZHEN FAST TECHNOLOGIES CO.,LTD
+74C412|Microsoft Corporation
+74C63B|AzureWave Technology Inc.
+74C929|Zhejiang Dahua Technology Co., Ltd.
+74C9A3|Fiberhome Telecommunication Technologies Co.,LTD
+74CA60|Sonos, Inc.
+74CC39|Fiberhome Telecommunication Technologies Co.,LTD
+74CC40|Apple, Inc.
+74CF00|Shenzhen SuperElectron Technology Co.,Ltd.
+74D02B|ASUSTek COMPUTER INC.
+74D21D|HUAWEI TECHNOLOGIES CO.,LTD
+74D423|Amazon Technologies Inc.
+74D435|GIGA-BYTE TECHNOLOGY CO.,LTD.
+74D4DD|Quanta Computer Inc.
+74D5E8|Apple, Inc.
+74D637|Amazon Technologies Inc.
+74D6E5|Huawei Device Co., Ltd.
+74D7CA|Panasonic Automotive Systems Co.,Ltd
+74D809|Microsoft Corporation
+74D83E|Intel Corporate
+74DA78|HP Inc.
+74DA88|TP-LINK TECHNOLOGIES CO.,LTD.
+74DADA|D-Link International
+74DDF0|SHEN ZHEN TENDA TECHNOLOGY CO.,LTD
+74DE2B|Liteon Technology Corporation
+74DFBF|Liteon Technology Corporation
+74E19A|Fiberhome Telecommunication Technologies Co.,LTD
+74E1B6|Apple, Inc.
+74E20C|Amazon Technologies Inc.
+74E28C|Microsoft Corporation
+74E2E7|Cisco Systems, Inc
+74E2F5|Apple, Inc.
+74E50B|Intel Corporate
+74E543|Liteon Technology Corporation
+74E5F9|Intel Corporate
+74E6B8|LG Electronics
+74E6E2|Dell Inc.
+74E798|Juniper Networks
+74E987|Apple, Inc.
+74E9BF|HUAWEI TECHNOLOGIES CO.,LTD
+74EA3A|TP-LINK TECHNOLOGIES CO.,LTD.
+74EB80|Samsung Electronics Co.,Ltd
+74EC42|Fiberhome Telecommunication Technologies Co.,LTD
+74ECB2|Amazon Technologies Inc.
+74EE2A|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+74F06D|AzureWave Technology Inc.
+74F2FA|Xiaomi Communications Co Ltd
+74F441|Samsung Electronics Co.,Ltd
+74F661|Schneider Electric Fire & Security Oy
+74F67A|Samsung Electronics Co.,Ltd
+74F90F|HUAWEI TECHNOLOGIES CO.,LTD
+74F92C|Ubiquiti Inc
+74FA29|Ubiquiti Inc
+74FC77|HUAWEI TECHNOLOGIES CO.,LTD
+74FECE|TP-Link Systems Inc
+74FF4C|Skyworth Digital Technology(Shenzhen) Co.,Ltd
+78009E|Samsung Electronics Co.,Ltd
+78028B|Apple, Inc.
+7802B1|Cisco Systems, Inc
+7802B7|ShenZhen Ultra Easy Technology CO.,LTD
+7802F8|Xiaomi Communications Co Ltd
+78034F|Nokia
+7804E3|Huawei Device Co., Ltd.
+78055F|Shenzhen WYC Technology Co., Ltd.
+7806C9|Huawei Device Co., Ltd.
+78078F|HUAWEI TECHNOLOGIES CO.,LTD
+78084D|HUAWEI TECHNOLOGIES CO.,LTD
+780CB8|Intel Corporate
+780CF0|Cisco Systems, Inc
+780E3E|HUAWEI TECHNOLOGIES CO.,LTD
+780F81|Cisco Meraki
+78119D|Cisco Systems, Inc
+7811DC|XIAOMI Electronics,CO.,LTD
+781699|HUAWEI TECHNOLOGIES CO.,LTD
+781735|Nokia Shanghai Bell Co., Ltd.
+7817BE|HUAWEI TECHNOLOGIES CO.,LTD
+781881|AzureWave Technology Inc.
+7818A8|Huawei Device Co., Ltd.
+7818EC|Fortinet, Inc.
+7819F7|Juniper Networks
+781A32|Huawei Device Co., Ltd.
+781C3C|Espressif Inc.
+781C5A|SHARP Corporation
+781D4A|zte corporation
+781DBA|HUAWEI TECHNOLOGIES CO.,LTD
+781EB8|Shenzhen iComm Semiconductor CO.,LTD
+781F7C|Nokia
+781FDB|Samsung Electronics Co.,Ltd
+78202E|Skychers Creations ShenZhen Limited
+782051|TP-Link Systems Inc.
+782184|Espressif Inc.
+782288|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+782327|Samsung Electronics Co.,Ltd
+7824AF|ASUSTek COMPUTER INC.
+7824BE|Cisco Systems, Inc
+782599|Huawei Device Co., Ltd.
+7825AD|Samsung Electronics Co.,Ltd
+7826A6|zte corporation
+7828CA|Sonos, Inc.
+782B46|Intel Corporate
+782B60|Huawei Device Co., Ltd.
+782BCB|Dell Inc.
+782DAD|HUAWEI TECHNOLOGIES CO.,LTD
+782EEF|Nokia Corporation
+78305D|zte corporation
+78312B|zte corporation
+7831C1|Apple, Inc.
+78321B|D-Link International
+7833C6|Samsung Electronics Co.,Ltd
+783409|HUAWEI TECHNOLOGIES CO.,LTD
+783486|Nokia
+7834B4|HUAWEI TECHNOLOGIES CO.,LTD
+783690|Yulong Computer Telecommunication Scientific (Shenzhen) Co.,Ltd
+783716|Samsung Electronics Co.,Ltd
+783A84|Apple, Inc.
+783D5B|TELNET Redes Inteligentes S.A.
+783EA1|Nokia Shanghai Bell Co., Ltd.
+783F4D|Apple, Inc.
+7840E4|Samsung Electronics Co.,Ltd
+78421C|Espressif Inc.
+78444A|Shenzhen Aiwinn information Technology Co., Ltd.
+784476|Zioncom Electronics (Shenzhen) Ltd.
+7844FD|TP-LINK TECHNOLOGIES CO.,LTD.
+784558|Ubiquiti Inc
+7845B3|Huawei Device Co., Ltd.
+7845C4|Dell Inc.
+7845DC|HUAWEI TECHNOLOGIES CO.,LTD
+78465F|Fiberhome Telecommunication Technologies Co.,LTD
+7846D4|Samsung Electronics Co.,Ltd
+78471D|Samsung Electronics Co.,Ltd
+784859|Hewlett Packard
+7849D7|Samsung Electronics Co.,Ltd
+784F43|Apple, Inc.
+784F9B|Juniper Networks
+78507C|Juniper Networks
+78521A|Samsung Electronics Co.,Ltd
+785237|zte corporation
+785262|Shenzhen Hojy Software Co., Ltd.
+78530D|Shenzhen Skyworth Digital Technology CO., Ltd
+785333|Beijing Xiaomi Electronics Co.,Ltd
+78542E|D-Link International
+785536|shenzhen AZW Technology(Group) Co.,Ltd
+785773|HUAWEI TECHNOLOGIES CO.,LTD
+7857B0|GERTEC BRASIL LTDA
+785860|HUAWEI TECHNOLOGIES CO.,LTD
+78595E|Samsung Electronics Co.,Ltd
+785968|Hon Hai Precision Ind. Co.,Ltd.
+785B64|Huawei Device Co., Ltd.
+785C5E|HUAWEI TECHNOLOGIES CO.,LTD
+785DC8|LG Electronics
+785ECC|Apple, Inc.
+785F36|Shenzhen Skyworth Digital Technology CO., Ltd
+78605B|TP-LINK TECHNOLOGIES CO.,LTD.
+786089|Samsung Electronics Co.,Ltd
+786256|HUAWEI TECHNOLOGIES CO.,LTD
+7864A0|Cisco Systems, Inc
+7864C0|Apple, Inc.
+786559|Sagemcom Broadband SAS
+7866A5|Chipsea Technologies (Shenzhen) Crop.
+7866AE|ZTEC Instruments, Inc.
+7866F3|shenzhen worldelite electronics co., LTD
+7867D7|Apple, Inc.
+786A89|HUAWEI TECHNOLOGIES CO.,LTD
+786C1C|Apple, Inc.
+786C84|Amazon Technologies Inc.
+786D94|Palo Alto Networks
+78725D|Cisco Systems, Inc
+787462|Intel Corporate
+78753E|Apple, Inc.
+787826|HUAWEI TECHNOLOGIES CO.,LTD
+787984|Apple, Inc.
+787B8A|Apple, Inc.
+787D53|Extreme Networks, Inc.
+787E42|zte corporation
+787E61|Apple, Inc.
+788371|HUAWEI TECHNOLOGIES CO.,LTD
+78843C|Sony Corporation
+788517|Cisco Systems, Inc
+7885F4|Huawei Device Co., Ltd.
+78862E|Microsoft Corporation
+7886B6|Shenzhen YOUHUA Technology Co., Ltd
+78886D|Apple, Inc.
+788A20|Ubiquiti Inc
+788C77|LEXMARK INTERNATIONAL, INC.
+788CB5|TP-Link Systems Inc
+788DAF|Sagemcom Broadband SAS
+7890A2|zte corporation
+78923E|Nokia Corporation
+78929C|Intel Corporate
+78960D|Apple, Inc.
+78966E|Huawei Device Co., Ltd.
+789682|zte corporation
+7896A3|Extreme Networks, Inc.
+7898E8|D-Link International
+789987|Xiaomi Communications Co Ltd
+789A18|Routerboard.com
+789CE7|Shenzhen Aikede Technology Co., Ltd
+789ED0|Samsung Electronics Co.,Ltd
+789F38|Shenzhen Feasycom Co., Ltd
+789F6A|Ruckus Wireless
+789F70|Apple, Inc.
+789FAA|Huawei Device Co., Ltd.
+78A03F|Amazon Technologies Inc.
+78A106|TP-LINK TECHNOLOGIES CO.,LTD.
+78A1D8|ShenzhenEnjoyTechnologyCo.,Ltd
+78A351|SHENZHEN ZHIBOTONG ELECTRONICS CO.,LTD
+78A3E4|Apple, Inc.
+78A5DD|Shenzhen Smarteye Digital Electronics Co., Ltd
+78A7C7|Apple, Inc.
+78A873|Samsung Electronics Co.,Ltd
+78ABBB|Samsung Electronics Co.,Ltd
+78AC44|Dell Inc.
+78ACC0|Hewlett Packard
+78AF08|Intel Corporate
+78AFB8|Shenzhen SDMC Technology CP,.LTD
+78B46A|HUAWEI TECHNOLOGIES CO.,LTD
+78B554|Huawei Device Co., Ltd.
+78B5F2|HUAWEI TECHNOLOGIES CO.,LTD
+78B6FE|Samsung Electronics Co.,Ltd
+78B8D6|Zebra Technologies Inc.
+78BAF9|Cisco Systems, Inc
+78BB5C|Nokia Solutions and Networks India Private Limited
+78BC1A|Cisco Systems, Inc
+78BDBC|Samsung Electronics Co.,Ltd
+78BE81|FN-LINK TECHNOLOGY Ltd.
+78C05A|TP-Link Systems Inc.
+78C11D|Samsung Electronics Co.,Ltd
+78C1A7|zte corporation
+78C213|Sagemcom Broadband SAS
+78C3E9|Samsung Electronics Co.,Ltd
+78C4AB|Shenzhen Runsil Technology Co.,Ltd
+78C57D|Zyxel Communications Corporation
+78C5F8|Huawei Device Co., Ltd.
+78C881|Sony Interactive Entertainment Inc.
+78C884|Huawei Device Co., Ltd.
+78CA04|Nokia Corporation
+78CA39|Apple, Inc.
+78CF2F|HUAWEI TECHNOLOGIES CO.,LTD
+78CFF9|Huawei Device Co., Ltd.
+78D162|Apple, Inc.
+78D294|NETGEAR
+78D6B2|Toshiba
+78D6DC|Motorola (Wuhan) Mobility Technologies Communication Co., Ltd.
+78D6F0|SAMSUNG ELECTRO MECHANICS CO., LTD.
+78D752|HUAWEI TECHNOLOGIES CO.,LTD
+78D75F|Apple, Inc.
+78D840|Xiaomi Communications Co Ltd
+78DA6E|Cisco Systems, Inc
+78DAAF|HUAWEI TECHNOLOGIES CO.,LTD
+78DC87|HUAWEI TECHNOLOGIES CO.,LTD
+78DD08|Hon Hai Precision Ind. Co.,Ltd.
+78DD33|HUAWEI TECHNOLOGIES CO.,LTD
+78E0C5|Samsung Electronics Co.,Ltd
+78E103|Amazon Technologies Inc.
+78E22C|Huawei Device Co., Ltd.
+78E36D|Espressif Inc.
+78E3B5|Hewlett Packard
+78E3DE|Apple, Inc.
+78E400|Hon Hai Precision Ind. Co.,Ltd.
+78E7D1|Hewlett Packard
+78E8B6|zte corporation
+78EB14|SHENZHEN FAST TECHNOLOGIES CO.,LTD
+78EB46|HUAWEI TECHNOLOGIES CO.,LTD
+78EDBC|OnePlus Technology (Shenzhen) Co., Ltd
+78EE4C|Espressif Inc.
+78F09B|Huawei Device Co., Ltd.
+78F1C6|Cisco Systems, Inc
+78F238|Samsung Electronics Co.,Ltd
+78F29E|PEGATRON CORPORATION
+78F557|HUAWEI TECHNOLOGIES CO.,LTD
+78F5FD|HUAWEI TECHNOLOGIES CO.,LTD
+78F7BE|Samsung Electronics Co.,Ltd
+78F882|LG Electronics (Mobile Communications)
+78F9B4|Nokia Solutions and Networks GmbH & Co. KG
+78FBD8|Apple, Inc.
+78FD94|Apple, Inc.
+78FDF1|Shenzhen Huadian Communication Co., Ltd
+78FE3D|Juniper Networks
+78FF57|Intel Corporate
+7C004D|HUAWEI TECHNOLOGIES CO.,LTD
+7C0191|Apple, Inc.
+7C034C|Sagemcom Broadband SAS
+7C035E|Xiaomi Communications Co Ltd
+7C03AB|Xiaomi Communications Co Ltd
+7C03C9|Shenzhen YOUHUA Technology Co., Ltd
+7C03D8|Sagemcom Broadband SAS
+7C04D0|Apple, Inc.
+7C0507|PEGATRON CORPORATION
+7C0A3F|Samsung Electronics Co.,Ltd
+7C0BC6|Samsung Electronics Co.,Ltd
+7C0C5F|Espressif Inc.
+7C0CF1|Beijing Xiaomi Mobile Software Co., Ltd
+7C0CFA|HUAWEI TECHNOLOGIES CO.,LTD
+7C0ECE|Cisco Systems, Inc
+7C10C9|ASUSTek COMPUTER INC.
+7C11BE|Apple, Inc.
+7C11CB|HUAWEI TECHNOLOGIES CO.,LTD
+7C162A|Huawei Device Co., Ltd.
+7C1689|Sagemcom Broadband SAS
+7C1960|HUAWEI TECHNOLOGIES CO.,LTD
+7C19E3|Google, Inc.
+7C1AC0|HUAWEI TECHNOLOGIES CO.,LTD
+7C1B93|Huawei Device Co., Ltd.
+7C1C68|Samsung Electronics Co.,Ltd
+7C1CF1|HUAWEI TECHNOLOGIES CO.,LTD
+7C1DD9|Xiaomi Communications Co Ltd
+7C1E52|Microsoft
+7C210D|Cisco Systems, Inc
+7C210E|Cisco Systems, Inc
+7C214A|Intel Corporate
+7C21D8|Shenzhen Think Will Communication Technology co., LTD.
+7C2302|Samsung Electronics Co.,Ltd
+7C2499|Apple, Inc.
+7C2586|Juniper Networks
+7C25A3|Fortinet, Inc.
+7C25DA|FN-LINK TECHNOLOGY LIMITED
+7C2664|Sagemcom Broadband SAS
+7C273C|Shenzhen Yunlink Technology Co., Ltd
+7C296F|Apple, Inc.
+7C2A31|Intel Corporate
+7C2ACA|Apple, Inc.
+7C2ADB|Xiaomi Communications Co Ltd
+7C2BE1|Shenzhen Ferex Electrical Co.,Ltd
+7C2C67|Espressif Inc.
+7C2EBD|Google, Inc.
+7C2EDD|Samsung Electronics Co.,Ltd
+7C310E|Cisco Systems, Inc
+7C33F9|HUAWEI TECHNOLOGIES CO.,LTD
+7C3626|HUAWEI TECHNOLOGIES CO.,LTD
+7C38AD|Samsung Electronics Co.,Ltd
+7C3953|zte corporation
+7C3985|HUAWEI TECHNOLOGIES CO.,LTD
+7C3B2D|Apple, Inc.
+7C3CB6|Shenzhen Homecare Technology Co.,Ltd.
+7C3D2B|Huawei Device Co., Ltd.
+7C3E74|Huawei Device Co., Ltd.
+7C41A2|Nokia
+7C45D0|Shenzhen Wewins Wireless Co., ltd
+7C4685|Motorola (Wuhan) Mobility Technologies Communication Co., Ltd.
+7C49EB|XIAOMI Electronics,CO.,LTD
+7C4B26|Apple, Inc.
+7C4D8F|HP Inc.
+7C4E09|Shenzhen Skyworth Wireless Technology Co.,Ltd
+7C4FAD|Espressif Inc.
+7C4FCD|Apple, Inc.
+7C5049|Apple, Inc.
+7C5079|Intel Corporate
+7C573C|Hewlett Packard Enterprise
+7C5758|HP Inc.
+7C59B1|Apple, Inc.
+7C5A1C|Sophos Ltd
+7C5CF8|Intel Corporate
+7C6097|HUAWEI TECHNOLOGIES CO.,LTD
+7C60DB|zte corporation
+7C6130|Apple, Inc.
+7C6166|Amazon Technologies Inc.
+7C62E7|Cisco Systems, Inc
+7C6305|Amazon Technologies Inc.
+7C6456|Samsung Electronics Co.,Ltd
+7C646C|LG Electronics
+7C669A|HUAWEI TECHNOLOGIES CO.,LTD
+7C66EF|Hon Hai Precision IND.CO.,LTD
+7C67A2|Intel Corporate
+7C67AB|Roku, Inc
+7C68B9|Huawei Device Co., Ltd.
+7C692B|HUAWEI TECHNOLOGIES CO.,LTD
+7C69F6|Cisco Systems, Inc
+7C6CE1|Shenzhen Honesty Electronics Co.,Ltd.
+7C6CF0|Shenzhen TINNO Mobile Technology Corp.
+7C6D12|Microsoft Corporation
+7C6D62|Apple, Inc.
+7C6DF8|Apple, Inc.
+7C6FF8|ShenZhen ACTO Digital Video Technology Co.,Ltd.
+7C70DB|Intel Corporate
+7C7398|Espressif Inc.
+7C73EB|Huawei Device Co., Ltd.
+7C752D|Samsung Electronics Co.,Ltd
+7C7630|Shenzhen YOUHUA Technology Co., Ltd
+7C7635|Intel Corporate
+7C7668|HUAWEI TECHNOLOGIES CO.,LTD
+7C7716|Zyxel Communications Corporation
+7C787E|Samsung Electronics Co.,Ltd
+7C7A91|Intel Corporate
+7C7B1C|Motorola Mobility LLC, a Lenovo Company
+7C7BBF|Samsung Electronics Co.,Ltd
+7C7D21|zte corporation
+7C7D3D|HUAWEI TECHNOLOGIES CO.,LTD
+7C8274|Shenzhen Hikeen Technology CO.,LTD
+7C852F|Huawei Device Co., Ltd.
+7C8530|Nokia
+7C8767|Cisco Systems, Inc
+7C87CE|Espressif Inc.
+7C8899|FN-LINK TECHNOLOGY Ltd.
+7C8931|Huawei Device Co., Ltd.
+7C8956|Samsung Electronics Co.,Ltd
+7C89C1|Palo Alto Networks
+7C8AE1|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+7C8BB5|Samsung Electronics Co.,Ltd
+7C8BCA|TP-LINK TECHNOLOGIES CO.,LTD.
+7C9122|Samsung Electronics Co.,Ltd
+7C942A|HUAWEI TECHNOLOGIES CO.,LTD
+7C949F|Shenzhen iComm Semiconductor CO.,LTD
+7C94B2|Philips Healthcare PCCI
+7C95B1|Extreme Networks, Inc.
+7C95F3|Cisco Systems, Inc
+7C97E1|Huawei Device Co., Ltd.
+7C9824|Sagemcom Broadband SAS
+7C9A1D|Apple, Inc.
+7C9EBD|Espressif Inc.
+7CA05E|Motorola Mobility LLC, a Lenovo Company
+7CA177|HUAWEI TECHNOLOGIES CO.,LTD
+7CA1AE|Apple, Inc.
+7CA23E|HUAWEI TECHNOLOGIES CO.,LTD
+7CA449|Xiaomi Communications Co Ltd
+7CA4F7|Extreme Networks, Inc.
+7CA53E|Motorola Mobility LLC, a Lenovo Company
+7CA58F|shenzhen Qikai Electronic Co., Ltd.
+7CA62A|Hewlett Packard Enterprise
+7CA7B0|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+7CA8EC|Hewlett Packard Enterprise
+7CAB60|Apple, Inc.
+7CAD4F|Cisco Systems, Inc
+7CAD74|Cisco Systems, Inc
+7CAF77|Nokia
+7CB0C2|Intel Corporate
+7CB15D|HUAWEI TECHNOLOGIES CO.,LTD
+7CB21B|Cisco SPVTG
+7CB27D|Intel Corporate
+7CB30A|zte corporation
+7CB353|Cisco Systems, Inc
+7CB566|Intel Corporate
+7CB59B|TP-LINK TECHNOLOGIES CO.,LTD.
+7CB59F|HUAWEI TECHNOLOGIES CO.,LTD
+7CC025|Palo Alto Networks
+7CC06F|Apple, Inc.
+7CC0AA|Microsoft Corporation
+7CC180|Apple, Inc.
+7CC225|Samsung Electronics Co.,Ltd
+7CC294|Beijing Xiaomi Mobile Software Co., Ltd
+7CC2C6|TP-Link Systems Inc
+7CC385|HUAWEI TECHNOLOGIES CO.,LTD
+7CC3A1|Apple, Inc.
+7CC537|Apple, Inc.
+7CC709|SHENZHEN RF-LINK TECHNOLOGY CO.,LTD.
+7CC74A|Fiberhome Telecommunication Technologies Co.,LTD
+7CC77E|Fiberhome Telecommunication Technologies Co.,LTD
+7CC790|Palo Alto Networks
+7CC882|HUAWEI TECHNOLOGIES CO.,LTD
+7CC8DF|Apple, Inc.
+7CC95A|Dell EMC
+7CCCB8|Intel Corporate
+7CCF0F|LCFC(Hefei) Electronics Technology co., ltd
+7CD1AD|Apple, Inc.
+7CD1C3|Apple, Inc.
+7CD2DA|Apple, Inc.
+7CD30A|INVENTEC CORPORATION
+7CD3E5|HUAWEI TECHNOLOGIES CO.,LTD
+7CD4A8|Sagemcom Broadband SAS
+7CD544|Espressif Inc.
+7CD566|Amazon Technologies Inc.
+7CD62C|Apple, Inc.
+7CD661|Xiaomi Communications Co Ltd
+7CD95C|Google, Inc.
+7CD9A0|HUAWEI TECHNOLOGIES CO.,LTD
+7CDC73|HUAWEI TECHNOLOGIES CO.,LTD
+7CDD90|Shenzhen Ogemray Technology Co., Ltd.
+7CDFA1|Espressif Inc.
+7CE2CA|Juniper Networks
+7CE53F|HUAWEI TECHNOLOGIES CO.,LTD
+7CE87F|Sagemcom Broadband SAS
+7CE8B1|Espressif Inc.
+7CE9D3|Hon Hai Precision Ind. Co.,Ltd.
+7CECB1|Apple, Inc.
+7CED8D|Microsoft
+7CEDC6|Amazon Technologies Inc.
+7CF05F|Apple, Inc.
+7CF0E5|OnePlus Technology (Shenzhen) Co., Ltd
+7CF17E|TP-Link Systems Inc
+7CF31B|LG Electronics (Mobile Communications)
+7CF34D|Apple, Inc.
+7CF666|Tuya Smart Inc.
+7CF854|Samsung Electronics Co.,Ltd
+7CF880|Cisco Systems, Inc
+7CF90E|Samsung Electronics Co.,Ltd
+7CF9A0|Fiberhome Telecommunication Technologies Co.,LTD
+7CFADF|Apple, Inc.
+7CFC16|Apple, Inc.
+7CFCFD|Fiberhome Telecommunication Technologies Co.,LTD
+7CFD6B|Xiaomi Communications Co Ltd
+7CFE4E|Shenzhen Safe vision Technology Co.,LTD
+7CFE62|ShenZhen XinZhongXin Technology Co.， Ltd
+80000B|Intel Corporate
+80006E|Apple, Inc.
+80030D|CANON INC.
+800384|Ruckus Wireless
+80045F|Apple, Inc.
+800518|HUAWEI TECHNOLOGIES CO.,LTD
+8006D9|zte corporation
+800794|Samsung Electronics Co.,Ltd
+800C67|Apple, Inc.
+800CF9|Amazon Technologies Inc.
+800D3F|Samsung Electronics Co.,Ltd
+800EA9|TCL Yuxin Zhixing Technology (Huizhou) Co.,Ltd
+801242|Apple, Inc.
+8012DF|Shenzhen SuperElectron Technology Co.,Ltd.
+801316|Intel Corporate
+801382|HUAWEI TECHNOLOGIES CO.,LTD
+8013BE|Juniper Networks
+801844|Dell Inc.
+8018A7|Samsung Electronics Co.,Ltd
+801934|Intel Corporate
+801970|Samsung Electronics Co.,Ltd
+801D39|Apple, Inc.
+801DAA|Avaya Inc
+8020DA|Sagemcom Broadband SAS
+8020FD|Samsung Electronics Co.,Ltd
+80248F|Cisco Systems, Inc
+802689|D-Link International
+80276C|Cisco Systems, Inc
+802AA8|Ubiquiti Inc
+802BF9|Hon Hai Precision Ind. Co.,Ltd.
+802D1A|zte corporation
+802DBF|Cisco Systems, Inc
+802EC3|HUAWEI TECHNOLOGIES CO.,LTD
+802EDE|Huawei Device Co., Ltd.
+803049|Liteon Technology Corporation
+8030E0|Hewlett Packard Enterprise
+8031F0|Samsung Electronics Co.,Ltd
+803253|Intel Corporate
+8035C1|Xiaomi Communications Co Ltd
+803773|NETGEAR
+803896|SHARP Corporation
+8038BC|HUAWEI TECHNOLOGIES CO.,LTD
+8038FB|Intel Corporate
+80398C|Samsung Electronics Co.,Ltd
+803AF4|Fiberhome Telecommunication Technologies Co.,LTD
+803C04|TP-Link Systems Inc.
+803C20|HUAWEI TECHNOLOGIES CO.,LTD
+803E48|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+803FD4|Apple, Inc.
+804126|HUAWEI TECHNOLOGIES CO.,LTD
+80433F|Juniper Networks
+80456B|Espressif Inc.
+8045DD|Intel Corporate
+804715|Apple, Inc.
+804786|Samsung Electronics Co.,Ltd
+80489F|Hangzhou Hikvision Digital Technology Co.,Ltd.
+804971|Apple, Inc.
+804A14|Apple, Inc.
+804AF2|Sonos, Inc.
+804DCB|Huawei Device Co., Ltd.
+804E70|Samsung Electronics Co.,Ltd
+804E81|Samsung Electronics Co.,Ltd
+80501B|Nokia Corporation
+8053E0|Espressif Inc.
+80542D|Samsung Electronics Co.,Ltd
+80546A|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+80549C|Samsung Electronics Co.,Ltd
+8054D9|HUAWEI TECHNOLOGIES CO.,LTD
+8054E3|Apple, Inc.
+8056F2|Hon Hai Precision Ind. Co.,Ltd.
+805719|Samsung Electronics Co.,Ltd
+8058F8|Motorola Mobility LLC, a Lenovo Company
+805A04|LG Electronics (Mobile Communications)
+805A70|Fortinet, Inc.
+805E0C|YEALINK(XIAMEN) NETWORK TECHNOLOGY CO.,LTD.
+805E4F|FN-LINK TECHNOLOGY LIMITED
+805EC0|YEALINK(XIAMEN) NETWORK TECHNOLOGY CO.,LTD.
+805FC5|Apple, Inc.
+806036|HUAWEI TECHNOLOGIES CO.,LTD
+806132|Cisco Systems, Inc
+80618F|Shenzhen sangfei consumer communications co.,ltd
+80646F|Espressif Inc.
+80647C|Tuya Smart Inc.
+80656D|Samsung Electronics Co.,Ltd
+80657C|Apple, Inc.
+806599|Espressif Inc.
+806933|HUAWEI TECHNOLOGIES CO.,LTD
+806A00|Cisco Systems, Inc
+806AB0|Shenzhen TINNO Mobile Technology Corp.
+806C1B|Motorola Mobility LLC, a Lenovo Company
+806D71|Amazon Technologies Inc.
+806F1C|Huawei Device Co., Ltd.
+80711F|Juniper Networks
+80717A|HUAWEI TECHNOLOGIES CO.,LTD
+807264|Huawei Device Co., Ltd.
+80739F|KYOCERA CORPORATION
+8075BF|Samsung Electronics Co.,Ltd
+807B3E|Samsung Electronics Co.,Ltd
+807C0A|zte corporation
+807C62|Hangzhou Hikvision Digital Technology Co.,Ltd.
+807D14|HUAWEI TECHNOLOGIES CO.,LTD
+807D3A|Espressif Inc.
+807EB4|Shenzhen SuperElectron Technology Co.,Ltd.
+807FF8|Juniper Networks
+80802C|Fortinet, Inc.
+8081A5|TONGQING COMMUNICATION EQUIPMENT (SHENZHEN) Co.,Ltd
+808223|Apple, Inc.
+8083F6|Apple, Inc.
+808489|Intel Corporate
+808544|Intelbras
+8086D9|Samsung Electronics Co.,Ltd
+8086F2|Intel Corporate
+808800|zte corporation
+808917|TP-LINK TECHNOLOGIES CO.,LTD.
+808943|Samsung Electronics Co.,Ltd
+808ABD|Samsung Electronics Co.,Ltd
+808B5C|Shenzhen Runhuicheng Technology Co., Ltd
+808DB7|Hewlett Packard Enterprise
+808F1D|TP-LINK TECHNOLOGIES CO.,LTD.
+808F97|Xiaomi Communications Co Ltd
+808FE8|Intelbras
+809133|AzureWave Technology Inc.
+80929F|Apple, Inc.
+8092A5|Valeo Interior Controls (Shenzhen) Co.,Ltd
+80953A|Apple, Inc.
+809562|Extreme Networks, Inc.
+809621|Lenovo
+809698|Apple, Inc.
+8096CA|Hon Hai Precision Ind. Co.,Ltd.
+809733|Shenzhen Elebao Technology Co., Ltd
+8099E7|Sony Corporation
+809B20|Intel Corporate
+809D65|FN-LINK TECHNOLOGY Ltd.
+809FAB|Fiberhome Telecommunication Technologies Co.,LTD
+809FE4|SHEN ZHEN TENDA TECHNOLOGY CO.,LTD
+809FF5|Samsung Electronics Co.,Ltd
+80A2FC|AzureWave Technology Inc.
+80A589|AzureWave Technology Inc.
+80A63C|Amazon Technologies Inc.
+80A796|Neuralink Corp.
+80A997|Apple, Inc.
+80AB4D|Nokia Solutions and Networks GmbH & Co. KG
+80ACAC|Juniper Networks
+80AD16|Xiaomi Communications Co Ltd
+80AE54|TP-LINK TECHNOLOGIES CO.,LTD.
+80AF19|Apple, Inc.
+80AFCA|Shenzhen Cudy Technology Co., Ltd.
+80B03D|Apple, Inc.
+80B07B|zte corporation
+80B54E|Espressif Inc.
+80B575|HUAWEI TECHNOLOGIES CO.,LTD
+80B655|Intel Corporate
+80B686|HUAWEI TECHNOLOGIES CO.,LTD
+80B946|Nokia
+80B989|Apple, Inc.
+80BC37|Ruckus Wireless
+80BE05|Apple, Inc.
+80BEAF|Hangzhou Hikvision Digital Technology Co.,Ltd.
+80C01E|Intel Corporate
+80C16E|Hewlett Packard
+80C548|Shenzhen Zowee Technology Co.,Ltd
+80C5E6|Microsoft Corporation
+80C5F2|AzureWave Technology Inc.
+80C755|Panasonic Appliances Company
+80C7C5|Fiberhome Telecommunication Technologies Co.,LTD
+80CA4B|SHENZHEN GONGJIN ELECTRONICS CO.,LTD
+80CA52|Wistron InfoComm(Chongqing)Co.,Ltd.
+80CC12|Huawei Device Co., Ltd.
+80CC9C|NETGEAR
+80CE62|Hewlett Packard
+80CEB9|Samsung Electronics Co.,Ltd
+80CF41|Lenovo Mobile Communication Technology Ltd.
+80CFA2|Huawei Device Co., Ltd.
+80D09B|HUAWEI TECHNOLOGIES CO.,LTD
+80D1CE|Apple, Inc.
+80D21D|AzureWave Technology Inc.
+80D4A5|HUAWEI TECHNOLOGIES CO.,LTD
+80D605|Apple, Inc.
+80DACE|Huawei Device Co., Ltd.
+80DB17|Juniper Networks
+80E01D|Cisco Systems, Inc
+80E1BF|HUAWEI TECHNOLOGIES CO.,LTD
+80E4BA|Intel Corporate
+80E63C|Xiaomi Communications Co Ltd
+80E650|Apple, Inc.
+80E82C|Hewlett Packard
+80E86F|Cisco Systems, Inc
+80E8A4|zte corporation
+80EA07|TP-LINK TECHNOLOGIES CO.,LTD.
+80EA0B|Zyxel Communications Corporation
+80EA96|Apple, Inc.
+80EB77|Wistron Corporation
+80ED2C|Apple, Inc.
+80EE25|Shenzhen Skyworth Digital Technology CO., Ltd
+80F0CF|Ruckus Wireless
+80F1A4|HUAWEI TECHNOLOGIES CO.,LTD
+80F1B2|Espressif Inc.
+80F3DA|Espressif Inc.
+80F416|Chipsea Technologies (Shenzhen) Corp.
+80F5AE|Hangzhou Hikvision Digital Technology Co.,Ltd.
+80F7A6|Shenzhen C-Data Technology Co., Ltd.
+80FB06|HUAWEI TECHNOLOGIES CO.,LTD
+84002D|PEGATRON CORPORATION
+8400D2|Sony Corporation
+840328|Juniper Networks
+840511|Apple, Inc.
+8406FA|Fiberhome Telecommunication Technologies Co.,LTD
+84083A|Intel Corporate
+840B2D|SAMSUNG ELECTRO MECHANICS CO., LTD.
+840C6D|Cisco Systems, Inc
+840D8E|Espressif Inc.
+840F4C|Apple, Inc.
+84100D|Motorola Mobility LLC, a Lenovo Company
+84119E|Samsung Electronics Co.,Ltd
+84139F|zte corporation
+84144D|Intel Corporate
+8415D3|HUAWEI TECHNOLOGIES CO.,LTD
+84160C|Broadcom Limited
+841623|zte corporation
+8416F9|TP-LINK TECHNOLOGIES CO.,LTD.
+84183A|Ruckus Wireless
+841888|Juniper Networks
+841985|Samsung Electronics Co.,Ltd
+841B38|Shenzhen Excelsecu Data Technology Co.,Ltd
+841B5E|NETGEAR
+841B77|Intel Corporate
+841C70|zte corporation
+841EA3|Sagemcom Broadband SAS
+841FE8|Espressif Inc.
+842096|SHENZHEN RF-LINK TECHNOLOGY CO.,LTD.
+842141|Shenzhen Ginwave Technologies Ltd.
+8421F1|HUAWEI TECHNOLOGIES CO.,LTD
+84225E|SHENZHEN TECHNEWCHIP TECHNOLOGY CO.,LTD.
+842289|Samsung Electronics Co.,Ltd
+842388|Ruckus Wireless
+84248D|Zebra Technologies Inc
+842519|Samsung Electronics
+8425DB|Samsung Electronics Co.,Ltd
+84262B|Nokia
+842789|Apple, Inc.
+842859|Amazon Technologies Inc.
+842999|Apple, Inc.
+842AFD|HP Inc.
+842B2B|Dell Inc.
+842BBC|Modelleisenbahn GmbH
+842E27|Samsung Electronics Co.,Ltd
+842F57|Apple, Inc.
+843095|Hon Hai Precision IND.CO.,LTD
+8430CE|Shenzhen Jaguar Microsystems Co., Ltd
+8432EA|ANHUI WANZTEN P&T CO., LTD
+8433F2|Shenzhen Stellamore Technology Co.,Ltd
+843497|Hewlett Packard
+8437D5|Samsung Electronics Co.,Ltd
+843835|Apple, Inc.
+843838|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+84398F|Fortinet, Inc.
+8439FC|Nokia
+843A4B|Intel Corporate
+843A5B|Inventec(Chongqing) Corporation
+843C99|zte corporation
+843CFC|HUAWEI TECHNOLOGIES CO.,LTD
+843DC6|Cisco Systems, Inc
+843E03|Sagemcom Broadband SAS
+843E79|Shenzhen Belon Technology CO.,LTD
+843E92|HUAWEI TECHNOLOGIES CO.,LTD
+844167|Apple, Inc.
+844693|Beijing Xiaomi Mobile Software Co., Ltd
+8446FE|HUAWEI TECHNOLOGIES CO.,LTD
+844709|Shenzhen IP3 Century Intelligent Technology CO.,Ltd
+844765|HUAWEI TECHNOLOGIES CO.,LTD
+844880|Amazon Technologies Inc.
+844BF5|Hon Hai Precision Ind. Co.,Ltd.
+844DBE|Fiberhome Telecommunication Technologies Co.,LTD
+845075|Huawei Device Co., Ltd.
+845181|Samsung Electronics Co.,Ltd
+845234|Juniper Networks
+8454DF|Huawei Device Co., Ltd.
+8455A5|Samsung Electronics Co.,Ltd
+845733|Microsoft Corporation
+8457EB|Motorola Mobility LLC, a Lenovo Company
+845A3E|Cisco Systems, Inc
+845B12|HUAWEI TECHNOLOGIES CO.,LTD
+845C31|Dell Inc.
+845CF3|Intel Corporate
+845DD7|Shenzhen Netcom Electronics Co.,Ltd
+845F04|Samsung Electronics Co.,Ltd
+846223|Shenzhen Coship Electronics Co., Ltd.
+8463D6|Microsoft Corporation
+8464DD|HUAWEI TECHNOLOGIES CO.,LTD
+84683E|Intel Corporate
+846878|Apple, Inc.
+846991|Nokia
+846993|HP Inc.
+846B48|ShenZhen EepuLink Co., Ltd.
+846EBC|Nokia Solutions and Networks India Private Limited
+84716A|Huawei Device Co., Ltd.
+84742A|zte corporation
+847460|zte corporation
+847637|HUAWEI TECHNOLOGIES CO.,LTD
+847848|Ubiquiti Inc
+84788B|Apple, Inc.
+8478AC|Cisco Systems, Inc
+847B57|Intel Corporate
+847BEB|Dell Inc.
+847CEE|Cisco Systems, Inc
+847D7E|Cisco Systems, Inc
+84802D|Cisco Systems, Inc
+848102|Fiberhome Telecommunication Technologies Co.,LTD
+848371|Avaya Inc
+848506|Apple, Inc.
+84850A|Hella Sonnen- und Wetterschutztechnik GmbH
+8487FF|Shenzhen Skyworth Digital Technology CO., Ltd
+8488E1|Apple, Inc.
+8489AD|Apple, Inc.
+848A8D|Cisco Systems, Inc
+848C8D|Apple, Inc.
+848DC7|Cisco SPVTG
+848E0C|Apple, Inc.
+848EDF|Sony Corporation
+848F69|Dell Inc.
+849265|Intel Corporate
+8492E5|HUAWEI TECHNOLOGIES CO.,LTD
+8493A0|Huawei Device Co., Ltd.
+8493B2|zte corporation
+849437|Apple, Inc.
+849459|Hangzhou Hikvision Digital Technology Co.,Ltd.
+849866|Samsung Electronics Co.,Ltd
+849A40|Hangzhou Hikvision Digital Technology Co.,Ltd.
+849D4B|Shenzhen Boomtech Industrial Corporation
+849FB5|HUAWEI TECHNOLOGIES CO.,LTD
+84A06E|Sagemcom Broadband SAS
+84A134|Apple, Inc.
+84A1D1|Sagemcom Broadband SAS
+84A423|Sagemcom Broadband SAS
+84A466|Samsung Electronics Co.,Ltd
+84A6C8|Intel Corporate
+84A824|Google, Inc.
+84A8E4|HUAWEI TECHNOLOGIES CO.,LTD
+84A938|LCFC(Hefei) Electronics Technology co., ltd
+84A93E|Hewlett Packard
+84A9C4|HUAWEI TECHNOLOGIES CO.,LTD
+84AB1A|Apple, Inc.
+84AC16|Apple, Inc.
+84AD58|HUAWEI TECHNOLOGIES CO.,LTD
+84AD8D|Apple, Inc.
+84AEDE|Xiaomi Communications Co Ltd
+84B153|Apple, Inc.
+84B1E2|Microsoft Corporation
+84B1E4|Apple, Inc.
+84B261|Cisco Systems, Inc
+84B4D2|Shenzhen iComm Semiconductor CO.,LTD
+84B517|Cisco Systems, Inc
+84B541|Samsung Electronics Co.,Ltd
+84B59C|Juniper Networks
+84B802|Cisco Systems, Inc
+84B890|TP-LINK TECHNOLOGIES CO.,LTD.
+84B8B8|Motorola (Wuhan) Mobility Technologies Communication Co., Ltd.
+84BA3B|CANON INC.
+84BA59|Wistron InfoComm(Chongqing)Co.,Ltd.
+84BE52|HUAWEI TECHNOLOGIES CO.,LTD
+84C0EF|Samsung Electronics Co.,Ltd
+84C1C1|Juniper Networks
+84C5A6|Intel Corporate
+84C7BB|Espressif Inc.
+84C7EA|Sony Corporation
+84C9B2|D-Link International
+84C9C6|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+84CC63|Huawei Device Co., Ltd.
+84CCA8|Espressif Inc.
+84CD62|ShenZhen IDWELL Technology CO.,Ltd
+84D1C1|Intel Corporate
+84D303|Chipsea Technologies (Shenzhen) Crop.
+84D328|Apple, Inc.
+84D3D5|Huawei Device Co., Ltd.
+84D412|Palo Alto Networks
+84D47E|Hewlett Packard Enterprise
+84D6D0|Amazon Technologies Inc.
+84D7DE|HUAWEI TECHNOLOGIES CO.,LTD
+84D81B|TP-LINK TECHNOLOGIES CO.,LTD.
+84DBA4|Huawei Device Co., Ltd.
+84DBAC|HUAWEI TECHNOLOGIES CO.,LTD
+84DBFC|Nokia
+84DD84|Cisco Systems, Inc
+84E342|Tuya Smart Inc.
+84E4D9|Shenzhen NEED technology Ltd.
+84E59E|Shenzhen YOUHUA Technology Co., Ltd
+84E657|Sony Interactive Entertainment Inc.
+84E986|Huawei Device Co., Ltd.
+84EA97|Shenzhen iComm Semiconductor CO.,LTD
+84EAED|Roku, Inc
+84EBEF|Cisco Systems, Inc
+84EE7F|HUAWEI TECHNOLOGIES CO.,LTD
+84EEE4|Samsung Electronics Co.,Ltd
+84EF18|Intel Corporate
+84F147|Cisco Systems, Inc
+84F2C1|zte corporation
+84F3EB|Espressif Inc.
+84F5EB|zte corporation
+84F703|Espressif Inc.
+84FC14|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+84FCAC|Apple, Inc.
+84FCE6|Espressif Inc.
+84FCFE|Apple, Inc.
+84FDD1|Intel Corporate
+84FE40|HUAWEI TECHNOLOGIES CO.,LTD
+84FFC2|Cisco Systems, Inc
+88074B|LG Electronics (Mobile Communications)
+880AA3|Juniper Networks
+880E85|Shenzhen Boomtech Industrial Corporation
+880FA2|Sagemcom Broadband SAS
+881032|Apple, Inc.
+881036|Panodic(ShenZhen) Electronics Limted
+88108F|HUAWEI TECHNOLOGIES CO.,LTD
+881196|HUAWEI TECHNOLOGIES CO.,LTD
+88124E|Qualcomm Inc.
+88127D|Shenzhen Melon Electronics Co.,Ltd
+8812AC|HUNAN FN-LINK TECHNOLOGY LIMITED
+8813BF|Espressif Inc.
+881544|Cisco Meraki
+881566|Huawei Device Co., Ltd.
+8815C5|Huawei Device Co., Ltd.
+8817A8|Apple, Inc.
+8818F1|Nokia
+881908|Apple, Inc.
+881B99|SHENZHEN XIN FEI JIA ELECTRONIC CO. LTD.
+881DFC|Cisco Systems, Inc
+881E5A|Apple, Inc.
+881FA1|Apple, Inc.
+88200D|Apple, Inc.
+882067|Fiberhome Telecommunication Technologies Co.,LTD
+88225B|Hewlett Packard Enterprise
+8822B2|Chipsea Technologies (Shenzhen) Corp.
+88238C|Fiberhome Telecommunication Technologies Co.,LTD
+882510|Hewlett Packard Enterprise
+882593|TP-LINK TECHNOLOGIES CO.,LTD.
+8828B3|HUAWEI TECHNOLOGIES CO.,LTD
+8828FB|Juniper Networks
+88299C|Samsung Electronics Co.,Ltd
+8829BF|Amazon Technologies Inc.
+882C31|Apple, Inc.
+882F92|Xiaomi Communications Co Ltd
+883037|Juniper Networks
+88329B|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+88365F|LG Electronics (Mobile Communications)
+8836CF|Huawei Device Co., Ltd.
+883A30|Hewlett Packard Enterprise
+883D24|Google, Inc.
+883F27|Huawei Device Co., Ltd.
+883FD3|HUAWEI TECHNOLOGIES CO.,LTD
+884033|HUAWEI TECHNOLOGIES CO.,LTD
+88403B|HUAWEI TECHNOLOGIES CO.,LTD
+884157|Shenzhen Atsmart Technology Co.,Ltd.
+8841C1|ORBISAT DA AMAZONIA IND E AEROL SA
+8843E1|Cisco Systems, Inc
+884477|HUAWEI TECHNOLOGIES CO.,LTD
+8844F6|Nokia Corporation
+884604|Xiaomi Communications Co Ltd
+88492D|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+884D7C|Apple, Inc.
+884F59|Cisco Systems, Inc
+8850F6|Shenzhen Jingxun Software Telecommunication Technology Co.,Ltd
+8851F2|Apple, Inc.
+8851FB|Hewlett Packard
+8852EB|Xiaomi Communications Co Ltd
+88532E|Intel Corporate
+885395|Apple, Inc.
+8853D4|HUAWEI TECHNOLOGIES CO.,LTD
+88541F|Google, Inc.
+8856A6|Espressif Inc.
+885721|Espressif Inc.
+885A92|Cisco Systems, Inc
+885BDD|Extreme Networks, Inc.
+885DFB|zte corporation
+885E54|Samsung Electronics Co.,Ltd
+8863C5|HUAWEI TECHNOLOGIES CO.,LTD
+8863DF|Apple, Inc.
+886440|Apple, Inc.
+88659F|Fiberhome Telecommunication Technologies Co.,LTD
+886639|HUAWEI TECHNOLOGIES CO.,LTD
+88665A|Apple, Inc.
+8866A5|Apple, Inc.
+8867DC|HUAWEI TECHNOLOGIES CO.,LTD
+88685C|Shenzhen ChuangDao & Perpetual Eternal Technology Co.,Ltd
+88693D|HUAWEI TECHNOLOGIES CO.,LTD
+886B6E|Apple, Inc.
+886BDB|Apple, Inc.
+886C60|Xiaomi Communications Co Ltd
+886D2D|Huawei Device Co., Ltd.
+886EEB|HUAWEI TECHNOLOGIES CO.,LTD
+886FD4|Dell Inc.
+887015|Apple, Inc.
+88708C|Lenovo Mobile Communication Technology Ltd.
+8871E5|Amazon Technologies Inc.
+887384|Toshiba
+887477|HUAWEI TECHNOLOGIES CO.,LTD
+887556|Cisco Systems, Inc
+887598|Samsung Electronics Co.,Ltd
+8876B9|D-Link Corporation
+887873|Intel Corporate
+88797E|Motorola Mobility LLC, a Lenovo Company
+887ABC|Cisco Systems, Inc
+887B2C|zte corporation
+887E25|Extreme Networks, Inc.
+887E9B|Apple, Inc.
+887FD5|zte corporation
+8881B9|Huawei Device Co., Ltd.
+888279|Shenzhen RB-LINK Intelligent Technology Co.Ltd
+888322|Samsung Electronics Co.,Ltd
+88835D|FN-LINK TECHNOLOGY LIMITED
+888603|HUAWEI TECHNOLOGIES CO.,LTD
+888717|CANON INC.
+88892F|HUAWEI TECHNOLOGIES CO.,LTD
+888E68|Huawei Device Co., Ltd.
+888F10|Shenzhen Max Infinite Technology Co.,Ltd.
+888FA4|Huawei Device Co., Ltd.
+889009|Juniper Networks
+88908D|Cisco Systems, Inc
+88947E|Fiberhome Telecommunication Technologies Co.,LTD
+889986|TP-LINK TECHNOLOGIES CO.,LTD.
+889B39|Samsung Electronics Co.,Ltd
+889CAD|Cisco Systems, Inc
+889E96|zte corporation
+889F6F|Samsung Electronics Co.,Ltd
+889FFA|Hon Hai Precision Ind. Co.,Ltd.
+88A0BE|HUAWEI TECHNOLOGIES CO.,LTD
+88A25E|Juniper Networks
+88A29E|Raspberry Pi (Trading) Ltd
+88A2D7|HUAWEI TECHNOLOGIES CO.,LTD
+88A303|Samsung Electronics Co.,Ltd
+88A479|Apple, Inc.
+88A4C2|LCFC(Hefei) Electronics Technology co., ltd
+88A6C6|Sagemcom Broadband SAS
+88A9B7|Apple, Inc.
+88AC9E|Shenzhen YOUHUA Technology Co., Ltd
+88ACC0|Zyxel Communications Corporation
+88AD43|PEGATRON CORPORATION
+88ADD2|Samsung Electronics Co.,Ltd
+88AE07|Apple, Inc.
+88AE1D|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+88B111|Intel Corporate
+88B291|Apple, Inc.
+88B2AB|Fiberhome Telecommunication Technologies Co.,LTD
+88B362|Nokia Shanghai Bell Co., Ltd.
+88B4A6|Motorola Mobility LLC, a Lenovo Company
+88B4BE|HUAWEI TECHNOLOGIES CO.,LTD
+88B5FF|Shenzhen iComm Semiconductor CO.,LTD
+88B7EB|Apple, Inc.
+88B945|Apple, Inc.
+88B951|Xiaomi Communications Co Ltd
+88BCAC|Zebra Technologies Inc.
+88BCC1|HUAWEI TECHNOLOGIES CO.,LTD
+88BD45|Samsung Electronics Co.,Ltd
+88BF35|Verifone, Inc.
+88BFE4|HUAWEI TECHNOLOGIES CO.,LTD
+88C08B|Apple, Inc.
+88C174|zte corporation
+88C227|HUAWEI TECHNOLOGIES CO.,LTD
+88C344|Google, Inc.
+88C397|Beijing Xiaomi Mobile Software Co., Ltd
+88C663|Apple, Inc.
+88C6E8|HUAWEI TECHNOLOGIES CO.,LTD
+88C78F|zte corporation
+88C9D0|LG Electronics (Mobile Communications)
+88C9E8|Sony Corporation
+88CB87|Apple, Inc.
+88CC45|Skyworth Digital Technology(Shenzhen) Co.,Ltd
+88CE3F|HUAWEI TECHNOLOGIES CO.,LTD
+88CEFA|HUAWEI TECHNOLOGIES CO.,LTD
+88CF98|HUAWEI TECHNOLOGIES CO.,LTD
+88D274|zte corporation
+88D546|Apple, Inc.
+88D7F6|ASUSTek COMPUTER INC.
+88D82E|Intel Corporate
+88D98F|Juniper Networks
+88DA04|HUAWEI TECHNOLOGIES CO.,LTD
+88DDB8|Huawei Device Co., Ltd.
+88DE39|Hangzhou Hikvision Digital Technology Co.,Ltd.
+88DEA9|Roku, Inc.
+88E056|HUAWEI TECHNOLOGIES CO.,LTD
+88E0A0|Shenzhen VisionSTOR Technologies Co., Ltd
+88E0F3|Juniper Networks
+88E3AB|HUAWEI TECHNOLOGIES CO.,LTD
+88E628|Shenzhen Kezhonglong Optoelectronic Technology Co.,Ltd
+88E64B|Juniper Networks
+88E87F|Apple, Inc.
+88E9A4|Hewlett Packard Enterprise
+88E9FE|Apple, Inc.
+88F031|Cisco Systems, Inc
+88F077|Cisco Systems, Inc
+88F155|Espressif Inc.
+88F2CE|Apple, Inc.
+88F3D5|Zyxel Communications Corporation
+88F488|cellon communications technology(shenzhen)Co.,Ltd.
+88F4DA|Intel Corporate
+88F56E|HUAWEI TECHNOLOGIES CO.,LTD
+88F6DC|Huawei Device Co., Ltd.
+88F872|HUAWEI TECHNOLOGIES CO.,LTD
+88FC5D|Cisco Systems, Inc
+8C006D|Apple, Inc.
+8C04BA|Dell Inc.
+8C0528|SHEN ZHEN TENDA TECHNOLOGY CO.,LTD
+8C0572|Huawei Device Co., Ltd.
+8C08AA|Apple, Inc.
+8C0C87|Nokia
+8C0C90|Ruckus Wireless
+8C0D76|HUAWEI TECHNOLOGIES CO.,LTD
+8C0F6F|PEGATRON CORPORATION
+8C0F7E|TCL King Electrical Appliances(Huizhou)Co.,Ltd
+8C0FC9|Huawei Device Co., Ltd.
+8C10D4|Sagemcom Broadband SAS
+8C142A|Cisco Systems, Inc
+8C14B4|zte corporation
+8C15C7|HUAWEI TECHNOLOGIES CO.,LTD
+8C1645|LCFC(Hefei) Electronics Technology co., ltd
+8C1759|Intel Corporate
+8C17B6|Huawei Device Co., Ltd.
+8C1801|zte corporation
+8C18D9|Shenzhen RF Technology Co., Ltd
+8C1952|Amazon Technologies Inc.
+8C1ABF|Samsung Electronics Co.,Ltd
+8C1AF3|Shenzhen Gooxi Information Security CO.,Ltd.
+8C1D96|Intel Corporate
+8C1E80|Cisco Systems, Inc
+8C210A|TP-LINK TECHNOLOGIES CO.,LTD.
+8C2114|Huawei Device Co., Ltd.
+8C22D2|Hangzhou Hikvision Digital Technology Co.,Ltd.
+8C2505|HUAWEI TECHNOLOGIES CO.,LTD
+8C26AA|Apple, Inc.
+8C2937|Apple, Inc.
+8C2A85|Amazon Technologies Inc.
+8C2DAA|Apple, Inc.
+8C2E72|Samsung Electronics Co.,Ltd
+8C3066|Ubiquiti Inc
+8C3396|Apple, Inc.
+8C3446|Huawei Device Co., Ltd.
+8C34FD|HUAWEI TECHNOLOGIES CO.,LTD
+8C367A|Palo Alto Networks
+8C3AE3|LG Electronics (Mobile Communications)
+8C3BAD|NETGEAR
+8C3D16|Shenzhen Four Seas Global Link Network Technology Co.,Ltd
+8C426D|HUAWEI TECHNOLOGIES CO.,LTD
+8C44A5|Cisco Systems, Inc
+8C44BB|SHEN ZHEN TENDA TECHNOLOGY CO.,LTD
+8C4598|Espressif Inc.
+8C47BE|Dell Inc.
+8C4962|Roku, Inc
+8C497A|Extreme Networks, Inc.
+8C4B14|Espressif Inc.
+8C4E46|Motorola Mobility LLC, a Lenovo Company
+8C4EBB|Amazon Technologies Inc.
+8C4F00|Espressif Inc.
+8C5105|Shenzhen ireadygo Information Technology CO.,LTD.
+8C5219|SHARP Corporation
+8C53C3|Beijing Xiaomi Mobile Software Co., Ltd
+8C554A|Intel Corporate
+8C5646|LG Electronics
+8C5877|Apple, Inc.
+8C5973|Zyxel Communications Corporation
+8C5AC1|Huawei Device Co., Ltd.
+8C5AF8|Beijing Xiaomi Electronics Co., Ltd.
+8C5EBD|Huawei Device Co., Ltd.
+8C5FAD|Fiberhome Telecommunication Technologies Co.,LTD
+8C604F|Cisco Systems, Inc
+8C6422|Sony Corporation
+8C64A2|OnePlus Technology (Shenzhen) Co., Ltd
+8C683A|HUAWEI TECHNOLOGIES CO.,LTD
+8C68C8|zte corporation
+8C6A3B|Samsung Electronics Co.,Ltd
+8C6BDB|Huawei Device Co., Ltd.
+8C6D50|SHENZHEN MTC CO LTD
+8C6D77|HUAWEI TECHNOLOGIES CO.,LTD
+8C705A|Intel Corporate
+8C71F8|Samsung Electronics Co.,Ltd
+8C736E|FUJITSU LIMITED
+8C73A0|Fiberhome Telecommunication Technologies Co.,LTD
+8C7712|Samsung Electronics Co.,Ltd
+8C78D7|SHENZHEN FAST TECHNOLOGIES CO.,LTD
+8C7909|Hewlett Packard Enterprise
+8C7967|zte corporation
+8C79F5|Samsung Electronics Co.,Ltd
+8C7A00|Nokia
+8C7A15|Ruckus Wireless
+8C7A3D|Xiaomi Communications Co Ltd
+8C7AAA|Apple, Inc.
+8C7B9D|Apple, Inc.
+8C7C92|Apple, Inc.
+8C7CB5|Hon Hai Precision Ind. Co.,Ltd.
+8C8283|Apple, Inc.
+8C839D|SHENZHEN XINYUPENG ELECTRONIC TECHNOLOGY CO., LTD
+8C83DF|Nokia
+8C83E1|Samsung Electronics Co.,Ltd
+8C83E8|HUAWEI TECHNOLOGIES CO.,LTD
+8C8442|Cisco Systems, Inc
+8C8474|Broadcom Limited
+8C8590|Apple, Inc.
+8C85C1|Hewlett Packard Enterprise
+8C861E|Apple, Inc.
+8C862A|HUAWEI TECHNOLOGIES CO.,LTD
+8C86DD|TP-Link Systems Inc.
+8C87D0|Shenzhen Uascent Technology Co.,Ltd
+8C8881|Cisco Meraki
+8C89A5|Micro-Star INT'L CO., LTD
+8C8ACD|HUAWEI TECHNOLOGIES CO.,LTD
+8C8C29|Espressif Inc.
+8C8CAA|LCFC(Hefei) Electronics Technology co., ltd
+8C8D28|Intel Corporate
+8C8E0D|zte corporation
+8C8EF2|Apple, Inc.
+8C8FE9|Apple, Inc.
+8C902D|TP-Link Systems Inc.
+8C90D3|Nokia
+8C91A4|Apple, Inc.
+8C941F|Cisco Systems, Inc
+8C9461|Cisco Systems, Inc
+8C94DF|Espressif Inc.
+8C9806|SHENZHEN SEI ROBOTICS CO.,LTD
+8C986B|Apple, Inc.
+8C9885|Samsung Electronics Co.,Ltd
+8C9A8F|Sagemcom Broadband SAS
+8CA2F5|Huawei Device Co., Ltd.
+8CA3EC|Samsung Electronics Co.,Ltd
+8CA401|Shenzhen New Chip Intelligence Co.,LTD
+8CA5CF|HUAWEI TECHNOLOGIES CO.,LTD
+8CA6DF|TP-LINK TECHNOLOGIES CO.,LTD.
+8CA96D|HUAWEI TECHNOLOGIES CO.,LTD
+8CA982|Intel Corporate
+8CAAB5|Espressif Inc.
+8CAACE|Xiaomi Communications Co Ltd
+8CB0E9|Samsung Electronics.,LTD
+8CB50E|Cisco Systems, Inc
+8CB64F|Cisco Systems, Inc
+8CB7F7|Shenzhen UniStrong Science & Technology Co., Ltd
+8CB84A|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+8CB87E|Intel Corporate
+8CBD37|Shenzhen Phaten Tech. LTD
+8CBEBE|Xiaomi Communications Co Ltd
+8CBFA6|Samsung Electronics Co.,Ltd
+8CBFEA|Espressif Inc.
+8CC121|Panasonic Corporation AVC Networks Company
+8CC246|Apple, Inc.
+8CC58C|ShenZhen Elsky Technology Co.,LTD
+8CC5B4|Sagemcom Broadband SAS
+8CC5D0|Samsung Electronics Co.,Ltd
+8CC5E1|ShenZhen Konka Telecommunication Technology Co.,Ltd
+8CC681|Intel Corporate
+8CC8CD|Samsung Electronics Co.,Ltd
+8CC9E9|Huawei Device Co., Ltd.
+8CCBDF|FOXCONN INTERCONNECT TECHNOLOGY
+8CCE4E|Espressif Inc.
+8CCEFD|Shenzhen zhouhai technology co.,LTD
+8CCF09|Dell EMC
+8CD0B2|Beijing Xiaomi Mobile Software Co., Ltd
+8CD9D6|Xiaomi Communications Co Ltd
+8CDC02|zte corporation
+8CDCD4|Hewlett Packard
+8CDEE6|Samsung Electronics Co.,Ltd
+8CDEF9|Beijing Xiaomi Mobile Software Co., Ltd
+8CE081|zte corporation
+8CE117|zte corporation
+8CE4DB|Shenzhen MiaoMing Intelligent Technology Co.,Ltd
+8CE5C0|Samsung Electronics Co.,Ltd
+8CE5EF|HUAWEI TECHNOLOGIES CO.,LTD
+8CE748|Hangzhou Hikvision Digital Technology Co.,Ltd.
+8CE9B4|Zhejiang Dahua Technology Co., Ltd.
+8CE9EE|Intel Corporate
+8CE9FF|Dell Inc.
+8CEA12|Shenzhen MiaoMing Intelligent Technology Co.,Ltd
+8CEA48|Samsung Electronics Co.,Ltd
+8CEBC6|HUAWEI TECHNOLOGIES CO.,LTD
+8CEC4B|Dell Inc.
+8CEC7B|Apple, Inc.
+8CEDE1|Ubiquiti Inc
+8CEEFD|zte corporation
+8CF112|Motorola Mobility LLC, a Lenovo Company
+8CF5A3|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+8CF67D|NETGEAR
+8CF773|Nokia
+8CF8C5|Intel Corporate
+8CF957|RuiXingHengFang Network (Shenzhen) Co.,Ltd
+8CFABA|Apple, Inc.
+8CFADD|HUAWEI TECHNOLOGIES CO.,LTD
+8CFCA0|Shenzhen Smart Device Technology Co., LTD.
+8CFD18|HUAWEI TECHNOLOGIES CO.,LTD
+8CFD49|Espressif Inc.
+8CFDDE|Sagemcom Broadband SAS
+8CFDF0|Qualcomm Inc.
+8CFE57|Apple, Inc.
+8CFE74|Ruckus Wireless
+90004E|Hon Hai Precision Ind. Co.,Ltd.
+9000DB|Samsung Electronics Co.,Ltd
+900117|HUAWEI TECHNOLOGIES CO.,LTD
+90013B|Sagemcom Broadband SAS
+90027A|Shenzhen Sworix Techonlogy Co., Ltd
+90028A|Shenzhen Shidean Legrand Electronic Products Co.,Ltd
+9002A9|Zhejiang Dahua Technology Co., Ltd.
+900325|HUAWEI TECHNOLOGIES CO.,LTD
+900628|Samsung Electronics Co.,Ltd
+9006DB|HUAWEI TECHNOLOGIES CO.,LTD
+9009D0|Synology Incorporated
+9009DF|Intel Corporate
+900A48|Samsung Electronics Co.,Ltd
+900CC8|Google, Inc.
+900E9E|Shenzhen SuperElectron Technology Co.,Ltd.
+900EB3|Shenzhen Amediatech Technology Co., Ltd.
+901057|Intel Corporate
+901195|Amazon Technologies Inc.
+901234|Shenzhen YOUHUA Technology Co., Ltd
+9014AF|Cambium Networks Limited
+901506|Espressif Inc.
+9016BA|HUAWEI TECHNOLOGIES CO.,LTD
+90173F|HUAWEI TECHNOLOGIES CO.,LTD
+9017AC|HUAWEI TECHNOLOGIES CO.,LTD
+9017C8|HUAWEI TECHNOLOGIES CO.,LTD
+90187C|SAMSUNG ELECTRO MECHANICS CO., LTD.
+901B0E|Fujitsu Technology Solutions GmbH
+901D27|zte corporation
+901F94|TP-Link Systems Inc.
+9020C2|Hewlett Packard Enterprise
+9020D7|Microsoft Corporation
+90235B|Amazon Technologies Inc.
+9025F2|HUAWEI TECHNOLOGIES CO.,LTD
+9027E4|Apple, Inc.
+902AEE|Xiaomi Communications Co Ltd
+902B34|GIGA-BYTE TECHNOLOGY CO.,LTD.
+902BD2|HUAWEI TECHNOLOGIES CO.,LTD
+902C09|Apple, Inc.
+902E16|LCFC(Hefei) Electronics Technology co., ltd
+902E1C|Intel Corporate
+903196|SHENZHEN IP-COM NETWORKS CO.,LTD.
+90324B|Hon Hai Precision Ind. Co.,Ltd.
+9034FC|Hon Hai Precision Ind. Co.,Ltd.
+9035A2|Apple, Inc.
+90380C|Espressif Inc.
+90395F|Amazon Technologies Inc.
+903A72|Ruckus Wireless
+903AA0|Nokia
+903C92|Apple, Inc.
+903CDA|Fiberhome Telecommunication Technologies Co.,LTD
+903D5A|Shenzhen Wision Technology Holding Limited
+903E7F|Fiberhome Telecommunication Technologies Co.,LTD
+903FC3|Huawei Device Co., Ltd.
+903FEA|HUAWEI TECHNOLOGIES CO.,LTD
+9041B2|Ubiquiti Inc
+904748|Sony Interactive Entertainment Inc.
+9047C2|Intel Corporate
+90489A|Hon Hai Precision Ind. Co.,Ltd.
+9049FA|Intel Corporate
+904C81|Hewlett Packard Enterprise
+904CC5|Apple, Inc.
+904CE5|Hon Hai Precision Ind. Co.,Ltd.
+904D4A|Sagemcom Broadband SAS
+904DE2|Apple, Inc.
+904E2B|HUAWEI TECHNOLOGIES CO.,LTD
+9051F8|Hewlett Packard Enterprise
+9055DE|Fiberhome Telecommunication Technologies Co.,LTD
+905671|Cisco Systems, Inc
+905C44|Compal Broadband Networks, Inc.
+905E44|HUAWEI TECHNOLOGIES CO.,LTD
+905F7A|Apple, Inc.
+9060F1|Apple, Inc.
+9061AE|Intel Corporate
+90623F|Apple, Inc.
+90633B|Samsung Electronics Co.,Ltd
+90649B|Espressif Inc.
+9064AD|HUAWEI TECHNOLOGIES CO.,LTD
+906584|Intel Corporate
+90671C|HUAWEI TECHNOLOGIES CO.,LTD
+9068C3|Motorola Mobility LLC, a Lenovo Company
+906989|Samsung Electronics Co.,Ltd
+906AEB|Microsoft Corporation
+906CAC|Fortinet, Inc.
+906D62|Cambium Networks Limited
+906EBB|Hon Hai Precision Ind. Co.,Ltd.
+907069|Espressif Inc.
+9070D3|Fiberhome Telecommunication Technologies Co.,LTD
+907240|Apple, Inc.
+907282|Sagemcom Broadband SAS
+90735A|Motorola Mobility LLC, a Lenovo Company
+9074AE|AzureWave Technology Inc.
+9074F2|HUAWEI TECHNOLOGIES CO.,LTD
+9075BC|Nokia Shanghai Bell Co., Ltd.
+9075DE|Zebra Technologies Inc.
+90769F|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+9077EE|Cisco Systems, Inc
+907841|Intel Corporate
+9078B2|Xiaomi Communications Co Ltd
+9079CF|zte corporation
+907E43|zte corporation
+907EBA|UTEK TECHNOLOGY (SHENZHEN) CO.,LTD
+90808F|Huawei Device Co., Ltd.
+90812A|Apple, Inc.
+908158|Apple, Inc.
+908175|Samsung Electronics Co.,Ltd
+9082C3|Quanta Computer Inc.
+90837E|Fiberhome Telecommunication Technologies Co.,LTD
+90840D|Apple, Inc.
+90869B|zte corporation
+908855|Cisco Systems, Inc
+908A80|Cisco Systems, Inc
+908C43|Apple, Inc.
+908D6C|Apple, Inc.
+908D6E|Dell Inc.
+908D78|D-Link International
+909497|HUAWEI TECHNOLOGIES CO.,LTD
+9094E4|D-Link International
+909507|HUAWEI TECHNOLOGIES CO.,LTD
+9097D5|Espressif Inc.
+9097F3|Samsung Electronics Co.,Ltd
+909838|Huawei Device Co., Ltd.
+909A4A|TP-LINK TECHNOLOGIES CO.,LTD.
+909B6F|Apple, Inc.
+909C4A|Apple, Inc.
+909F22|Zyxel Communications Corporation
+90A25B|Apple, Inc.
+90A57D|Huawei Device Co., Ltd.
+90A5AF|HUAWEI TECHNOLOGIES CO.,LTD
+90A822|Amazon Technologies Inc.
+90AC6D|Apple, Inc.
+90AE1B|TP-LINK TECHNOLOGIES CO.,LTD.
+90B021|Intel Corporate
+90B0ED|Apple, Inc.
+90B11C|Dell Inc.
+90B141|Motorola Mobility LLC, a Lenovo Company
+90B144|Samsung Electronics Co.,Ltd
+90B176|Intel Corporate
+90B21F|Apple, Inc.
+90B339|Espressif Inc.
+90B57F|Shenzhen iComm Semiconductor CO.,LTD
+90B622|Samsung Electronics Co.,Ltd
+90B67A|Shenzhen Skyworth Digital Technology CO., Ltd
+90B790|Apple, Inc.
+90B832|Extreme Networks, Inc.
+90B8E0|SHENZHEN YANRAY TECHNOLOGY CO.,LTD
+90B931|Apple, Inc.
+90B942|zte corporation
+90B9F9|Motorola Mobility LLC, a Lenovo Company
+90BA09|HUAWEI TECHNOLOGIES CO.,LTD
+90C115|Sony Corporation
+90C119|Nokia
+90C1C6|Apple, Inc.
+90C710|zte corporation
+90C7D8|zte corporation
+90C97E|HUAWEI TECHNOLOGIES CO.,LTD
+90CAFA|Google, Inc.
+90CC7A|Huawei Device Co., Ltd.
+90CCDF|Intel Corporate
+90CDB6|Hon Hai Precision Ind. Co.,Ltd.
+90CDE8|Apple, Inc.
+90CF15|Nokia Corporation
+90D20B|Nokia Shanghai Bell Co., Ltd.
+90D432|zte corporation
+90D733|HUAWEI TECHNOLOGIES CO.,LTD
+90D8F3|zte corporation
+90DA72|Espressif Inc.
+90DD5D|Apple, Inc.
+90DE80|Shenzhen Century Xinyang Technology Co., Ltd
+90E17B|Apple, Inc.
+90E2BA|Intel Corporate
+90E4B0|SHARP Corporation
+90E5B1|Espressif Inc.
+90E6BA|ASUSTek COMPUTER INC.
+90E868|AzureWave Technology Inc.
+90E95E|Cisco Systems, Inc
+90EB50|Cisco Systems, Inc
+90ECE3|Nokia
+90ECEA|Apple, Inc.
+90EEC7|Samsung Electronics Co.,Ltd
+90EF68|Zyxel Communications Corporation
+90F04C|Nokia Solutions (Shanghai) Co.,Ltd.
+90F1AA|Samsung Electronics Co.,Ltd
+90F260|Shenzhen Honesty Electronics Co.,Ltd.
+90F644|Huawei Device Co., Ltd.
+90F652|TP-LINK TECHNOLOGIES CO.,LTD.
+90F80C|Samsung Electronics Co.,Ltd
+90F82E|Amazon Technologies Inc.
+90F970|HUAWEI TECHNOLOGIES CO.,LTD
+90F9B7|HUAWEI TECHNOLOGIES CO.,LTD
+90FB5B|Avaya Inc
+90FB5D|Beijing Xiaomi Mobile Software Co., Ltd
+90FBA6|Hon Hai Precision Ind. Co.,Ltd.
+90FD61|Apple, Inc.
+90FD73|zte corporation
+940070|Nokia Corporation
+9400B0|HUAWEI TECHNOLOGIES CO.,LTD
+94017D|SHENZHEN SHLINK.CO.,LIMITED
+9401C2|Samsung Electronics Co.,Ltd
+94049C|HUAWEI TECHNOLOGIES CO.,LTD
+940853|Liteon Technology Corporation
+9408C7|Huawei Device Co., Ltd.
+9409D3|shenzhen maxtopic technology co.,ltd
+940B19|HUAWEI TECHNOLOGIES CO.,LTD
+940B2D|NetView Technologies(Shenzhen) Co., Ltd
+940B83|zte corporation
+940BCD|Apple, Inc.
+940C6D|TP-LINK TECHNOLOGIES CO.,LTD.
+940C98|Apple, Inc.
+940D4B|Cisco Systems, Inc
+940E5F|Apple, Inc.
+940E6B|HUAWEI TECHNOLOGIES CO.,LTD
+940EE7|HUAWEI TECHNOLOGIES CO.,LTD
+94105A|Dell Inc.
+941457|Shenzhen Sundray Technologies company Limited
+9415B2|Huawei Device Co., Ltd.
+941625|Apple, Inc.
+941700|Xiaomi Communications Co Ltd
+941787|Nokia
+941865|NETGEAR
+941882|Hewlett Packard Enterprise
+941DD4|Google, Inc.
+942053|Nokia Corporation
+942157|Apple, Inc.
+94236E|Shenzhen Junlan Electronic Ltd
+942453|HUAWEI TECHNOLOGIES CO.,LTD
+942533|HUAWEI TECHNOLOGIES CO.,LTD
+94261D|HUAWEI TECHNOLOGIES CO.,LTD
+94270E|Intel Corporate
+94286F|zte corporation
+942A6F|Ubiquiti Inc
+942B68|Apple, Inc.
+942D3A|PRIZOR VIZTECH LIMITED
+942DDC|Samsung Electronics Co.,Ltd
+942E17|Schneider Electric Canada Inc
+9433D8|Cisco Systems, Inc
+94350A|Samsung Electronics Co.,Ltd
+943589|HUAWEI TECHNOLOGIES CO.,LTD
+9437F7|Huawei Device Co., Ltd.
+94390E|Intel Corporate
+9439E5|Hon Hai Precision Ind. Co.,Ltd.
+943A91|Amazon Technologies Inc.
+943AF0|Nokia Corporation
+943B22|NETGEAR
+943C96|Sagemcom Broadband SAS
+943CC6|Espressif Inc.
+943FC2|Hewlett Packard Enterprise
+943FD6|Apple, Inc.
+9440C9|Hewlett Packard Enterprise
+9440F3|HUAWEI TECHNOLOGIES CO.,LTD
+944560|Google, Inc.
+944667|Cisco Systems, Inc
+944788|HUAWEI TECHNOLOGIES CO.,LTD
+9447EE|Fiberhome Telecommunication Technologies Co.,LTD
+9449F6|Huawei Device Co., Ltd.
+944FDB|Nokia
+945103|Samsung Electronics Co.,Ltd
+9451DC|Espressif Inc.
+945244|Samsung Electronics Co.,Ltd
+945330|Hon Hai Precision Ind. Co.,Ltd.
+9453FF|Intel Corporate
+9454C5|Espressif Inc.
+945641|Palo Alto Networks
+9457A5|Hewlett Packard
+945915|Amazon Technologies Inc.
+945AEA|HUAWEI TECHNOLOGIES CO.,LTD
+945AFC|Amazon Technologies Inc.
+945C9A|Apple, Inc.
+945DBF|Nokia Solutions and Networks India Private Limited
+946010|Huawei Device Co., Ltd.
+9460D5|Hewlett Packard Enterprise
+94626D|Beijing Xiaomi Electronics Co.,Ltd
+9463D1|Samsung Electronics Co.,Ltd
+946424|Hewlett Packard Enterprise
+94652D|OnePlus Technology (Shenzhen) Co., Ltd
+94659C|Intel Corporate
+946A7C|OnePlus Technology (Shenzhen) Co., Ltd
+94742E|MERCUSYS TECHNOLOGIES CO., LTD.
+9476B7|Samsung Electronics Co.,Ltd
+94772B|HUAWEI TECHNOLOGIES CO.,LTD
+947AF4|HUAWEI TECHNOLOGIES CO.,LTD
+947BAE|Xiaomi Communications Co Ltd
+947BE7|Samsung Electronics Co.,Ltd
+947D77|HUAWEI TECHNOLOGIES CO.,LTD
+947F1D|Shenzhen Fastrain Technology Co., Ltd.
+947FD8|Shenzhen Skyworth Digital Technology CO., Ltd
+9487E0|Xiaomi Communications Co Ltd
+948978|Apple, Inc.
+948B93|Xiaomi Communications Co Ltd
+948BC1|Samsung Electronics Co.,Ltd
+949010|HUAWEI TECHNOLOGIES CO.,LTD
+949034|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+949386|Shenzhen SiACRRIER Industry Machines Co.,LTD
+949426|Apple, Inc.
+9495A0|Google, Inc.
+949722|AzureWave Technology Inc.
+94974F|Liteon Technology Corporation
+949869|zte corporation
+94988F|Sagemcom Broadband SAS
+949901|Shenzhen YITOA Digital Appliance CO.,LTD
+949AA9|Microsoft Corporation
+949B2C|Extreme Networks, Inc.
+949CBE|HUAWEI TECHNOLOGIES CO.,LTD
+949D57|Panasonic do Brasil Limitada
+949F3E|Sonos, Inc.
+949F8B|zte corporation
+94A07D|Huawei Device Co., Ltd.
+94A25D|HUAWEI TECHNOLOGIES CO.,LTD
+94A408|Shenzhen Trolink Technology CO, LTD
+94A4F9|HUAWEI TECHNOLOGIES CO.,LTD
+94A67E|NETGEAR
+94A7B7|zte corporation
+94A990|Espressif Inc.
+94AA07|Nokia
+94AA0A|Fiberhome Telecommunication Technologies Co.,LTD
+94ABFE|Nokia
+94AD05|Huawei Device Co., Ltd.
+94AD23|Apple, Inc.
+94AEF0|Cisco Systems, Inc
+94B01F|Apple, Inc.
+94B10A|Samsung Electronics Co.,Ltd
+94B271|HUAWEI TECHNOLOGIES CO.,LTD
+94B34F|Ruckus Wireless
+94B40F|Hewlett Packard Enterprise
+94B43A|Samsung Electronics Co.,Ltd
+94B555|Espressif Inc.
+94B609|Intel Corporate
+94B819|Nokia
+94B86D|Intel Corporate
+94B97E|Espressif Inc.
+94BA06|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+94BA56|Shenzhen Coship Electronics Co., Ltd.
+94BB43|AzureWave Technology Inc.
+94BE46|Motorola (Wuhan) Mobility Technologies Communication Co., Ltd.
+94BF2D|Apple, Inc.
+94BF80|zte corporation
+94BF94|Juniper Networks
+94BF95|Shenzhen Coship Electronics Co., Ltd
+94BFC4|Ruckus Wireless
+94CA0F|Honeywell Analytics
+94CBCD|zte corporation
+94CE0F|Huawei Device Co., Ltd.
+94CE2C|Sony Corporation
+94CFB0|Huawei Device Co., Ltd.
+94D00D|HUAWEI TECHNOLOGIES CO.,LTD
+94D2BC|HUAWEI TECHNOLOGIES CO.,LTD
+94D331|Xiaomi Communications Co Ltd
+94D469|Cisco Systems, Inc
+94D505|Fiberhome Telecommunication Technologies Co.,LTD
+94D54D|HUAWEI TECHNOLOGIES CO.,LTD
+94D60E|shenzhen yunmao information technologies co., ltd
+94D771|Samsung Electronics Co.,Ltd
+94D9B3|TP-LINK TECHNOLOGIES CO.,LTD.
+94DB56|Sony Home Entertainment&Sound Products Inc
+94DBC9|AzureWave Technology Inc.
+94DBDA|HUAWEI TECHNOLOGIES CO.,LTD
+94DDF8|Brother Industries, LTD.
+94DE80|GIGA-BYTE TECHNOLOGY CO.,LTD.
+94DF34|HUAWEI TECHNOLOGIES CO.,LTD
+94DF4E|Wistron InfoComm(Kunshan)Co.,Ltd.
+94E129|Samsung Electronics Co.,Ltd
+94E1AC|Hangzhou Hikvision Digital Technology Co.,Ltd.
+94E23C|Intel Corporate
+94E300|HUAWEI TECHNOLOGIES CO.,LTD
+94E3EE|zte corporation
+94E4BA|Huawei Device Co., Ltd.
+94E686|Espressif Inc.
+94E6BA|Samsung Electronics Co.,Ltd
+94E6F7|Intel Corporate
+94E70B|Intel Corporate
+94E7EA|HUAWEI TECHNOLOGIES CO.,LTD
+94E7F3|HUAWEI TECHNOLOGIES CO.,LTD
+94E96A|Apple, Inc.
+94E979|Liteon Technology Corporation
+94E98C|Nokia
+94E9EE|Huawei Device Co., Ltd.
+94EA32|Apple, Inc.
+94EB2C|Google, Inc.
+94EF50|TP-Link Systems Inc.
+94F128|Hewlett Packard Enterprise
+94F392|Fortinet, Inc.
+94F665|Ruckus Wireless
+94F6A3|Apple, Inc.
+94F6D6|Apple, Inc.
+94F7AD|Juniper Networks
+94FAE8|Shenzhen Eycom Technology Co., Ltd
+94FB29|Zebra Technologies Inc.
+94FBB2|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+94FE22|HUAWEI TECHNOLOGIES CO.,LTD
+94FE9D|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+94FEF4|Sagemcom Broadband SAS
+94FF06|Hewlett Packard Enterprise
+94FF3C|Fortinet, Inc.
+98006A|zte corporation
+9800C6|Apple, Inc.
+9801A7|Apple, Inc.
+98038E|TP-Link Systems Inc.
+9803CF|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+9803D8|Apple, Inc.
+98045F|Huawei Device Co., Ltd.
+98063C|Samsung Electronics Co.,Ltd
+980709|Huawei Device Co., Ltd.
+98076A|Apple, Inc.
+9809CF|OnePlus Technology (Shenzhen) Co., Ltd
+980A4B|Nokia Solutions and Networks GmbH & Co. KG
+980C82|SAMSUNG ELECTRO MECHANICS CO., LTD.
+980CA5|Motorola (Wuhan) Mobility Technologies Communication Co., Ltd.
+980D51|Huawei Device Co., Ltd.
+980D67|Zyxel Communications Corporation
+980D6F|Samsung Electronics Co.,Ltd
+980DAF|Apple, Inc.
+981094|Shenzhen Vsun communication technology Co.,ltd
+9810E8|Apple, Inc.
+9812E0|Xiaomi Communications Co Ltd
+981333|zte corporation
+98171A|Beijing Xiaomi Mobile Software Co., Ltd
+9817F1|zte corporation
+981888|Cisco Meraki
+981A35|HUAWEI TECHNOLOGIES CO.,LTD
+981CA2|Apple, Inc.
+981DFA|Samsung Electronics Co.,Ltd
+981E19|Sagemcom Broadband SAS
+981FB1|Shenzhen Lemon Network Technology Co.,Ltd
+98226E|Amazon Technologies Inc.
+9822EF|Liteon Technology Corporation
+98247B|HUAWEI TECHNOLOGIES CO.,LTD
+98254A|TP-Link Systems Inc
+9828A6|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+9829A6|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+982A0A|Intelbras
+982AFD|HUAWEI TECHNOLOGIES CO.,LTD
+982BA6|Motorola Mobility LLC, a Lenovo Company
+982CBC|Intel Corporate
+982D68|Samsung Electronics Co., Ltd
+982FF8|Huawei Device Co., Ltd.
+9835ED|HUAWEI TECHNOLOGIES CO.,LTD
+98398E|Samsung Electronics Co.,Ltd
+983A1F|Google, Inc.
+983B8F|Intel Corporate
+983C8C|Apple, Inc.
+983DAE|Espressif Inc.
+983F60|HUAWEI TECHNOLOGIES CO.,LTD
+983FA4|zte corporation
+983FE8|Samsung Electronics Co.,Ltd
+9840BB|Dell Inc.
+984265|Sagemcom Broadband SAS
+9842F5|Apple, Inc.
+9843FA|Intel Corporate
+9844CE|HUAWEI TECHNOLOGIES CO.,LTD
+98460A|Apple, Inc.
+984744|Shenzhen Boomtech Industrial Corporation
+984827|TP-LINK TECHNOLOGIES CO.,LTD.
+984874|HUAWEI TECHNOLOGIES CO.,LTD
+984925|Juniper Networks
+984B06|HUAWEI TECHNOLOGIES CO.,LTD
+984BE1|Hewlett Packard
+984E8A|Samsung Electronics Co.,Ltd
+984FEE|Intel Corporate
+98502E|Apple, Inc.
+9851FC|Huawei Device Co., Ltd.
+985207|HUAWEI TECHNOLOGIES CO.,LTD
+9852B1|Samsung Electronics Co.,Ltd
+98535F|HUAWEI TECHNOLOGIES CO.,LTD
+98541B|Intel Corporate
+9857D3|HON HAI-CCPBG PRECISION IND.CO.,LTD.
+98597A|Intel Corporate
+985A98|HUAWEI TECHNOLOGIES CO.,LTD
+985AEB|Apple, Inc.
+985F41|Intel Corporate
+985FD3|Microsoft Corporation
+9860CA|Apple, Inc.
+986110|HUAWEI TECHNOLOGIES CO.,LTD
+986297|Shenzhen Techwinsemi Technology Co., Ltd.
+986610|zte corporation
+98698A|Apple, Inc.
+986CF5|zte corporation
+986DC8|TOSHIBA MITSUBISHI-ELECTRIC INDUSTRIAL SYSTEMS CORPORATION
+98743D|Shenzhen Jun Kai Hengye Technology Co. Ltd
+98751A|Huawei Device Co., Ltd.
+987552|Xiaomi Communications Co Ltd
+987A14|Microsoft Corporation
+987A9B|TCL MOKA International Limited
+987EB5|Huawei Device Co., Ltd.
+9880EE|Samsung Electronics Co.,Ltd
+98818A|Huawei Device Co., Ltd.
+988389|Samsung Electronics Co.,Ltd
+98865D|Nokia Shanghai Bell Co., Ltd.
+98868B|Juniper Networks
+98876C|Huawei Device Co., Ltd.
+98886C|Huawei Device Co., Ltd.
+9888E0|Espressif Inc.
+988B0A|Hangzhou Hikvision Digital Technology Co.,Ltd.
+988B5D|Sagemcom Broadband SAS
+988B69|Shenzhen hylitech Co.,LTD
+988D46|Intel Corporate
+988F00|Hewlett Packard Enterprise
+989096|Dell Inc.
+9893CC|LG ELECTRONICS INC
+9897CC|TP-LINK TECHNOLOGIES CO.,LTD.
+9898FB|Google, Inc.
+989AB9|zte corporation
+989C57|HUAWEI TECHNOLOGIES CO.,LTD
+989DE5|Hangzhou Hikvision Digital Technology Co.,Ltd.
+989E63|Apple, Inc.
+989F1E|HUAWEI TECHNOLOGIES CO.,LTD
+98A2C0|Cisco Systems, Inc
+98A316|Espressif Inc.
+98A33C|Shenzhen Cultraview Digital Technology Co., Ltd
+98A375|Huawei Device Co., Ltd.
+98A5F9|Apple, Inc.
+98AD1D|Huawei Device Co., Ltd.
+98AF65|Intel Corporate
+98B039|Nokia
+98B08B|Samsung Electronics Co.,Ltd
+98B379|Apple, Inc.
+98B3EF|Huawei Device Co., Ltd.
+98B785|Shenzhen 10Gtek Transceivers Co., Limited
+98B8BA|LG Electronics (Mobile Communications)
+98B8BC|Samsung Electronics Co.,Ltd
+98B8E3|Apple, Inc.
+98BA5F|TP-Link Systems Inc.
+98BD80|Intel Corporate
+98C08A|HUAWEI TECHNOLOGIES CO.,LTD
+98C377|Espressif Inc.
+98C7A4|Shenzhen HS Fiber Communication Equipment CO., LTD
+98C97C|Shenzhen iComm Semiconductor CO.,LTD
+98C9BE|Shenzhen SDMC Technology CO., LTD
+98CA33|Apple, Inc.
+98CAB5|Apple, Inc.
+98CC4D|Shenzhen mantunsci co., LTD
+98CCD9|Shenzhen SuperElectron Technology Co.,Ltd.
+98CCE4|Shenzhen Mindray Animal Medical Technology Co.,LTD
+98CCF3|Amazon Technologies Inc.
+98CDAC|Espressif Inc.
+98CF7D|Apple, Inc.
+98D293|Google, Inc.
+98D331|Shenzhen Bolutek Technology Co.,Ltd.
+98D3D7|HUAWEI TECHNOLOGIES CO.,LTD
+98D6BB|Apple, Inc.
+98D6F7|LG Electronics (Mobile Communications)
+98D742|Samsung Electronics Co.,Ltd
+98D7E1|Cisco Systems, Inc
+98DAC4|TP-LINK TECHNOLOGIES CO.,LTD.
+98DD60|Apple, Inc.
+98DED0|TP-LINK TECHNOLOGIES CO.,LTD.
+98DF82|Hangzhou Hikvision Digital Technology Co.,Ltd.
+98E081|Beijing Xiaomi Mobile Software Co., Ltd
+98E0D9|Apple, Inc.
+98E301|Shenzhen Sundray Technologies company Limited
+98E55B|Intelbras
+98E743|Dell Inc.
+98E79A|Foxconn(NanJing) Communication Co.,Ltd.
+98E7F4|Hewlett Packard
+98E7F5|HUAWEI TECHNOLOGIES CO.,LTD
+98E859|Apple, Inc.
+98EDCA|Fiberhome Telecommunication Technologies Co.,LTD
+98EE8C|zte corporation
+98EE94|Xiaomi Communications Co Ltd
+98EECB|Wistron Infocomm (Zhongshan) Corporation
+98F04C|Cisco Systems, Inc
+98F083|HUAWEI TECHNOLOGIES CO.,LTD
+98F0AB|Apple, Inc.
+98F112|Hangzhou Hikvision Digital Technology Co.,Ltd.
+98F2B3|Hewlett Packard Enterprise
+98F3F6|HUAWEI TECHNOLOGIES CO.,LTD
+98F428|zte corporation
+98F4AB|Espressif Inc.
+98F537|zte corporation
+98F621|Xiaomi Communications Co Ltd
+98F67A|Chipsea Technologies (Shenzhen) Crop.
+98F9CC|Zhejiang Dahua Technology Co., Ltd.
+98FA2E|Sony Interactive Entertainment Inc.
+98FA9B|LCFC(Hefei) Electronics Technology co., ltd
+98FAE3|Xiaomi Communications Co Ltd
+98FB27|Samsung Electronics Co.,Ltd
+98FC11|Cisco-Linksys, LLC
+98FE3E|Intel Corporate
+98FE54|Raspberry Pi (Trading) Ltd
+98FE94|Apple, Inc.
+98FEE1|Apple, Inc.
+98FFD0|Lenovo Mobile Communication Technology Ltd.
+9C00D3|SHENZHEN IK WORLD Technology Co., Ltd
+9C0111|Shenzhen Newabel Electronic Co., Ltd.
+9C0298|Samsung Electronics Co.,Ltd
+9C0351|HUAWEI TECHNOLOGIES CO.,LTD
+9C04EB|Apple, Inc.
+9C05D6|Ubiquiti Inc
+9C098B|Cisco Systems, Inc
+9C09CA|Huawei Device Co., Ltd.
+9C0C35|Shenzhenshi Xinzhongxin Technology Co.Ltd
+9C0E4A|Shenzhen Vastking Electronic Co.,Ltd.
+9C0E51|Schneider Electric
+9C139E|Espressif Inc.
+9C1463|Zhejiang Dahua Technology Co., Ltd.
+9C1874|Nokia Danmark A/S
+9C1A25|Apple, Inc.
+9C1C12|Hewlett Packard Enterprise
+9C1D36|HUAWEI TECHNOLOGIES CO.,LTD
+9C1FE6|Shenzhen Skyworth Display Technologies Co.,Ltd
+9C207B|Apple, Inc.
+9C216A|TP-LINK TECHNOLOGIES CO.,LTD.
+9C2183|Broadcom Limited
+9C2472|Sagemcom Broadband SAS
+9C2595|Samsung Electronics Co.,Ltd
+9C28B3|Apple, Inc.
+9C28EF|HUAWEI TECHNOLOGIES CO.,LTD
+9C28F7|Xiaomi Communications Co Ltd
+9C293F|Apple, Inc.
+9C2976|Intel Corporate
+9C2A70|Hon Hai Precision Ind. Co.,Ltd.
+9C2A83|Samsung Electronics Co.,Ltd
+9C2DCD|LCFC(Hefei) Electronics Technology co., ltd
+9C2E7A|Samsung Electronics Co.,Ltd
+9C2EA1|Xiaomi Communications Co Ltd
+9C2F4E|zte corporation
+9C2F9D|Liteon Technology Corporation
+9C305B|Hon Hai Precision Ind. Co.,Ltd.
+9C32CE|CANON INC.
+9C35EB|Apple, Inc.
+9C3708|Hewlett Packard Enterprise
+9C37CB|Sony Interactive Entertainment Inc.
+9C37F4|HUAWEI TECHNOLOGIES CO.,LTD
+9C3818|Cisco Systems, Inc
+9C3928|Samsung Electronics Co.,Ltd
+9C3A9A|Shenzhen Sundray Technologies company Limited
+9C3AAF|Samsung Electronics Co.,Ltd
+9C3DCF|NETGEAR
+9C3E53|Apple, Inc.
+9C4782|TP-LINK TECHNOLOGIES CO.,LTD.
+9C47F4|Nokia
+9C4929|HUAWEI TECHNOLOGIES CO.,LTD
+9C4A7B|Nokia Corporation
+9C4DC2|Cisco Systems, Inc
+9C4E20|Cisco Systems, Inc
+9C4E36|Intel Corporate
+9C4F5F|Google, Inc.
+9C4FAC|zte corporation
+9C4FDA|Apple, Inc.
+9C52F8|HUAWEI TECHNOLOGIES CO.,LTD
+9C5322|TP-Link Systems Inc
+9C5416|Cisco Systems, Inc
+9C541C|Shenzhen My-power Technology Co.,Ltd
+9C5467|Nokia
+9C5636|Huawei Device Co., Ltd.
+9C5766|HUAWEI TECHNOLOGIES CO.,LTD
+9C57AD|Cisco Systems, Inc
+9C583C|Apple, Inc.
+9C5884|Apple, Inc.
+9C5A44|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+9C5A80|Juniper Networks
+9C5A81|Xiaomi Communications Co Ltd
+9C5C8E|ASUSTek COMPUTER INC.
+9C5CF9|Sony Corporation
+9C5D12|Extreme Networks, Inc.
+9C5FB0|Samsung Electronics Co.,Ltd
+9C6076|Apple, Inc.
+9C611D|Panasonic Corporation of North America
+9C61D7|HUAWEI TECHNOLOGIES CO.,LTD
+9C635B|zte corporation
+9C63ED|zte corporation
+9C648B|Apple, Inc.
+9C65B0|Samsung Electronics Co.,Ltd
+9C65EB|Intel Corporate
+9C6697|Cisco Systems, Inc
+9C67D6|Intel Corporate
+9C6865|Fiberhome Telecommunication Technologies Co.,LTD
+9C69D1|HUAWEI TECHNOLOGIES CO.,LTD
+9C6BF0|Shenzhen Yipingfang Network Technology Co., Ltd.
+9C6C15|Microsoft Corporation
+9C6F52|zte corporation
+9C713A|HUAWEI TECHNOLOGIES CO.,LTD
+9C7370|HUAWEI TECHNOLOGIES CO.,LTD
+9C73B1|Samsung Electronics Co.,Ltd
+9C741A|HUAWEI TECHNOLOGIES CO.,LTD
+9C746F|HUAWEI TECHNOLOGIES CO.,LTD
+9C760E|Apple, Inc.
+9C79E3|Apple, Inc.
+9C7BEF|Hewlett Packard
+9C7DA3|HUAWEI TECHNOLOGIES CO.,LTD
+9C7F81|SHENZHEN FAST TECHNOLOGIES CO.,LTD
+9C823F|Huawei Device Co., Ltd.
+9C8306|Samsung Electronics Co.,Ltd
+9C84B6|Shenzhen iComm Semiconductor CO.,LTD
+9C84BF|Apple, Inc.
+9C862B|MOTOROLA SOLUTIONS MALAYSIA SDN. BHD.
+9C88AD|Fiberhome Telecommunication Technologies Co.,LTD
+9C8ACB|Juniper Networks
+9C8BA0|Apple, Inc.
+9C8C6E|Samsung Electronics Co.,Ltd
+9C8CD8|Hewlett Packard Enterprise
+9C8E99|Hewlett Packard
+9C8E9C|Huawei Device Co., Ltd.
+9C924F|Apple, Inc.
+9C934E|Xerox Corporation
+9C9567|Huawei Device Co., Ltd.
+9C9613|Lenovo Future Communication Technology (Chongqing) Company Limited
+9C96D5|Espressif Systems (Singapore) Pte. Ltd
+9C971B|Intel Corporate
+9C9774|HUAWEI TECHNOLOGIES CO.,LTD
+9C9793|HUAWEI TECHNOLOGIES CO.,LTD
+9C99A0|Xiaomi Communications Co Ltd
+9C9C1F|Espressif Inc.
+9C9D07|FN-LINK TECHNOLOGY Ltd.
+9C9D7E|Beijing Xiaomi Mobile Software Co., Ltd
+9C9E6E|Espressif Inc.
+9C9E71|Huawei Device Co., Ltd.
+9C9ED5|Xiaomi Communications Co Ltd
+9CA118|Huawei Device Co., Ltd.
+9CA2F4|TP-Link Systems Inc
+9CA389|Nokia
+9CA513|Samsung Electronics Co.,Ltd
+9CA615|TP-LINK TECHNOLOGIES CO.,LTD.
+9CA6D8|Fiberhome Telecommunication Technologies Co.,LTD
+9CA9B8|Cisco Systems, Inc
+9CA9C5|Apple, Inc.
+9CA9E4|zte corporation
+9CAA1B|Microsoft Corporation
+9CAD97|Hon Hai Precision Ind. Co.,Ltd.
+9CAED3|Seiko Epson Corporation
+9CAFCA|Cisco Systems, Inc
+9CB150|Intel Corporate
+9CB2B2|HUAWEI TECHNOLOGIES CO.,LTD
+9CB2E8|HUAWEI TECHNOLOGIES CO.,LTD
+9CB400|zte corporation
+9CB654|Hewlett Packard
+9CB6D0|Rivet Networks
+9CB70D|Liteon Technology Corporation
+9CBCA6|Hewlett Packard Enterprise
+9CBCF0|Xiaomi Communications Co Ltd
+9CBFCD|HUAWEI TECHNOLOGIES CO.,LTD
+9CC172|HUAWEI TECHNOLOGIES CO.,LTD
+9CC394|Apple, Inc.
+9CC7D1|SHARP Corporation
+9CC7D3|AzureWave Technology Inc.
+9CC893|Juniper Networks
+9CC8E9|Amazon Technologies Inc.
+9CC9EB|NETGEAR
+9CCAD9|Nokia Corporation
+9CCC01|Espressif Inc.
+9CCC83|Juniper Networks
+9CD21E|Hon Hai Precision Ind. Co.,Ltd.
+9CD24B|zte corporation
+9CD35B|Samsung Electronics Co.,Ltd
+9CD36D|NETGEAR
+9CD57D|Cisco Systems, Inc
+9CD643|D-Link International
+9CD917|Motorola Mobility LLC, a Lenovo Company
+9CDA3E|Intel Corporate
+9CDAA8|Apple, Inc.
+9CDAB7|Hewlett Packard Enterprise
+9CDBAF|HUAWEI TECHNOLOGIES CO.,LTD
+9CDC71|Hewlett Packard Enterprise
+9CDC99|Extreme Networks, Inc.
+9CDF8A|HUAWEI TECHNOLOGIES CO.,LTD
+9CDFB1|Shenzhen Crave Communication Co., LTD
+9CE041|Nokia
+9CE063|Samsung Electronics Co.,Ltd
+9CE176|Cisco Systems, Inc
+9CE330|Cisco Meraki
+9CE33F|Apple, Inc.
+9CE374|HUAWEI TECHNOLOGIES CO.,LTD
+9CE65E|Apple, Inc.
+9CE6E7|Samsung Electronics Co.,Ltd
+9CE91C|zte corporation
+9CE951|Shenzhen Sang Fei Consumer Communications Ltd., Co.
+9CEC61|Huawei Device Co., Ltd.
+9CF155|Nokia
+9CF1D4|Roku, Inc
+9CF27E|Samsung Electronics Co.,Ltd
+9CF387|Apple, Inc.
+9CF3AC|Apple, Inc.
+9CF48E|Apple, Inc.
+9CF8B8|Shenzhen Skyworth Digital Technology CO., Ltd
+9CF8DB|shenzhen eyunmei technology co,.ltd
+9CF9A1|Juniper Networks
+9CFA76|Apple, Inc.
+9CFC01|Apple, Inc.
+9CFC28|Apple, Inc.
+9CFCE8|Intel Corporate
+9CFEA1|Fiberhome Telecommunication Technologies Co.,LTD
+A002A5|Intel Corporate
+A002DC|Amazon Technologies Inc.
+A00460|NETGEAR
+A00798|Samsung Electronics Co.,Ltd
+A0086F|HUAWEI TECHNOLOGIES CO.,LTD
+A0092E|zte corporation
+A009ED|Avaya Inc
+A00A9A|Huawei Device Co., Ltd.
+A00BBA|SAMSUNG ELECTRO MECHANICS CO., LTD.
+A00CE2|Shenzhen Shokz Co., Ltd.
+A00E98|HUAWEI TECHNOLOGIES CO.,LTD
+A00F37|Cisco Systems, Inc
+A01077|zte corporation
+A01081|Samsung Electronics Co.,Ltd
+A01290|Avaya Inc
+A013CB|Fiberhome Telecommunication Technologies Co.,LTD
+A01828|Apple, Inc.
+A01859|Shenzhen Yidashi Electronics Co Ltd
+A01B29|Sagemcom Broadband SAS
+A01B9E|Samsung Electronics Co.,Ltd
+A01C8D|HUAWEI TECHNOLOGIES CO.,LTD
+A01D48|Hewlett Packard
+A020A6|Espressif Inc.
+A02195|Samsung Electronics Co.,Ltd
+A021B7|NETGEAR
+A0239F|Cisco Systems, Inc
+A02442|Shenzhenshi Xinzhongxin Technology Co.Ltd
+A025D7|Hewlett Packard Enterprise
+A027B6|Samsung Electronics Co.,Ltd
+A02919|Dell Inc.
+A02942|Intel Corporate
+A02BB8|Hewlett Packard
+A02C36|FN-LINK TECHNOLOGY LIMITED
+A02DDB|Sagemcom Broadband SAS
+A031DB|HUAWEI TECHNOLOGIES CO.,LTD
+A03299|Lenovo (Beijing) Co., Ltd.
+A0334F|Cisco Systems, Inc
+A03679|HUAWEI TECHNOLOGIES CO.,LTD
+A0369F|Intel Corporate
+A036BC|ASUSTek COMPUTER INC.
+A03768|Shenzhen E-Life Intelligence Technology Co.,Ltd.
+A039EE|Sagemcom Broadband SAS
+A039F7|LG Electronics (Mobile Communications)
+A039F9|Sagemcom Broadband SAS
+A03BE3|Apple, Inc.
+A03C20|Sagemcom Broadband SAS
+A03C31|Shenzhen Belon Technology CO.,LTD
+A03D6E|Cisco Systems, Inc
+A03D6F|Cisco Systems, Inc
+A0406F|HUAWEI TECHNOLOGIES CO.,LTD
+A040A0|NETGEAR
+A04147|Huawei Device Co., Ltd.
+A042D1|Huawei Device Co., Ltd.
+A0445C|HUAWEI TECHNOLOGIES CO.,LTD
+A044B7|PAX Computer Technology(Shenzhen) Ltd.
+A0465A|Motorola Mobility LLC, a Lenovo Company
+A0481C|Hewlett Packard
+A04839|HUAWEI TECHNOLOGIES CO.,LTD
+A04A5E|Microsoft Corporation
+A04C0C|Shenzhen Skyworth Digital Technology CO., Ltd
+A04C5B|Shenzhen TINNO Mobile Technology Corp.
+A04E04|Nokia Corporation
+A04E8D|Cisco Meraki
+A04EA7|Apple, Inc.
+A04ECF|Apple, Inc.
+A04F52|Intel Corporate
+A04F85|LG Electronics (Mobile Communications)
+A04FE4|PAX Computer Technology(Shenzhen) Ltd.
+A0510B|Intel Corporate
+A051C6|Avaya Inc
+A05272|Apple, Inc.
+A05394|Shenzhen zediel co., Ltd.
+A0551F|Sagemcom Broadband SAS
+A0552E|zte corporation
+A0554F|Cisco Systems, Inc
+A0562C|Samsung Electronics Co.,Ltd
+A056F3|Apple, Inc.
+A057E3|HUAWEI TECHNOLOGIES CO.,LTD
+A05911|Cisco Meraki
+A05950|Intel Corporate
+A06090|Samsung Electronics Co.,Ltd
+A06391|NETGEAR
+A06610|FUJITSU LIMITED
+A067D6|Nokia
+A070B7|HUAWEI TECHNOLOGIES CO.,LTD
+A071A9|Nokia Corporation
+A07591|Samsung Electronics Co.,Ltd
+A0764E|Espressif Inc.
+A0779E|Chipsea Technologies (Shenzhen) Corp.
+A07817|Apple, Inc.
+A0782D|Apple, Inc.
+A07D42|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+A07D9C|Samsung Electronics Co.,Ltd
+A07F8A|Sagemcom Broadband SAS
+A08069|Intel Corporate
+A0821F|Samsung Electronics Co.,Ltd
+A08527|Intel Corporate
+A085E3|Espressif Inc.
+A085FC|Microsoft Corporation
+A086C6|Xiaomi Communications Co Ltd
+A087BE|Apple, Inc.
+A08869|Intel Corporate
+A0889D|Huawei Device Co., Ltd.
+A088B4|Intel Corporate
+A089E4|Skyworth Digital Technology(Shenzhen) Co.,Ltd
+A08CF8|HUAWEI TECHNOLOGIES CO.,LTD
+A08CFD|Hewlett Packard
+A08D16|HUAWEI TECHNOLOGIES CO.,LTD
+A08E78|Sagemcom Broadband SAS
+A09169|LG Electronics (Mobile Communications)
+A091A2|OnePlus Electronics (Shenzhen) Co., Ltd.
+A091C8|zte corporation
+A091CA|Nokia Solutions and Networks GmbH & Co. KG
+A09208|Tuya Smart Inc.
+A09351|Cisco Systems, Inc
+A0946A|Shenzhen XGTEC Technology Co,.Ltd.
+A09857|Shenzhen ELINK Technology Co., Ltd.
+A0999B|Apple, Inc.
+A09A52|Shenzhen MoreSense Technology Co., Ltd.
+A09A8E|Apple, Inc.
+A09D22|Apple, Inc.
+A09F10|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+A09F7A|D-Link Middle East FZCO
+A0A001|Hewlett Packard Enterprise
+A0A0DC|Huawei Device Co., Ltd.
+A0A309|Apple, Inc.
+A0A33B|HUAWEI TECHNOLOGIES CO.,LTD
+A0A3B3|Espressif Inc.
+A0A3F0|D-Link International
+A0A47F|Cisco Systems, Inc
+A0A4C5|Intel Corporate
+A0A8CD|Intel Corporate
+A0AB1B|D-Link International
+A0AC69|Samsung Electronics Co.,Ltd
+A0AC78|Shenzhen iComm Semiconductor CO.,LTD
+A0AD62|HUAWEI TECHNOLOGIES CO.,LTD
+A0AD9F|ASUSTek COMPUTER INC.
+A0AF12|HUAWEI TECHNOLOGIES CO.,LTD
+A0AFBD|Intel Corporate
+A0B0BD|Samsung Electronics Co.,Ltd
+A0B100|ShenZhen Cando Electronics Co.,Ltd
+A0B15C|Google, Inc.
+A0B339|Intel Corporate
+A0B3CC|Hewlett Packard
+A0B40F|Apple, Inc.
+A0B439|Cisco Systems, Inc
+A0B4A5|Samsung Electronics Co.,Ltd
+A0B765|Espressif Inc.
+A0BC6F|Cisco Systems, Inc
+A0BD1D|Zhejiang Dahua Technology Co., Ltd.
+A0BD71|QUALCOMM Incorporated
+A0C1C5|Apple, Inc.
+A0C20D|Huawei Device Co., Ltd.
+A0C589|Intel Corporate
+A0C6EC|ShenZhen ANYK Technology Co.,LTD
+A0C773|Chipsea Technologies (Shenzhen) Corp.
+A0C7D2|Cisco Systems, Inc
+A0C926|Huawei Device Co., Ltd.
+A0C98B|Nokia Solutions and Networks GmbH & Co. KG
+A0CBFD|Samsung Electronics Co.,Ltd
+A0CF5B|Cisco Systems, Inc
+A0CFF5|zte corporation
+A0D05B|Samsung Electronics Co.,Ltd
+A0D0DC|Amazon Technologies Inc.
+A0D1B3|Apple, Inc.
+A0D2B1|Amazon Technologies Inc.
+A0D365|Intel Corporate
+A0D37A|Intel Corporate
+A0D3C1|Hewlett Packard
+A0D722|Samsung Electronics Co.,Ltd
+A0D795|Apple, Inc.
+A0D7A0|Huawei Device Co., Ltd.
+A0D7F3|Samsung Electronics Co.,Ltd
+A0D807|Huawei Device Co., Ltd.
+A0D83D|Fiberhome Telecommunication Technologies Co.,LTD
+A0DD6C|Espressif Inc.
+A0DDE5|SHARP Corporation
+A0DE0F|Huawei Device Co., Ltd.
+A0DF15|HUAWEI TECHNOLOGIES CO.,LTD
+A0E06D|Fiberhome Telecommunication Technologies Co.,LTD
+A0E0AF|Cisco Systems, Inc
+A0E390|Apple, Inc.
+A0E453|Sony Corporation
+A0E4CB|Zyxel Communications Corporation
+A0E70B|Intel Corporate
+A0EC80|zte corporation
+A0ECF9|Cisco Systems, Inc
+A0EDCD|Apple, Inc.
+A0EE1A|Apple, Inc.
+A0F261|Palo Alto Networks
+A0F262|Espressif Inc.
+A0F3C1|TP-LINK TECHNOLOGIES CO.,LTD.
+A0F419|Nokia Corporation
+A0F459|FN-LINK TECHNOLOGY LIMITED
+A0F479|HUAWEI TECHNOLOGIES CO.,LTD
+A0F849|Cisco Systems, Inc
+A0F895|Shenzhen TINNO Mobile Technology Corp.
+A0FAC8|HUAWEI TECHNOLOGIES CO.,LTD
+A0FBC5|Apple, Inc.
+A0FF0C|Hangzhou Hikvision Digital Technology Co.,Ltd.
+A0FF22|SHENZHEN APICAL TECHNOLOGY CO., LTD
+A4004E|Cisco Systems, Inc
+A400E2|HUAWEI TECHNOLOGIES CO.,LTD
+A402B7|Amazon Technologies Inc.
+A402B9|Intel Corporate
+A407B6|Samsung Electronics Co.,Ltd
+A40801|Amazon Technologies Inc.
+A40853|Nokia Solutions and Networks India Private Limited
+A408F5|Sagemcom Broadband SAS
+A40987|Apple, Inc.
+A409B3|HUAWEI TECHNOLOGIES CO.,LTD
+A40C66|Shenzhen Colorful Yugong Technology and Development Co., Ltd.
+A40CC3|Cisco Systems, Inc
+A40E75|Hewlett Packard Enterprise
+A410B6|Cisco Systems, Inc
+A41194|Lenovo
+A411BB|Cisco Systems, Inc
+A41437|Hangzhou Hikvision Digital Technology Co.,Ltd.
+A416C0|Apple, Inc.
+A416E7|HUAWEI TECHNOLOGIES CO.,LTD
+A41731|Hon Hai Precision Ind. Co.,Ltd.
+A4178B|HUAWEI TECHNOLOGIES CO.,LTD
+A41791|Shenzhen Decnta Technology Co.,LTD.
+A41875|Cisco Systems, Inc
+A41908|Fiberhome Telecommunication Technologies Co.,LTD
+A41A3A|TP-LINK TECHNOLOGIES CO.,LTD.
+A41A6E|zte corporation
+A41F72|Dell Inc.
+A42249|Sagemcom Broadband SAS
+A422B6|Motorola Mobility LLC, a Lenovo Company
+A4251B|Avaya Inc
+A426CA|Intel Corporate
+A427A5|Palo Alto Networks
+A42902|Hangzhou Hikvision Digital Technology Co.,Ltd.
+A42940|Shenzhen YOUHUA Technology Co., Ltd
+A42A95|D-Link International
+A42B8C|NETGEAR
+A42BB0|TP-LINK TECHNOLOGIES CO.,LTD.
+A42DF1|Motorola Mobility LLC, a Lenovo Company
+A4307A|Samsung Electronics Co.,Ltd
+A43135|Apple, Inc.
+A434D9|Intel Corporate
+A4373E|Huawei Device Co., Ltd.
+A43828|HUAWEI TECHNOLOGIES CO.,LTD
+A439B3|Beijing Xiaomi Mobile Software Co., Ltd
+A439B6|SHENZHEN PEIZHE MICROELECTRONICS CO .LTD
+A43B0E|Huawei Device Co., Ltd.
+A43F51|Shenzhen Benew Technology Co.,Ltd.
+A43FA7|Hewlett Packard Enterprise
+A44027|zte corporation
+A4403D|Shenzhen Baseus Technology Co., Ltd.
+A4423B|Intel Corporate
+A44280|Apple, Inc.
+A44343|Huawei Device Co., Ltd.
+A44380|Huawei Device Co., Ltd.
+A44519|Xiaomi Communications Co Ltd
+A446B4|Huawei Device Co., Ltd.
+A44BD5|Xiaomi Communications Co Ltd
+A44BD9|Hangzhou Hikvision Digital Technology Co.,Ltd.
+A44C11|Cisco Systems, Inc
+A44CC8|Dell Inc.
+A44E31|Intel Corporate
+A45006|SHENZHEN HUACHUANG SHIDAI TECHNOLOGYCO.,LTD
+A45046|Xiaomi Communications Co Ltd
+A4515E|Juniper Networks
+A4516F|Microsoft Mobile Oy
+A4530E|Cisco Systems, Inc
+A45590|Xiaomi Communications Co Ltd
+A45630|Cisco Systems, Inc
+A45D36|Hewlett Packard
+A45E60|Apple, Inc.
+A46011|Verifone, Inc.
+A46706|Apple, Inc.
+A46BB6|Intel Corporate
+A46C24|HUAWEI TECHNOLOGIES CO.,LTD
+A46C2A|Cisco Systems, Inc
+A46CF1|Samsung Electronics Co.,Ltd
+A46DA4|HUAWEI TECHNOLOGIES CO.,LTD
+A470D6|Motorola Mobility LLC, a Lenovo Company
+A47174|HUAWEI TECHNOLOGIES CO.,LTD
+A473AB|Extreme Networks, Inc.
+A475B9|Samsung Electronics Co.,Ltd
+A47733|Google, Inc.
+A47760|Nokia Corporation
+A477F3|Apple, Inc.
+A47806|Cisco Systems, Inc
+A47886|Avaya Inc
+A47952|Huawei Device Co., Ltd.
+A47B1A|Huawei Device Co., Ltd.
+A47B2C|Nokia
+A47B9D|Espressif Inc.
+A47CC9|HUAWEI TECHNOLOGIES CO.,LTD
+A47D9F|Shenzhen iComm Semiconductor CO.,LTD
+A47E39|zte corporation
+A47F1B|Juniper Networks
+A481EE|Nokia Corporation
+A483E7|Apple, Inc.
+A48431|Samsung Electronics Co.,Ltd
+A48873|Cisco Systems, Inc
+A48CDB|Lenovo
+A49005|CHINA GREATWALL COMPUTER SHENZHEN CO.,LTD
+A492CB|Nokia
+A4933F|HUAWEI TECHNOLOGIES CO.,LTD
+A4934C|Cisco Systems, Inc
+A493AD|Huawei Device Co., Ltd.
+A493FE|HUAWEI TECHNOLOGIES CO.,LTD
+A49700|Cisco Systems, Inc
+A49791|Extreme Networks, Inc.
+A49947|HUAWEI TECHNOLOGIES CO.,LTD
+A49A58|Samsung Electronics Co.,Ltd
+A49B4F|HUAWEI TECHNOLOGIES CO.,LTD
+A49BCD|Cisco Systems, Inc
+A49DB8|SHENZHEN TECNO TECHNOLOGY
+A49DDD|Samsung Electronics Co.,Ltd
+A49FE7|Samsung Electronics Co.,Ltd
+A4A24A|Cisco SPVTG
+A4A459|Hangzhou Hikvision Digital Technology Co.,Ltd.
+A4A46B|HUAWEI TECHNOLOGIES CO.,LTD
+A4A490|Samsung Electronics Co.,Ltd
+A4A584|Cisco Systems, Inc
+A4A80F|Shenzhen Coship Electronics Co., Ltd.
+A4A930|Beijing Xiaomi Mobile Software Co., Ltd
+A4AAFE|Huawei Device Co., Ltd.
+A4AB39|Shenzhen Taichi Technology Limited
+A4AC0F|Huawei Device Co., Ltd.
+A4AE11|Hon Hai Precision Industry Co., Ltd.
+A4AE12|Hon Hai Precision Industry Co., Ltd.
+A4B039|Shenzhen iComm Semiconductor CO.,LTD
+A4B197|Apple, Inc.
+A4B1C1|Intel Corporate
+A4B239|Cisco Systems, Inc
+A4B256|Shenzhen Incar Technology Co., Ltd.
+A4B439|Cisco Systems, Inc
+A4B61E|Huawei Device Co., Ltd.
+A4B805|Apple, Inc.
+A4BA70|Beijing Xiaomi Mobile Software Co., Ltd
+A4BA76|HUAWEI TECHNOLOGIES CO.,LTD
+A4BADB|Dell Inc.
+A4BB6D|Dell Inc.
+A4BDC4|HUAWEI TECHNOLOGIES CO.,LTD
+A4BE2B|HUAWEI TECHNOLOGIES CO.,LTD
+A4BF01|Intel Corporate
+A4C0C7|ShenZhen Hitom Communication Technology Co..LTD
+A4C337|Apple, Inc.
+A4C361|Apple, Inc.
+A4C3BE|Xiaomi Communications Co Ltd
+A4C3F0|Intel Corporate
+A4C494|Intel Corporate
+A4C54E|Huawei Device Co., Ltd.
+A4C64F|HUAWEI TECHNOLOGIES CO.,LTD
+A4C69A|Samsung Electronics Co.,Ltd
+A4C6F0|Apple, Inc.
+A4C74B|Huawei Device Co., Ltd.
+A4C788|Xiaomi Communications Co Ltd
+A4C7F6|Extreme Networks, Inc.
+A4CAA0|HUAWEI TECHNOLOGIES CO.,LTD
+A4CB8F|Espressif Inc.
+A4CCB3|Xiaomi Communications Co Ltd
+A4CD23|Shenzhenshi Xinzhongxin Co., Ltd
+A4CF12|Espressif Inc.
+A4CF99|Apple, Inc.
+A4D18C|Apple, Inc.
+A4D18F|Shenzhen Skyee Optical Fiber Communication Technology Ltd.
+A4D1D2|Apple, Inc.
+A4D23E|Apple, Inc.
+A4D4B2|Shenzhen MeiG Smart Technology Co.,Ltd
+A4D530|Avaya LLC
+A4D5C2|Hangzhou Hikvision Digital Technology Co.,Ltd.
+A4D73C|Seiko Epson Corporation
+A4D7D6|Shenzhen Linkoh Network Technology Co;Ltd
+A4D931|Apple, Inc.
+A4D990|Samsung Electronics Co.,Ltd
+A4DB30|Liteon Technology Corporation
+A4DCBE|HUAWEI TECHNOLOGIES CO.,LTD
+A4DCD5|Cisco Systems, Inc
+A4DD58|HUAWEI TECHNOLOGIES CO.,LTD
+A4E11A|Juniper Networks
+A4E287|Xiaomi Communications Co Ltd
+A4E31B|Nokia
+A4E57C|Espressif Inc.
+A4E615|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+A4E731|Nokia Corporation
+A4E88D|FN-LINK TECHNOLOGY Ltd.
+A4E975|Apple, Inc.
+A4EA8E|Extreme Networks, Inc.
+A4EBD3|Samsung Electronics Co.,Ltd
+A4EE57|Seiko Epson Corporation
+A4F00F|Espressif Inc.
+A4F01F|CANON INC.
+A4F1E8|Apple, Inc.
+A4F33B|zte corporation
+A4F6E6|Apple, Inc.
+A4F6E8|Apple, Inc.
+A4F841|Apple, Inc.
+A4F8FF|Ubiquiti Inc
+A4F921|Apple, Inc.
+A4F933|Intel Corporate
+A4FC14|Apple, Inc.
+A4FCA1|Nokia Solutions and Networks GmbH & Co. KG
+A4FF95|Nokia
+A4FF9F|Xiaomi Communications Co Ltd
+A802DB|zte corporation
+A8032A|Espressif Inc.
+A80600|Samsung Electronics Co.,Ltd
+A809B1|Huawei Device Co., Ltd.
+A80B6B|Chipsea Technologies (Shenzhen) Corp.
+A80BFB|Ruckus Wireless
+A80C0D|Cisco Systems, Inc
+A80C63|HUAWEI TECHNOLOGIES CO.,LTD
+A80CCA|Shenzhen Sundray Technologies company Limited
+A80DE1|HUAWEI TECHNOLOGIES CO.,LTD
+A81374|Panasonic Corporation AVC Networks Company
+A81378|Nokia
+A8154D|TP-LINK TECHNOLOGIES CO.,LTD.
+A815D6|Shenzhen Meione Technology CO., LTD
+A816B2|LG Electronics (Mobile Communications)
+A816D0|Samsung Electronics Co.,Ltd
+A81AF1|Apple, Inc.
+A81D16|AzureWave Technology Inc.
+A81E84|Quanta Computer Inc.
+A82066|Apple, Inc.
+A8213A|Shenzhen Talent Technology Comapny Limited 深圳市泰霖科技有限公司
+A821C8|shenzhen phoenix telecom technology Co.,Ltd.
+A82316|Nokia
+A823FE|LG Electronics
+A824B8|Nokia
+A82948|TP-Link Systems Inc.
+A829DC|TP-Link Systems Inc.
+A82BB9|Samsung Electronics Co.,Ltd
+A82BCD|HUAWEI TECHNOLOGIES CO.,LTD
+A82BD5|Xiaomi Communications Co Ltd
+A82BDD|LCFC(Hefei) Electronics Technology co., ltd
+A82C3E|Shenzhen Cultraview Digital Technology Co., Ltd
+A82C89|Apple, Inc.
+A830BC|Samsung Electronics Co.,Ltd
+A8346A|Samsung Electronics Co.,Ltd
+A83512|Huawei Device Co., Ltd.
+A83759|Huawei Device Co., Ltd.
+A83B5C|HUAWEI TECHNOLOGIES CO.,LTD
+A83CA5|Dell Inc.
+A83ED3|HUAWEI TECHNOLOGIES CO.,LTD
+A84021|zte corporation
+A841F4|AzureWave Technology Inc.
+A842A1|TP-Link Systems Inc
+A842E3|Espressif Inc.
+A84481|Nokia Corporation
+A844AA|Fiberhome Telecommunication Technologies Co.,LTD
+A84616|HUAWEI TECHNOLOGIES CO.,LTD
+A84674|Espressif Inc.
+A8469D|Cisco Meraki
+A8474A|Hon Hai Precision Ind. Co.,Ltd.
+A848FA|Espressif Inc.
+A8494D|HUAWEI TECHNOLOGIES CO.,LTD
+A84A28|Apple, Inc.
+A84B4D|Samsung Electronics Co.,Ltd
+A84FB1|Cisco Systems, Inc
+A85081|HUAWEI TECHNOLOGIES CO.,LTD
+A8515B|Samsung Electronics Co.,Ltd
+A851AB|Apple, Inc.
+A852D4|Hewlett Packard Enterprise
+A8574E|TP-LINK TECHNOLOGIES CO.,LTD.
+A857BA|Shenzhen YOUHUA Technology Co., Ltd
+A8595F|Intel Corporate
+A85AE0|Huawei Device Co., Ltd.
+A85B78|Apple, Inc.
+A85BB0|Shenzhen Dehoo Technology Co.,Ltd
+A85BB7|Apple, Inc.
+A85BD1|INVENTEC CORPORATION
+A85BF7|Hewlett Packard Enterprise
+A85C2C|Apple, Inc.
+A85E45|ASUSTek COMPUTER INC.
+A85F61|Apple, Inc.
+A860B6|Apple, Inc.
+A8637D|D-Link International
+A864F1|Intel Corporate
+A8667F|Apple, Inc.
+A86A86|Xiaomi Communications Co Ltd
+A86ABB|Sagemcom Broadband SAS
+A86B7C|SHENZHEN FENGLIAN TECHNOLOGY CO., LTD.
+A86BAD|Hon Hai Precision Ind. Co.,Ltd.
+A86DAA|Intel Corporate
+A86E4E|Huawei Device Co., Ltd.
+A86E84|TP-Link Systems Inc
+A8724D|Intel Corporate
+A87484|zte corporation
+A87650|Samsung Electronics Co.,Ltd
+A877E5|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+A87971|HUAWEI TECHNOLOGIES CO.,LTD
+A8798D|Samsung Electronics Co.,Ltd
+A87B39|Nokia Corporation
+A87C01|Samsung Electronics Co.,Ltd
+A87C45|HUAWEI TECHNOLOGIES CO.,LTD
+A87CF8|Apple, Inc.
+A87D12|HUAWEI TECHNOLOGIES CO.,LTD
+A87E33|Nokia Danmark A/S
+A87EEA|Intel Corporate
+A88038|ShenZhen MovingComm Technology Co., Limited
+A88055|Tuya Smart Inc.
+A8817E|Apple, Inc.
+A88195|Samsung Electronics Co.,Ltd
+A886DD|Apple, Inc.
+A887B3|Samsung Electronics Co.,Ltd
+A88808|Apple, Inc.
+A88940|Huawei Device Co., Ltd.
+A88B28|SHENZHEN DIYANG SMART TECHNOLOGY CO.,LTD.
+A88C3E|Microsoft Corporation
+A88E24|Apple, Inc.
+A88FD9|Apple, Inc.
+A8913D|Apple, Inc.
+A89162|Sophos Ltd
+A8922C|LG Electronics (Mobile Communications)
+A89609|FN-LINK TECHNOLOGY Ltd.
+A89675|Motorola Mobility LLC, a Lenovo Company
+A8968A|Apple, Inc.
+A89969|Dell Inc.
+A89A8C|zte corporation
+A89A93|Sagemcom Broadband SAS
+A89AD7|Nokia
+A89C6C|Ubiquiti Inc
+A89C78|Apple, Inc.
+A89CED|Xiaomi Communications Co Ltd
+A89D21|Cisco Systems, Inc
+A89FBA|Samsung Electronics Co.,Ltd
+A8A668|zte corporation
+A8A795|Hon Hai Precision Ind. Co.,Ltd.
+A8AA7C|Huawei Device Co., Ltd.
+A8ABB5|Apple, Inc.
+A8B0D1|EFUN Display Technology (Shenzhen) Co., Ltd.
+A8B13B|HP Inc.
+A8B1D4|Cisco Systems, Inc
+A8B271|HUAWEI TECHNOLOGIES CO.,LTD
+A8B2DA|FUJITSU LIMITED
+A8B456|Cisco Systems, Inc
+A8B483|Shenzhen SuperElectron Technology Co.,Ltd.
+A8B57C|Roku, Inc
+A8B58E|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+A8B86E|LG Electronics (Mobile Communications)
+A8BA25|Hewlett Packard Enterprise
+A8BA69|Samsung Electronics Co.,Ltd
+A8BB56|Apple, Inc.
+A8BBCF|Apple, Inc.
+A8BD27|Hewlett Packard Enterprise
+A8BE27|Apple, Inc.
+A8C092|Huawei Device Co., Ltd.
+A8C252|Huawei Device Co., Ltd.
+A8C407|HUAWEI TECHNOLOGIES CO.,LTD
+A8C647|Extreme Networks, Inc.
+A8C83A|HUAWEI TECHNOLOGIES CO.,LTD
+A8CA77|Amazon Technologies Inc.
+A8CA7B|HUAWEI TECHNOLOGIES CO.,LTD
+A8CA87|ZHEJIANG DAHUA ZHILIAN CO.,LTD
+A8CAB9|SAMSUNG ELECTRO MECHANICS CO., LTD.
+A8CEE7|Fiberhome Telecommunication Technologies Co.,LTD
+A8D081|Huawei Device Co., Ltd.
+A8D0E5|Juniper Networks
+A8D162|Samsung Electronics Co.,Ltd
+A8D4E0|HUAWEI TECHNOLOGIES CO.,LTD
+A8DA01|Shenzhen NUOLIJIA Digital Technology Co.,Ltd
+A8DB03|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+A8DDBC|Tuya Smart Inc.
+A8E018|Nokia Corporation
+A8E291|AzureWave Technology Inc.
+A8E2C3|Shenzhen YOUHUA Technology Co., Ltd
+A8E3EE|Sony Interactive Entertainment Inc.
+A8E544|HUAWEI TECHNOLOGIES CO.,LTD
+A8E5EC|Nokia
+A8E621|Amazon Technologies Inc.
+A8E705|Fiberhome Telecommunication Technologies Co.,LTD
+A8E978|Huawei Device Co., Ltd.
+A8EA71|Fiberhome Telecommunication Technologies Co.,LTD
+A8EE67|Samsung Electronics Co.,Ltd
+A8F059|HUAWEI TECHNOLOGIES CO.,LTD
+A8F07C|Huawei Device Co., Ltd.
+A8F266|Huawei Device Co., Ltd.
+A8F274|Samsung Electronics Co.,Ltd
+A8F5AC|HUAWEI TECHNOLOGIES CO.,LTD
+A8F5E1|Shenzhen Shokz Co., Ltd.
+A8FAD8|Apple, Inc.
+A8FB40|Nokia Solutions and Networks GmbH & Co. KG
+A8FB45|Google, Inc.
+A8FD07|Espressif Inc.
+A8FE9D|Apple, Inc.
+A8FECE|Fiberhome Telecommunication Technologies Co.,LTD
+A8FFBA|HUAWEI TECHNOLOGIES CO.,LTD
+AC007A|Apple, Inc.
+AC00D0|zte corporation
+AC0416|zte corporation
+AC05C7|Intel Corporate
+AC075F|HUAWEI TECHNOLOGIES CO.,LTD
+AC0775|Apple, Inc.
+AC0BFB|Espressif Inc.
+AC0D1B|LG Electronics (Mobile Communications)
+AC1203|Intel Corporate
+AC1518|Espressif Inc.
+AC15A2|TP-Link Systems Inc
+AC15F4|Apple, Inc.
+AC1615|Apple, Inc.
+AC162D|Hewlett Packard
+AC16DE|Intel Corporate
+AC1794|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+AC17C8|Cisco Meraki
+AC1826|Seiko Epson Corporation
+AC198E|Intel Corporate
+AC1A3D|Dell Inc.
+AC1D06|Apple, Inc.
+AC1E92|Samsung Electronics Co.,Ltd
+AC1E9E|Xiaomi Communications Co Ltd
+AC1EA9|Intelbras
+AC1F09|shenzhen RAKwireless technology Co.,Ltd
+AC1F74|Apple, Inc.
+AC2205|Compal Broadband Networks, Inc.
+AC220B|ASUSTek COMPUTER INC.
+AC2241|HUAWEI TECHNOLOGIES CO.,LTD
+AC233F|Shenzhen Minew Technologies Co., Ltd.
+AC2477|Shenzhen Tinno Mobile Technology Corp
+AC276E|Espressif Inc.
+AC293A|Apple, Inc.
+AC2AA1|Cisco Systems, Inc
+AC2B6E|Intel Corporate
+AC3019|Shenzhen Hailingwei Electronics Co., Ltd.
+AC3184|Huawei Device Co., Ltd.
+AC319D|Shenzhen TG-NET Botone Technology Co.,Ltd.
+AC3328|Huawei Device Co., Ltd.
+AC35EE|FN-LINK TECHNOLOGY LIMITED
+AC3613|Samsung Electronics Co.,Ltd
+AC361B|Hon Hai Precision Industry Co.,LTD
+AC3870|Lenovo Mobile Communication Technology Ltd.
+AC3A67|Cisco Systems, Inc
+AC3A7A|Roku, Inc.
+AC3AE2|NVIDIA Corporation
+AC3B77|Sagemcom Broadband SAS
+AC3C0B|Apple, Inc.
+AC3DCB|Intel Corporate
+AC3EB1|Google, Inc.
+AC416A|Amazon Technologies Inc.
+AC4500|Apple, Inc.
+AC45B0|Shenzhen Jidao Technology Co Ltd
+AC45EF|Intel Corporate
+AC471B|Huawei Device Co., Ltd.
+AC49DB|Apple, Inc.
+AC4A56|Cisco Systems, Inc
+AC4A67|Cisco Systems, Inc
+AC4BC8|Juniper Networks
+AC4DD9|Extreme Networks, Inc.
+AC4E2E|Shenzhen JingHanDa Electronics Co.Ltd
+AC4E65|Fiberhome Telecommunication Technologies Co.,LTD
+AC4E74|SHEN ZHEN TENDA TECHNOLOGY CO.,LTD
+AC4E91|HUAWEI TECHNOLOGIES CO.,LTD
+AC51AB|HUAWEI TECHNOLOGIES CO.,LTD
+AC5322|Samsung Electronics Co.,Ltd
+AC5A14|Samsung Electronics Co.,Ltd
+AC5AF0|LG Electronics
+AC5AFC|Intel Corporate
+AC5C2C|Apple, Inc.
+AC5D5C|FN-LINK TECHNOLOGY LIMITED
+AC5E14|HUAWEI TECHNOLOGIES CO.,LTD
+AC5F3E|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+AC5FEA|OnePlus Technology (Shenzhen) Co., Ltd
+AC606F|Nokia Shanghai Bell Co., Ltd.
+AC6089|HUAWEI TECHNOLOGIES CO.,LTD
+AC6175|HUAWEI TECHNOLOGIES CO.,LTD
+AC61EA|Apple, Inc.
+AC63BE|Amazon Technologies Inc.
+AC6462|zte corporation
+AC6490|HUAWEI TECHNOLOGIES CO.,LTD
+AC64CF|FN-LINK TECHNOLOGY LIMITED
+AC6706|Ruckus Wireless
+AC675D|Intel Corporate
+AC6784|Google, Inc.
+AC67B2|Espressif Inc.
+AC69CF|Cisco Meraki
+AC6AA3|Shenzhen Kertong Technology Co.,Ltd
+AC6C90|Samsung Electronics Co.,Ltd
+AC6E1A|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+AC712E|Fortinet, Inc.
+AC7289|Intel Corporate
+AC74B1|Intel Corporate
+AC751D|HUAWEI TECHNOLOGIES CO.,LTD
+AC7713|Honeywell Safety Products (Shanghai) Co.,Ltd
+AC78D1|Juniper Networks
+AC7A56|Cisco Systems, Inc
+AC7BA1|Intel Corporate
+AC7E01|Huawei Device Co., Ltd.
+AC7E8A|Cisco Systems, Inc
+AC7F3E|Apple, Inc.
+AC7F8D|Extreme Networks, Inc.
+AC800A|Sony Corporation
+AC80AE|Fiberhome Telecommunication Technologies Co.,LTD
+AC80FB|Samsung Electronics Co.,Ltd
+AC81F3|Nokia Corporation
+AC8247|Intel Corporate
+AC82F0|Apple, Inc.
+AC8317|Shenzhen Furtunetel Communication Co., Ltd
+AC84C6|TP-LINK TECHNOLOGIES CO.,LTD.
+AC84C9|Sagemcom Broadband SAS
+AC853D|HUAWEI TECHNOLOGIES CO.,LTD
+AC86A3|Apple, Inc.
+AC87A3|Apple, Inc.
+AC8866|Shenzhen Skyworth Digital Technology CO., Ltd
+AC88FD|Apple, Inc.
+AC8995|AzureWave Technology Inc.
+AC8AC7|HUAWEI TECHNOLOGIES CO.,LTD
+AC8BA9|Ubiquiti Inc
+AC8C46|Beijing Xiaomi Mobile Software Co., Ltd
+AC8D34|HUAWEI TECHNOLOGIES CO.,LTD
+AC8EBD|Microsoft Corporation
+AC8FA9|Nokia Solutions and Networks GmbH & Co. KG
+AC8FF8|Nokia
+AC9073|HUAWEI TECHNOLOGIES CO.,LTD
+AC9085|Apple, Inc.
+AC91A1|Dell Inc.
+AC9232|HUAWEI TECHNOLOGIES CO.,LTD
+AC932F|Nokia Corporation
+AC936A|Huawei Device Co., Ltd.
+AC9738|Apple, Inc.
+AC9929|HUAWEI TECHNOLOGIES CO.,LTD
+AC9B0A|Sony Corporation
+AC9E17|ASUSTek COMPUTER INC.
+ACA016|Cisco Systems, Inc
+ACA09D|Juniper Networks
+ACA213|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+ACA26A|Espressif Systems (Singapore) Pte. Ltd
+ACA31E|Hewlett Packard Enterprise
+ACA46E|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+ACA704|Espressif Inc.
+ACA7F1|TP-Link Systems Inc.
+ACA88E|SHARP Corporation
+ACAD4B|zte corporation
+ACAE19|Roku, Inc
+ACAFB9|Samsung Electronics Co.,Ltd
+ACB1EE|SHENZHEN FENDA TECHNOLOGY CO., LTD
+ACB3B5|HUAWEI TECHNOLOGIES CO.,LTD
+ACB480|Dell Inc.
+ACB57D|Liteon Technology Corporation
+ACB92F|Hangzhou Hikvision Digital Technology Co.,Ltd.
+ACBC32|Apple, Inc.
+ACBCB5|Apple, Inc.
+ACBCD9|Cisco Systems, Inc
+ACBD70|Huawei Device Co., Ltd.
+ACBDF7|Cisco Meraki
+ACC048|OnePlus Technology (Shenzhen) Co., Ltd
+ACC1EE|Xiaomi Communications Co Ltd
+ACC25D|Fiberhome Telecommunication Technologies Co.,LTD
+ACC33A|Samsung Electronics Co.,Ltd
+ACC3E5|Cisco Meraki
+ACC4A9|Fiberhome Telecommunication Technologies Co.,LTD
+ACC5B4|HUAWEI TECHNOLOGIES CO.,LTD
+ACC906|Apple, Inc.
+ACCB36|Fiberhome Telecommunication Technologies Co.,LTD
+ACCB51|Hangzhou Hikvision Digital Technology Co.,Ltd.
+ACCC8E|Axis Communications AB
+ACCCFC|Amazon Technologies Inc.
+ACCF5C|Apple, Inc.
+ACCF85|HUAWEI TECHNOLOGIES CO.,LTD
+ACD074|Espressif Inc.
+ACD1B8|Hon Hai Precision Ind. Co.,Ltd.
+ACD31D|Cisco Meraki
+ACD400|Cisco Systems, Inc
+ACD618|OnePlus Technology (Shenzhen) Co., Ltd
+ACD75B|Sagemcom Broadband SAS
+ACDBDA|Shenzhen Geniatech Inc, Ltd
+ACDCCA|HUAWEI TECHNOLOGIES CO.,LTD
+ACDE01|Ruckus Wireless
+ACDFA1|Apple, Inc.
+ACE010|Liteon Technology Corporation
+ACE011|HUAWEI TECHNOLOGIES CO.,LTD
+ACE215|HUAWEI TECHNOLOGIES CO.,LTD
+ACE2D3|Hewlett Packard
+ACE342|HUAWEI TECHNOLOGIES CO.,LTD
+ACE403|Shenzhen Visteng Technology CO.,LTD
+ACE4B5|Apple, Inc.
+ACE4D8|Xiaomi Communications Co Ltd
+ACE64B|Shenzhen Baojia Battery Technology Co., Ltd.
+ACE6BB|Google, Inc.
+ACE6FB|Apple, Inc.
+ACE87B|HUAWEI TECHNOLOGIES CO.,LTD
+ACEAEA|HUAWEI TECHNOLOGIES CO.,LTD
+ACEBE6|Espressif Inc.
+ACED32|Extreme Networks, Inc.
+ACED5C|Intel Corporate
+ACEE64|Shenzhen SuperElectron Technology Co.,Ltd.
+ACEE9E|Samsung Electronics Co.,Ltd
+ACF1DF|D-Link International
+ACF2C5|Cisco Systems, Inc
+ACF466|HP Inc.
+ACF5E6|Cisco Systems, Inc
+ACF6F7|LG Electronics (Mobile Communications)
+ACF7F3|Xiaomi Communications Co Ltd
+ACF878|Tuya Smart Inc.
+ACF970|HUAWEI TECHNOLOGIES CO.,LTD
+ACFBC2|Shenzhen Skyworth Digital Technology CO., Ltd
+ACFC82|Shenzhen Sundray Technologies company Limited
+ACFDCE|Intel Corporate
+ACFDEC|Apple, Inc.
+ACFF6B|HUAWEI TECHNOLOGIES CO.,LTD
+B000B4|Cisco Systems, Inc
+B00594|Liteon Technology Corporation
+B00875|HUAWEI TECHNOLOGIES CO.,LTD
+B00AD5|zte corporation
+B00B22|Huawei Device Co., Ltd.
+B00CD1|Hewlett Packard
+B01041|Hon Hai Precision Ind. Co.,Ltd.
+B0104B|Fiberhome Telecommunication Technologies Co.,LTD
+B01656|HUAWEI TECHNOLOGIES CO.,LTD
+B01831|Apple, Inc.
+B01921|TP-Link Systems Inc
+B019C6|Apple, Inc.
+B01BFC|Cisco Systems, Inc
+B01C0C|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+B01F8C|Hewlett Packard Enterprise
+B01FF4|Sagemcom Broadband SAS
+B0216F|HUAWEI TECHNOLOGIES CO.,LTD
+B0227A|HP Inc.
+B02347|Shenzhen Giant Microelectronics Company Limited
+B02491|Huawei Device Co., Ltd.
+B025AA|AIstone Global Limited
+B02628|Broadcom Limited
+B02680|Cisco Systems, Inc
+B027CF|Extreme Networks, Inc.
+B02A43|Google, Inc.
+B02B64|Cisco Systems, Inc
+B02EE0|Huawei Device Co., Ltd.
+B033A6|Juniper Networks
+B03495|Apple, Inc.
+B034FB|ShenZhen Microtest Automation Co.,Ltd
+B0358D|Nokia Corporation
+B0359F|Intel Corporate
+B035B5|Apple, Inc.
+B03795|LG Electronics
+B03956|NETGEAR
+B03ACE|Huawei Device Co., Ltd.
+B03CDC|Intel Corporate
+B03DBF|shenzhen ceita communications technology co.,ltd
+B03DC2|Wasp artificial intelligence(Shenzhen) Co.,ltd
+B03F64|Apple, Inc.
+B03FD3|Espressif Inc.
+B0416F|Shenzhen Maxtang Computer Co.,Ltd
+B042B7|HUAWEI TECHNOLOGIES CO.,LTD
+B04502|Huawei Device Co., Ltd.
+B047BF|Samsung Electronics Co.,Ltd
+B047E9|Intel Corporate
+B0481A|Apple, Inc.
+B0487A|TP-LINK TECHNOLOGIES CO.,LTD.
+B04A6A|Samsung Electronics Co.,Ltd
+B04AB4|Motorola Mobility LLC, a Lenovo Company
+B04E26|TP-LINK TECHNOLOGIES CO.,LTD.
+B04F13|Dell Inc.
+B04FC3|Shenzhen NVC Cloud Technology Co., Ltd.
+B050BC|SHENZHEN BASICOM ELECTRONIC CO.,LTD.
+B05216|Hon Hai Precision Ind. Co.,Ltd.
+B05476|Samsung Electronics Co.,Ltd
+B05508|HUAWEI TECHNOLOGIES CO.,LTD
+B05947|Shenzhen Qihu Intelligent Technology Company Limited
+B05A7B|Huawei Device Co., Ltd.
+B05ADA|Hewlett Packard
+B05B67|HUAWEI TECHNOLOGIES CO.,LTD
+B05B99|Sagemcom Broadband SAS
+B05C16|Fiberhome Telecommunication Technologies Co.,LTD
+B05CDA|HP Inc.
+B05CE5|Nokia Corporation
+B06088|Intel Corporate
+B061A9|YEALINK(XIAMEN) NETWORK TECHNOLOGY CO.,LTD.
+B064E0|Samsung Electronics Co.,Ltd
+B065BD|Apple, Inc.
+B067B5|Apple, Inc.
+B06A41|Google, Inc.
+B06EBF|ASUSTek COMPUTER INC.
+B06FE0|Samsung Electronics Co.,Ltd
+B0700D|Nokia
+B0702D|Apple, Inc.
+B07219|Apple, Inc.
+B0735D|Huawei Device Co., Ltd.
+B0739C|Amazon Technologies Inc.
+B0754D|Nokia
+B075D5|zte corporation
+B0761B|HUAWEI TECHNOLOGIES CO.,LTD
+B07994|Motorola Mobility LLC, a Lenovo Company
+B07ADF|HUAWEI TECHNOLOGIES CO.,LTD
+B07B25|Dell Inc.
+B07C51|Ruckus Wireless
+B07C8E|Brother Industries, LTD.
+B07D47|Cisco Systems, Inc
+B07D64|Intel Corporate
+B07FB9|NETGEAR
+B08184|Espressif Inc.
+B082E2|ASUSTek COMPUTER INC.
+B083FE|Dell Inc.
+B08900|HUAWEI TECHNOLOGIES CO.,LTD
+B08B92|zte corporation
+B08BA8|Amazon Technologies Inc.
+B08BCF|Cisco Systems, Inc
+B08BD0|Cisco Systems, Inc
+B08C75|Apple, Inc.
+B08CB3|FN-LINK TECHNOLOGY Ltd.
+B08D57|Cisco Systems, Inc
+B0907E|Cisco Systems, Inc
+B090D4|Shenzhen Hoin Internet Technology Co., Ltd
+B09200|Apple, Inc.
+B0924A|Sagemcom Broadband SAS
+B09575|TP-LINK TECHNOLOGIES CO.,LTD.
+B0958E|TP-LINK TECHNOLOGIES CO.,LTD.
+B09738|Shenzhen Skyworth Digital Technology CO., Ltd
+B0982B|Sagemcom Broadband SAS
+B098BC|Huawei Device Co., Ltd.
+B09928|FUJITSU LIMITED
+B0995A|HUAWEI TECHNOLOGIES CO.,LTD
+B099D7|Samsung Electronics Co.,Ltd
+B09C18|Shenzhen Taichi Technology Limited
+B09C63|Xiaomi Communications Co Ltd
+B09CB2|Google, Inc.
+B09FBA|Apple, Inc.
+B0A2E7|Shenzhen TINNO Mobile Technology Corp.
+B0A460|Intel Corporate
+B0A4F0|HUAWEI TECHNOLOGIES CO.,LTD
+B0A5B3|Hewlett Packard Enterprise
+B0A604|Espressif Inc.
+B0A651|Cisco Systems, Inc
+B0A732|Espressif Inc.
+B0A737|Roku, Inc.
+B0A7B9|TP-Link Systems Inc
+B0A7D2|Fiberhome Telecommunication Technologies Co.,LTD
+B0A86E|Juniper Networks
+B0AA77|Cisco Systems, Inc
+B0ACD2|zte corporation
+B0ACFA|FUJITSU LIMITED
+B0ADAA|Avaya Inc
+B0AFF7|Shenzhen Yipingfang Network Technology Co., Ltd.
+B0B0A1|Hon Hai Precision Industry Co.,LTD
+B0B194|zte corporation
+B0B21C|Espressif Inc.
+B0B28F|Sagemcom Broadband SAS
+B0B2DC|Zyxel Communications Corporation
+B0B369|Shenzhen SDMC Technology CO.,Ltd.
+B0B867|Hewlett Packard Enterprise
+B0B98A|NETGEAR
+B0BBA9|Apple, Inc.
+B0BBE5|Sagemcom Broadband SAS
+B0BE76|TP-LINK TECHNOLOGIES CO.,LTD.
+B0BE83|Apple, Inc.
+B0C19E|zte corporation
+B0C2C7|Motorola Mobility LLC, a Lenovo Company
+B0C38E|Huawei Device Co., Ltd.
+B0C4E7|Samsung Electronics Co.,Ltd
+B0C53C|Cisco Systems, Inc
+B0C554|D-Link International
+B0C559|Samsung Electronics Co.,Ltd
+B0C61C|HUAWEI TECHNOLOGIES CO.,LTD
+B0C69A|Juniper Networks
+B0C787|HUAWEI TECHNOLOGIES CO.,LTD
+B0CA68|Apple, Inc.
+B0CAE7|Huawei Device Co., Ltd.
+B0CBD8|Espressif Inc.
+B0CCFE|Huawei Device Co., Ltd.
+B0CFCB|Amazon Technologies Inc.
+B0D09C|Samsung Electronics Co.,Ltd
+B0D1D6|Nokia Shanghai Bell Co., Ltd.
+B0D568|Shenzhen Cultraview Digital Technology Co., Ltd
+B0D576|Apple, Inc.
+B0D59D|Shenzhen Zowee Technology Co., Ltd
+B0D5FB|Google, Inc.
+B0D77E|HUAWEI TECHNOLOGIES CO.,LTD
+B0D888|Panasonic Automotive Systems Co.,Ltd
+B0DCEF|Intel Corporate
+B0DE28|Apple, Inc.
+B0DE31|Samsung Electronics Co.,Ltd
+B0DF3A|Samsung Electronics Co.,Ltd
+B0DFC1|Tenda Technology Co.,Ltd.Dongguan branch
+B0E17E|HUAWEI TECHNOLOGIES CO.,LTD
+B0E235|Xiaomi Communications Co Ltd
+B0E2E5|Fiberhome Telecommunication Technologies Co.,LTD
+B0E45C|Samsung Electronics Co.,Ltd
+B0E4D5|Google, Inc.
+B0E5ED|HUAWEI TECHNOLOGIES CO.,LTD
+B0E5EF|Apple, Inc.
+B0E5F9|Apple, Inc.
+B0E892|Seiko Epson Corporation
+B0E9FE|Woan Technology (Shenzhen) Co., Ltd.
+B0EA19|TPV Audio and Visual Technology (Shenzhen) Co.,Ltd.
+B0EB57|HUAWEI TECHNOLOGIES CO.,LTD
+B0EB7F|Juniper Networks
+B0EC69|Apple, Inc.
+B0EC71|Samsung Electronics Co.,Ltd
+B0ECDD|HUAWEI TECHNOLOGIES CO.,LTD
+B0EE45|AzureWave Technology Inc.
+B0EE7B|Roku, Inc
+B0F1D8|Apple, Inc.
+B0F2F6|Samsung Electronics Co.,Ltd
+B0F7C4|Amazon Technologies Inc.
+B0FA8B|Huawei Device Co., Ltd.
+B0FAEB|Cisco Systems, Inc
+B0FBDD|Shenzhen SuperElectron Technology Co.,Ltd.
+B0FC0D|Amazon Technologies Inc.
+B0FC4B|Shenzhen Phaten Tech. LTD
+B0FC88|Sagemcom Broadband SAS
+B0FEE5|Huawei Device Co., Ltd.
+B0FF0D|Hangzhou Hikvision Digital Technology Co.,Ltd.
+B40016|INGENICO TERMINALS SAS
+B40216|Cisco Systems, Inc
+B40421|zte corporation
+B405A1|Xiaomi Communications Co Ltd
+B407F9|SAMSUNG ELECTRO MECHANICS CO., LTD.
+B40931|HUAWEI TECHNOLOGIES CO.,LTD
+B40AD8|Sony Interactive Entertainment Inc.
+B40B1D|Samsung Electronics Co.,Ltd
+B40C25|Palo Alto Networks
+B40EDE|Intel Corporate
+B40F3B|Tenda Technology Co.,Ltd.Dongguan branch
+B4107A|Amazon Technologies Inc.
+B41324|Google, Inc.
+B41489|Cisco Systems, Inc
+B414E6|HUAWEI TECHNOLOGIES CO.,LTD
+B41513|HUAWEI TECHNOLOGIES CO.,LTD
+B41584|Samsung Electronics Co.,Ltd
+B41678|Juniper Networks
+B418D1|Apple, Inc.
+B41974|Apple, Inc.
+B41A1D|Samsung Electronics Co.,Ltd
+B41BB0|Apple, Inc.
+B41C30|zte corporation
+B41D2B|Shenzhen YOUHUA Technology Co., Ltd
+B41D62|Nokia Shanghai Bell Co., Ltd.
+B41DC4|HUAWEI TECHNOLOGIES CO.,LTD
+B41F4D|Sony Interactive Entertainment Inc.
+B42200|Brother Industries, LTD.
+B423A2|Google, Inc.
+B42802|Intel Corporate
+B4293D|Shenzhen Urovo Technology Co.,Ltd.
+B42BB9|HUAWEI TECHNOLOGIES CO.,LTD
+B42D56|Extreme Networks, Inc.
+B42E99|GIGA-BYTE TECHNOLOGY CO.,LTD.
+B43052|HUAWEI TECHNOLOGIES CO.,LTD
+B437D8|D-Link (Shanghai) Limited Corp.
+B43836|HUAWEI TECHNOLOGIES CO.,LTD
+B43939|Shenzhen TINNO Mobile Technology Corp.
+B4394C|HUAWEI TECHNOLOGIES CO.,LTD
+B43A28|Samsung Electronics Co.,Ltd
+B43A45|Espressif Inc.
+B43AE2|HUAWEI TECHNOLOGIES CO.,LTD
+B43B52|Sagemcom Broadband SAS
+B440A4|Apple, Inc.
+B440DC|Samsung Electronics Co.,Ltd
+B4417A|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+B44326|HUAWEI TECHNOLOGIES CO.,LTD
+B44389|HUAWEI TECHNOLOGIES CO.,LTD
+B44506|Dell Inc.
+B4475E|Avaya Inc
+B44BD2|Apple, Inc.
+B44C3B|Zhejiang Dahua Technology Co., Ltd.
+B44C90|Cisco Systems, Inc
+B4527D|Sony Corporation
+B4527E|Sony Corporation
+B454F2|Huawei Device Co., Ltd.
+B45575|Apple, Inc.
+B4565D|Chipsea Technologies (Shenzhen) Corp.
+B456E3|Apple, Inc.
+B45976|Apple, Inc.
+B45BD1|TP-Link Systems Inc.
+B45D50|Hewlett Packard Enterprise
+B45F84|zte corporation
+B4608C|Fiberhome Telecommunication Technologies Co.,LTD
+B460ED|Beijing Xiaomi Mobile Software Co., Ltd
+B46142|HUAWEI TECHNOLOGIES CO.,LTD
+B46293|Samsung Electronics Co.,Ltd
+B4636F|Nokia Solutions and Networks GmbH & Co. KG
+B4673F|Shenzhen Shokz Co., Ltd.
+B46921|Intel Corporate
+B46BFC|Intel Corporate
+B46C47|Panasonic Appliances Company
+B46D83|Intel Corporate
+B46DC2|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+B46E08|HUAWEI TECHNOLOGIES CO.,LTD
+B47064|Samsung Electronics Co.,Ltd
+B472D4|zte corporation
+B47443|Samsung Electronics Co.,Ltd
+B476A4|Huawei Device Co., Ltd.
+B47748|Shenzhen Neoway Technology Co.,Ltd.
+B479A7|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+B479C8|Ruckus Wireless
+B47AF1|Hewlett Packard Enterprise
+B47B1A|HUAWEI TECHNOLOGIES CO.,LTD
+B47C29|Shenzhen Guzidi Technology Co.,Ltd
+B47C9C|Amazon Technologies Inc.
+B47CA6|zte corporation
+B47E9F|Xiaomi Communications Co Ltd
+B48107|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+B48351|Intel Corporate
+B485E1|Apple, Inc.
+B48655|HUAWEI TECHNOLOGIES CO.,LTD
+B48901|HUAWEI TECHNOLOGIES CO.,LTD
+B48A0A|Espressif Inc.
+B48A5F|Juniper Networks
+B48B19|Apple, Inc.
+B48C9D|AzureWave Technology Inc.
+B49107|HUAWEI TECHNOLOGIES CO.,LTD
+B49691|Intel Corporate
+B496A5|Apple, Inc.
+B49842|zte corporation
+B499BA|Hewlett Packard
+B49A95|Shenzhen Boomtech Industrial Corporation
+B49CDF|Apple, Inc.
+B49D02|Samsung Electronics Co.,Ltd
+B49DFD|Shenzhen SDMC Technology CO.,Ltd.
+B49EE6|SHENZHEN TECHNOLOGY CO LTD
+B49F4D|Fiberhome Telecommunication Technologies Co.,LTD
+B4A10A|Huawei Device Co., Ltd.
+B4A25C|Cambium Networks Limited
+B4A382|Hangzhou Hikvision Digital Technology Co.,Ltd.
+B4A3BD|Extreme Networks, Inc.
+B4A4E3|Cisco Systems, Inc
+B4A64A|Espressif Inc.
+B4A828|Shenzhen Concox Information Technology Co., Ltd
+B4A898|Huawei Device Co., Ltd.
+B4A8B9|Cisco Systems, Inc
+B4A95A|Avaya Inc
+B4A9FC|Quanta Computer Inc.
+B4A9FE|GHIA Technology (Shenzhen) LTD
+B4AE2B|Microsoft
+B4AEC1|Apple, Inc.
+B4B017|Avaya Inc
+B4B024|TP-Link Systems Inc
+B4B055|HUAWEI TECHNOLOGIES CO.,LTD
+B4B291|LG Electronics
+B4B2E9|Fortinet, Inc.
+B4B362|zte corporation
+B4B384|ShenZhen Figigantic Electronic Co.,Ltd
+B4B52F|Hewlett Packard
+B4B676|Intel Corporate
+B4B686|Hewlett Packard
+B4B742|Amazon Technologies Inc.
+B4BFE9|Espressif Inc.
+B4BFF6|Samsung Electronics Co.,Ltd
+B4C0C3|TP-Link Systems Inc.
+B4C0F5|Shenzhen TINNO Mobile Technology Corp.
+B4C2F7|Huawei Device Co., Ltd.
+B4C3D9|HUAWEI TECHNOLOGIES CO.,LTD
+B4C4FC|Xiaomi Communications Co Ltd
+B4C799|Extreme Networks, Inc.
+B4CADD|Cisco Systems, Inc
+B4CD27|HUAWEI TECHNOLOGIES CO.,LTD
+B4CE40|Samsung Electronics Co.,Ltd
+B4CFDB|Shenzhen Jiuzhou Electric Co.,LTD
+B4D1F6|HUAWEI TECHNOLOGIES CO.,LTD
+B4D5BD|Intel Corporate
+B4D5E5|Samsung Electronics Co.,Ltd
+B4DE31|Cisco Systems, Inc
+B4DEDF|zte corporation
+B4DF91|Cisco Meraki
+B4E10F|Dell Inc.
+B4E1C4|Microsoft Mobile Oy
+B4E25B|HP Inc.
+B4E265|Shenzhen SDMC Technology CO.,Ltd.
+B4E3D0|LG Electronics
+B4E454|Amazon Technologies Inc.
+B4E53E|Ruckus Wireless
+B4E5C5|Huawei Device Co., Ltd.
+B4E62D|Espressif Inc.
+B4E9B0|Cisco Systems, Inc
+B4E9B8|Dell Inc.
+B4EE25|Shenzhen Belon Technology CO.,LTD
+B4EF39|Samsung Electronics Co.,Ltd
+B4F0AB|Apple, Inc.
+B4F18C|Huawei Device Co., Ltd.
+B4F1DA|LG Electronics (Mobile Communications)
+B4F267|Compal Broadband Networks, Inc.
+B4F49B|Huawei Device Co., Ltd.
+B4F58E|HUAWEI TECHNOLOGIES CO.,LTD
+B4F61C|Apple, Inc.
+B4F7A1|LG Electronics (Mobile Communications)
+B4F95D|Juniper Networks
+B4FA48|Apple, Inc.
+B4FBE4|Ubiquiti Inc
+B4FBF9|HUAWEI TECHNOLOGIES CO.,LTD
+B4FF98|HUAWEI TECHNOLOGIES CO.,LTD
+B8005B|Huawei Device Co., Ltd.
+B8011F|Apple, Inc.
+B80305|Intel Corporate
+B80533|Apple, Inc.
+B805AB|zte corporation
+B8060D|Tuya Smart Inc.
+B80756|Cisco Meraki
+B808CF|Intel Corporate
+B808D7|HUAWEI TECHNOLOGIES CO.,LTD
+B8098A|Apple, Inc.
+B80B9A|HUAWEI TECHNOLOGIES CO.,LTD
+B80E1D|PAX Computer Technology(Shenzhen) Ltd.
+B8114B|Cisco Systems, Inc
+B8144D|Apple, Inc.
+B8145C|Huawei Device Co., Ltd.
+B81743|shenzhen worldelite electronics co., LTD
+B817C2|Apple, Inc.
+B81904|Nokia Shanghai Bell Co., Ltd.
+B81D1F|HUAWEI TECHNOLOGIES CO.,LTD
+B81DAA|LG Electronics (Mobile Communications)
+B81E0B|Extreme Networks, Inc.
+B81E9E|HUAWEI TECHNOLOGIES CO.,LTD
+B81EA4|Liteon Technology Corporation
+B81F3F|Espressif Inc.
+B8208E|Panasonic Connect Co., Ltd.
+B8211C|Apple, Inc.
+B8220C|Apple, Inc.
+B827C5|Huawei Device Co., Ltd.
+B827EB|Raspberry Pi Foundation
+B82A72|Dell Inc.
+B82AA9|Apple, Inc.
+B82B68|Huawei Device Co., Ltd.
+B831B5|Microsoft Corporation
+B83446|Motorola Mobility LLC, a Lenovo Company
+B8374A|Apple, Inc.
+B8374B|Hewlett Packard Enterprise
+B837B2|Hewlett Packard Enterprise
+B83861|Cisco Systems, Inc
+B83865|Hewlett Packard Enterprise
+B83A08|Tenda Technology Co.,Ltd.Dongguan branch
+B83A5A|Hewlett Packard Enterprise
+B83BCC|Xiaomi Communications Co Ltd
+B83C20|Huawei Device Co., Ltd.
+B83C28|Apple, Inc.
+B83D4E|Shenzhen Cultraview Digital Technology Co.,Ltd Shanghai Branch
+B83E59|Roku, Inc.
+B841A4|Apple, Inc.
+B844D9|Apple, Inc.
+B845EB|Apple, Inc.
+B8496D|Apple, Inc.
+B84D43|HUNAN FN-LINK TECHNOLOGY LIMITED
+B84FA7|Apple, Inc.
+B84FD5|Microsoft Corporation
+B85001|Extreme Networks, Inc.
+B850D8|Beijing Xiaomi Mobile Software Co., Ltd
+B851A9|Nokia
+B85213|zte corporation
+B852E0|Beijing Xiaomi Electronics Co.,Ltd
+B85384|Xiaomi Communications Co Ltd
+B853AC|Apple, Inc.
+B85510|Zioncom Electronics (Shenzhen) Ltd.
+B85600|HUAWEI TECHNOLOGIES CO.,LTD
+B857D6|Cisco Systems, Inc
+B857D8|Samsung Electronics Co.,Ltd
+B85A73|Samsung Electronics Co.,Ltd
+B85C5C|Microsoft Corporation
+B85D0A|Apple, Inc.
+B85DC3|HUAWEI TECHNOLOGIES CO.,LTD
+B85E7B|Samsung Electronics Co.,Ltd
+B85F98|Amazon Technologies Inc.
+B85FB0|HUAWEI TECHNOLOGIES CO.,LTD
+B861FC|Juniper Networks
+B8621F|Cisco Systems, Inc
+B8634D|Apple, Inc.
+B86685|Sagemcom Broadband SAS
+B869F4|Routerboard.com
+B86AF1|Sagemcom Broadband SAS
+B86B23|Toshiba
+B86CE0|Hewlett Packard Enterprise
+B86CE8|Samsung Electronics Co.,Ltd
+B87029|Shenzhen Ruiyuanchuangxin Technology Co.,Ltd.
+B870F4|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+B8752E|Huawei Device Co., Ltd.
+B8763F|Hon Hai Precision Ind. Co.,Ltd.
+B8782E|Apple, Inc.
+B87B4D|Espressif Inc.
+B87BC5|Apple, Inc.
+B87BD4|Google, Inc.
+B87CD0|Huawei Device Co., Ltd.
+B87CF2|Extreme Networks, Inc.
+B87E39|Motorola Mobility LLC, a Lenovo Company
+B87E40|Huawei Device Co., Ltd.
+B87EE5|Intelbras
+B88035|Shenzhen Qihu Intelligent Technology Company Limited
+B88198|Intel Corporate
+B881FA|Apple, Inc.
+B88268|SHENZHEN HOPESTAR TECHNOLOGY CO.,LTD.
+B88303|Hewlett Packard Enterprise
+B88411|Shenzhen Shokz Co., Ltd.
+B8857B|HUAWEI TECHNOLOGIES CO.,LTD
+B88584|Dell Inc.
+B88687|Liteon Technology Corporation
+B88788|HP Inc.
+B888E3|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+B88A60|Intel Corporate
+B88C2B|Sagemcom Broadband SAS
+B88D12|Apple, Inc.
+B88E82|Huawei Device Co., Ltd.
+B88EB0|Shenzhen Skyworth Digital Technology CO., Ltd
+B89047|Apple, Inc.
+B89436|HUAWEI TECHNOLOGIES CO.,LTD
+B894E7|Xiaomi Communications Co Ltd
+B8977A|Nokia Solutions and Networks GmbH & Co. KG
+B898AD|Motorola Mobility LLC, a Lenovo Company
+B898F7|Gionee Communication Equipment Co,Ltd.ShenZhen
+B899AE|Shenzhen MiaoMing Intelligent Technology Co.,Ltd
+B89A2A|Intel Corporate
+B89FCC|HUAWEI TECHNOLOGIES CO.,LTD
+B8A0B8|Samsung Electronics Co.,Ltd
+B8A175|Roku, Inc.
+B8A25D|Motorola Mobility LLC, a Lenovo Company
+B8A377|Cisco Systems, Inc
+B8A386|D-Link International
+B8A44F|Axis Communications AB
+B8A825|Samsung Electronics Co.,Ltd
+B8AB61|Cisco Meraki
+B8AC6F|Dell Inc.
+B8AF67|Hewlett Packard
+B8B2F8|Apple, Inc.
+B8B409|Samsung Electronics Co.,Ltd
+B8B42E|Gionee Communication Equipment Co,Ltd.ShenZhen
+B8B4C9|Cisco Meraki
+B8B81E|Intel Corporate
+B8B94E|Shenzhen iBaby Labs, Inc.
+B8BA66|Microsoft Corporation
+B8BB11|Espressif Systems (Singapore) Pte. Ltd
+B8BBAF|Samsung Electronics Co.,Ltd
+B8BC1B|HUAWEI TECHNOLOGIES CO.,LTD
+B8BC5B|Samsung Electronics Co.,Ltd
+B8BEBF|Cisco Systems, Inc
+B8BF83|Intel Corporate
+B8C111|Apple, Inc.
+B8C253|Juniper Networks
+B8C385|HUAWEI TECHNOLOGIES CO.,LTD
+B8C68E|Samsung Electronics Co.,Ltd
+B8C716|Fiberhome Telecommunication Technologies Co.,LTD
+B8C75D|Apple, Inc.
+B8C924|Cisco Systems, Inc
+B8CA3A|Dell Inc.
+B8CB29|Dell Inc.
+B8CC38|Shenzhen Yinwang Intelligent Technologies Co., Ltd.
+B8CC5F|Shenzhen iComm Semiconductor CO.,LTD
+B8CD58|Shenzhen SuperElectron Technology Co.,Ltd.
+B8CEED|Broadcom
+B8D4BC|zte corporation
+B8D4C3|HUAWEI TECHNOLOGIES CO.,LTD
+B8D4E7|Hewlett Packard Enterprise
+B8D526|Zyxel Communications Corporation
+B8D5AD|Nokia
+B8D61A|Espressif Inc.
+B8D6F6|HUAWEI TECHNOLOGIES CO.,LTD
+B8D94D|Sagemcom Broadband SAS
+B8D9CE|Samsung Electronics Co.,Ltd
+B8DAE8|Huawei Device Co., Ltd.
+B8DB38|Google, Inc.
+B8DC28|Extreme Networks, Inc.
+B8DD71|zte corporation
+B8DFD4|Fiberhome Telecommunication Technologies Co.,LTD
+B8E28C|MOTOROLA SOLUTIONS MALAYSIA SDN. BHD.
+B8E3B1|HUAWEI TECHNOLOGIES CO.,LTD
+B8E60C|Apple, Inc.
+B8E856|Apple, Inc.
+B8E937|Sonos, Inc.
+B8EA98|Xiaomi Communications Co Ltd
+B8ECA3|Zyxel Communications Corporation
+B8EE0E|Sagemcom Broadband SAS
+B8EE65|Liteon Technology Corporation
+B8EF8B|SHENZHEN CANNICE TECHNOLOGY CO.,LTD
+B8F009|Espressif Inc.
+B8F015|Juniper Networks
+B8F0B9|zte corporation
+B8F12A|Apple, Inc.
+B8F4A4|Google, Inc.
+B8F653|Shenzhen Jingxun Software Telecommunication Technology Co.,Ltd
+B8F6B1|Apple, Inc.
+B8F774|Fiberhome Telecommunication Technologies Co.,LTD
+B8F775|Intel Corporate
+B8F862|Espressif Inc.
+B8F883|TP-LINK TECHNOLOGIES CO.,LTD.
+B8F934|Sony Corporation
+B8FBB3|TP-Link Systems Inc.
+B8FE90|Cisco Systems, Inc
+B8FE96|Amazon Technologies Inc.
+B8FF61|Apple, Inc.
+BC0004|Fiberhome Telecommunication Technologies Co.,LTD
+BC0358|Intel Corporate
+BC071D|TP-Link Systems Inc.
+BC091B|Intel Corporate
+BC0963|Apple, Inc.
+BC0EAB|Samsung Electronics Co.,Ltd
+BC0F64|Intel Corporate
+BC0F9A|D-Link International
+BC0FF3|HP Inc.
+BC0FFE|Juniper Networks
+BC107B|Samsung Electronics Co.,Ltd
+BC122F|LCFC(Hefei) Electronics Technology co., ltd
+BC13A8|Shenzhen YOUHUA Technology Co., Ltd
+BC1485|Samsung Electronics Co.,Ltd
+BC1541|Nokia
+BC1665|Cisco Systems, Inc
+BC1695|zte corporation
+BC16F5|Cisco Systems, Inc
+BC17B8|Intel Corporate
+BC1827|Apple, Inc.
+BC1896|HUAWEI TECHNOLOGIES CO.,LTD
+BC1926|Espressif Inc.
+BC1AE4|Huawei Device Co., Ltd.
+BC1D89|Motorola Mobility LLC, a Lenovo Company
+BC1E85|HUAWEI TECHNOLOGIES CO.,LTD
+BC20A4|Samsung Electronics Co.,Ltd
+BC2228|D-Link International
+BC25E0|HUAWEI TECHNOLOGIES CO.,LTD
+BC26C7|Cisco Systems, Inc
+BC277A|Samsung Electronics Co.,Ltd
+BC2978|Prama Hikvision India Private Limited
+BC2CE6|Cisco Systems, Inc
+BC2EC3|Shenzhen Tianruixiang Communication Equipment Co.,Ltd
+BC2EF6|Huawei Device Co., Ltd.
+BC305B|Dell Inc.
+BC325F|Zhejiang Dahua Technology Co., Ltd.
+BC32B2|Samsung Electronics Co.,Ltd
+BC3329|Sony Interactive Entertainment Inc.
+BC3340|Cisco Meraki
+BC33DB|Sagemcom Broadband SAS
+BC34D6|Extreme Networks, Inc.
+BC351E|Tuya Smart Inc.
+BC36F7|HUAWEI TECHNOLOGIES CO.,LTD
+BC37D3|Apple, Inc.
+BC3898|Intel Corporate
+BC3BAF|Apple, Inc.
+BC3D85|HUAWEI TECHNOLOGIES CO.,LTD
+BC3E0B|Panasonic Connect Co., Ltd.
+BC3F8F|HUAWEI TECHNOLOGIES CO.,LTD
+BC4101|Shenzhen TINNO Mobile Technology Corp.
+BC41A0|zte corporation
+BC4434|Shenzhen TINNO Mobile Technology Corp.
+BC4486|Samsung Electronics Co.,Ltd
+BC4529|zte corporation
+BC455B|Samsung Electronics Co.,Ltd
+BC458C|Shenzhen Topwise Communication Co.,Ltd
+BC4632|Fiberhome Telecommunication Technologies Co.,LTD
+BC4699|TP-LINK TECHNOLOGIES CO.,LTD.
+BC4760|Samsung Electronics Co.,Ltd
+BC49B2|SHENZHEN ALONG COMMUNICATION TECH CO., LTD
+BC4A56|Cisco Systems, Inc
+BC4C78|HUAWEI TECHNOLOGIES CO.,LTD
+BC4CA0|HUAWEI TECHNOLOGIES CO.,LTD
+BC4CC4|Apple, Inc.
+BC4F2D|Apple, Inc.
+BC515F|Nokia Solutions and Networks India Private Limited
+BC5274|Samsung Electronics Co.,Ltd
+BC52B4|Nokia
+BC52B7|Apple, Inc.
+BC542F|Intel Corporate
+BC5436|Apple, Inc.
+BC5451|Samsung Electronics Co.,Ltd
+BC54FC|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+BC5729|Shenzhen KKM Co., Ltd
+BC5A56|Cisco Systems, Inc
+BC5E33|Hangzhou Hikvision Digital Technology Co.,Ltd.
+BC60A7|Sony Interactive Entertainment Inc.
+BC6193|Xiaomi Communications Co Ltd
+BC620E|HUAWEI TECHNOLOGIES CO.,LTD
+BC629C|zte corporation
+BC671C|Cisco Systems, Inc
+BC6778|Apple, Inc.
+BC68C3|HUAWEI TECHNOLOGIES CO.,LTD
+BC69CB|Panasonic Electric Works Networks Co., Ltd.
+BC6AD1|Xiaomi Communications Co Ltd
+BC6B4D|Nokia
+BC6C21|Apple, Inc.
+BC6C96|SHEN ZHEN TENDA TECHNOLOGY CO.,LTD
+BC6E64|Sony Corporation
+BC6EE2|Intel Corporate
+BC72B1|Samsung Electronics Co.,Ltd
+BC74EA|Apple, Inc.
+BC7574|HUAWEI TECHNOLOGIES CO.,LTD
+BC765E|Samsung Electronics Co.,Ltd
+BC7670|HUAWEI TECHNOLOGIES CO.,LTD
+BC76C5|HUAWEI TECHNOLOGIES CO.,LTD
+BC7737|Intel Corporate
+BC79AD|Samsung Electronics Co.,Ltd
+BC7ABF|Samsung Electronics Co.,Ltd
+BC7B72|Huawei Device Co., Ltd.
+BC7E8B|Samsung Electronics Co.,Ltd
+BC7EC3|Zyxel Communications Corporation
+BC7F7B|Huawei Device Co., Ltd.
+BC7FA4|Xiaomi Communications Co Ltd
+BC804E|Apple, Inc.
+BC8385|Microsoft Corporation
+BC83A7|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+BC851F|Samsung Electronics Co.,Ltd
+BC8556|Hon Hai Precision Ind. Co.,Ltd.
+BC89A7|Apple, Inc.
+BC89C1|Apple, Inc.
+BC8CCD|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+BC8D0E|Nokia
+BC8D1F|Cisco Systems, Inc
+BC8D2D|Fiberhome Telecommunication Technologies Co.,LTD
+BC926B|Apple, Inc.
+BC9307|Samsung Electronics Co.,Ltd
+BC9388|Nokia Solutions (Shanghai) Co.,Ltd.
+BC9680|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+BC9789|Huawei Device Co., Ltd.
+BC97E1|Broadcom Limited
+BC9889|Fiberhome Telecommunication Technologies Co.,LTD
+BC98DF|Motorola Mobility LLC, a Lenovo Company
+BC9911|Zyxel Communications Corporation
+BC9930|HUAWEI TECHNOLOGIES CO.,LTD
+BC9A53|Huawei Device Co., Ltd.
+BC9B5E|Hangzhou Hikvision Digital Technology Co.,Ltd.
+BC9C31|HUAWEI TECHNOLOGIES CO.,LTD
+BC9C8D|Ruckus Wireless
+BC9D42|SHENZHEN RF-LINK TECHNOLOGY CO.,LTD.
+BC9D4E|Shenzhen Skyworth Digital Technology CO., Ltd
+BC9F58|Apple, Inc.
+BC9FE4|Hewlett Packard Enterprise
+BC9FEF|Apple, Inc.
+BCA080|Samsung Electronics Co.,Ltd
+BCA0B9|HUAWEI TECHNOLOGIES CO.,LTD
+BCA231|HUAWEI TECHNOLOGIES CO.,LTD
+BCA511|NETGEAR
+BCA58B|Samsung Electronics Co.,Ltd
+BCA5A9|Apple, Inc.
+BCA8A6|Intel Corporate
+BCA920|Apple, Inc.
+BCA993|Cambium Networks Limited
+BCAA82|Fiberhome Telecommunication Technologies Co.,LTD
+BCABF5|Cisco Systems, Inc
+BCAD28|Hangzhou Hikvision Digital Technology Co.,Ltd.
+BCADAB|Avaya Inc
+BCAEC5|ASUSTek COMPUTER INC.
+BCB0E7|HUAWEI TECHNOLOGIES CO.,LTD
+BCB181|SHARP CORPORATION
+BCB1D3|Cisco Meraki
+BCB1F3|Samsung Electronics Co.,Ltd
+BCB2CC|Samsung Electronics Co.,Ltd
+BCB30E|Cisco Systems, Inc
+BCB863|Apple, Inc.
+BCBAC2|Hangzhou Hikvision Digital Technology Co.,Ltd.
+BCBB58|Apple, Inc.
+BCBCCA|Huawei Device Co., Ltd.
+BCBD84|zte corporation
+BCBF2E|ASUSTek COMPUTER INC.
+BCC00F|Fiberhome Telecommunication Technologies Co.,LTD
+BCC342|Panasonic Communications Co., Ltd.
+BCC427|HUAWEI TECHNOLOGIES CO.,LTD
+BCC436|Nokia
+BCC493|Cisco Systems, Inc
+BCC6DB|Nokia Corporation
+BCC746|Hon Hai Precision IND.CO.,LTD
+BCC810|Cisco SPVTG
+BCC8CC|Seiko Epson Corporation
+BCCD7F|Huawei Device Co., Ltd.
+BCCD99|Intel Corporate
+BCCF4F|Zyxel Communications Corporation
+BCD074|Apple, Inc.
+BCD11F|Samsung Electronics Co.,Ltd
+BCD165|Cisco SPVTG
+BCD177|TP-LINK TECHNOLOGIES CO.,LTD.
+BCD1D3|Shenzhen TINNO Mobile Technology Corp.
+BCD206|HUAWEI TECHNOLOGIES CO.,LTD
+BCD22C|Intel Corporate
+BCD295|Cisco Systems, Inc
+BCD5ED|Sagemcom Broadband SAS
+BCD7A5|Hewlett Packard Enterprise
+BCD7D4|Roku, Inc
+BCDB09|Cisco Meraki
+BCDDC2|Espressif Inc.
+BCDF58|Google, Inc.
+BCE143|Apple, Inc.
+BCE265|HUAWEI TECHNOLOGIES CO.,LTD
+BCE63F|Samsung Electronics Co.,Ltd
+BCE67C|Cambium Networks Limited
+BCE712|Cisco Systems, Inc
+BCE92F|HP Inc.
+BCEAFA|Hewlett Packard
+BCEBE8|Samsung Electronics Co.,Ltd
+BCEC23|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+BCEC5D|Apple, Inc.
+BCECA0|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+BCEE7B|ASUSTek COMPUTER INC.
+BCF105|Intel Corporate
+BCF171|Intel Corporate
+BCF1F2|Cisco Systems, Inc
+BCF310|Extreme Networks, Inc.
+BCF45F|zte corporation
+BCF5AC|LG Electronics (Mobile Communications)
+BCF685|D-Link International
+BCF730|Samsung Electronics Co.,Ltd
+BCF88B|zte corporation
+BCFAEB|Cisco Systems, Inc
+BCFCE7|ASUSTek COMPUTER INC.
+BCFD0C|Shenzhen Phaten Tech. LTD
+BCFED9|Apple, Inc.
+BCFF21|Smart Code(shenzhen)Technology Co.,Ltd
+BCFF4D|Espressif Inc.
+BCFF54|zte corporation
+BCFFEB|Motorola Mobility LLC, a Lenovo Company
+C00195|Amazon Technologies Inc.
+C00380|Juniper Networks
+C0060C|HUAWEI TECHNOLOGIES CO.,LTD
+C006C3|TP-Link Systems Inc
+C00925|FN-LINK TECHNOLOGY Ltd.
+C01173|Samsung Electronics Co.,Ltd
+C0143D|Hon Hai Precision Ind. Co.,Ltd.
+C014B8|Nokia
+C014FE|Cisco Systems, Inc
+C0151B|Sony Interactive Entertainment Inc.
+C01693|Xiaomi Communications Co Ltd
+C0174D|Samsung Electronics Co.,Ltd
+C01754|Apple, Inc.
+C01803|HP Inc.
+C01850|Quanta Computer Inc.
+C01885|Hon Hai Precision Ind. Co.,Ltd.
+C01944|Juniper Networks
+C01ADA|Apple, Inc.
+C01C30|Shenzhen WIFI-3L Technology Co.,Ltd
+C01C6A|Google, Inc.
+C0210D|SHENZHEN RF-LINK TECHNOLOGY CO.,LTD.
+C0238D|Samsung Electronics Co.,Ltd
+C0252F|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+C0255C|Cisco Systems, Inc
+C025A5|Dell Inc.
+C025E9|TP-LINK TECHNOLOGIES CO.,LTD.
+C02C17|Cisco Systems, Inc
+C02C5C|Apple, Inc.
+C02C7A|Shenzhen Horn Audio Co.,Ltd.
+C02E1D|Nokia Solutions and Networks GmbH & Co. KG
+C02E5F|Zyxel Communications Corporation
+C0335E|Microsoft
+C03379|HUAWEI TECHNOLOGIES CO.,LTD
+C033DA|Shenzhen JRUN Technologies CO., LTD
+C034B4|Gigastone Corporation
+C03532|Liteon Technology Corporation
+C03656|Fiberhome Telecommunication Technologies Co.,LTD
+C03896|Hon Hai Precision Ind. Co.,Ltd.
+C038F9|Nokia Danmark A/S
+C0395A|Zhejiang Dahua Technology Co., Ltd.
+C03A55|TP-Link Systems Inc.
+C03C04|Sagemcom Broadband SAS
+C03C59|Intel Corporate
+C03D03|Samsung Electronics Co.,Ltd
+C03E50|HUAWEI TECHNOLOGIES CO.,LTD
+C03E75|HUAWEI TECHNOLOGIES CO.,LTD
+C03EBA|Dell Inc.
+C03F0E|NETGEAR
+C03FDD|HUAWEI TECHNOLOGIES CO.,LTD
+C04121|Nokia Solutions and Networks GmbH & Co. KG
+C041F6|LG ELECTRONICS INC
+C042D0|Juniper Networks
+C04442|Apple, Inc.
+C044E3|Shenzhen Sinkna Electronics Co., LTD
+C0470E|Dell Inc.
+C048E6|Samsung Electronics Co.,Ltd
+C048FB|Shenzhen JingHanDa Electronics Co.Ltd
+C04943|zte corporation
+C049EF|Espressif Inc.
+C04A00|TP-LINK TECHNOLOGIES CO.,LTD.
+C04E30|Espressif Inc.
+C04E8A|HUAWEI TECHNOLOGIES CO.,LTD
+C0515C|zte corporation
+C0517E|Hangzhou Hikvision Digital Technology Co.,Ltd.
+C05234|HUAWEI TECHNOLOGIES CO.,LTD
+C0544D|Nokia Shanghai Bell Co., Ltd.
+C056E3|Hangzhou Hikvision Digital Technology Co.,Ltd.
+C057BC|Avaya Inc
+C0582E|Cisco Systems, Inc
+C05B44|Beijing Xiaomi Mobile Software Co., Ltd
+C05BBD|HUAWEI TECHNOLOGIES CO.,LTD
+C05D89|Espressif Inc.
+C05E79|SHENZHEN HUAXUN ARK TECHNOLOGIES CO.,LTD
+C06118|TP-LINK TECHNOLOGIES CO.,LTD.
+C06194|Huawei Device Co., Ltd.
+C0626B|Cisco Systems, Inc
+C06394|Apple, Inc.
+C064C6|Nokia Corporation
+C064E4|Cisco Systems, Inc
+C06599|Samsung Electronics Co.,Ltd
+C067AF|Cisco Systems, Inc
+C068CC|Shenzhen Skyworth Digital Technology CO., Ltd
+C06B55|Motorola Mobility LLC, a Lenovo Company
+C06C0C|Apple, Inc.
+C06DED|Hangzhou Hikvision Digital Technology Co.,Ltd.
+C06E3D|SHENZHEN TECNO TECHNOLOGY
+C07009|HUAWEI TECHNOLOGIES CO.,LTD
+C071AA|ShenZhen OnMicro Electronics Co.,Ltd.
+C0742B|SHENZHEN XUNLONG SOFTWARE CO.,LIMITED
+C074AD|Grandstream Networks, Inc.
+C07831|Huawei Device Co., Ltd.
+C07982|TCL King Electrical Appliances(Huizhou)Co.,Ltd
+C07AD6|Samsung Electronics Co.,Ltd
+C07BBC|Cisco Systems, Inc
+C07C90|Shenzhen YOUHUA Technology Co., Ltd
+C07CD1|PEGATRON CORPORATION
+C07E40|SHENZHEN XDK COMMUNICATION EQUIPMENT CO.,LTD
+C083C9|Huawei Device Co., Ltd.
+C0847A|Apple, Inc.
+C084E0|HUAWEI TECHNOLOGIES CO.,LTD
+C086B3|Shenzhen Voxtech Co., Ltd.
+C08706|Shenzhen Qianfenyi Intelligent Technology Co.,LTD
+C087EB|Samsung Electronics Co.,Ltd
+C08997|Samsung Electronics Co.,Ltd
+C08ADE|Ruckus Wireless
+C08B05|HUAWEI TECHNOLOGIES CO.,LTD
+C08B27|FN-LINK TECHNOLOGY Ltd.
+C08B2A|Cisco Systems, Inc
+C08C60|Cisco Systems, Inc
+C08C71|Motorola Mobility LLC, a Lenovo Company
+C08D51|Amazon Technologies Inc.
+C08F20|Shenzhen Skyworth Digital Technology CO., Ltd
+C091B9|Amazon Technologies Inc.
+C09296|zte corporation
+C094AD|zte corporation
+C0956D|Apple, Inc.
+C095CF|Amazon Technologies Inc.
+C096A4|Fiberhome Telecommunication Technologies Co.,LTD
+C09727|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+C09879|Acer Inc.
+C09AD0|Apple, Inc.
+C09B63|HUAWEI TECHNOLOGIES CO.,LTD
+C09F42|Apple, Inc.
+C09FE1|zte corporation
+C0A0BB|D-Link International
+C0A36D|HUAWEI TECHNOLOGIES CO.,LTD
+C0A53E|Apple, Inc.
+C0A5DD|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+C0A5E8|Intel Corporate
+C0A600|Apple, Inc.
+C0A810|Intel Corporate
+C0A938|HUAWEI TECHNOLOGIES CO.,LTD
+C0AB2B|Huawei Device Co., Ltd.
+C0AC54|Sagemcom Broadband SAS
+C0AEFD|Shenzhen HC-WLAN Technology Co.,Ltd
+C0B101|zte corporation
+C0B22F|Apple, Inc.
+C0B47D|Huawei Device Co., Ltd.
+C0B550|Broadcom Limited
+C0B5CD|Huawei Device Co., Ltd.
+C0B658|Apple, Inc.
+C0B6F9|Intel Corporate
+C0B883|Intel Corporate
+C0BC9A|HUAWEI TECHNOLOGIES CO.,LTD
+C0BDC8|Samsung Electronics Co.,Ltd
+C0BDD1|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+C0BFA7|Juniper Networks
+C0BFAC|Huawei Device Co., Ltd.
+C0BFBE|AzureWave Technology Inc.
+C0BFC0|HUAWEI TECHNOLOGIES CO.,LTD
+C0C170|Shenzhen SuperElectron Technology Co.,Ltd.
+C0C1C0|Cisco-Linksys, LLC
+C0C520|Ruckus Wireless
+C0C687|Cisco SPVTG
+C0C70A|Ruckus Wireless
+C0C7DB|Apple, Inc.
+C0C976|Shenzhen TINNO Mobile Technology Corp.
+C0C9E3|TP-LINK TECHNOLOGIES CO.,LTD.
+C0CB38|Hon Hai Precision Ind. Co.,Ltd.
+C0CCF8|Apple, Inc.
+C0CDD6|Espressif Inc.
+C0CECD|Apple, Inc.
+C0D012|Apple, Inc.
+C0D026|Huawei Device Co., Ltd.
+C0D044|Sagemcom Broadband SAS
+C0D193|Huawei Device Co., Ltd.
+C0D2DD|Samsung Electronics Co.,Ltd
+C0D3C0|Samsung Electronics Co.,Ltd
+C0D46B|Huawei Device Co., Ltd.
+C0D5E2|Samsung Electronics Co.,Ltd
+C0D6D5|Microsoft Corporation
+C0D941|Shenzhen VMAX Software Co., Ltd.
+C0DA5E|Huawei Device Co., Ltd.
+C0DCD7|Huawei Device Co., Ltd.
+C0DCDA|Samsung Electronics Co.,Ltd
+C0DFED|Juniper Networks
+C0E018|HUAWEI TECHNOLOGIES CO.,LTD
+C0E1BE|HUAWEI TECHNOLOGIES CO.,LTD
+C0E3FB|HUAWEI TECHNOLOGIES CO.,LTD
+C0E42D|TP-LINK TECHNOLOGIES CO.,LTD.
+C0E434|AzureWave Technology Inc.
+C0E579|Huawei Device Co., Ltd.
+C0E862|Apple, Inc.
+C0E8EA|Fiberhome Telecommunication Technologies Co.,LTD
+C0EAE4|Sonicwall
+C0EEFB|OnePlus Tech (Shenzhen) Ltd
+C0F2FB|Apple, Inc.
+C0F4E6|HUAWEI TECHNOLOGIES CO.,LTD
+C0F6C2|HUAWEI TECHNOLOGIES CO.,LTD
+C0F6EC|HUAWEI TECHNOLOGIES CO.,LTD
+C0F853|Tuya Smart Inc.
+C0F87F|Cisco Systems, Inc
+C0F8DA|Hon Hai Precision Ind. Co.,Ltd.
+C0F945|Toshiba Toko Meter Systems Co., LTD.
+C0F9B0|HUAWEI TECHNOLOGIES CO.,LTD
+C0FD6F|Sagemcom Broadband SAS
+C0FD84|zte corporation
+C0FFA8|HUAWEI TECHNOLOGIES CO.,LTD
+C0FFD4|NETGEAR
+C4017C|Ruckus Wireless
+C403A8|Intel Corporate
+C40415|NETGEAR
+C4047B|Shenzhen YOUHUA Technology Co., Ltd
+C40528|HUAWEI TECHNOLOGIES CO.,LTD
+C40683|HUAWEI TECHNOLOGIES CO.,LTD
+C4072F|HUAWEI TECHNOLOGIES CO.,LTD
+C4084A|Nokia
+C40880|Shenzhen UTEPO Tech Co., Ltd.
+C409B7|Juniper Networks
+C40ACB|Cisco Systems, Inc
+C40B31|Apple, Inc.
+C40BCB|Xiaomi Communications Co Ltd
+C40D96|HUAWEI TECHNOLOGIES CO.,LTD
+C40F08|Intel Corporate
+C4108A|Ruckus Wireless
+C41234|Apple, Inc.
+C412EC|HUAWEI TECHNOLOGIES CO.,LTD
+C412F5|D-Link International
+C413E2|Extreme Networks, Inc.
+C41411|Apple, Inc.
+C4143C|Cisco Systems, Inc
+C414A2|Cisco Meraki
+C41688|Huawei Device Co., Ltd.
+C4168F|Apple, Inc.
+C416C8|HUAWEI TECHNOLOGIES CO.,LTD
+C4170E|Huawei Device Co., Ltd.
+C417FE|Hon Hai Precision Ind. Co.,Ltd.
+C418E9|Samsung Electronics Co.,Ltd
+C418FC|Cisco Systems, Inc
+C41C07|Samsung Electronics Co.,Ltd
+C42155|Huawei Device Co., Ltd.
+C421B9|zte corporation
+C421C8|KYOCERA CORPORATION
+C42360|Intel Corporate
+C42456|Palo Alto Networks
+C42728|zte corporation
+C4278C|Huawei Device Co., Ltd.
+C42AD0|Apple, Inc.
+C42B44|Huawei Device Co., Ltd.
+C42C03|Apple, Inc.
+C42F90|Hangzhou Hikvision Digital Technology Co.,Ltd.
+C4345B|HUAWEI TECHNOLOGIES CO.,LTD
+C4346B|Hewlett Packard
+C435D9|Apple, Inc.
+C43655|Shenzhen Fenglian Technology Co., Ltd.
+C43875|Sonos, Inc.
+C43A35|FN-LINK TECHNOLOGY LIMITED
+C43AA5|AzureWave Technology Inc.
+C43ABE|Sony Corporation
+C43CB0|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+C43D1A|Intel Corporate
+C43DC7|NETGEAR
+C43EAB|Huawei Device Co., Ltd.
+C44202|Samsung Electronics Co.,Ltd
+C4438F|LG Electronics (Mobile Communications)
+C4447D|HUAWEI TECHNOLOGIES CO.,LTD
+C444A0|Cisco Systems, Inc
+C44606|Cisco Systems, Inc
+C44619|Hon Hai Precision Ind. Co.,Ltd.
+C4473F|HUAWEI TECHNOLOGIES CO.,LTD
+C4474E|Intel Corporate
+C4491B|Apple, Inc.
+C4493E|Motorola Mobility LLC, a Lenovo Company
+C44B31|Cisco Systems, Inc
+C44D84|Cisco Systems, Inc
+C44EAC|Shenzhen Shiningworth Technology Co., Ltd.
+C44F33|Espressif Inc.
+C44F5F|Huawei Device Co., Ltd.
+C45006|Samsung Electronics Co.,Ltd
+C4518D|Shenzhen YOUHUA Technology Co., Ltd
+C4524F|Apple, Inc.
+C45444|Quanta Computer Inc.
+C4550D|HUAWEI TECHNOLOGIES CO.,LTD
+C4576E|Samsung Electronics Co.,Ltd
+C457CD|HUAWEI TECHNOLOGIES CO.,LTD
+C458C2|Shenzhen TATFOOK Technology Co., Ltd.
+C45A86|Huawei Device Co., Ltd.
+C45AB1|Dell Inc.
+C45BAC|Apple, Inc.
+C45BBE|Espressif Inc.
+C45D83|Samsung Electronics Co.,Ltd
+C45E5C|HUAWEI TECHNOLOGIES CO.,LTD
+C4618B|Apple, Inc.
+C461C7|Microsoft Corporation
+C462EA|Samsung Electronics Co.,Ltd
+C463C4|HUAWEI TECHNOLOGIES CO.,LTD
+C46413|Cisco Systems, Inc
+C464B7|Fiberhome Telecommunication Technologies Co.,LTD
+C46516|Hewlett Packard
+C467D1|HUAWEI TECHNOLOGIES CO.,LTD
+C46940|Xiaomi Communications Co Ltd
+C469F0|HUAWEI TECHNOLOGIES CO.,LTD
+C46AB7|Xiaomi Communications Co Ltd
+C46DD1|HUAWEI TECHNOLOGIES CO.,LTD
+C46E1F|TP-LINK TECHNOLOGIES CO.,LTD.
+C46E7B|SHENZHEN RF-LINK TECHNOLOGY CO.,LTD.
+C4710F|Xiaomi Communications Co Ltd
+C47154|TP-LINK TECHNOLOGIES CO.,LTD.
+C471FE|Cisco Systems, Inc
+C47295|Cisco Systems, Inc
+C4731E|Samsung Electronics Co.,Ltd
+C4741E|zte corporation
+C475AB|Intel Corporate
+C475EA|HUAWEI TECHNOLOGIES CO.,LTD
+C47764|Samsung Electronics Co.,Ltd
+C478A2|Huawei Device Co., Ltd.
+C47BE3|HUAWEI TECHNOLOGIES CO.,LTD
+C47D46|FUJITSU LIMITED
+C47D4F|Cisco Systems, Inc
+C47D9F|Samsung Electronics Co.,Ltd
+C47DCC|Zebra Technologies Inc
+C47EE0|Cisco Systems, Inc
+C48025|Huawei Device Co., Ltd.
+C482E1|Tuya Smart Inc.
+C48466|Apple, Inc.
+C484C0|Motorola Mobility LLC, a Lenovo Company
+C484FC|Apple, Inc.
+C48508|Intel Corporate
+C486E9|HUAWEI TECHNOLOGIES CO.,LTD
+C488E5|Samsung Electronics Co.,Ltd
+C48BA3|Cisco Meraki
+C48E8F|Hon Hai Precision Ind. Co.,Ltd.
+C48F07|Shenzhen Yihao Hulian Science and Technology Co., Ltd.
+C4910C|Apple, Inc.
+C4913A|Shenzhen Sanland Electronic Co., ltd.
+C492D9|zte corporation
+C493BB|Beijing Xiaomi Mobile Software Co., Ltd
+C493D9|Samsung Electronics Co.,Ltd
+C49500|Amazon Technologies Inc.
+C495A2|SHENZHEN WEIJIU INDUSTRY AND TRADE DEVELOPMENT CO., LTD
+C4969F|Amazon Technologies Inc.
+C49880|Apple, Inc.
+C49A02|LG Electronics (Mobile Communications)
+C49A31|Zyxel Communications Corporation
+C49D08|Huawei Device Co., Ltd.
+C49DED|Microsoft Corporation
+C49E7E|Espressif Inc.
+C49F4C|HUAWEI TECHNOLOGIES CO.,LTD
+C4A052|Motorola Mobility LLC, a Lenovo Company
+C4A1AE|Huawei Device Co., Ltd.
+C4A366|zte corporation
+C4A402|HUAWEI TECHNOLOGIES CO.,LTD
+C4A72B|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+C4A81D|D-Link International
+C4AA43|Cisco Systems, Inc
+C4AA99|HUAWEI TECHNOLOGIES CO.,LTD
+C4AAC4|Zhejiang Dahua Technology Co., Ltd.
+C4AB4D|Cisco Systems, Inc
+C4ACAA|Apple, Inc.
+C4AD34|Routerboard.com
+C4AE12|Samsung Electronics Co.,Ltd
+C4B1D9|HUAWEI TECHNOLOGIES CO.,LTD
+C4B239|Cisco Systems, Inc
+C4B301|Apple, Inc.
+C4B349|Apple, Inc.
+C4B36A|Cisco Systems, Inc
+C4B8B4|HUAWEI TECHNOLOGIES CO.,LTD
+C4B9CD|Cisco Systems, Inc
+C4BB03|HUAWEI TECHNOLOGIES CO.,LTD
+C4BB4C|Zebra Information Tech Co. Ltd
+C4BD8D|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+C4BDE5|Intel Corporate
+C4BED4|Avaya Inc
+C4C00A|Microsoft Corporation
+C4C17D|Apple, Inc.
+C4C36B|Apple, Inc.
+C4C603|Cisco Systems, Inc
+C4C6E6|LCFC(Hefei) Electronics Technology co., ltd
+C4CB76|Microsoft Corporation
+C4CBE1|Dell Inc.
+C4CCF9|zte corporation
+C4CD50|Shenzhen C-Data Technology Co., Ltd.
+C4D0E3|Intel Corporate
+C4D438|HUAWEI TECHNOLOGIES CO.,LTD
+C4D496|Shenzhen Excelsecu Data Technology Co.,Ltd
+C4D4D0|SHENZHEN TECNO TECHNOLOGY
+C4D666|Cisco Meraki
+C4D6D3|Dell Inc.
+C4D738|Huawei Device Co., Ltd.
+C4D8D4|HUAWEI TECHNOLOGIES CO.,LTD
+C4D8D5|Espressif Inc.
+C4D987|Intel Corporate
+C4DB04|HUAWEI TECHNOLOGIES CO.,LTD
+C4DD57|Espressif Inc.
+C4DE7B|Huawei Device Co., Ltd.
+C4DEE2|Espressif Inc.
+C4E287|HUAWEI TECHNOLOGIES CO.,LTD
+C4E90A|D-Link International
+C4E984|TP-LINK TECHNOLOGIES CO.,LTD.
+C4EB39|Sagemcom Broadband SAS
+C4EB41|Sagemcom Broadband SAS
+C4EB42|Sagemcom Broadband SAS
+C4EB43|Sagemcom Broadband SAS
+C4EB81|Apple, Inc.
+C4EBFF|zte corporation
+C4EF3D|Samsung Electronics Co.,Ltd
+C4EFBB|LCFC(Hefei) Electronics Technology co., ltd
+C4EFDA|Honeywell
+C4F081|HUAWEI TECHNOLOGIES CO.,LTD
+C4F0EC|Fiberhome Telecommunication Technologies Co.,LTD
+C4F445|Apple, Inc.
+C4F7C1|Apple, Inc.
+C4F7D5|Cisco Systems, Inc
+C4FBAA|HUAWEI TECHNOLOGIES CO.,LTD
+C4FBC8|Shenzhen Candour Co., Ltd.
+C4FC22|YEALINK(XIAMEN) NETWORK TECHNOLOGY CO.,LTD.
+C4FF1F|HUAWEI TECHNOLOGIES CO.,LTD
+C4FF22|Huawei Device Co., Ltd.
+C4FF99|Intel Corporate
+C80084|Cisco Systems, Inc
+C803F5|Ruckus Wireless
+C805A4|Motorola(Wuhan) Mobility Technologies Communication Co.,Ltd
+C80873|Ruckus Wireless
+C808E9|LG Electronics
+C809A8|Intel Corporate
+C80AA9|Quanta Computer Inc.
+C80CC8|HUAWEI TECHNOLOGIES CO.,LTD
+C8102F|NETGEAR
+C8120B|Samsung Electronics Co.,Ltd
+C81337|Juniper Networks
+C8138B|Shenzhen Skyworth Digital Technology CO., Ltd
+C81451|HUAWEI TECHNOLOGIES CO.,LTD
+C81479|Samsung Electronics Co.,Ltd
+C8154E|Intel Corporate
+C819D8|Blink by Amazon
+C819F7|Samsung Electronics Co.,Ltd
+C81CFE|Zebra Technologies Inc.
+C81EE7|Apple, Inc.
+C81F66|Dell Inc.
+C81FBE|HUAWEI TECHNOLOGIES CO.,LTD
+C81FE8|Apple, Inc.
+C81FEA|Avaya Inc
+C82158|Intel Corporate
+C821DA|Shenzhen YOUHUA Technology Co., Ltd
+C82832|Beijing Xiaomi Electronics Co., Ltd.
+C828E5|Cisco Systems, Inc
+C829C8|Palo Alto Networks
+C82A14|Apple, Inc.
+C82ADD|Google, Inc.
+C82B6B|shenzhen worldelite electronics co., LTD
+C82B96|Espressif Inc.
+C82E18|Espressif Inc.
+C83049|Huawei Device Co., Ltd.
+C8334B|Apple, Inc.
+C83374|Zyxel Communications Corporation
+C833E5|HUAWEI TECHNOLOGIES CO.,LTD
+C8348E|Intel Corporate
+C834E5|Cisco Systems, Inc
+C836A3|GERTEC BRASIL LTDA
+C83870|Samsung Electronics Co.,Ltd
+C839AC|Huawei Device Co., Ltd.
+C83A1B|Toshiba TEC Corporation Inc
+C83A35|Tenda Technology Co., Ltd.
+C83A6B|Roku, Inc
+C83C85|Apple, Inc.
+C83D97|Nokia Corporation
+C83DDC|Xiaomi Communications Co Ltd
+C83E9E|Huawei Device Co., Ltd.
+C83F26|Microsoft Corporation
+C84029|Fiberhome Telecommunication Technologies Co.,LTD
+C84052|PAX Computer Technology(Shenzhen) Ltd.
+C8418A|Samsung Electronics.,LTD
+C84709|Cisco Systems, Inc
+C84AA0|Sony Interactive Entertainment Inc.
+C84BD6|Dell Inc.
+C84C75|Cisco Systems, Inc
+C84C78|zte corporation
+C84D44|Shenzhen Jiapeng Huaxiang Technology Co.,Ltd
+C84F86|Sophos Ltd
+C850CE|HUAWEI TECHNOLOGIES CO.,LTD
+C85142|Samsung Electronics Co.,Ltd
+C85195|HUAWEI TECHNOLOGIES CO.,LTD
+C851FB|Extreme Networks, Inc.
+C85309|LCFC(Hefei) Electronics Technology co., ltd
+C8544B|Zyxel Communications Corporation
+C85895|Motorola Mobility LLC, a Lenovo Company
+C858B3|Intel Corporate
+C858C0|Intel Corporate
+C85A9F|zte corporation
+C85ACF|HP Inc.
+C85B76|LCFC(Hefei) Electronics Technology co., ltd
+C85BA0|Shenzhen Qihu Intelligent Technology Company Limited
+C85CCC|Beijing Xiaomi Mobile Software Co., Ltd
+C85EA9|Intel Corporate
+C86000|ASUSTek COMPUTER INC.
+C8608F|Cisco Systems, Inc
+C86340|Cisco Meraki
+C863F1|Sony Interactive Entertainment Inc.
+C864C7|zte corporation
+C8665D|Extreme Networks, Inc.
+C8675E|Extreme Networks, Inc.
+C868DE|Huawei Device Co., Ltd.
+C869CD|Apple, Inc.
+C86C3D|Amazon Technologies Inc.
+C86C87|Zyxel Communications Corporation
+C86E08|Intel Corporate
+C86F1D|Apple, Inc.
+C8727E|Nokia
+C8741B|Fiberhome Telecommunication Technologies Co.,LTD
+C875DD|LG Electronics NV
+C8787D|D-Link Corporation
+C878F7|Cisco Systems, Inc
+C87B5B|zte corporation
+C87D77|Shenzhen Kingtech Communication Equipment Co.,Ltd
+C87E75|Samsung Electronics Co.,Ltd
+C87EA1|TCL MOKA International Limited
+C87F54|ASUSTek COMPUTER INC.
+C8806D|Apple, Inc.
+C88234|Cisco Systems, Inc
+C8848C|Ruckus Wireless
+C884A1|Cisco Systems, Inc
+C884CF|HUAWEI TECHNOLOGIES CO.,LTD
+C88541|Espressif Inc.
+C88550|Apple, Inc.
+C88629|Shenzhen Duubee Intelligent Technologies Co.,LTD.
+C889F3|Apple, Inc.
+C88A7B|Espressif Inc.
+C88A9A|Intel Corporate
+C88D83|HUAWEI TECHNOLOGIES CO.,LTD
+C88F26|Skyworth Digital Technology(Shenzhen) Co.,Ltd
+C8908A|Samsung Electronics Co.,Ltd
+C890F7|HUAWEI TECHNOLOGIES CO.,LTD
+C891F9|Sagemcom Broadband SAS
+C894BB|HUAWEI TECHNOLOGIES CO.,LTD
+C895CE|Intel Corporate
+C89665|Microsoft Corporation
+C8979F|Nokia Corporation
+C89828|zte corporation
+C89C1D|Cisco Systems, Inc
+C89D18|Huawei Device Co., Ltd.
+C89E43|NETGEAR
+C89F0C|Motorola Mobility LLC, a Lenovo Company
+C89F1A|HUAWEI TECHNOLOGIES CO.,LTD
+C89F1D|SHENZHEN COMMUNICATION TECHNOLOGIES CO.,LTD
+C8A1B6|Shenzhen Longway Technologies Co., Ltd
+C8A1DC|Motorola Mobility LLC, a Lenovo Company
+C8A23B|Shenzhen Sundray Technologies company Limited
+C8A608|Ruckus Wireless
+C8A6EF|Samsung Electronics Co.,Ltd
+C8A702|Hangzhou Hikvision Digital Technology Co.,Ltd.
+C8A776|HUAWEI TECHNOLOGIES CO.,LTD
+C8A823|Samsung Electronics Co.,Ltd
+C8AAB2|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+C8ADE7|Shenzhen Shengxi Industrial Co.,Ltd
+C8B0B2|zte corporation
+C8B1CD|Apple, Inc.
+C8B21E|CHIPSEA TECHNOLOGIES (SHENZHEN) CORP.
+C8B29B|Intel Corporate
+C8B373|Cisco-Linksys, LLC
+C8B5AD|Hewlett Packard Enterprise
+C8B5B7|Apple, Inc.
+C8B6D3|HUAWEI TECHNOLOGIES CO.,LTD
+C8B78A|HUAWEI TECHNOLOGIES CO.,LTD
+C8BA94|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+C8BB81|Huawei Device Co., Ltd.
+C8BC9C|Huawei Device Co., Ltd.
+C8BCC8|Apple, Inc.
+C8BD4D|Samsung Electronics Co.,Ltd
+C8BD69|Samsung Electronics Co.,Ltd
+C8BE19|D-Link International
+C8BE35|Extreme Networks, Inc.
+C8BF4C|Beijing Xiaomi Mobile Software Co., Ltd
+C8BFFE|Huawei Device Co., Ltd.
+C8C2FA|HUAWEI TECHNOLOGIES CO.,LTD
+C8C465|HUAWEI TECHNOLOGIES CO.,LTD
+C8C50E|Shenzhen Primestone Network Technologies.Co., Ltd.
+C8C750|Motorola Mobility LLC, a Lenovo Company
+C8C919|Broadcom Limited
+C8C9A3|Espressif Inc.
+C8C9B2|Amazon Technologies Inc.
+C8CA63|Huawei Device Co., Ltd.
+C8CB9E|Intel Corporate
+C8CBB8|Hewlett Packard
+C8CD72|Sagemcom Broadband SAS
+C8D083|Apple, Inc.
+C8D10B|Nokia Corporation
+C8D15E|HUAWEI TECHNOLOGIES CO.,LTD
+C8D1A9|HUAWEI TECHNOLOGIES CO.,LTD
+C8D2C1|Jetlun (Shenzhen) Corporation
+C8D3A3|D-Link International
+C8D3FF|Hewlett Packard
+C8D5FE|Shenzhen Zowee Technology Co., Ltd
+C8D719|Cisco-Linksys, LLC
+C8D7B0|Samsung Electronics Co.,Ltd
+C8D959|Motorola Mobility LLC, a Lenovo Company
+C8D995|Juniper Networks
+C8D9D2|Hewlett Packard
+C8DA29|Espressif Systems (Singapore) Pte. Ltd
+C8DDC9|Lenovo Mobile Communication Technology Ltd.
+C8DF7C|Nokia Corporation
+C8E07A|Fiberhome Telecommunication Technologies Co.,LTD
+C8E0EB|Apple, Inc.
+C8E265|Intel Corporate
+C8E31D|HUAWEI TECHNOLOGIES CO.,LTD
+C8E5E0|HUAWEI TECHNOLOGIES CO.,LTD
+C8E600|HUAWEI TECHNOLOGIES CO.,LTD
+C8E7F0|Juniper Networks
+C8EA71|Espressif Inc.
+C8EAF8|zte corporation
+C8EBEC|Shenzhen YOUHUA Technology Co., Ltd
+C8ED8B|Espressif Inc.
+C8EDFC|Shenzhen Ideaform Industrial Product Design Co., Ltd
+C8EEA6|Shenzhen SHX Technology Co., Ltd
+C8F09E|Espressif Inc.
+C8F319|LG Electronics (Mobile Communications)
+C8F386|Shenzhen Xiaoniao Technology Co.,Ltd
+C8F406|Avaya Inc
+C8F650|Apple, Inc.
+C8F6C8|Fiberhome Telecommunication Technologies Co.,LTD
+C8F733|Intel Corporate
+C8F750|Dell Inc.
+C8F9C8|NewSharp Technology(SuZhou)Co,Ltd
+C8F9F9|Cisco Systems, Inc
+C8FB26|Cisco SPVTG
+C8FE0F|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+C8FE6A|Juniper Networks
+C8FF28|Liteon Technology Corporation
+CC00F1|Sagemcom Broadband SAS
+CC033D|Beijing Xiaomi Mobile Software Co., Ltd
+CC03D9|Cisco Meraki
+CC051B|Samsung Electronics Co.,Ltd
+CC0577|HUAWEI TECHNOLOGIES CO.,LTD
+CC0677|Fiberhome Telecommunication Technologies Co.,LTD
+CC07AB|Samsung Electronics Co.,Ltd
+CC07E4|Lenovo Mobile Communication Technology Ltd.
+CC087B|HUAWEI TECHNOLOGIES CO.,LTD
+CC088D|Apple, Inc.
+CC08E0|Apple, Inc.
+CC08FA|Apple, Inc.
+CC08FB|TP-LINK TECHNOLOGIES CO.,LTD.
+CC0DCB|Microsoft Corporation
+CC0DEC|Cisco SPVTG
+CC0DF2|Motorola Mobility LLC, a Lenovo Company
+CC115A|Apple, Inc.
+CC13F3|Hangzhou Hikvision Digital Technology Co.,Ltd.
+CC1531|Intel Corporate
+CC167E|Cisco Systems, Inc
+CC1AFA|zte corporation
+CC1B5A|Ruckus Wireless
+CC1E56|HUAWEI TECHNOLOGIES CO.,LTD
+CC1E97|HUAWEI TECHNOLOGIES CO.,LTD
+CC208C|HUAWEI TECHNOLOGIES CO.,LTD
+CC20AC|Samsung Electronics Co.,Ltd
+CC20E8|Apple, Inc.
+CC2119|Samsung Electronics Co.,Ltd
+CC219D|Shenzhen Wangliantong Intelligent Technology Co.,Lte
+CC2293|Amazon Technologies Inc.
+CC22FE|Apple, Inc.
+CC242E|Shenzhen SuperElectron Technology Co.,Ltd.
+CC25EF|Apple, Inc.
+CC2746|Apple, Inc.
+CC28AA|ASUSTek COMPUTER INC.
+CC29BD|zte corporation
+CC29F5|Apple, Inc.
+CC2D21|Tenda Technology Co.,Ltd.Dongguan branch
+CC2D8C|LG ELECTRONICS INC
+CC2DB7|Apple, Inc.
+CC2DD2|Ruckus Wireless
+CC2DE0|Routerboard.com
+CC2F71|Intel Corporate
+CC312A|HUIZHOU TCL COMMUNICATION ELECTRON CO.,LTD
+CC3296|Huawei Device Co., Ltd.
+CC32E5|TP-LINK TECHNOLOGIES CO.,LTD.
+CC33BB|Sagemcom Broadband SAS
+CC3429|TP-LINK TECHNOLOGIES CO.,LTD.
+CC35D9|Ubiquiti Inc
+CC36CF|Cisco Systems, Inc
+CC38D0|Palo Alto Networks
+CC38E1|HUAWEI TECHNOLOGIES CO.,LTD
+CC3A61|SAMSUNG ELECTRO MECHANICS CO., LTD.
+CC3D82|Intel Corporate
+CC3DD1|HUAWEI TECHNOLOGIES CO.,LTD
+CC3E5F|Hewlett Packard
+CC3F36|Apple, Inc.
+CC40D0|NETGEAR
+CC4210|Xiaomi Communications Co Ltd
+CC4460|Huawei Device Co., Ltd.
+CC4463|Apple, Inc.
+CC464E|Samsung Electronics Co.,Ltd
+CC46D6|Cisco Systems, Inc
+CC4740|AzureWave Technology Inc.
+CC483A|Dell Inc.
+CC4B04|Apple, Inc.
+CC4D75|Beijing Xiaomi Mobile Software Co., Ltd
+CC500A|Fiberhome Telecommunication Technologies Co.,LTD
+CC50E3|Espressif Inc.
+CC5289|SHENZHEN OPTFOCUS TECHNOLOGY.,LTD
+CC53B5|HUAWEI TECHNOLOGIES CO.,LTD
+CC5763|Panasonic Automotive Systems Co.,Ltd
+CC5830|Sagemcom Broadband SAS
+CC58C7|Nokia
+CC5A53|Cisco Systems, Inc
+CC5C61|Huawei Device Co., Ltd.
+CC5D4E|Zyxel Communications Corporation
+CC5EA5|Palo Alto Networks
+CC6023|Apple, Inc.
+CC60C8|Microsoft Corporation
+CC61E5|Motorola Mobility LLC, a Lenovo Company
+CC641A|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+CC64A6|HUAWEI TECHNOLOGIES CO.,LTD
+CC660A|Apple, Inc.
+CC66B2|Nokia
+CC68B6|TP-Link Systems Inc
+CC68C7|Espressif Inc.
+CC68E0|Apple, Inc.
+CC69FA|Apple, Inc.
+CC6A33|Cisco Systems, Inc
+CC6DA0|Roku, Inc.
+CC6E2A|Cisco Meraki
+CC6EA4|Samsung Electronics Co.,Ltd
+CC70ED|Cisco Systems, Inc
+CC722A|Apple, Inc.
+CC763A|zte corporation
+CC7645|Microsoft Corporation
+CC77C9|Fiberhome Telecommunication Technologies Co.,LTD
+CC785F|Apple, Inc.
+CC79CF|SHENZHEN RF-LINK TECHNOLOGY CO.,LTD.
+CC79D7|Cisco Systems, Inc
+CC7A8B|SHENZHEN TECNO TECHNOLOGY
+CC7B35|zte corporation
+CC7B5C|Espressif Inc.
+CC7E1F|Espressif Inc.
+CC7EE7|Panasonic Corporation AVC Networks Company
+CC7F75|Cisco Systems, Inc
+CC7F76|Cisco Systems, Inc
+CC808F|Apple, Inc.
+CC8130|Intelbras
+CC817D|Apple, Inc.
+CC82EB|KYOCERA CORPORATION
+CC856C|SHENZHEN MDK DIGITAL TECHNOLOGY CO.,LTD
+CC874A|Nokia
+CC88C7|Hewlett Packard Enterprise
+CC895E|HUAWEI TECHNOLOGIES CO.,LTD
+CC89FD|Nokia Corporation
+CC8A84|Huawei Device Co., Ltd.
+CC8CBF|Tuya Smart Inc.
+CC8CDA|Shenzhen Wei Da Intelligent Technology Go.,Ltd
+CC8DA2|Espressif Inc.
+CC8DB5|Shenzhen SuperElectron Technology Co.,Ltd.
+CC8E71|Cisco Systems, Inc
+CC9070|Cisco Systems, Inc
+CC9096|Huawei Device Co., Ltd.
+CC90E8|Shenzhen YOUHUA Technology Co., Ltd
+CC915B|Huawei Device Co., Ltd.
+CC96A0|HUAWEI TECHNOLOGIES CO.,LTD
+CC96E5|Dell Inc.
+CC988B|SONY Visual Products Inc.
+CC9891|Cisco Systems, Inc
+CC9C3E|Cisco Meraki
+CC9EA2|Amazon Technologies Inc.
+CCA08F|zte corporation
+CCA12B|TCL King Electrical Appliances (Huizhou) Co., Ltd
+CCA219|SHENZHEN ALONG INVESTMENT CO.,LTD
+CCA223|HUAWEI TECHNOLOGIES CO.,LTD
+CCA4AF|Shenzhen Sowell Technology Co., LTD
+CCA7C1|Google, Inc.
+CCAA00|Microsoft Corporation
+CCAF78|Hon Hai Precision Ind. Co.,Ltd.
+CCAFE3|Amazon Technologies Inc.
+CCB071|Fiberhome Telecommunication Technologies Co.,LTD
+CCB0A8|Huawei Device Co., Ltd.
+CCB0B3|Microsoft Corporation
+CCB0DA|Liteon Technology Corporation
+CCB11A|Samsung Electronics Co.,Ltd
+CCB182|HUAWEI TECHNOLOGIES CO.,LTD
+CCB255|D-Link International
+CCB3AB|shenzhen Biocare Bio-Medical Equipment Co.,Ltd.
+CCB3F8|FUJITSU ISOTEC LIMITED
+CCB5D1|Beijing Xiaomi Mobile Software Co., Ltd
+CCB6C8|Cisco Systems, Inc
+CCB775|Huawei Device Co., Ltd.
+CCB777|zte corporation
+CCB7C4|HUAWEI TECHNOLOGIES CO.,LTD
+CCB85E|Shenzhen Phaten Tech. LTD
+CCBA6F|HUAWEI TECHNOLOGIES CO.,LTD
+CCBA97|Espressif Inc.
+CCBABD|TP-Link Systems Inc.
+CCBBFE|HUAWEI TECHNOLOGIES CO.,LTD
+CCBC2B|Huawei Device Co., Ltd.
+CCBCE3|HUAWEI TECHNOLOGIES CO.,LTD
+CCBE61|Apple, Inc.
+CCBF0C|SHENZHEN FENDA TECHNOLOGY CO., LTD
+CCC253|zte corporation
+CCC3EA|Motorola Mobility LLC, a Lenovo Company
+CCC4B2|Shenzhen Trolink Technology Co.,LTD
+CCC50A|SHENZHEN DAJIAHAO TECHNOLOGY CO.,LTD
+CCC530|AzureWave Technology Inc.
+CCC5E5|Dell Inc.
+CCC760|Apple, Inc.
+CCC95D|Apple, Inc.
+CCCC81|HUAWEI TECHNOLOGIES CO.,LTD
+CCD083|Hewlett Packard Enterprise
+CCD281|Apple, Inc.
+CCD29B|Shenzhen Bopengfa Elec&Technology CO.,Ltd
+CCD342|Cisco Systems, Inc
+CCD539|Cisco Systems, Inc
+CCD73C|HUAWEI TECHNOLOGIES CO.,LTD
+CCD843|Beijing Xiaomi Mobile Software Co., Ltd
+CCD8C1|Cisco Systems, Inc
+CCD9AC|Intel Corporate
+CCDA20|Beijing Xiaomi Mobile Software Co., Ltd
+CCDB93|Cisco Systems, Inc
+CCDBA7|Espressif Inc.
+CCDEDE|Nokia
+CCE17F|Juniper Networks
+CCE194|Juniper Networks
+CCE686|Samsung Electronics Co.,Ltd
+CCE9FA|Samsung Electronics Co.,Ltd
+CCEB5E|Xiaomi Communications Co Ltd
+CCECB7|ShenZhen Linked-Z Intelligent Display Co., Ltd
+CCED21|Nokia Shanghai Bell Co., Ltd.
+CCED4D|Cisco Systems, Inc
+CCEF48|Cisco Systems, Inc
+CCF305|SHENZHEN TIAN XING CHUANG ZHAN ELECTRONIC CO.,LTD
+CCF411|Google, Inc.
+CCF735|Amazon Technologies Inc.
+CCF826|Samsung Electronics Co.,Ltd
+CCF954|Avaya Inc
+CCF9E4|Intel Corporate
+CCF9E8|Samsung Electronics Co.,Ltd
+CCF9F0|Samsung Electronics Co.,Ltd
+CCFA00|LG Electronics (Mobile Communications)
+CCFA66|Huawei Device Co., Ltd.
+CCFAF1|Sagemcom Broadband SAS
+CCFE3C|Samsung Electronics Co.,Ltd
+CCFF90|Huawei Device Co., Ltd.
+D0034B|Apple, Inc.
+D003DF|Samsung Electronics Co.,Ltd
+D00401|Motorola Mobility LLC, a Lenovo Company
+D00477|HUAWEI TECHNOLOGIES CO.,LTD
+D00492|Fiberhome Telecommunication Technologies Co.,LTD
+D004B0|Samsung Electronics Co.,Ltd
+D005E4|Huawei Device Co., Ltd.
+D007CA|Juniper Networks
+D009C8|Cisco Systems, Inc
+D00DF7|Huawei Device Co., Ltd.
+D011E5|Apple, Inc.
+D013C1|Shenzhen Skyworth Digital Technology CO., Ltd
+D013FD|LG Electronics (Mobile Communications)
+D0154A|zte corporation
+D015A6|Hewlett Packard Enterprise
+D016B4|HUAWEI TECHNOLOGIES CO.,LTD
+D0176A|Samsung Electronics Co.,Ltd
+D017C2|ASUSTek COMPUTER INC.
+D01B49|Samsung Electronics Co.,Ltd
+D01BF4|Sagemcom Broadband SAS
+D021F9|Ubiquiti Inc
+D022BE|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+D023DB|Apple, Inc.
+D02544|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+D02598|Apple, Inc.
+D02788|Hon Hai Precision Ind. Co.,Ltd.
+D02B20|Apple, Inc.
+D02C39|Cisco Systems, Inc
+D02DB3|HUAWEI TECHNOLOGIES CO.,LTD
+D03169|Samsung Electronics Co.,Ltd
+D032C3|D-Link Corporation
+D032E7|Tuya Smart Inc.
+D03311|Apple, Inc.
+D03742|Yulong Computer Telecommunication Scientific (Shenzhen) Co.,Ltd
+D03745|TP-LINK TECHNOLOGIES CO.,LTD.
+D03957|Liteon Technology Corporation
+D039FA|Samsung Electronics Co.,Ltd
+D03BF4|Shenzhen Kean Digital Co.,Ltd
+D03C1F|Intel Corporate
+D03E07|Apple, Inc.
+D03E5C|HUAWEI TECHNOLOGIES CO.,LTD
+D03E7D|CHIPSEA TECHNOLOGIES (SHENZHEN) CORP.
+D03FAA|Apple, Inc.
+D041C9|Fiberhome Telecommunication Technologies Co.,LTD
+D0431E|Dell Inc.
+D0458D|Shenzhen Skyworth Digital Technology CO., Ltd
+D0460C|Dell Inc.
+D0484F|Nokia Solutions and Networks GmbH & Co. KG
+D048A1|Juniper Networks
+D0497C|OnePlus Technology (Shenzhen) Co., Ltd
+D04D2C|Roku, Inc.
+D04D86|Apple, Inc.
+D04DC6|Hewlett Packard Enterprise
+D04E99|HUAWEI TECHNOLOGIES CO.,LTD
+D04F58|Ruckus Wireless
+D04F7E|Apple, Inc.
+D04FAB|Yoqu Technology (Shenzhen) Co., Ltd.
+D05162|Sony Corporation
+D05349|Liteon Technology Corporation
+D05533|Palo Alto Networks
+D056FB|Samsung Electronics Co.,Ltd
+D0574C|Cisco Systems, Inc
+D0577B|Intel Corporate
+D0577E|Intel Corporate
+D05794|Sagemcom Broadband SAS
+D058A5|Apple, Inc.
+D058A8|zte corporation
+D05919|zte corporation
+D05995|Fiberhome Telecommunication Technologies Co.,LTD
+D059E4|Samsung Electronics Co.,Ltd
+D05AF1|Shenzhen Pulier Tech CO.,Ltd
+D05BA8|zte corporation
+D05FAF|Shenzhen C-Data Technology Co., Ltd.
+D0608C|zte corporation
+D06158|HUAWEI TECHNOLOGIES CO.,LTD
+D06544|Apple, Inc.
+D06578|Intel Corporate
+D065B3|TCL King Electrical Appliances(Huizhou)Co.,Ltd
+D065CA|HUAWEI TECHNOLOGIES CO.,LTD
+D0666D|Shenzhen Bus-Lan Technology Co., Ltd.
+D0667B|Samsung Electronics Co.,Ltd
+D06726|Hewlett Packard Enterprise
+D067E5|Dell Inc.
+D069C1|HUAWEI TECHNOLOGIES CO.,LTD
+D069FF|Fiberhome Telecommunication Technologies Co.,LTD
+D06B78|Apple, Inc.
+D06DC8|HUAWEI TECHNOLOGIES CO.,LTD
+D06DC9|Sagemcom Broadband SAS
+D06EDE|Sagemcom Broadband SAS
+D06F82|HUAWEI TECHNOLOGIES CO.,LTD
+D071C4|zte corporation
+D072DC|Cisco Systems, Inc
+D07380|Huawei Device Co., Ltd.
+D076E7|TP-LINK TECHNOLOGIES CO.,LTD.
+D07714|Motorola Mobility LLC, a Lenovo Company
+D07880|Fiberhome Telecommunication Technologies Co.,LTD
+D07AB5|HUAWEI TECHNOLOGIES CO.,LTD
+D07D33|Huawei Device Co., Ltd.
+D07E01|Huawei Device Co., Ltd.
+D07E28|Hewlett Packard
+D07E35|Intel Corporate
+D07FA0|Samsung Electronics Co.,Ltd
+D07FC4|Ou Wei Technology Co.，Ltd. of Shenzhen City
+D0817A|Apple, Inc.
+D081C5|Juniper Networks
+D082E8|Tuya Smart Inc.
+D082EB|Tuya Smart Inc.
+D084B0|Sagemcom Broadband SAS
+D08543|Cisco Systems, Inc
+D087E2|Samsung Electronics Co.,Ltd
+D0880C|Apple, Inc.
+D08999|APCON, Inc.
+D08E79|Dell Inc.
+D09168|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+D09282|Apple, Inc.
+D0929E|Microsoft Corporation
+D092FA|Fiberhome Telecommunication Technologies Co.,LTD
+D093F8|Stonestreet One LLC
+D09466|Dell Inc.
+D094CF|HUAWEI TECHNOLOGIES CO.,LTD
+D09AAF|Espressif Systems (Singapore) Pte. Ltd
+D09C7A|Xiaomi Communications Co Ltd
+D0A0BB|Shenzhen iComm Semiconductor CO.,LTD
+D0A5A6|Cisco Systems, Inc
+D0A637|Apple, Inc.
+D0ABD5|Intel Corporate
+D0AD08|HP Inc.
+D0AE05|Xiaomi Communications Co Ltd
+D0B128|Samsung Electronics Co.,Ltd
+D0B1CA|Shenzhen Skyworth Digital Technology CO., Ltd
+D0B324|Apple, Inc.
+D0B33F|Shenzhen TINNO Mobile Technology Corp.
+D0B45D|Huawei Device Co., Ltd.
+D0BB61|zte corporation
+D0BF9C|Hewlett Packard
+D0C050|Apple, Inc.
+D0C1B1|Samsung Electronics Co.,Ltd
+D0C1B5|Dell Inc.
+D0C1BF|Xiaomi Communications Co Ltd
+D0C24E|Samsung Electronics Co.,Ltd
+D0C282|Cisco Systems, Inc
+D0C5D3|AzureWave Technology Inc.
+D0C5F3|Apple, Inc.
+D0C637|Intel Corporate
+D0C65B|HUAWEI TECHNOLOGIES CO.,LTD
+D0C67F|HUAWEI TECHNOLOGIES CO.,LTD
+D0C730|zte corporation
+D0C789|Cisco Systems, Inc
+D0C7C0|TP-LINK TECHNOLOGIES CO.,LTD.
+D0CDBF|LG Electronics
+D0CEC0|Xiaomi Communications Co Ltd
+D0CF0E|Sagemcom Broadband SAS
+D0CF13|Espressif Inc.
+D0D003|Samsung Electronics Co.,Ltd
+D0D04B|HUAWEI TECHNOLOGIES CO.,LTD
+D0D0FD|Cisco Systems, Inc
+D0D23C|Apple, Inc.
+D0D2B0|Apple, Inc.
+D0D3E0|Hewlett Packard Enterprise
+D0D49F|Apple, Inc.
+D0D783|HUAWEI TECHNOLOGIES CO.,LTD
+D0D7BE|HUAWEI TECHNOLOGIES CO.,LTD
+D0DAD7|Apple, Inc.
+D0DB32|Nokia Corporation
+D0DC2C|Cisco Systems, Inc
+D0DD49|Juniper Networks
+D0DD7C|zte corporation
+D0DF9A|Liteon Technology Corporation
+D0DFC7|Samsung Electronics Co.,Ltd
+D0E042|Cisco Systems, Inc
+D0E140|Apple, Inc.
+D0E581|Apple, Inc.
+D0E782|AzureWave Technology Inc.
+D0EA11|Routerboard.com
+D0EC35|Cisco Systems, Inc
+D0EF76|Espressif Inc.
+D0EFC1|HUAWEI TECHNOLOGIES CO.,LTD
+D0F3F5|Huawei Device Co., Ltd.
+D0F405|Hon Hai Precision Industry Co., Ltd.
+D0F4F7|Huawei Device Co., Ltd.
+D0F520|KYOCERA Corporation
+D0F76E|Shenzhen YOUHUA Technology Co., Ltd
+D0F815|HUAWEI TECHNOLOGIES CO.,LTD
+D0F88C|Motorola (Wuhan) Mobility Technologies Communication Co., Ltd.
+D0F8E7|Shenzhen Shutong Space Technology Co., Ltd
+D0F928|zte corporation
+D0F99B|zte corporation
+D0FCCC|Samsung Electronics Co.,Ltd
+D0FF98|HUAWEI TECHNOLOGIES CO.,LTD
+D40068|Fiberhome Telecommunication Technologies Co.,LTD
+D40129|Broadcom
+D4016D|TP-LINK TECHNOLOGIES CO.,LTD.
+D401C3|Routerboard.com
+D404E6|Broadcom Limited
+D404FF|Juniper Networks
+D40592|Espressif Inc.
+D40DAB|Shenzhen Cudy Technology Co., Ltd.
+D40F9E|Apple, Inc.
+D411A3|Samsung Electronics Co.,Ltd
+D4126E|Apple, Inc.
+D41368|Shenzhen Intellirocks Tech. Co. Ltd.
+D41761|Xiaomi Communications Co Ltd
+D41972|Hewlett Packard Enterprise
+D41AD1|Zyxel Communications Corporation
+D41D71|Palo Alto Networks
+D4223F|Lenovo Mobile Communication Technology Ltd.
+D4258B|Intel Corporate
+D427FF|Sagemcom Broadband SAS
+D42B6F|Cisco Systems, Inc
+D42C44|Cisco Systems, Inc
+D42CA6|Samsung Electronics Co.,Ltd
+D42DCC|Apple, Inc.
+D42F4B|Hon Hai Precision Industry Co.,LTD
+D42FCA|Apple, Inc.
+D43538|Beijing Xiaomi Mobile Software Co., Ltd
+D437D7|zte corporation
+D4389C|Sony Corporation
+D43A2C|Google, Inc.
+D43A2E|SHENZHEN MTC CO LTD
+D43A2F|SHENZHEN MTC CO LTD
+D43B04|Intel Corporate
+D43B8A|Shenzhen Zhide technology Co., LTD
+D43D7E|Micro-Star Int'l Co, Ltd
+D43DF3|Zyxel Communications Corporation
+D440F0|HUAWEI TECHNOLOGIES CO.,LTD
+D4430E|Zhejiang Dahua Technology Co., Ltd.
+D4438A|Beijing Xiaomi Mobile Software Co., Ltd
+D44649|HUAWEI TECHNOLOGIES CO.,LTD
+D446E1|Apple, Inc.
+D4482D|Shenzhen Deejoy Lighting Technology Co.,Ltd.
+D44C9C|Shenzhen YOOBAO Technology Co.Ltd
+D44D77|Nokia
+D44D9F|Shenzhen Skyworth Digital Technology CO., Ltd
+D44F67|HUAWEI TECHNOLOGIES CO.,LTD
+D45039|Sagemcom Broadband SAS
+D4532A|Beijing Xiaomi Mobile Software Co., Ltd
+D4548B|Intel Corporate
+D455BE|SHENZHEN FAST TECHNOLOGIES CO.,LTD
+D45763|Apple, Inc.
+D45800|Fiberhome Telecommunication Technologies Co.,LTD
+D45A3F|Juniper Networks
+D45B51|Motorola Mobility LLC, a Lenovo Company
+D45D42|Nokia Corporation
+D45D64|ASUSTek COMPUTER INC.
+D45DDF|PEGATRON CORPORATION
+D45E89|Motorola Mobility LLC, a Lenovo Company
+D45EEC|Beijing Xiaomi Electronics Co., Ltd.
+D45F25|Shenzhen YOUHUA Technology Co., Ltd
+D45F2C|zte corporation
+D45F7A|HUAWEI TECHNOLOGIES CO.,LTD
+D4612E|HUAWEI TECHNOLOGIES CO.,LTD
+D46195|zte corporation
+D4619D|Apple, Inc.
+D461DA|Apple, Inc.
+D462EA|HUAWEI TECHNOLOGIES CO.,LTD
+D463C0|Apple, Inc.
+D463C6|Motorola Mobility LLC, a Lenovo Company
+D46624|Cisco Systems, Inc
+D46663|Shenzhen Detran Technology Co.,Ltd.
+D467E7|Fiberhome Telecommunication Technologies Co.,LTD
+D4684D|Ruckus Wireless
+D468AA|Apple, Inc.
+D468BA|Shenzhen Sundray Technologies company Limited
+D46A35|Cisco Systems, Inc
+D46A6A|Hon Hai Precision Ind. Co.,Ltd.
+D46AA8|HUAWEI TECHNOLOGIES CO.,LTD
+D46BA6|HUAWEI TECHNOLOGIES CO.,LTD
+D46D50|Cisco Systems, Inc
+D46D6D|Intel Corporate
+D46E0E|TP-LINK TECHNOLOGIES CO.,LTD.
+D46E5C|HUAWEI TECHNOLOGIES CO.,LTD
+D47226|zte corporation
+D47327|HUAWEI TECHNOLOGIES CO.,LTD
+D47415|Huawei Device Co., Ltd.
+D476A0|Fortinet, Inc.
+D476EA|zte corporation
+D47798|Cisco Systems, Inc
+D47856|Avaya Inc
+D4789B|Cisco Systems, Inc
+D47954|Huawei Device Co., Ltd.
+D47AE2|Samsung Electronics Co.,Ltd
+D47F35|Cisco Systems, Inc
+D4808B|Seiko Epson Corporation
+D481D7|Dell Inc.
+D48304|SHENZHEN FAST TECHNOLOGIES CO.,LTD
+D48409|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+D48564|Hewlett Packard
+D487D8|Samsung Electronics Co.,Ltd
+D48866|HUAWEI TECHNOLOGIES CO.,LTD
+D48890|Samsung Electronics Co.,Ltd
+D489C1|Ubiquiti Inc
+D48A39|Samsung Electronics Co.,Ltd
+D48A3B|HUNAN FN-LINK TECHNOLOGY LIMITED
+D48AFC|Espressif Inc.
+D48C49|Espressif Inc.
+D48CB5|Cisco Systems, Inc
+D48F33|Microsoft Corporation
+D48FA2|Huawei Device Co., Ltd.
+D4909C|Apple, Inc.
+D4910F|Amazon Technologies Inc.
+D49398|Nokia Corporation
+D49400|HUAWEI TECHNOLOGIES CO.,LTD
+D494A9|Intel Corporate
+D494E8|HUAWEI TECHNOLOGIES CO.,LTD
+D4955D|zte corporation
+D4970B|Xiaomi Communications Co Ltd
+D4996C|Juniper Networks
+D49A20|Apple, Inc.
+D49AF6|AzureWave Technology Inc.
+D49CF4|Palo Alto Networks
+D49D9D|Shenzhen Goodocom lnformation Technology Co.,Ltd.
+D49DC0|Samsung Electronics Co.,Ltd
+D49E05|zte corporation
+D49F29|Fiberhome Telecommunication Technologies Co.,LTD
+D49FDD|Huawei Device Co., Ltd.
+D4A02A|Cisco Systems, Inc
+D4A148|HUAWEI TECHNOLOGIES CO.,LTD
+D4A254|HUAWEI TECHNOLOGIES CO.,LTD
+D4A2CD|Dell Inc.
+D4A33D|Apple, Inc.
+D4A365|Xiaomi Communications Co Ltd
+D4A3EB|Shenzhen iComm Semiconductor CO.,LTD
+D4A651|Tuya Smart Inc.
+D4A923|HUAWEI TECHNOLOGIES CO.,LTD
+D4AB61|Intel Corporate
+D4AD2D|Fiberhome Telecommunication Technologies Co.,LTD
+D4AD71|Cisco Systems, Inc
+D4ADBD|Cisco Systems, Inc
+D4ADFC|Shenzhen Intellirocks Tech. Co. Ltd.
+D4AE05|Samsung Electronics Co.,Ltd
+D4AE52|Dell Inc.
+D4B110|HUAWEI TECHNOLOGIES CO.,LTD
+D4B4C0|Fortinet, Inc.
+D4B5CD|Sagemcom Broadband SAS
+D4B6C9|Nokia
+D4B709|zte corporation
+D4BBE6|Huawei Device Co., Ltd.
+D4BD4F|Ruckus Wireless
+D4BED7|Dell Inc.
+D4BED9|Dell Inc.
+D4BEDC|Roku, Inc
+D4C19E|Ruckus Wireless
+D4C1C8|zte corporation
+D4C1FC|Nokia Corporation
+D4C93C|Cisco Systems, Inc
+D4C94B|Motorola Mobility LLC, a Lenovo Company
+D4C9EF|Hewlett Packard
+D4CA6D|Routerboard.com
+D4CBAF|Nokia Corporation
+D4CE40|Apple, Inc.
+D4CFF9|Shenzhen SEI Robotics Co.,Ltd
+D4D252|Intel Corporate
+D4D2D6|FN-LINK TECHNOLOGY LIMITED
+D4D4DA|Espressif Inc.
+D4D51B|HUAWEI TECHNOLOGIES CO.,LTD
+D4D6DF|TP-Link Systems Inc.
+D4D748|Cisco Systems, Inc
+D4D853|Intel Corporate
+D4D892|HUAWEI TECHNOLOGIES CO.,LTD
+D4DA21|Beijing Xiaomi Mobile Software Co., Ltd
+D4DCCD|Apple, Inc.
+D4E053|Hewlett Packard Enterprise
+D4E22F|Roku, Inc
+D4E33F|Nokia
+D4E3C5|zte corporation
+D4E6B7|Samsung Electronics Co.,Ltd
+D4E853|Hangzhou Hikvision Digital Technology Co.,Ltd.
+D4E880|Cisco Systems, Inc
+D4E8B2|Samsung Electronics Co.,Ltd
+D4E98A|Intel Corporate
+D4E9F4|Espressif Inc.
+D4EA0E|Avaya Inc
+D4EB68|Cisco Systems, Inc
+D4F0B4|Napco Security Technologies
+D4F0C9|KYOCERA Document Solutions Inc.
+D4F0EA|Beijing Xiaomi Mobile Software Co., Ltd
+D4F242|Huawei Device Co., Ltd.
+D4F32D|Intel Corporate
+D4F46F|Apple, Inc.
+D4F4BE|Palo Alto Networks
+D4F547|Google, Inc.
+D4F5EF|Hewlett Packard Enterprise
+D4F756|zte corporation
+D4F786|Fiberhome Telecommunication Technologies Co.,LTD
+D4F7D5|Sony Interactive Entertainment Inc.
+D4F829|Sagemcom Broadband SAS
+D4F98D|Espressif Inc.
+D4F9A1|HUAWEI TECHNOLOGIES CO.,LTD
+D4FB8E|Apple, Inc.
+D4FC13|Fiberhome Telecommunication Technologies Co.,LTD
+D4FF1A|Apple, Inc.
+D8004D|Apple, Inc.
+D801D0|HUAWEI TECHNOLOGIES CO.,LTD
+D8028A|Shenzhen YOUHUA Technology Co., Ltd
+D802C0|Extreme Networks, Inc.
+D806D1|Honeywell Fire System (Shanghai) Co,. Ltd.
+D807B6|TP-LINK TECHNOLOGIES CO.,LTD.
+D80831|Samsung Electronics Co.,Ltd
+D8097F|zte corporation
+D80A60|HUAWEI TECHNOLOGIES CO.,LTD
+D80AE6|zte corporation
+D80B9A|Samsung Electronics Co.,Ltd
+D80D17|TP-LINK TECHNOLOGIES CO.,LTD.
+D80F99|Hon Hai Precision Ind. Co.,Ltd.
+D80FB5|SHENZHEN ULTRAEASY TECHNOLOGY CO LTD
+D8109F|HUAWEI TECHNOLOGIES CO.,LTD
+D8132A|Espressif Inc.
+D814DF|TCL King Electrical Appliances (Huizhou) Co., Ltd
+D8150D|TP-LINK TECHNOLOGIES CO.,LTD.
+D818D3|Juniper Networks
+D81BB5|HUAWEI TECHNOLOGIES CO.,LTD
+D81C79|Apple, Inc.
+D81D72|Apple, Inc.
+D81F12|Tuya Smart Inc.
+D820A2|HUAWEI TECHNOLOGIES CO.,LTD
+D824BD|Cisco Systems, Inc
+D82918|HUAWEI TECHNOLOGIES CO.,LTD
+D829F8|HUAWEI TECHNOLOGIES CO.,LTD
+D82A7E|Nokia Corporation
+D82D9B|Shenzhen G.Credit Communication Technology Co., Ltd
+D83062|Apple, Inc.
+D8312C|zte corporation
+D83134|Roku, Inc
+D83139|zte corporation
+D831CF|Samsung Electronics Co.,Ltd
+D83214|Tenda Technology Co.,Ltd.Dongguan branch
+D8325A|Shenzhen YOUHUA Technology Co., Ltd
+D832E3|Xiaomi Communications Co Ltd
+D833B7|Sagemcom Broadband SAS
+D834D1|Shenzhen Orange Digital Technology Co.,Ltd
+D8365F|Intelbras
+D8373B|Shenzhen Jingxun Software Telecommunication Technology Co.,Ltd
+D837BE|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+D8380D|SHENZHEN IP-COM Network Co.,Ltd
+D838FC|Ruckus Wireless
+D83ADD|Raspberry Pi Trading Ltd
+D83BBF|Intel Corporate
+D83BDA|Espressif Inc.
+D83C69|Shenzhen TINNO Mobile Technology Corp.
+D83DCC|shenzhen UDD Technologies,co.,Ltd
+D84008|HUAWEI TECHNOLOGIES CO.,LTD
+D843AE|Micro-Star INTL CO., LTD.
+D84489|TP-Link Systems Inc
+D846CE|Apple, Inc.
+D84732|TP-LINK TECHNOLOGIES CO.,LTD.
+D847BB|Huawei Device Co., Ltd.
+D8490B|HUAWEI TECHNOLOGIES CO.,LTD
+D8492F|CANON INC.
+D84A2B|zte corporation
+D84C90|Apple, Inc.
+D84FB8|LG ELECTRONICS
+D850E6|ASUSTek COMPUTER INC.
+D8539A|Juniper Networks
+D853AD|Cisco Meraki
+D853BC|Lenovo Information Products (Shenzhen)Co.,Ltd
+D85437|HUAWEI TECHNOLOGIES CO.,LTD
+D854A2|Extreme Networks, Inc.
+D854F2|Huawei Device Co., Ltd.
+D85575|Samsung Electronics Co.,Ltd
+D855A3|zte corporation
+D857EF|Samsung Electronics Co.,Ltd
+D85982|HUAWEI TECHNOLOGIES CO.,LTD
+D85B22|Shenzhen Hohunet Technology Co., Ltd
+D85B2A|Samsung Electronics Co.,Ltd
+D85D4C|TP-LINK TECHNOLOGIES CO.,LTD.
+D85DE2|Hon Hai Precision Ind. Co.,Ltd.
+D85ED3|GIGA-BYTE TECHNOLOGY CO.,LTD.
+D862CA|Cisco Systems, Inc
+D8630D|Motorola (Wuhan) Mobility Technologies Communication Co., Ltd.
+D86375|Xiaomi Communications Co Ltd
+D8638C|Shenzhen Dttek Technology Co., Ltd.
+D866C6|Shenzhen Daystar Technology Co.,ltd
+D867D3|Huawei Device Co., Ltd.
+D867D9|Cisco Systems, Inc
+D86852|HUAWEI TECHNOLOGIES CO.,LTD
+D868A0|Samsung Electronics Co.,Ltd
+D868C3|Samsung Electronics Co.,Ltd
+D86BFC|zte corporation
+D86C63|Google, Inc.
+D86CE9|Sagemcom Broadband SAS
+D86D17|HUAWEI TECHNOLOGIES CO.,LTD
+D87154|Samsung Electronics Co.,Ltd
+D87157|Lenovo Mobile Communication Technology Ltd.
+D87475|Apple, Inc.
+D87495|zte corporation
+D874DF|HUAWEI TECHNOLOGIES CO.,LTD
+D87533|Nokia Corporation
+D876AE|HUAWEI TECHNOLOGIES CO.,LTD
+D8778B|Intelbras
+D87988|Hon Hai Precision Ind. Co.,Ltd.
+D87D7F|Sagemcom Broadband SAS
+D880DC|Huawei Device Co., Ltd.
+D88466|Extreme Networks, Inc.
+D8855E|zte corporation
+D885AC|Espressif Inc.
+D88863|HUAWEI TECHNOLOGIES CO.,LTD
+D88ADC|Huawei Device Co., Ltd.
+D88C73|zte corporation
+D88C79|Google, Inc.
+D88F76|Apple, Inc.
+D890E8|Samsung Electronics Co.,Ltd
+D8912A|Zyxel Communications Corporation
+D89333|HUAWEI TECHNOLOGIES CO.,LTD
+D893D4|Xiaomi Communications Co Ltd
+D89403|Hewlett Packard Enterprise
+D89695|Apple, Inc.
+D897BA|PEGATRON CORPORATION
+D89A0D|zte corporation
+D89AC1|Nokia
+D89B3B|HUAWEI TECHNOLOGIES CO.,LTD
+D89C67|Hon Hai Precision Ind. Co.,Ltd.
+D89D13|Samsung Electronics Co.,Ltd
+D89D67|Hewlett Packard
+D89E3F|Apple, Inc.
+D89E61|Huawei Device Co., Ltd.
+D89ED4|Fiberhome Telecommunication Technologies Co.,LTD
+D89EF3|Dell Inc.
+D8A01D|Espressif Inc.
+D8A0E8|zte corporation
+D8A25E|Apple, Inc.
+D8A35C|Samsung Electronics Co.,Ltd
+D8A491|Huawei Device Co., Ltd.
+D8A756|Sagemcom Broadband SAS
+D8A8C8|zte corporation
+D8AFF1|Panasonic Appliances Company
+D8B053|Xiaomi Communications Co Ltd
+D8B061|SHENZHEN WENXUN TECHNOLOGY CO.,LTD
+D8B122|Juniper Networks
+D8B12A|Panasonic Mobile Communications Co.,Ltd.
+D8B190|Cisco Systems, Inc
+D8B1DE|Hewlett Packard Enterprise
+D8B249|Huawei Device Co., Ltd.
+D8B2AA|zte corporation
+D8B370|Ubiquiti Inc
+D8BB2C|Apple, Inc.
+D8BBC1|Micro-Star INTL CO., LTD.
+D8BC38|Espressif Inc.
+D8BC59|Shenzhen DAPU Microelectronics Co., Ltd
+D8BE1F|Apple, Inc.
+D8BE65|Amazon Technologies Inc.
+D8BF42|Intel Corporate
+D8BFC0|Espressif Inc.
+D8C0A6|AzureWave Technology Inc.
+D8C262|Ubiquiti Inc
+D8C497|Quanta Computer Inc.
+D8C4E9|Samsung Electronics Co.,Ltd
+D8C771|HUAWEI TECHNOLOGIES CO.,LTD
+D8C7C8|Hewlett Packard Enterprise
+D8C80C|Tuya Smart Inc.
+D8C960|Huawei Device Co., Ltd.
+D8CB8A|Micro-Star INTL CO., LTD.
+D8CC98|Huawei Device Co., Ltd.
+D8CE3A|Xiaomi Communications Co Ltd
+D8CF61|Sagemcom Broadband SAS
+D8CF9C|Apple, Inc.
+D8CFBF|Motorola Mobility LLC, a Lenovo Company
+D8D090|Dell Inc.
+D8D1CB|Apple, Inc.
+D8D385|Hewlett Packard
+D8D43C|Sony Corporation
+D8D668|Tuya Smart Inc.
+D8D775|Sagemcom Broadband SAS
+D8D866|SHENZHEN TOZED TECHNOLOGIES CO.,LTD.
+D8DAF1|HUAWEI TECHNOLOGIES CO.,LTD
+D8DC40|Apple, Inc.
+D8DE3A|Apple, Inc.
+D8E016|Extreme Networks, Inc.
+D8E0E1|Samsung Electronics Co.,Ltd
+D8E2DF|Microsoft Corporation
+D8E374|Xiaomi Communications Co Ltd
+D8E593|Apple, Inc.
+D8E72F|Chipsea Technologies (Shenzhen) Corp.
+D8E844|zte corporation
+D8EB46|Google, Inc.
+D8ECE5|Zyxel Communications Corporation
+D8EDA8|Xiaomi Communications Co Ltd
+D8EF42|Huawei Device Co., Ltd.
+D8EFCD|Nokia Solutions and Networks GmbH & Co. KG
+D8F12E|TP-Link Systems Inc.
+D8F15B|Espressif Inc.
+D8F2CA|Intel Corporate
+D8F3BC|Liteon Technology Corporation
+D8F507|Fiberhome Telecommunication Technologies Co.,LTD
+D8F883|Intel Corporate
+D8FBD6|Amazon Technologies Inc.
+D8FC92|Tuya Smart Inc.
+D8FC93|Intel Corporate
+D8FEE3|D-Link International
+D8FFC3|Shenzhen 3SNIC information technology company Limited
+DC0077|TP-LINK TECHNOLOGIES CO.,LTD.
+DC028E|zte corporation
+DC0539|Cisco Systems, Inc
+DC0675|Espressif Inc.
+DC07F8|Hangzhou Hikvision Digital Technology Co.,Ltd.
+DC080F|Apple, Inc.
+DC094C|HUAWEI TECHNOLOGIES CO.,LTD
+DC0A69|Espressif Inc.
+DC0B09|Cisco Systems, Inc
+DC0B34|LG Electronics (Mobile Communications)
+DC0C5C|Apple, Inc.
+DC0D30|Shenzhen Feasycom Technology Co., Ltd.
+DC0E96|Palo Alto Networks
+DC0EA1|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+DC1057|Apple, Inc.
+DC121D|HUAWEI TECHNOLOGIES CO.,LTD
+DC16B2|HUAWEI TECHNOLOGIES CO.,LTD
+DC1A01|Ecoliv Technology ( Shenzhen ) Ltd.
+DC1BA1|Intel Corporate
+DC1ED5|Espressif Inc.
+DC2148|Intel Corporate
+DC215C|Intel Corporate
+DC21E2|HUAWEI TECHNOLOGIES CO.,LTD
+DC233B|Extreme Networks, Inc.
+DC2727|Huawei Device Co., Ltd.
+DC293A|Shenzhen Nuoshi Technology Co., LTD.
+DC2B2A|Apple, Inc.
+DC2B61|Apple, Inc.
+DC2C6E|Routerboard.com
+DC2D3C|Huawei Device Co., Ltd.
+DC3052|zte corporation
+DC333D|Huawei Device Co., Ltd.
+DC35F1|Positivo Tecnologia S.A.
+DC3642|zte corporation
+DC3714|Apple, Inc.
+DC38E1|Juniper Networks
+DC3979|Cisco Systems, Inc
+DC3A5E|Roku, Inc.
+DC3EF8|Nokia Corporation
+DC415F|Apple, Inc.
+DC41A9|Intel Corporate
+DC41E5|Shenzhen Zhixin Data Service Co., Ltd.
+DC42C8|Huawei Device Co., Ltd.
+DC44B6|Samsung Electronics Co.,Ltd
+DC4546|Intel Corporate
+DC45B8|Apple, Inc.
+DC4628|Intel Corporate
+DC4A3E|Hewlett Packard
+DC4BDD|Shenzhen SuperElectron Technology Co.,Ltd.
+DC4BFE|Shenzhen Belon Technology CO.,LTD
+DC4EF4|Shenzhen MTN Electronics CO., Ltd
+DC4F22|Espressif Inc.
+DC5193|zte corporation
+DC5285|Apple, Inc.
+DC5360|Intel Corporate
+DC537C|Compal Broadband Networks, Inc.
+DC5392|Apple, Inc.
+DC5475|Espressif Inc.
+DC54D7|Amazon Technologies Inc.
+DC55B1|Espressif Inc.
+DC56E6|Shenzhen Bococom Technology Co.,LTD
+DC56E7|Apple, Inc.
+DC5D89|Cisco Systems, Inc
+DC6180|HUAWEI TECHNOLOGIES CO.,LTD
+DC621F|HUAWEI TECHNOLOGIES CO.,LTD
+DC6279|TP-Link Systems Inc
+DC64B8|Shenzhen JingHanDa Electronics Co.Ltd
+DC663A|Apacer Technology Inc.
+DC6672|Samsung Electronics Co.,Ltd
+DC680C|Hewlett Packard Enterprise
+DC6880|zte corporation
+DC69E2|Samsung Electronics Co.,Ltd
+DC6AE7|Xiaomi Communications Co Ltd
+DC6B1B|Huawei Device Co., Ltd.
+DC6DBC|Apple, Inc.
+DC7137|zte corporation
+DC7144|SAMSUNG ELECTRO MECHANICS CO., LTD.
+DC7196|Intel Corporate
+DC71D0|Apple, Inc.
+DC729B|HUAWEI TECHNOLOGIES CO.,LTD
+DC7385|Huawei Device Co., Ltd.
+DC74A8|Samsung Electronics Co.,Ltd
+DC774C|Cisco Systems, Inc
+DC7794|Huawei Device Co., Ltd.
+DC7B94|Cisco Systems, Inc
+DC7E1D|HUAWEI TECHNOLOGIES CO.,LTD
+DC7EF5|HUAWEI TECHNOLOGIES CO.,LTD
+DC8084|Apple, Inc.
+DC83BF|Seiko Epson Corporation
+DC8403|shenzhen trolink Technology Co.,Ltd
+DC84E9|Shenzhen Qihoo Intelligent Technology Co.,Ltd
+DC85DE|AzureWave Technology Inc.
+DC868D|HUAWEI TECHNOLOGIES CO.,LTD
+DC86D8|Apple, Inc.
+DC87F8|Samsung Electronics Co.,Ltd
+DC8983|Samsung Electronics Co.,Ltd
+DC8B28|Intel Corporate
+DC8C37|Cisco Systems, Inc
+DC8D8A|Nokia Solutions and Networks GmbH & Co. KG
+DC8E6D|Huawei Device Co., Ltd.
+DC9009|Intel Corporate
+DC9088|HUAWEI TECHNOLOGIES CO.,LTD
+DC9166|Huawei Device Co., Ltd.
+DC91BF|Amazon Technologies Inc.
+DC9272|Sagemcom Broadband SAS
+DC9396|Apple, Inc.
+DC9566|Apple, Inc.
+DC97BA|Intel Corporate
+DC97E6|Sagemcom Broadband SAS
+DC9840|Microsoft Corporation
+DC9914|HUAWEI TECHNOLOGIES CO.,LTD
+DC9B9C|Apple, Inc.
+DC9C99|HUAWEI TECHNOLOGIES CO.,LTD
+DC9C9F|Shenzhen YOUHUA Technology Co., Ltd
+DC9DED|Samsung Electronics Co.,Ltd
+DC9E8F|Apple, Inc.
+DC9FA4|Nokia Corporation
+DC9FDB|Ubiquiti Inc
+DCA0D0|Amazon Technologies Inc.
+DCA120|Nokia
+DCA266|Hon Hai Precision Ind. Co.,Ltd.
+DCA313|Shenzhen Changjin Communication Technology Co.,Ltd
+DCA333|Shenzhen YOUHUA Technology Co., Ltd
+DCA4CA|Apple, Inc.
+DCA5F4|Cisco Systems, Inc
+DCA632|Raspberry Pi Trading Ltd
+DCA782|HUAWEI TECHNOLOGIES CO.,LTD
+DCA904|Apple, Inc.
+DCA971|Intel Corporate
+DCAA43|Shenzhen Terca Information Technology Co., Ltd.
+DCAEEB|Ruckus Wireless
+DCB082|Nokia
+DCB131|SHENZHEN HUARUIAN TECHNOLOGY CO.,LTD
+DCB347|SHENZHEN FAST TECHNOLOGIES CO.,LTD
+DCB3B4|Honeywell Environmental & Combustion Controls (Tianjin) Co., Ltd.
+DCB4C4|Microsoft XCG
+DCB4D9|Espressif Inc.
+DCB54F|Apple, Inc.
+DCB72E|Xiaomi Communications Co Ltd
+DCB7AC|Hewlett Packard Enterprise
+DCB808|Extreme Networks, Inc.
+DCB87D|Hewlett Packard Enterprise
+DCBB3D|Extreme Networks, Inc.
+DCBBFA|Cisco Meraki
+DCBFE9|Motorola Mobility LLC, a Lenovo Company
+DCC0DB|Shenzhen Kaiboer Technology Co., Ltd.
+DCC2C9|CANON INC.
+DCC49C|Samsung Electronics Co.,Ltd
+DCC64B|HUAWEI TECHNOLOGIES CO.,LTD
+DCC793|Nokia Corporation
+DCCCE6|Samsung Electronics Co.,Ltd
+DCCD2F|Seiko Epson Corporation
+DCCEBC|Shenzhen JSR Technology Co.,Ltd.
+DCCEC1|Cisco Systems, Inc
+DCCF96|Samsung Electronics Co.,Ltd
+DCD26A|Hangzhou Hikvision Digital Technology Co.,Ltd.
+DCD2FC|HUAWEI TECHNOLOGIES CO.,LTD
+DCD2FD|HUAWEI TECHNOLOGIES CO.,LTD
+DCD3A2|Apple, Inc.
+DCD444|Huawei Device Co., Ltd.
+DCD7A0|Huawei Device Co., Ltd.
+DCD83B|Cisco Systems, Inc
+DCD87F|Shenzhen JoinCyber Telecom Equipment Ltd
+DCD916|HUAWEI TECHNOLOGIES CO.,LTD
+DCD9AE|Nokia Shanghai Bell Co., Ltd.
+DCDA0C|Espressif Inc.
+DCDB27|Huawei Device Co., Ltd.
+DCDCC3|Extreme Networks, Inc.
+DCDCE2|Samsung Electronics Co.,Ltd
+DCDE4B|SHENZHEN TRANSCHAN TECHNOLOGY LIMITED
+DCDFD6|zte corporation
+DCE1AD|Shenzhen Wintop Photoelectric Technology Co., Ltd
+DCE541|Apple, Inc.
+DCE55B|Google, Inc.
+DCE5D8|zte corporation
+DCE650|Extreme Networks, Inc.
+DCE838|CK Telecom (Shenzhen) Limited
+DCEAE7|D-Link Corporation
+DCEB4D|Motorola (Wuhan) Mobility Technologies Communication Co., Ltd.
+DCEB94|Cisco Systems, Inc
+DCED83|Beijing Xiaomi Mobile Software Co., Ltd
+DCEE06|HUAWEI TECHNOLOGIES CO.,LTD
+DCEF09|NETGEAR
+DCEF80|HUAWEI TECHNOLOGIES CO.,LTD
+DCF110|Nokia Corporation
+DCF401|Dell Inc.
+DCF4CA|Apple, Inc.
+DCF505|AzureWave Technology Inc.
+DCF719|Cisco Systems, Inc
+DCF756|Samsung Electronics Co.,Ltd
+DCF8B9|zte corporation
+DCFB48|Intel Corporate
+DCFE07|PEGATRON CORPORATION
+DCFE18|TP-LINK TECHNOLOGIES CO.,LTD.
+E00084|HUAWEI TECHNOLOGIES CO.,LTD
+E0036B|Samsung Electronics Co.,Ltd
+E00370|ShenZhen Continental Wireless Technology Co., Ltd.
+E005C5|TP-LINK TECHNOLOGIES CO.,LTD.
+E00630|HUAWEI TECHNOLOGIES CO.,LTD
+E006E6|Hon Hai Precision Ind. Co.,Ltd.
+E0071B|Hewlett Packard Enterprise
+E009BF|SHENZHEN TONG BO WEI TECHNOLOGY Co.,LTD
+E00AF6|Liteon Technology Corporation
+E00CE5|HUAWEI TECHNOLOGIES CO.,LTD
+E00DEE|Huawei Device Co., Ltd.
+E00ECE|Fiberhome Telecommunication Technologies Co.,LTD
+E00EDA|Cisco Systems, Inc
+E0107F|Ruckus Wireless
+E01283|Shenzhen Fanzhuo Communication Technology Co., Lt
+E0150B|HUAWEI TECHNOLOGIES CO.,LTD
+E01877|FUJITSU LIMITED
+E0191D|HUAWEI TECHNOLOGIES CO.,LTD
+E01954|zte corporation
+E01ADF|Google, Inc.
+E01C41|Extreme Networks, Inc.
+E01CFC|D-Link International
+E01F2B|Nokia Solutions and Networks GmbH & Co. KG
+E01F6A|Huawei Device Co., Ltd.
+E01F88|Xiaomi Communications Co Ltd
+E01FED|Nokia Shanghai Bell Co., Ltd.
+E01FFC|Motorola (Wuhan) Mobility Technologies Communication Co., Ltd.
+E023FF|Fortinet, Inc.
+E0247F|HUAWEI TECHNOLOGIES CO.,LTD
+E02481|HUAWEI TECHNOLOGIES CO.,LTD
+E02611|Apple, Inc.
+E0280A|TP-Link Systems Inc.
+E02861|HUAWEI TECHNOLOGIES CO.,LTD
+E028B1|Shenzhen Skyworth Digital Technology CO., Ltd
+E02A25|Shenzhen Intellirocks Tech. Co. Ltd.
+E02A66|Cisco Systems, Inc
+E02AE6|Fiberhome Telecommunication Technologies Co.,LTD
+E02B96|Apple, Inc.
+E02BE9|Intel Corporate
+E02CB2|Lenovo Mobile Communication (Wuhan) Company Limited
+E02E0B|Intel Corporate
+E02E3F|Huawei Device Co., Ltd.
+E02EFE|Zhejiang Dahua Technology Co., Ltd.
+E02F6D|Cisco Systems, Inc
+E030F9|Juniper Networks
+E0338E|Apple, Inc.
+E03676|HUAWEI TECHNOLOGIES CO.,LTD
+E0383F|zte corporation
+E03AAA|Intel Corporate
+E03C5B|SHENZHEN JIAXINJIE ELECTRON CO.,LTD
+E03E44|Broadcom
+E03F49|ASUSTek COMPUTER INC.
+E04007|Huawei Device Co., Ltd.
+E04027|Huawei Device Co., Ltd.
+E04102|zte corporation
+E043DB|Shenzhen ViewAt Technology Co.,Ltd.
+E0469A|NETGEAR
+E046EE|NETGEAR
+E04BA6|HUAWEI TECHNOLOGIES CO.,LTD
+E04E5D|HUAWEI TECHNOLOGIES CO.,LTD
+E04F95|Sagemcom Broadband SAS
+E0508B|Zhejiang Dahua Technology Co., Ltd.
+E0553D|Cisco Meraki
+E05A1B|Espressif Inc.
+E05F45|Apple, Inc.
+E05FB9|Cisco Systems, Inc
+E0604A|Fiberhome Telecommunication Technologies Co.,LTD
+E06267|Xiaomi Communications Co Ltd
+E063DA|Ubiquiti Inc
+E063E5|Sony Corporation
+E06678|Apple, Inc.
+E067B3|Shenzhen C-Data Technology Co., Ltd.
+E06995|PEGATRON CORPORATION
+E069BA|Cisco Systems, Inc
+E06A05|Shenzhen YOUHUA Technology Co., Ltd
+E06A1B|Shenzhen Zidoo Technology Co., Ltd.
+E06C4E|Shenzhen TINNO Mobile Technology Corp.
+E06CC5|Huawei Device Co., Ltd.
+E06D17|Apple, Inc.
+E070EA|HP Inc.
+E0720A|Shenzhen SuperElectron Technology Co.,Ltd.
+E07256|Intel Corporate
+E072A1|Espressif Inc.
+E073E7|HP Inc.
+E0757D|Motorola Mobility LLC, a Lenovo Company
+E07726|Huawei Device Co., Ltd.
+E07C13|zte corporation
+E0806B|Xiaomi Communications Co Ltd
+E0859A|SHENZHEN RF-LINK TECHNOLOGY CO.,LTD.
+E0897E|Apple, Inc.
+E0899D|Cisco Systems, Inc
+E08C3C|Cisco Systems, Inc
+E08CFE|Espressif Inc.
+E08E3C|Aztech Electronics Pte Ltd
+E08F4C|Intel Corporate
+E091F5|NETGEAR
+E0925C|Apple, Inc.
+E09467|Intel Corporate
+E096E8|Fiberhome Telecommunication Technologies Co.,LTD
+E09796|HUAWEI TECHNOLOGIES CO.,LTD
+E09806|Espressif Inc.
+E09861|Motorola Mobility LLC, a Lenovo Company
+E09971|Samsung Electronics Co.,Ltd
+E09D13|Samsung Electronics Co.,Ltd
+E09D1E|zte corporation
+E09D31|Intel Corporate
+E09E2D|Nokia
+E0A129|Extreme Networks, Inc.
+E0A1CE|zte corporation
+E0A366|Motorola Mobility LLC, a Lenovo Company
+E0A3AC|HUAWEI TECHNOLOGIES CO.,LTD
+E0A447|zte corporation
+E0A498|SHENZHEN ORFA TECH CO.,LTD
+E0A670|Nokia Corporation
+E0AA96|Samsung Electronics Co.,Ltd
+E0ACCB|Apple, Inc.
+E0ACF1|Cisco Systems, Inc
+E0AD9B|HUAWEI TECHNOLOGIES CO.,LTD
+E0AEA2|HUAWEI TECHNOLOGIES CO.,LTD
+E0B2F1|FN-LINK TECHNOLOGY LIMITED
+E0B52D|Apple, Inc.
+E0B55F|Apple, Inc.
+E0B655|Beijing Xiaomi Electronics Co., Ltd.
+E0B668|zte corporation
+E0B72E|ShenZhen Qualmesh Technology Co.,Ltd.
+E0B94D|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+E0B98A|Shenzhen Taike industrial automation company,Ltd
+E0B9A5|AzureWave Technology Inc.
+E0B9BA|Apple, Inc.
+E0BA78|Apple, Inc.
+E0BAAD|Hangzhou Hikvision Digital Technology Co.,Ltd.
+E0BB9E|Seiko Epson Corporation
+E0BDA0|Apple, Inc.
+E0BFB2|Apple, Inc.
+E0C0D1|CK Telecom (Shenzhen) Limited
+E0C250|NETGEAR
+E0C264|Intel Corporate
+E0C29E|zte corporation
+E0C377|Samsung Electronics Co.,Ltd
+E0C3EA|Apple, Inc.
+E0C3F3|zte corporation
+E0C767|Apple, Inc.
+E0C86A|SHENZHEN TW-SCIE Co., Ltd
+E0C932|Intel Corporate
+E0C97A|Apple, Inc.
+E0CA3C|Hangzhou Hikvision Digital Technology Co.,Ltd.
+E0CA4D|Shenzhen Unistar Communication Co.,LTD
+E0CB19|Nokia
+E0CB1D|Amazon Technologies Inc.
+E0CB4E|ASUSTek COMPUTER INC.
+E0CB56|Shenzhen iComm Semiconductor CO.,LTD
+E0CBBC|Cisco Meraki
+E0CBEE|Samsung Electronics Co.,Ltd
+E0CC7A|HUAWEI TECHNOLOGIES CO.,LTD
+E0CCF8|Xiaomi Communications Co Ltd
+E0CDB8|Huawei Device Co., Ltd.
+E0D045|Intel Corporate
+E0D083|Samsung Electronics Co.,Ltd
+E0D173|Cisco Systems, Inc
+E0D362|TP-Link Systems Inc.
+E0D38E|Chipsea Technologies (Shenzhen) Crop.
+E0D3B4|Cisco Meraki
+E0D462|Huawei Device Co., Ltd.
+E0D464|Intel Corporate
+E0D491|Cisco Systems, Inc
+E0D4E8|Intel Corporate
+E0D55D|Intel Corporate
+E0D55E|GIGA-BYTE TECHNOLOGY CO.,LTD.
+E0D848|Dell Inc.
+E0DA90|HUAWEI TECHNOLOGIES CO.,LTD
+E0DAD7|zte corporation
+E0DB10|Samsung Electronics Co.,Ltd
+E0DB55|Dell Inc.
+E0DCFF|Xiaomi Communications Co Ltd
+E0DF13|Hangzhou Hikvision Digital Technology Co.,Ltd.
+E0E0FC|Huawei Device Co., Ltd.
+E0E1A9|Shenzhen Four Seas Global Link Network Technology Co., Ltd.
+E0E258|Intel Corporate
+E0E2E6|Espressif Inc.
+E0E37C|Huawei Device Co., Ltd.
+E0E8E6|Shenzhen C-Data Technology Co., Ltd.
+E0EB40|Apple, Inc.
+E0EDC7|Shenzhen Friendcom Technology Development Co., Ltd
+E0EE1B|Panasonic Automotive Systems Company of America
+E0F330|HUAWEI TECHNOLOGIES CO.,LTD
+E0F442|Huawei Device Co., Ltd.
+E0F5C6|Apple, Inc.
+E0F62D|Juniper Networks
+E0F678|Fiberhome Telecommunication Technologies Co.,LTD
+E0F728|Amazon Technologies Inc.
+E0F847|Apple, Inc.
+E4013B|Apple, Inc.
+E4029B|Intel Corporate
+E406E0|HUAWEI TECHNOLOGIES CO.,LTD
+E4072B|Huawei Device Co., Ltd.
+E407B4|HUAWEI TECHNOLOGIES CO.,LTD
+E40A16|HUAWEI TECHNOLOGIES CO.,LTD
+E40D36|Intel Corporate
+E40EEE|HUAWEI TECHNOLOGIES CO.,LTD
+E41088|Samsung Electronics Co.,Ltd
+E4115B|Hewlett Packard
+E41218|ShenZhen Rapoo Technology Co., Ltd.
+E4121D|Samsung Electronics Co.,Ltd
+E4135C|Cisco Systems, Inc
+E41613|Extreme Networks, Inc.
+E4186B|Zyxel Communications Corporation
+E419C1|HUAWEI TECHNOLOGIES CO.,LTD
+E41B43|Beijing Xiaomi Mobile Software Co., Ltd
+E41F7B|Cisco Systems, Inc
+E41FD5|Intel Corporate
+E4233C|Juniper Networks
+E42354|SHENZHEN FUZHI SOFTWARE TECHNOLOGY CO.,LTD
+E4246C|Zhejiang Dahua Technology Co., Ltd.
+E425E7|Apple, Inc.
+E4268B|Huawei Device Co., Ltd.
+E426D5|Motorola Mobility LLC, a Lenovo Company
+E4293D|Shenzhen Sy-Fiber Optical Communication Technology.Co.,Ltd
+E42AAC|Microsoft Corporation
+E42B34|Apple, Inc.
+E42B79|Nokia
+E42F26|Fiberhome Telecommunication Technologies Co.,LTD
+E42F37|Apple, Inc.
+E432CB|Samsung Electronics Co.,Ltd
+E43493|HUAWEI TECHNOLOGIES CO.,LTD
+E435C8|HUAWEI TECHNOLOGIES CO.,LTD
+E4379F|Cisco Systems, Inc
+E43819|Shenzhen Hi-Link Electronic CO.,Ltd.
+E4387E|Cisco Systems, Inc
+E43883|Ubiquiti Inc
+E43A6E|Shenzhen Zeroone Technology CO.,LTD
+E43A85|Cisco Systems, Inc
+E43D1A|Broadcom Limited
+E43EC6|HUAWEI TECHNOLOGIES CO.,LTD
+E440E2|Samsung Electronics Co.,Ltd
+E44122|OnePlus Technology (Shenzhen) Co., Ltd
+E44164|Nokia
+E442A6|Intel Corporate
+E4434B|Dell Inc.
+E44389|Apple, Inc.
+E443CF|TP-Link Systems Inc.
+E444E5|Extreme Networks, Inc.
+E44519|Beijing Xiaomi Electronics Co.,Ltd
+E446B0|Fujitsu Client Computing Limited
+E446DA|Xiaomi Communications Co Ltd
+E447B3|zte corporation
+E448C7|Cisco SPVTG
+E44AE0|Intel Corporate
+E44C6C|Shenzhen Guo Wei Electronic Co,. Ltd.
+E44E12|zte corporation
+E44E2D|Cisco Systems, Inc
+E44E76|CHAMPIONTECH ENTERPRISE (SHENZHEN) INC
+E450EB|Apple, Inc.
+E45341|Apple, Inc.
+E454E5|Huawei Device Co., Ltd.
+E454E8|Dell Inc.
+E455A8|Cisco Meraki
+E458B8|Samsung Electronics Co.,Ltd
+E458E7|Samsung Electronics Co.,Ltd
+E45BB3|zte corporation
+E45D37|Juniper Networks
+E45D52|Avaya Inc
+E45D75|Samsung Electronics Co.,Ltd
+E45E1B|Google, Inc.
+E45E37|Intel Corporate
+E45ECC|Juniper Networks
+E45F01|Raspberry Pi Trading Ltd
+E46017|Intel Corporate
+E4604D|zte corporation
+E461F4|shenzhen worldelite electronics co., LTD
+E462C4|Cisco Systems, Inc
+E46564|SHENZHEN KTC TECHNOLOGY CO.,LTD
+E465B8|Espressif Inc.
+E466AB|zte corporation
+E468A3|HUAWEI TECHNOLOGIES CO.,LTD
+E46F13|D-Link International
+E47010|Apple, Inc.
+E470B8|Intel Corporate
+E4729D|Nokia Shanghai Bell Co., Ltd.
+E472E2|HUAWEI TECHNOLOGIES CO.,LTD
+E47305|Shenzhen INVT Electric CO.,Ltd
+E47319|Huawei Device Co., Ltd.
+E47450|Shenzhen Grandsun Electronic Co.,Ltd.
+E47684|Apple, Inc.
+E47723|zte corporation
+E47727|HUAWEI TECHNOLOGIES CO.,LTD
+E4793F|Juniper Networks
+E47CF9|Samsung Electronics Co.,Ltd
+E47DBD|Samsung Electronics Co.,Ltd
+E47E66|HUAWEI TECHNOLOGIES CO.,LTD
+E47E9A|zte corporation
+E47F3C|zte corporation
+E47FB2|FUJITSU LIMITED
+E48184|Nokia
+E481B3|Shenzhen ACT Industrial Co.,Ltd.
+E48210|HUAWEI TECHNOLOGIES CO.,LTD
+E48326|HUAWEI TECHNOLOGIES CO.,LTD
+E484D3|Xiaomi Communications Co Ltd
+E489CA|Cisco Systems, Inc
+E48B7F|Apple, Inc.
+E48D8C|Routerboard.com
+E48EC5|HUAWEI TECHNOLOGIES CO.,LTD
+E48F1D|Huawei Device Co., Ltd.
+E4902A|HUAWEI TECHNOLOGIES CO.,LTD
+E4907E|Motorola Mobility LLC, a Lenovo Company
+E490FD|Apple, Inc.
+E49282|Samsung Electronics Co.,Ltd
+E492FB|Samsung Electronics Co.,Ltd
+E498D1|Microsoft Mobile Oy
+E498D6|Apple, Inc.
+E4995F|HUAWEI TECHNOLOGIES CO.,LTD
+E49A79|Apple, Inc.
+E49ADC|Apple, Inc.
+E49C67|Apple, Inc.
+E49F7D|Samsung Electronics Co.,Ltd
+E4A41C|Cisco Systems, Inc
+E4A430|Samsung Electronics Co.,Ltd
+E4A471|Intel Corporate
+E4A749|Palo Alto Networks
+E4A7A0|Intel Corporate
+E4A7C5|HUAWEI TECHNOLOGIES CO.,LTD
+E4A7D0|HUAWEI TECHNOLOGIES CO.,LTD
+E4A8B6|HUAWEI TECHNOLOGIES CO.,LTD
+E4A8DF|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+E4AA5D|Cisco Systems, Inc
+E4AAE4|Xiaomi Communications Co Ltd
+E4AAEA|Liteon Technology Corporation
+E4AEE4|Tuya Smart Inc.
+E4B021|Samsung Electronics Co.,Ltd
+E4B063|Espressif Inc.
+E4B107|Huawei Device Co., Ltd.
+E4B16C|Apple, Inc.
+E4B224|HUAWEI TECHNOLOGIES CO.,LTD
+E4B2FB|Apple, Inc.
+E4B318|Intel Corporate
+E4B323|Espressif Inc.
+E4B555|Huawei Device Co., Ltd.
+E4B97A|Dell Inc.
+E4BCAA|Xiaomi Communications Co Ltd
+E4BD4B|zte corporation
+E4BEFB|HUAWEI TECHNOLOGIES CO.,LTD
+E4C0E2|Sagemcom Broadband SAS
+E4C0FE|Apple, Inc.
+E4C1F1|SHENZHEN SPOTMAU INFORMATION TECHNOLIGY CO., Ltd
+E4C2D1|HUAWEI TECHNOLOGIES CO.,LTD
+E4C32A|TP-LINK TECHNOLOGIES CO.,LTD.
+E4C63D|Apple, Inc.
+E4C722|Cisco Systems, Inc
+E4C767|Intel Corporate
+E4CA12|zte corporation
+E4CDA7|zte corporation
+E4CE8F|Apple, Inc.
+E4D332|TP-LINK TECHNOLOGIES CO.,LTD.
+E4D373|HUAWEI TECHNOLOGIES CO.,LTD
+E4D398|Xiaomi Communications Co Ltd
+E4D3F1|Cisco Systems, Inc
+E4D436|Nokia Solutions and Networks India Private Limited
+E4D53D|Hon Hai Precision Ind. Co.,Ltd.
+E4D58B|Hangzhou Hikvision Digital Technology Co.,Ltd.
+E4DB6D|Beijing Xiaomi Electronics Co., Ltd.
+E4DBAE|Extreme Networks, Inc.
+E4DC43|Huawei Device Co., Ltd.
+E4DCCC|HUAWEI TECHNOLOGIES CO.,LTD
+E4DE40|Hewlett Packard Enterprise
+E4E0A6|Apple, Inc.
+E4E0C5|Samsung Electronics Co.,Ltd
+E4E4AB|Apple, Inc.
+E4E749|Hewlett Packard
+E4EA83|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+E4EC10|Nokia Corporation
+E4ECE8|Samsung Electronics Co.,Ltd
+E4F004|Dell Inc.
+E4F042|Google, Inc.
+E4F27C|Juniper Networks
+E4F3C4|Samsung Electronics Co.,Ltd
+E4F3E8|Shenzhen SuperElectron Technology Co.,Ltd.
+E4F3F5|SHENZHEN MERCURY COMMUNICATION TECHNOLOGIES CO.,LTD.
+E4F4C6|NETGEAR
+E4F58E|Schneider Electric USA
+E4F89C|Intel Corporate
+E4F8EF|Samsung Electronics Co.,Ltd
+E4FAC4|TP-Link Systems Inc
+E4FADE|Microsoft Corporation
+E4FAE4|Shenzhen SDMC Technology CP,.LTD
+E4FAED|Samsung Electronics Co.,Ltd
+E4FAFD|Intel Corporate
+E4FB1E|Microsoft Corporation
+E4FB5D|HUAWEI TECHNOLOGIES CO.,LTD
+E4FC82|Juniper Networks
+E4FD45|Intel Corporate
+E4FD8C|Extreme Networks, Inc.
+E4FDA1|HUAWEI TECHNOLOGIES CO.,LTD
+E4FE43|Beijing Xiaomi Mobile Software Co., Ltd
+E4FED4|Microsoft Corporation
+E8018D|Fiberhome Telecommunication Technologies Co.,LTD
+E8039A|Samsung Electronics Co.,Ltd
+E8040B|Apple, Inc.
+E80462|Cisco Systems, Inc
+E805DC|Verifone, Inc.
+E80688|Apple, Inc.
+E80690|Espressif Inc.
+E807BF|SHENZHEN BOOMTECH INDUSTRY CO.,LTD
+E8088B|HUAWEI TECHNOLOGIES CO.,LTD
+E808AF|zte corporation
+E80AB9|Cisco Systems, Inc
+E81098|Hewlett Packard Enterprise
+E81132|Samsung Electronics Co.,Ltd
+E8136E|HUAWEI TECHNOLOGIES CO.,LTD
+E81499|Yoqu Technology(Shenzhen)Co.,Ltd.
+E8150E|Nokia Corporation
+E81711|Shenzhen Vipstech Co., Ltd
+E817FC|Fujitsu Limited
+E81CA5|Hewlett Packard Enterprise
+E81CBA|Fortinet, Inc.
+E81CD8|Apple, Inc.
+E81DA8|Ruckus Wireless
+E81E92|Huawei Device Co., Ltd.
+E822B8|Shenzhen Skyworth Digital Technology CO., Ltd
+E824A6|Juniper Networks
+E82587|Shenzhen Chilink IoT Technology Co., Ltd.
+E82689|Hewlett Packard Enterprise
+E8268D|Shenzhen SuperElectron Technology Co.,Ltd.
+E826CF|Shenzhen Jingxun Technology Co., Ltd.
+E82725|Axis Communications AB
+E8288D|Huawei Device Co., Ltd.
+E82A44|Liteon Technology Corporation
+E82AEA|Intel Corporate
+E82BC5|Huawei Device Co., Ltd.
+E831CD|Espressif Inc.
+E83617|Apple, Inc.
+E8377A|Zyxel Communications Corporation
+E83935|Hewlett Packard
+E83A12|Samsung Electronics Co.,Ltd
+E83A97|Toshiba Corporation
+E83DC1|Espressif Inc.
+E83F67|Huawei Device Co., Ltd.
+E84040|Cisco Systems, Inc
+E840F2|PEGATRON CORPORATION
+E84368|zte corporation
+E843B6|QNAP Systems, Inc.
+E8473A|Hon Hai Precision Industry Co.,LTD
+E848B8|TP-Link Systems Inc
+E84A54|Beijing Xiaomi Mobile Software Co., Ltd
+E84A78|Apple, Inc.
+E84C4A|Amazon Technologies Inc.
+E84D74|HUAWEI TECHNOLOGIES CO.,LTD
+E84DD0|HUAWEI TECHNOLOGIES CO.,LTD
+E84DEC|Xerox Corporation
+E84E84|Samsung Electronics Co.,Ltd
+E84EBA|Google, Inc.
+E84F4B|Shenzhen Delos Electronic Co., Ltd
+E84FA7|Huawei Device Co., Ltd.
+E8508B|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+E85497|Samsung Electronics Co.,Ltd
+E8567A|zte corporation
+E85A8B|Xiaomi Communications Co Ltd
+E85AD1|Fiberhome Telecommunication Technologies Co.,LTD
+E85B5B|LG ELECTRONICS INC
+E85C0A|Cisco Systems, Inc
+E85C5F|FN-LINK TECHNOLOGY Ltd.
+E85F02|Apple, Inc.
+E85FB4|Xiaomi Communications Co Ltd
+E8617E|Liteon Technology Corporation
+E862BE|Intel Corporate
+E86549|Cisco Systems, Inc
+E8655F|Dell Inc.
+E865D4|Tenda Technology Co.,Ltd.Dongguan branch
+E86819|HUAWEI TECHNOLOGIES CO.,LTD
+E868E7|Espressif Inc.
+E86A64|LCFC(Hefei) Electronics Technology co., ltd
+E86BEA|Espressif Inc.
+E86DCB|Samsung Electronics Co.,Ltd
+E86DE9|HUAWEI TECHNOLOGIES CO.,LTD
+E86E3A|Sony Interactive Entertainment Inc.
+E86E44|zte corporation
+E8757F|FIRS Technologies(Shenzhen) Co., Ltd
+E87865|Apple, Inc.
+E879A3|Cisco Systems, Inc
+E87E1C|HUAWEI TECHNOLOGIES CO.,LTD
+E87EEF|Xiaomi Communications Co Ltd
+E87F6B|Samsung Electronics Co.,Ltd
+E87F95|Apple, Inc.
+E8802E|Apple, Inc.
+E88088|LCFC(Hefei) Electronics Technology co., ltd
+E880E7|Huawei Device Co., Ltd.
+E88152|Apple, Inc.
+E88175|zte corporation
+E884A5|Intel Corporate
+E884C6|HUAWEI TECHNOLOGIES CO.,LTD
+E8854B|Apple, Inc.
+E886CF|Nokia
+E88843|Xiaomi Communications Co Ltd
+E8886C|Shenzhen SC Technologies Co.,LTD
+E88D28|Apple, Inc.
+E8910F|Fiberhome Telecommunication Technologies Co.,LTD
+E89120|Motorola Mobility LLC, a Lenovo Company
+E892A4|LG Electronics (Mobile Communications)
+E89309|Samsung Electronics Co.,Ltd
+E89363|Nokia
+E894F6|TP-LINK TECHNOLOGIES CO.,LTD.
+E89505|Shenzhen MiaoMing Intelligent Technology Co.,Ltd
+E89606|testo Instruments (Shenzhen) Co., Ltd.
+E89744|LCFC(Hefei) Electronics Technology co., ltd
+E89847|Xiaomi Communications Co Ltd
+E8986D|Palo Alto Networks
+E898EE|Apple, Inc.
+E89A8F|Quanta Computer Inc.
+E89C25|ASUSTek COMPUTER INC.
+E89D87|Toshiba
+E89EB4|Hon Hai Precision Ind. Co.,Ltd.
+E89F39|Nokia
+E89F6D|Espressif Inc.
+E8A0ED|Hangzhou Hikvision Digital Technology Co.,Ltd.
+E8A1F8|zte corporation
+E8A245|Juniper Networks
+E8A34E|HUAWEI TECHNOLOGIES CO.,LTD
+E8A55A|Juniper Networks
+E8A660|HUAWEI TECHNOLOGIES CO.,LTD
+E8A6CA|Huawei Device Co., Ltd.
+E8A72F|Microsoft Corporation
+E8A730|Apple, Inc.
+E8AACB|Samsung Electronics Co.,Ltd
+E8ABF3|HUAWEI TECHNOLOGIES CO.,LTD
+E8ABFA|Shenzhen Reecam Tech.Ltd.
+E8AC23|HUAWEI TECHNOLOGIES CO.,LTD
+E8ACAD|zte corporation
+E8ADA6|Sagemcom Broadband SAS
+E8B0C5|Intel Corporate
+E8B1FC|Intel Corporate
+E8B265|Dell Inc.
+E8B2AC|Apple, Inc.
+E8B3EF|Fiberhome Telecommunication Technologies Co.,LTD
+E8B4AE|Shenzhen C&D Electronics Co.,Ltd
+E8B4C8|Samsung Electronics Co.,Ltd
+E8B541|zte corporation
+E8B5D0|Dell Inc.
+E8B6C2|Juniper Networks
+E8B723|Shenzhen Vatilon Electronics Co.,Ltd
+E8B748|Cisco Systems, Inc
+E8BA17|Beijing Xiaomi Mobile Software Co., Ltd
+E8BA70|Cisco Systems, Inc
+E8BCE4|Cisco Systems, Inc
+E8BDD1|HUAWEI TECHNOLOGIES CO.,LTD
+E8BE81|Sagemcom Broadband SAS
+E8BFB8|Intel Corporate
+E8BFE1|Intel Corporate
+E8C1D7|Philips
+E8C1E8|Shenzhen Xiao Bi En Culture Education Technology Co.,Ltd.
+E8C386|Apple, Inc.
+E8C3C5|Huawei Device Co., Ltd.
+E8C417|Fiberhome Telecommunication Technologies Co.,LTD
+E8C74F|Liteon Technology Corporation
+E8C829|Intel Corporate
+E8C913|Samsung Electronics Co.,Ltd
+E8CBA1|Nokia Corporation
+E8CBED|Chipsea Technologies(Shenzhen) Corp.
+E8CC18|D-Link International
+E8CD2D|HUAWEI TECHNOLOGIES CO.,LTD
+E8CF83|Dell Inc.
+E8D03C|Shenzhen Jingxun Software Telecommunication Technology Co.,Ltd
+E8D099|Fiberhome Telecommunication Technologies Co.,LTD
+E8D0FC|Liteon Technology Corporation
+E8D2FF|Sagemcom Broadband SAS
+E8D322|Cisco Systems, Inc
+E8D52B|Google, Inc.
+E8D765|HUAWEI TECHNOLOGIES CO.,LTD
+E8D775|HUAWEI TECHNOLOGIES CO.,LTD
+E8D819|AzureWave Technology Inc.
+E8D87E|Amazon Technologies Inc.
+E8D8D1|HP Inc.
+E8DA3E|Huawei Device Co., Ltd.
+E8DB84|Espressif Inc.
+E8DC6C|Cisco Systems, Inc
+E8DE27|TP-LINK TECHNOLOGIES CO.,LTD.
+E8E0B7|Toshiba
+E8E5D6|Samsung Electronics Co.,Ltd
+E8E776|Shenzhen Kootion Technology Co., Ltd
+E8E7C3|zte corporation
+E8EA34|HUAWEI TECHNOLOGIES CO.,LTD
+E8EA4D|HUAWEI TECHNOLOGIES CO.,LTD
+E8EA7C|Shenzhen Amazwear Holdings Co., Ltd
+E8EB34|Cisco Systems, Inc
+E8EDD6|Fortinet, Inc.
+E8EDF3|Cisco Systems, Inc
+E8F085|HUAWEI TECHNOLOGIES CO.,LTD
+E8F1B0|Sagemcom Broadband SAS
+E8F375|Nokia
+E8F408|Intel Corporate
+E8F60A|Espressif Inc.
+E8F654|HUAWEI TECHNOLOGIES CO.,LTD
+E8F673|Microsoft Corporation
+E8F724|Hewlett Packard Enterprise
+E8F72F|HUAWEI TECHNOLOGIES CO.,LTD
+E8F791|Xiaomi Communications Co Ltd
+E8F8D0|Nokia Shanghai Bell Co., Ltd.
+E8F9D4|HUAWEI TECHNOLOGIES CO.,LTD
+E8FA23|Huawei Device Co., Ltd.
+E8FB1C|AzureWave Technology Inc.
+E8FBE9|Apple, Inc.
+E8FC5F|Ruckus Wireless
+E8FCAF|NETGEAR
+E8FD35|Huawei Device Co., Ltd.
+E8FEBE|Apple, Inc.
+E8FF98|Huawei Device Co., Ltd.
+E8FFF4|Apple, Inc.
+EC01D5|Cisco Systems, Inc
+EC01E2|FOXCONN INTERCONNECT TECHNOLOGY
+EC0273|Hewlett Packard Enterprise
+EC0441|ShenZhen TIGO Semiconductor Co., Ltd.
+EC086B|TP-LINK TECHNOLOGIES CO.,LTD.
+EC08E5|Motorola Mobility LLC, a Lenovo Company
+EC0C96|Nokia
+EC0D51|Apple, Inc.
+EC0DE4|Amazon Technologies Inc.
+EC0EC4|Hon Hai Precision Ind. Co.,Ltd.
+EC1055|Beijing Xiaomi Electronics Co.,Ltd
+EC107B|Samsung Electronics Co.,Ltd
+EC13DB|Juniper Networks
+EC172F|TP-LINK TECHNOLOGIES CO.,LTD.
+EC192E|Cisco Systems, Inc
+EC1A02|HUAWEI TECHNOLOGIES CO.,LTD
+EC1B5F|Hewlett Packard Enterprise
+EC1D53|HUAWEI TECHNOLOGIES CO.,LTD
+EC1D7F|zte corporation
+EC1D8B|Cisco Systems, Inc
+EC1DA9|YEALINK(XIAMEN) NETWORK TECHNOLOGY CO.,LTD.
+EC1F72|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+EC2125|Toshiba Corp.
+EC21E5|Toshiba
+EC2280|D-Link International
+EC233D|HUAWEI TECHNOLOGIES CO.,LTD
+EC237B|zte corporation
+EC2651|Apple, Inc.
+EC26CA|TP-LINK TECHNOLOGIES CO.,LTD.
+EC28D3|Apple, Inc.
+EC2A72|Dell Inc.
+EC2BEB|Amazon Technologies Inc.
+EC2C0D|Apple, Inc.
+EC2C73|Apple, Inc.
+EC2CE2|Apple, Inc.
+EC2E98|AzureWave Technology Inc.
+EC3091|Cisco Systems, Inc
+EC30B3|Xiaomi Communications Co Ltd
+EC315F|Amazon Technologies Inc.
+EC33CC|Hewlett Packard Enterprise
+EC3586|Apple, Inc.
+EC3873|Juniper Networks
+EC388F|HUAWEI TECHNOLOGIES CO.,LTD
+EC3A52|Huawei Device Co., Ltd.
+EC3A56|AzureWave Technology Inc.
+EC3CBB|Huawei Device Co., Ltd.
+EC3DFD|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+EC3EB3|Zyxel Communications Corporation
+EC3EF7|Juniper Networks
+EC4118|XIAOMI Electronics,CO.,LTD
+EC41CA|Shenzhen TecAnswer Technology co.,ltd
+EC41F9|Shenzhen iComm Semiconductor CO.,LTD
+EC42CC|Apple, Inc.
+EC43F6|Zyxel Communications Corporation
+EC4476|Cisco Systems, Inc
+EC4654|Apple, Inc.
+EC4684|Microsoft Corporation
+EC4C8C|Intel Corporate
+EC4D3E|Beijing Xiaomi Mobile Software Co., Ltd
+EC4D47|HUAWEI TECHNOLOGIES CO.,LTD
+EC50A6|Sagemcom Broadband SAS
+EC50AA|Hewlett Packard Enterprise
+EC536F|HUAWEI TECHNOLOGIES CO.,LTD
+EC551C|HUAWEI TECHNOLOGIES CO.,LTD
+EC55F9|Hon Hai Precision Ind. Co.,Ltd.
+EC5623|HUAWEI TECHNOLOGIES CO.,LTD
+EC5865|Shenzhen Xinguodu Technology Co., Ltd
+EC58EA|Ruckus Wireless
+EC59E7|Microsoft Corporation
+EC5A86|Yulong Computer Telecommunication Scientific (Shenzhen) Co.,Ltd
+EC5AA3|Huawei Device Co., Ltd.
+EC5B71|Inventec(Chongqing) Corporation
+EC6073|TP-LINK TECHNOLOGIES CO.,LTD.
+EC6260|Espressif Inc.
+EC63D7|Intel Corporate
+EC64C9|Espressif Inc.
+EC65CC|Panasonic Automotive Systems Company of America
+EC6794|Hewlett Packard Enterprise
+EC6881|Palo Alto Networks
+EC6CB5|zte corporation
+EC725B|zte corporation
+EC7359|Shenzhen Cloudsky Technologies Co., Ltd.
+EC7379|Apple, Inc.
+EC748C|Sony Interactive Entertainment Inc.
+EC74D7|Grandstream Networks Inc
+EC750C|TP-Link Systems Inc.
+EC753E|HUAWEI TECHNOLOGIES CO.,LTD
+EC7949|FUJITSU LIMITED
+EC79C0|zte corporation
+EC7C2C|HUAWEI TECHNOLOGIES CO.,LTD
+EC7C5C|Juniper Networks
+EC7C74|Justone Technologies Co., Ltd.
+EC7CB6|Samsung Electronics Co.,Ltd
+EC7CBA|Hewlett Packard Enterprise
+EC8150|Apple, Inc.
+EC8152|HUAWEI TECHNOLOGIES CO.,LTD
+EC819C|HUAWEI TECHNOLOGIES CO.,LTD
+EC8263|zte corporation
+EC8350|Microsoft Corporation
+EC852F|Apple, Inc.
+EC888F|TP-LINK TECHNOLOGIES CO.,LTD.
+EC8892|Motorola Mobility LLC, a Lenovo Company
+EC8914|HUAWEI TECHNOLOGIES CO.,LTD
+EC89F5|Lenovo Mobile Communication Technology Ltd.
+EC8A4C|zte corporation
+EC8AC4|Amazon Technologies Inc.
+EC8AC7|Fiberhome Telecommunication Technologies Co.,LTD
+EC8C9A|HUAWEI TECHNOLOGIES CO.,LTD
+EC8CA2|Ruckus Wireless
+EC8E12|Nokia
+EC8E77|Intel Corporate
+EC8EB5|Hewlett Packard
+EC90C1|Samsung Electronics Co.,Ltd
+EC94CB|Espressif Inc.
+EC94D5|Juniper Networks
+EC97A2|Apple, Inc.
+EC9A74|Hewlett Packard
+EC9B5B|Nokia Corporation
+EC9B75|Roku, Inc
+EC9B8B|Hewlett Packard Enterprise
+EC9BF3|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+ECA138|Amazon Technologies Inc.
+ECA1CC|Cisco Systems, Inc
+ECA1D1|HUAWEI TECHNOLOGIES CO.,LTD
+ECA62F|HUAWEI TECHNOLOGIES CO.,LTD
+ECA78D|Cisco Systems, Inc
+ECA907|Apple, Inc.
+ECA971|Hangzhou Hikvision Digital Technology Co.,Ltd.
+ECAA25|Samsung Electronics Co.,Ltd
+ECAA8F|HUAWEI TECHNOLOGIES CO.,LTD
+ECAAA0|PEGATRON CORPORATION
+ECADB8|Apple, Inc.
+ECADE0|D-Link International
+ECB157|Sagemcom Broadband SAS
+ECB1D7|Hewlett Packard
+ECB293|Hewlett Packard Enterprise
+ECB313|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+ECB4E8|Wistron Mexico SA de CV
+ECB550|Samsung Electronics Co.,Ltd
+ECB5FA|Philips Lighting BV
+ECB878|Huawei Device Co., Ltd.
+ECB931|TP-Link Systems Inc.
+ECB9A5|Huawei Device Co., Ltd.
+ECBB78|Cisco Systems, Inc
+ECBD1D|Cisco Systems, Inc
+ECBEDD|Sagemcom Broadband SAS
+ECC018|Cisco Systems, Inc
+ECC01B|HUAWEI TECHNOLOGIES CO.,LTD
+ECC342|zte corporation
+ECC3B0|zte corporation
+ECC5D2|Huawei Device Co., Ltd.
+ECC882|Cisco Systems, Inc
+ECC89C|Hangzhou Hikvision Digital Technology Co.,Ltd.
+ECC9FF|Espressif Inc.
+ECCB30|HUAWEI TECHNOLOGIES CO.,LTD
+ECCE13|Cisco Systems, Inc
+ECCED7|Apple, Inc.
+ECD09F|Xiaomi Communications Co Ltd
+ECD508|Apple, Inc.
+ECD61B|Espressif Inc.
+ECD68A|Shenzhen JMicron Intelligent Technology Developmen
+ECD9D1|Shenzhen TG-NET Botone Technology Co.,Ltd.
+ECDA3B|Espressif Inc.
+ECDCAA|Apple, Inc.
+ECDD24|Cisco Systems, Inc
+ECE09B|Samsung Electronics Co.,Ltd
+ECE1A9|Cisco Systems, Inc
+ECE334|Espressif Inc.
+ECE61D|Huawei Device Co., Ltd.
+ECE6A2|Fiberhome Telecommunication Technologies Co.,LTD
+ECE7A7|Intel Corporate
+ECE9D2|Apple, Inc.
+ECE9F5|HUAWEI TECHNOLOGIES CO.,LTD
+ECEBB8|Hewlett Packard Enterprise
+ECED04|Intel Corporate
+ECED73|Motorola Mobility LLC, a Lenovo Company
+ECF0FE|zte corporation
+ECF33C|Intel Corporate
+ECF35B|Nokia Corporation
+ECF40C|Cisco Systems, Inc
+ECF4BB|Dell Inc.
+ECF8D0|HUAWEI TECHNOLOGIES CO.,LTD
+ECFA5C|Beijing Xiaomi Electronics Co., Ltd.
+ECFABC|Espressif Inc.
+ECFC2F|Sagemcom Broadband SAS
+ECFCC6|Hewlett Packard Enterprise
+ECFF3A|Apple, Inc.
+F0038C|AzureWave Technology Inc.
+F003BC|Cisco Systems, Inc
+F004E1|Apple, Inc.
+F0051B|Samsung Electronics Co.,Ltd
+F008D1|Espressif Inc.
+F008F1|Samsung Electronics Co.,Ltd
+F0090D|TP-Link Systems Inc
+F00C51|zte corporation
+F00FEC|HUAWEI TECHNOLOGIES CO.,LTD
+F013C3|SHENZHEN FENDA TECHNOLOGY CO., LTD
+F0161D|Espressif Inc.
+F01628|Technicolor (China) Technology Co., Ltd.
+F01653|YEALINK(XIAMEN) NETWORK TECHNOLOGY CO.,LTD.
+F01898|Apple, Inc.
+F01AA0|Hewlett Packard Enterprise
+F01B24|zte corporation
+F01C13|LG Electronics (Mobile Communications)
+F01C2D|Juniper Networks
+F01D2D|Cisco Systems, Inc
+F01DBC|Microsoft Corporation
+F01FAF|Dell Inc.
+F01FC7|Apple, Inc.
+F020FF|Intel Corporate
+F02475|Apple, Inc.
+F024F9|Espressif Inc.
+F02572|Cisco Systems, Inc
+F0258E|HUAWEI TECHNOLOGIES CO.,LTD
+F025B7|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+F0272D|Amazon Technologies Inc.
+F027A0|Apple, Inc.
+F02929|Cisco Systems, Inc
+F02B7C|Extreme Networks, Inc.
+F02C59|Chipsea Technologies (Shenzhen) Crop.
+F02F4B|Apple, Inc.
+F02F50|Shenzhen SEI Robotics Co.,Ltd
+F02F74|ASUSTek COMPUTER INC.
+F02F9E|Amazon Technologies Inc.
+F02FA7|HUAWEI TECHNOLOGIES CO.,LTD
+F02FBA|Apple, Inc.
+F033E5|HUAWEI TECHNOLOGIES CO.,LTD
+F037A1|Huike Electronics (SHENZHEN) CO., LTD.
+F037CF|Huawei Device Co., Ltd.
+F03965|Samsung Electronics Co.,Ltd
+F03E90|Ruckus Wireless
+F03F95|HUAWEI TECHNOLOGIES CO.,LTD
+F0407B|Fiberhome Telecommunication Technologies Co.,LTD
+F040D9|Apple, Inc.
+F0421C|Intel Corporate
+F042F5|Huawei Device Co., Ltd.
+F04347|HUAWEI TECHNOLOGIES CO.,LTD
+F04A02|Cisco Systems, Inc
+F04B3A|Juniper Networks
+F04DA2|Dell Inc.
+F04DD4|Sagemcom Broadband SAS
+F04EA4|HP Inc.
+F04F7C|Amazon Technologies Inc.
+F05494|Honeywell Connected Building
+F05501|Huawei Device Co., Ltd.
+F057A6|Intel Corporate
+F05A09|Samsung Electronics Co.,Ltd
+F05B7B|Samsung Electronics Co.,Ltd
+F05C0E|Huawei Device Co., Ltd.
+F05C19|Hewlett Packard Enterprise
+F05C77|Google, Inc.
+F05CD5|Apple, Inc.
+F05D88|HUAWEI TECHNOLOGIES CO.,LTD
+F061C0|Hewlett Packard Enterprise
+F0620D|Shenzhen Egreat Tech Corp.,Ltd
+F063F9|HUAWEI TECHNOLOGIES CO.,LTD
+F06426|Extreme Networks, Inc.
+F065AE|Samsung Electronics Co.,Ltd
+F067B1|Samsung Electronics Co.,Ltd
+F068E3|AzureWave Technology Inc.
+F06BCA|Samsung Electronics Co.,Ltd
+F06C5D|Xiaomi Communications Co Ltd
+F06C73|Nokia
+F06E0B|Microsoft Corporation
+F06FCE|Ruckus Wireless
+F0704F|Samsung Electronics Co.,Ltd
+F0728C|Samsung Electronics Co.,Ltd
+F072EA|Google, Inc.
+F074C1|Blink by Amazon
+F0761C|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+F0766F|Apple, Inc.
+F077C3|Intel Corporate
+F07807|Apple, Inc.
+F07816|Cisco Systems, Inc
+F07959|ASUSTek COMPUTER INC.
+F07960|Apple, Inc.
+F07A55|zte corporation
+F07B65|Sagemcom Broadband SAS
+F07BCB|Hon Hai Precision Ind. Co.,Ltd.
+F07CC7|Juniper Networks
+F07D68|D-Link Corporation
+F07F06|Cisco Systems, Inc
+F08173|Amazon Technologies Inc.
+F08175|Sagemcom Broadband SAS
+F08261|Sagemcom Broadband SAS
+F084C9|zte corporation
+F085C1|SHENZHEN RF-LINK TECHNOLOGY CO.,LTD.
+F08756|Zyxel Communications Corporation
+F0877F|Magnetar Technology Shenzhen Co., LTD.
+F08A76|Samsung Electronics Co.,Ltd
+F08CFB|Fiberhome Telecommunication Technologies Co.,LTD
+F09008|Shenzhen Skyworth Digital Technology CO., Ltd
+F0921C|Hewlett Packard
+F09838|HUAWEI TECHNOLOGIES CO.,LTD
+F0989D|Apple, Inc.
+F099B6|Apple, Inc.
+F099BF|Apple, Inc.
+F09BB8|HUAWEI TECHNOLOGIES CO.,LTD
+F09CE9|Extreme Networks, Inc.
+F09E4A|Intel Corporate
+F09E63|Cisco Systems, Inc
+F09E9E|Espressif Inc.
+F09FC2|Ubiquiti Inc
+F09FFC|SHARP Corporation
+F0A0B1|HUAWEI TECHNOLOGIES CO.,LTD
+F0A225|Amazon Technologies Inc.
+F0A35A|Apple, Inc.
+F0A4EA|Huawei Device Co., Ltd.
+F0A731|TP-Link Systems Inc
+F0A882|shenzhen trolink Technology Co.,Ltd
+F0A951|HUAWEI TECHNOLOGIES CO.,LTD
+F0AB1F|zte corporation
+F0ABF3|Fiberhome Telecommunication Technologies Co.,LTD
+F0ABFA|Shenzhen Rayin Technology Co.,Ltd
+F0B040|HUNAN FN-LINK TECHNOLOGY LIMITED
+F0B052|Ruckus Wireless
+F0B0E7|Apple, Inc.
+F0B11D|Nokia
+F0B13F|Huawei Device Co., Ltd.
+F0B2B9|Intel Corporate
+F0B2E5|Cisco Systems, Inc
+F0B3EC|Apple, Inc.
+F0B429|Xiaomi Communications Co Ltd
+F0B479|Apple, Inc.
+F0B4D2|D-Link International
+F0B61E|Intel Corporate
+F0BDEE|Huawei Device Co., Ltd.
+F0BF97|Sony Corporation
+F0C1F1|Apple, Inc.
+F0C371|Apple, Inc.
+F0C42F|Huawei Device Co., Ltd.
+F0C478|HUAWEI TECHNOLOGIES CO.,LTD
+F0C725|Apple, Inc.
+F0C814|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+F0C850|HUAWEI TECHNOLOGIES CO.,LTD
+F0C8B5|HUAWEI TECHNOLOGIES CO.,LTD
+F0CBA1|Apple, Inc.
+F0CCE0|Shenzhen All-Smartlink Technology Co.,Ltd.
+F0CD31|Samsung Electronics Co.,Ltd
+F0D018|Hewlett Packard Enterprise
+F0D1A9|Apple, Inc.
+F0D2F1|Amazon Technologies Inc.
+F0D31F|Apple, Inc.
+F0D32B|Juniper Networks
+F0D415|Intel Corporate
+F0D4E2|Dell Inc.
+F0D5BF|Intel Corporate
+F0D635|Apple, Inc.
+F0D793|Apple, Inc.
+F0D7AA|Motorola Mobility LLC, a Lenovo Company
+F0D7EE|Huawei Device Co., Ltd.
+F0D805|Cisco Systems, Inc
+F0DBE2|Apple, Inc.
+F0DBF8|Apple, Inc.
+F0DCE2|Apple, Inc.
+F0DEF1|Wistron Infocomm (Zhongshan) Corporation
+F0E426|Samsung Electronics Co.,Ltd
+F0E4A2|HUAWEI TECHNOLOGIES CO.,LTD
+F0E752|Shenzhen Huajuxin Semiconductor Co.,ltd
+F0E77E|Samsung Electronics Co.,Ltd
+F0EC80|Zero Boundary Singularity Technology(Shenzhen)
+F0ED19|zte corporation
+F0EE10|Samsung Electronics Co.,Ltd
+F0EE7A|Apple, Inc.
+F0EF86|Google, Inc.
+F0F002|Hon Hai Precision Ind. Co.,Ltd.
+F0F0A4|Amazon Technologies Inc.
+F0F336|TP-LINK TECHNOLOGIES CO.,LTD.
+F0F564|Samsung Electronics Co.,Ltd
+F0F5BD|Espressif Inc.
+F0F61C|Apple, Inc.
+F0F6C1|Sonos, Inc.
+F0F755|Cisco Systems, Inc
+F0F7E7|HUAWEI TECHNOLOGIES CO.,LTD
+F0F7FC|HUAWEI TECHNOLOGIES CO.,LTD
+F0F832|Google, Inc.
+F0FABA|NVIDIA Corporation
+F0FAC7|Huawei Device Co., Ltd.
+F0FEE7|Huawei Device Co., Ltd.
+F400A2|Samsung Electronics Co.,Ltd
+F40223|PAX Computer Technology(Shenzhen) Ltd.
+F40228|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+F40270|Dell Inc.
+F40304|Google, Inc.
+F4032A|Amazon Technologies Inc.
+F40343|Hewlett Packard Enterprise
+F40595|Sagemcom Broadband SAS
+F40616|Apple, Inc.
+F40669|Intel Corporate
+F406A3|Huawei Device Co., Ltd.
+F409D8|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+F40A2E|Shenzhen Skyworth Digital Technology CO., Ltd
+F40E01|Apple, Inc.
+F40E22|Samsung Electronics Co.,Ltd
+F40F1B|Cisco Systems, Inc
+F40F24|Apple, Inc.
+F412DA|zte corporation
+F412FA|Espressif Inc.
+F41A9C|Xiaomi Communications Co Ltd
+F41AB0|Shenzhen Xingguodu Technology Co., Ltd.
+F41AF7|zte corporation
+F41BA1|Apple, Inc.
+F41C71|SHENZHEN SANMU COMMUNICATION TECHNOLOGY CO., LTD
+F41D6B|HUAWEI TECHNOLOGIES CO.,LTD
+F41E57|Routerboard.com
+F41F88|zte corporation
+F41FC2|Cisco Systems, Inc
+F421CA|Apple, Inc.
+F4248B|HUAWEI TECHNOLOGIES CO.,LTD
+F425FE|HUAWEI TECHNOLOGIES CO.,LTD
+F42679|Intel Corporate
+F42853|Zioncom Electronics (Shenzhen) Ltd.
+F42A7D|TP-LINK TECHNOLOGIES CO.,LTD.
+F42B8C|Samsung Electronics Co.,Ltd
+F42D06|zte corporation
+F42DC9|Espressif Inc.
+F42E48|zte corporation
+F42E7F|Hewlett Packard Enterprise
+F4308B|Xiaomi Communications Co Ltd
+F430B9|Hewlett Packard
+F431C3|Apple, Inc.
+F43392|Cisco Systems, Inc
+F433B7|Apple, Inc.
+F434F0|Apple, Inc.
+F437B7|Apple, Inc.
+F438C1|Huawei Device Co., Ltd.
+F43909|Hewlett Packard
+F439A6|Apple, Inc.
+F43A7B|zte corporation
+F43BD8|Intel Corporate
+F43C3B|HUNAN FN-LINK TECHNOLOGY LIMITED
+F43E61|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+F4419E|Huawei Device Co., Ltd.
+F4428F|Samsung Electronics Co.,Ltd
+F4442C|Shenzhen SuperElectron Technology Co.,Ltd.
+F44588|HUAWEI TECHNOLOGIES CO.,LTD
+F44637|Intel Corporate
+F449EF|EMSTONE
+F44B2A|Cisco SPVTG
+F44C70|Skyworth Digital Technology(Shenzhen) Co.,Ltd
+F44C7F|HUAWEI TECHNOLOGIES CO.,LTD
+F44D5C|Zyxel Communications Corporation
+F44E05|Cisco Systems, Inc
+F44EE3|Intel Corporate
+F44FD3|shenzhen hemuwei technology co.,ltd
+F45293|Apple, Inc.
+F453E4|HUAWEI TECHNOLOGIES CO.,LTD
+F45424|Extreme Networks, Inc.
+F4559C|HUAWEI TECHNOLOGIES CO.,LTD
+F4573E|Fiberhome Telecommunication Technologies Co.,LTD
+F45B29|HUAWEI TECHNOLOGIES CO.,LTD
+F45BB4|Cisco Systems, Inc
+F45C42|Huawei Device Co., Ltd.
+F45C89|Apple, Inc.
+F45FD4|Cisco SPVTG
+F460E2|Xiaomi Communications Co Ltd
+F462DC|Huawei Device Co., Ltd.
+F4631F|HUAWEI TECHNOLOGIES CO.,LTD
+F46412|Sony Interactive Entertainment Inc.
+F4645D|Toshiba
+F4650B|Espressif Inc.
+F465A6|Apple, Inc.
+F4672D|ShenZhen Topstar Technology Company
+F46802|HUAWEI TECHNOLOGIES CO.,LTD
+F46A92|SHENZHEN FAST TECHNOLOGIES CO.,LTD
+F46AD7|Microsoft Corporation
+F46ADD|Liteon Technology Corporation
+F46B8C|Hon Hai Precision Industry Co., Ltd.
+F46BEF|Sagemcom Broadband SAS
+F46D04|ASUSTek COMPUTER INC.
+F46D2F|TP-LINK TECHNOLOGIES CO.,LTD.
+F46D3F|Intel Corporate
+F46DE2|zte corporation
+F46E95|Extreme Networks, Inc.
+F46FED|Fiberhome Telecommunication Technologies Co.,LTD
+F47190|Samsung Electronics Co.,Ltd
+F47470|Cisco Systems, Inc
+F478AC|Apple, Inc.
+F47946|HUAWEI TECHNOLOGIES CO.,LTD
+F47960|HUAWEI TECHNOLOGIES CO.,LTD
+F47B09|Intel Corporate
+F47B5E|Samsung Electronics Co.,Ltd
+F47D8F|Google, Inc.
+F47DEF|Samsung Electronics Co.,Ltd
+F47F35|Cisco Systems, Inc
+F48139|CANON INC.
+F481C4|Apple, Inc.
+F483CD|TP-LINK TECHNOLOGIES CO.,LTD.
+F4848D|TP-LINK TECHNOLOGIES CO.,LTD.
+F487C5|Huawei Device Co., Ltd.
+F48918|HUAWEI TECHNOLOGIES CO.,LTD
+F48974|Cisco Systems, Inc
+F48B32|Xiaomi Communications Co Ltd
+F48C50|Intel Corporate
+F48CEB|D-Link International
+F48E09|Nokia Corporation
+F48E38|Dell Inc.
+F48E92|HUAWEI TECHNOLOGIES CO.,LTD
+F492BF|Ubiquiti Inc
+F4939F|Hon Hai Precision Industry Co., Ltd.
+F49634|Intel Corporate
+F49AB1|Hewlett Packard Enterprise
+F49F54|Samsung Electronics Co.,Ltd
+F49FF3|HUAWEI TECHNOLOGIES CO.,LTD
+F4A157|Huawei Device Co., Ltd.
+F4A1A6|Apple, Inc.
+F4A310|Apple, Inc.
+F4A3C2|Shenzhen iComm Semiconductor CO.,LTD
+F4A475|Intel Corporate
+F4A4D6|HUAWEI TECHNOLOGIES CO.,LTD
+F4A59D|Huawei Device Co., Ltd.
+F4A739|Juniper Networks
+F4A80D|Wistron InfoComm(Kunshan)Co.,Ltd.
+F4A997|CANON INC.
+F4ACC1|Cisco Systems, Inc
+F4AFE7|Apple, Inc.
+F4B1C2|Zhejiang Dahua Technology Co., Ltd.
+F4B24E|Huawei Device Co., Ltd.
+F4B301|Intel Corporate
+F4B52F|Juniper Networks
+F4B599|Apple, Inc.
+F4B5AA|zte corporation
+F4B78D|HUAWEI TECHNOLOGIES CO.,LTD
+F4B7E2|Hon Hai Precision Ind. Co.,Ltd.
+F4B821|Cisco Systems, Inc
+F4B8A7|zte corporation
+F4BC97|Shenzhen Crave Communication Co., LTD
+F4BCDA|Shenzhen Jingxun Software Telecommunication Technology Co.,Ltd
+F4BD9E|Cisco Systems, Inc
+F4BDAE|Shenzhen V-Link Technology CO., LTD.
+F4BEEC|Apple, Inc.
+F4BF80|HUAWEI TECHNOLOGIES CO.,LTD
+F4BFA8|Juniper Networks
+F4C248|Samsung Electronics Co.,Ltd
+F4C4D6|Shenzhen Xinfa Electronic Co.,ltd
+F4C714|HUAWEI TECHNOLOGIES CO.,LTD
+F4C7AA|Marvell Semiconductors
+F4C88A|Intel Corporate
+F4CB52|HUAWEI TECHNOLOGIES CO.,LTD
+F4CBE7|Apple, Inc.
+F4CC55|Juniper Networks
+F4CE23|Intel Corporate
+F4CE46|Hewlett Packard
+F4CE48|Extreme Networks, Inc.
+F4CFA2|Espressif Inc.
+F4CFE2|Cisco Systems, Inc
+F4D108|Intel Corporate
+F4D454|Shenzhen Skyworth Digital Technology CO., Ltd
+F4D488|Apple, Inc.
+F4D58A|Palo Alto Networks
+F4D9FB|Samsung Electronics Co.,Ltd
+F4DBE3|Apple, Inc.
+F4DBE6|Cisco Systems, Inc
+F4DCF9|HUAWEI TECHNOLOGIES CO.,LTD
+F4DD06|Samsung Electronics Co.,Ltd
+F4DEAF|HUAWEI TECHNOLOGIES CO.,LTD
+F4E1FC|Hewlett Packard Enterprise
+F4E2C6|Ubiquiti Inc
+F4E3FB|HUAWEI TECHNOLOGIES CO.,LTD
+F4E451|HUAWEI TECHNOLOGIES CO.,LTD
+F4E4AD|zte corporation
+F4E5F2|HUAWEI TECHNOLOGIES CO.,LTD
+F4E84F|zte corporation
+F4E8C7|Apple, Inc.
+F4EA67|Cisco Systems, Inc
+F4EAB5|Extreme Networks, Inc.
+F4EB38|Sagemcom Broadband SAS
+F4EC38|TP-LINK TECHNOLOGIES CO.,LTD.
+F4ED5F|SHENZHEN KTC TECHNOLOGY GROUP
+F4EE08|Dell Inc.
+F4EE31|Cisco Systems, Inc
+F4F15A|Apple, Inc.
+F4F19E|Wistron InforComm (Zhongshan) Corporation
+F4F1E1|Motorola Mobility LLC, a Lenovo Company
+F4F26D|TP-LINK TECHNOLOGIES CO.,LTD.
+F4F28A|HUAWEI TECHNOLOGIES CO.,LTD
+F4F309|Samsung Electronics Co.,Ltd
+F4F50B|TP-Link Systems Inc.
+F4F524|Motorola Mobility LLC, a Lenovo Company
+F4F5A5|Nokia Corporation
+F4F5D8|Google, Inc.
+F4F5DB|Xiaomi Communications Co Ltd
+F4F5E8|Google, Inc.
+F4F647|zte corporation
+F4F951|Apple, Inc.
+F4FBB8|HUAWEI TECHNOLOGIES CO.,LTD
+F4FC49|zte corporation
+F4FE3E|Apple, Inc.
+F4FEFB|Samsung Electronics Co.,Ltd
+F800A1|HUAWEI TECHNOLOGIES CO.,LTD
+F80113|HUAWEI TECHNOLOGIES CO.,LTD
+F801B4|LG Electronics
+F80377|Apple, Inc.
+F8042E|SAMSUNG ELECTRO-MECHANICS(THAILAND)
+F8075D|Huawei Device Co., Ltd.
+F8084F|Sagemcom Broadband SAS
+F80BCB|Cisco Systems, Inc
+F80CF3|LG Electronics (Mobile Communications)
+F80D43|Hon Hai Precision Ind. Co.,Ltd.
+F80D60|CANON INC.
+F80DA9|Zyxel Communications Corporation
+F80DAC|HP Inc.
+F80DF0|zte corporation
+F80F41|Wistron Infocomm (Zhongshan) Corporation
+F80F6F|Cisco Systems, Inc
+F80FF9|Google, Inc.
+F81093|Apple, Inc.
+F81308|Nokia
+F814DD|Cisco Systems, Inc
+F81547|Avaya Inc
+F8160C|Shenzhen iComm Semiconductor CO.,LTD
+F81654|Intel Corporate
+F8172D|Tuya Smart Inc.
+F81A2B|Google, Inc.
+F81A67|TP-LINK TECHNOLOGIES CO.,LTD.
+F81E49|Apple, Inc.
+F81EDF|Apple, Inc.
+F81F32|Motorola Mobility LLC, a Lenovo Company
+F820A9|Huawei Device Co., Ltd.
+F82229|Nokia Shanghai Bell Co., Ltd.
+F82387|Shenzhen Horn Audio Co.,Ltd.
+F823B2|HUAWEI TECHNOLOGIES CO.,LTD
+F82551|Seiko Epson Corporation
+F82793|Apple, Inc.
+F82819|Liteon Technology Corporation
+F828C9|HUAWEI TECHNOLOGIES CO.,LTD
+F8293A|HUAWEI TECHNOLOGIES CO.,LTD
+F82AE2|Apple, Inc.
+F82B7F|Huawei Device Co., Ltd.
+F82D7C|Apple, Inc.
+F82E3F|HUAWEI TECHNOLOGIES CO.,LTD
+F82F65|Huawei Device Co., Ltd.
+F82FA8|Hon Hai Precision Ind. Co.,Ltd.
+F832E4|ASUSTek COMPUTER INC.
+F83441|Intel Corporate
+F83869|LG Electronics
+F83880|Apple, Inc.
+F83918|Cisco Systems, Inc
+F83B7E|Huawei Device Co., Ltd.
+F83C44|SHENZHEN TRANSCHAN TECHNOLOGY LIMITED
+F83DC6|AzureWave Technology Inc.
+F83DFF|HUAWEI TECHNOLOGIES CO.,LTD
+F83E95|HUAWEI TECHNOLOGIES CO.,LTD
+F83F51|Samsung Electronics Co.,Ltd
+F84288|Apple, Inc.
+F843EE|Espressif Inc.
+F843EF|Xiaomi Communications Co Ltd
+F845C4|Shenzhen Netforward Micro-Electronic Co., Ltd.
+F8461C|Sony Interactive Entertainment Inc.
+F847E3|Shenzhen Skyworth Digital Technology CO., Ltd
+F84ABF|HUAWEI TECHNOLOGIES CO.,LTD
+F84CDA|HUAWEI TECHNOLOGIES CO.,LTD
+F84D33|Fiberhome Telecommunication Technologies Co.,LTD
+F84D89|Apple, Inc.
+F84DFC|Hangzhou Hikvision Digital Technology Co.,Ltd.
+F84E17|Sony Corporation
+F84E58|Samsung Electronics Co.,Ltd
+F84E73|Apple, Inc.
+F84F57|Cisco Systems, Inc
+F85329|HUAWEI TECHNOLOGIES CO.,LTD
+F854B8|Amazon Technologies Inc.
+F854F6|AzureWave Technology Inc.
+F856C3|zte corporation
+F85971|Intel Corporate
+F85B1B|Espressif Inc.
+F85B6E|Samsung Electronics Co.,Ltd
+F85C24|Sonos Inc.
+F85C4D|Nokia
+F85C7D|Shenzhen Honesty Electronics Co.,Ltd.
+F85C7E|Shenzhen Honesty Electronics Co.,Ltd.
+F85E3C|SHENZHEN ZHIBOTONG ELECTRONICS CO.,LTD
+F85EA0|Intel Corporate
+F85F2A|Nokia Corporation
+F860F0|Hewlett Packard Enterprise
+F86214|Apple, Inc.
+F8633F|Intel Corporate
+F864B8|zte corporation
+F8665A|Apple, Inc.
+F866D1|Hon Hai Precision Ind. Co.,Ltd.
+F866F2|Cisco Systems, Inc
+F868FF|Cisco Systems, Inc
+F86BD9|Cisco Systems, Inc
+F86C03|Shenzhen Teleone Technology Co., Ltd
+F86EEE|HUAWEI TECHNOLOGIES CO.,LTD
+F86FB0|TP-LINK TECHNOLOGIES CO.,LTD.
+F86FC1|Apple, Inc.
+F86FDE|Shenzhen Goodix Technology Co.,Ltd.
+F8710C|Xiaomi Communications Co Ltd
+F871A6|Apple, Inc.
+F872EA|Cisco Systems, Inc
+F8731A|zte corporation
+F87394|NETGEAR
+F873A2|Avaya Inc
+F873DF|Apple, Inc.
+F87588|HUAWEI TECHNOLOGIES CO.,LTD
+F875A4|LCFC(Hefei) Electronics Technology co., ltd
+F877B8|Samsung Electronics Co.,Ltd
+F87907|Huawei Device Co., Ltd.
+F87928|zte corporation
+F87A41|Cisco Systems, Inc
+F87B20|Cisco Systems, Inc
+F87D3F|Huawei Device Co., Ltd.
+F87D76|Apple, Inc.
+F88306|Beijing Xiaomi Mobile Software Co., Ltd
+F88479|Yaojin Technology(Shenzhen)Co.,Ltd
+F884F2|Samsung Electronics Co.,Ltd
+F887F1|Apple, Inc.
+F8893C|Inventec Appliances Corp.
+F88C21|TP-LINK TECHNOLOGIES CO.,LTD.
+F88F07|Samsung Electronics Co.,Ltd
+F88FC8|Chipsea Technologies (Shenzhen) Corp.
+F88FCA|Google, Inc.
+F894C2|Intel Corporate
+F89522|HUAWEI TECHNOLOGIES CO.,LTD
+F895C7|LG Electronics (Mobile Communications)
+F895EA|Apple, Inc.
+F89753|Huawei Device Co., Ltd.
+F898B9|HUAWEI TECHNOLOGIES CO.,LTD
+F898EF|HUAWEI TECHNOLOGIES CO.,LTD
+F89A25|HUAWEI TECHNOLOGIES CO.,LTD
+F89A78|HUAWEI TECHNOLOGIES CO.,LTD
+F89B6E|Nokia Solutions and Networks GmbH & Co. KG
+F89D9D|Shenzhen MinewSemi Co.,LTD.
+F89E28|Cisco Meraki
+F89E94|Intel Corporate
+F8A26D|CANON INC.
+F8A2D6|Liteon Technology Corporation
+F8A34F|zte corporation
+F8A45F|Xiaomi Communications Co Ltd
+F8A5C5|Cisco Systems, Inc
+F8A73A|Cisco Systems, Inc
+F8A963|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+F8A986|Microsoft Corporation
+F8A9D0|LG Electronics (Mobile Communications)
+F8AA8A|Axview Technology (Shenzhen) Co.,Ltd
+F8AB05|Sagemcom Broadband SAS
+F8AB82|Xiaomi Communications Co Ltd
+F8ABE5|shenzhen worldelite electronics co., LTD
+F8AC65|Intel Corporate
+F8AF05|Huawei Device Co., Ltd.
+F8AFDB|Fiberhome Telecommunication Technologies Co.,LTD
+F8B132|HUAWEI TECHNOLOGIES CO.,LTD
+F8B156|Dell Inc.
+F8B1DD|Apple, Inc.
+F8B22C|Roku, Inc
+F8B3B7|Espressif Inc.
+F8B46A|Hewlett Packard
+F8B54D|Intel Corporate
+F8B7E2|Cisco Systems, Inc
+F8B8B4|Shenzhen Skyworth Digital Technology CO., Ltd
+F8BAE6|Nokia
+F8BC12|Dell Inc.
+F8BF09|HUAWEI TECHNOLOGIES CO.,LTD
+F8C001|Juniper Networks
+F8C116|Juniper Networks
+F8C288|Cisco Systems, Inc
+F8C39E|HUAWEI TECHNOLOGIES CO.,LTD
+F8C3CC|Apple, Inc.
+F8C650|Cisco Systems, Inc
+F8C903|TP-LINK TECHNOLOGIES CO.,LTD.
+F8C96C|Fiberhome Telecommunication Technologies Co.,LTD
+F8CAB8|Dell Inc.
+F8CB15|Apple, Inc.
+F8CE07|ZHEJIANG DAHUA TECHNOLOGYCO.,LTD
+F8CE21|TP-LINK TECHNOLOGIES CO.,LTD.
+F8CE72|Wistron Corporation
+F8CF52|Intel Corporate
+F8CFC5|Motorola Mobility LLC, a Lenovo Company
+F8D027|Seiko Epson Corporation
+F8D0AC|Sony Interactive Entertainment Inc.
+F8D0BD|Samsung Electronics Co.,Ltd
+F8D111|TP-LINK TECHNOLOGIES CO.,LTD.
+F8D3F0|Apple, Inc.
+F8DA0C|Hon Hai Precision Ind. Co.,Ltd.
+F8DB88|Dell Inc.
+F8DE73|HUAWEI TECHNOLOGIES CO.,LTD
+F8DFA8|zte corporation
+F8E079|Motorola Mobility LLC, a Lenovo Company
+F8E252|Apple, Inc.
+F8E4A4|Fiberhome Telecommunication Technologies Co.,LTD
+F8E4E3|Intel Corporate
+F8E57E|Cisco Systems, Inc
+F8E5CE|Apple, Inc.
+F8E61A|Samsung Electronics Co.,Ltd
+F8E71E|Ruckus Wireless
+F8E811|HUAWEI TECHNOLOGIES CO.,LTD
+F8E903|D-Link International
+F8E94E|Apple, Inc.
+F8E94F|Cisco Systems, Inc
+F8EDFC|HP Inc.
+F8EF5D|Motorola Mobility LLC, a Lenovo Company
+F8F1B6|Motorola Mobility LLC, a Lenovo Company
+F8F1E6|Samsung Electronics Co.,Ltd
+F8F21E|Intel Corporate
+F8F2F0|Chipsea Technologies (Shenzhen) Crop.
+F8F3D3|Shenzhen Gotron electronic CO.,LTD
+F8F58C|Apple, Inc.
+F8F6B7|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+F8F7B9|HUAWEI TECHNOLOGIES CO.,LTD
+F8FCE1|Amazon Technologies Inc.
+F8FE5E|Intel Corporate
+F8FF5F|Shenzhen Communication Technology Co.,Ltd
+F8FFC2|Apple, Inc.
+FC0012|Toshiba Samsung Storage Technolgoy Korea Corporation
+FC012C|Espressif Inc.
+FC017C|Hon Hai Precision Ind. Co.,Ltd.
+FC0296|Xiaomi Communications Co Ltd
+FC039F|Samsung Electronics Co.,Ltd
+FC068C|SHENZHEN MICIPC TECHNOLOGY CO.,LTD
+FC0736|Huawei Device Co., Ltd.
+FC084A|FUJITSU LIMITED
+FC0A81|Extreme Networks, Inc.
+FC0C45|Shenzhen SuperElectron Technology Co.,Ltd.
+FC0F76|Amazon Technologies Inc.
+FC0FE6|Sony Interactive Entertainment Inc.
+FC101A|Palo Alto Networks
+FC1165|Cambium Networks Limited
+FC1193|HUAWEI TECHNOLOGIES CO.,LTD
+FC122C|HUAWEI TECHNOLOGIES CO.,LTD
+FC15B4|Hewlett Packard
+FC1803|HUAWEI TECHNOLOGIES CO.,LTD
+FC183C|Apple, Inc.
+FC1910|Samsung Electronics Co.,Ltd
+FC1999|Xiaomi Communications Co Ltd
+FC1A46|Samsung Electronics Co.,Ltd
+FC1BD1|HUAWEI TECHNOLOGIES CO.,LTD
+FC1CA1|Nokia
+FC1D3A|HUAWEI TECHNOLOGIES CO.,LTD
+FC1D43|Apple, Inc.
+FC1F19|SAMSUNG ELECTRO MECHANICS CO., LTD.
+FC2120|Cisco Systems, Inc
+FC221C|Shenzhen Xunman Technology Co., Ltd
+FC22F4|Zyxel Communications Corporation
+FC2325|EosTek (Shenzhen) Co., Ltd.
+FC23CD|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+FC253F|Apple, Inc.
+FC2640|Huawei Device Co., Ltd.
+FC2A9C|Apple, Inc.
+FC2D5E|zte corporation
+FC2FAA|Nokia
+FC315D|Apple, Inc.
+FC3342|Juniper Networks
+FC3497|ASUSTek COMPUTER INC.
+FC34E2|Shenzhen YOUHUA Technology Co., Ltd
+FC376D|SHENZHEN BILIAN ELECTRONIC CO.，LTD
+FC386A|Shenzhen Skyworth Digital Technology CO., Ltd
+FC395A|SonicWall
+FC3CD7|Tuya Smart Inc.
+FC3F7C|HUAWEI TECHNOLOGIES CO.,LTD
+FC3FDB|Hewlett Packard
+FC4009|zte corporation
+FC4116|Google, Inc.
+FC4203|Samsung Electronics Co.,Ltd
+FC4345|Xiaomi Communications Co Ltd
+FC4482|Intel Corporate
+FC449F|zte corporation
+FC4596|COMPAL INFORMATION (KUNSHAN) CO., LTD.
+FC478D|SHENZHEN TOPWELL TECHNOLOGY CO., LTD.
+FC47D8|Apple, Inc.
+FC48EF|HUAWEI TECHNOLOGIES CO.,LTD
+FC492D|Amazon Technologies Inc.
+FC4A47|Nokia
+FC4CEA|Dell Inc.
+FC4CEF|Huawei Device Co., Ltd.
+FC4D8C|SHENZHEN PANTE ELECTRONICS TECHNOLOGY CO., LTD
+FC4DA6|HUAWEI TECHNOLOGIES CO.,LTD
+FC4E6D|HUAWEI TECHNOLOGIES CO.,LTD
+FC4EA4|Apple, Inc.
+FC50D6|Huawei Device Co., Ltd.
+FC51B5|HUAWEI TECHNOLOGIES CO.,LTD
+FC52CE|Control iD
+FC5557|Apple, Inc.
+FC5708|Broadcom Limited
+FC589A|Cisco Systems, Inc
+FC597A|Zebra Technologies Inc.
+FC5B39|Cisco Systems, Inc
+FC5B8C|Xiaomi Communications Co Ltd
+FC5C45|Ruckus Wireless
+FC5CEE|LCFC(Hefei) Electronics Technology co., ltd
+FC5F49|Zhejiang Dahua Technology Co., Ltd.
+FC61E9|Fiberhome Telecommunication Technologies Co.,LTD
+FC643A|Samsung Electronics Co.,Ltd
+FC64BA|Xiaomi Communications Co Ltd
+FC65B3|Huawei Device Co., Ltd.
+FC65DE|Amazon Technologies Inc.
+FC6637|Sagemcom Broadband SAS
+FC66CF|Apple, Inc.
+FC671F|Tuya Smart Inc.
+FC6D77|Intel Corporate
+FC6E83|Samsung Electronics Co.,Ltd
+FC7288|Cisco Systems, Inc
+FC73FB|HUAWEI TECHNOLOGIES CO.,LTD
+FC7516|D-Link International
+FC7774|Intel Corporate
+FC79DD|Huawei Device Co., Ltd.
+FC7A58|Shenzhen Skyworth Digital Technology CO., Ltd
+FC7FF1|Hewlett Packard Enterprise
+FC8399|Avaya Inc
+FC862A|Huawei Device Co., Ltd.
+FC8743|HUAWEI TECHNOLOGIES CO.,LTD
+FC8827|Apple, Inc.
+FC8A3D|zte corporation
+FC8AF7|zte corporation
+FC8B97|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+FC8C11|Microsoft Corporation
+FC8F7D|SHENZHEN GONGJIN ELECTRONICS CO.,LT
+FC8F90|Samsung Electronics Co.,Ltd
+FC915D|Google, Inc.
+FC923B|Nokia Corporation
+FC931D|HUAWEI TECHNOLOGIES CO.,LTD
+FC934E|REALTEK SEMICONDUCTOR CORP.
+FC936B|Samsung Electronics Co.,Ltd
+FC942E|Cisco Meraki
+FC9435|HUAWEI TECHNOLOGIES CO.,LTD
+FC94CE|zte corporation
+FC9643|Juniper Networks
+FC9947|Cisco Systems, Inc
+FC9CA7|Apple, Inc.
+FC9D05|Micro-Star INTL CO., LTD.
+FC9DD2|Apple, Inc.
+FC9E53|Intel Corporate
+FC9F2A|Zyxel Communications Corporation
+FC9FFD|Hangzhou Hikvision Digital Technology Co.,Ltd.
+FCA0F3|HUAWEI TECHNOLOGIES CO.,LTD
+FCA13E|Samsung Electronics Co.,Ltd
+FCA183|Amazon Technologies Inc.
+FCA27E|HUAWEI TECHNOLOGIES CO.,LTD
+FCA386|SHENZHEN CHUANGWEI-RGB ELECTRONICS CO.,LTD
+FCA5C8|Apple, Inc.
+FCA621|Samsung Electronics Co.,Ltd
+FCA667|Amazon Technologies Inc.
+FCA6CD|Fiberhome Telecommunication Technologies Co.,LTD
+FCA841|Avaya Inc
+FCA9F5|Xiaomi Communications Co Ltd
+FCAA14|GIGA-BYTE TECHNOLOGY CO.,LTD.
+FCAA81|Apple, Inc.
+FCAAB6|Samsung Electronics Co.,Ltd
+FCAB90|HUAWEI TECHNOLOGIES CO.,LTD
+FCABF5|zte corporation
+FCB10D|Shenzhen Tian Kun Technology Co.,LTD.
+FCB214|Apple, Inc.
+FCB3AA|Intel Corporate
+FCB3BC|Intel Corporate
+FCB467|Espressif Inc.
+FCB585|Shenzhen Water World Information Co.,Ltd.
+FCB69D|Zhejiang Dahua Technology Co., Ltd.
+FCB6D8|Apple, Inc.
+FCB9DF|Motorola Mobility LLC, a Lenovo Company
+FCBBA1|Shenzhen Minicreate Technology Co.,Ltd
+FCBCD1|HUAWEI TECHNOLOGIES CO.,LTD
+FCC17D|Xiaomi Communications Co Ltd
+FCC233|ASUSTek COMPUTER INC.
+FCC734|Samsung Electronics Co.,Ltd
+FCC766|Huawei Device Co., Ltd.
+FCC897|zte corporation
+FCCA10|MERCUSYS TECHNOLOGIES CO., LTD.
+FCCA40|Sony Interactive Entertainment Inc.
+FCD436|Motorola Mobility LLC, a Lenovo Company
+FCD586|Shenzhen SuperElectron Technology Co.,Ltd.
+FCD5D9|Shenzhen SDMC Technology CO.,Ltd.
+FCD733|TP-LINK TECHNOLOGIES CO.,LTD.
+FCD749|Amazon Technologies Inc.
+FCD848|Apple, Inc.
+FCD908|Xiaomi Communications Co Ltd
+FCDD55|Shenzhen WeWins wireless Co.,Ltd
+FCDE90|Samsung Electronics Co.,Ltd
+FCE1A6|HUAWEI TECHNOLOGIES CO.,LTD
+FCE26C|Apple, Inc.
+FCE33C|HUAWEI TECHNOLOGIES CO.,LTD
+FCE557|Nokia Corporation
+FCE5F0|Samsung Electronics Co.,Ltd
+FCE8C0|Espressif Inc.
+FCE998|Apple, Inc.
+FCE9D8|Amazon Technologies Inc.
+FCEB7B|HUAWEI TECHNOLOGIES CO.,LTD
+FCECDA|Ubiquiti Inc
+FCEFD7|HUAWEI TECHNOLOGIES CO.,LTD
+FCF136|Samsung Electronics Co.,Ltd
+FCF152|Sony Corporation
+FCF528|Zyxel Communications Corporation
+FCF5C4|Espressif Inc.
+FCF647|Fiberhome Telecommunication Technologies Co.,LTD
+FCF738|HUAWEI TECHNOLOGIES CO.,LTD
+FCF77B|Huawei Device Co., Ltd.
+FCF8AE|Intel Corporate
+FCFA21|zte corporation
+FCFBFB|Cisco Systems, Inc
+FCFC48|Apple, Inc.
+'@
 # Cache de fabricantes em disco: assessments futuros reaproveitam o que já foi resolvido (rápido e funciona offline).
 $script:ArquivoCacheOui = Join-Path $env:LOCALAPPDATA 'Nextec-Assessment\oui-cache.csv'
 if (Test-Path $script:ArquivoCacheOui) {
@@ -912,10 +15290,8 @@ function Initialize-OuiIeee {
     $script:OuiIeee = @{}
     # 1) Base embutida no próprio script: funciona offline em qualquer máquina, sem arquivo do lado.
     try {
-        if ($script:OuiEmbutidoGz) {
-            $ms = New-Object IO.MemoryStream (, [Convert]::FromBase64String($script:OuiEmbutidoGz))
-            $gz = New-Object IO.Compression.GZipStream ($ms, [IO.Compression.CompressionMode]::Decompress)
-            $sr = New-Object IO.StreamReader ($gz, [Text.Encoding]::UTF8)
+        if ($script:OuiEmbutido) {
+            $sr = New-Object IO.StringReader ($script:OuiEmbutido)
             while ($null -ne ($linha = $sr.ReadLine())) {
                 $i = $linha.IndexOf('|')
                 if ($i -gt 0) { $script:OuiIeee[$linha.Substring(0, $i)] = $linha.Substring($i + 1) }
@@ -937,10 +15313,10 @@ function Initialize-OuiIeee {
             if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
             $precisaBaixar = -not (Test-Path $script:ArquivoOuiIeee)
             if (-not $precisaBaixar -and ((Get-Date) - (Get-Item $script:ArquivoOuiIeee).LastWriteTime).TotalDays -gt 120) { $precisaBaixar = $true }
-            if ($precisaBaixar -and -not $SemConsultaInternet) {
+            if ($precisaBaixar -and $ConsultasWeb -and -not $SemConsultaInternet) {
                 Write-Log 'Baixando a base de fabricantes da IEEE (uma vez; ~4 MB)...'
                 try {
-                    Invoke-WebRequest -Uri 'https://standards-oui.ieee.org/oui/oui.csv' -OutFile $script:ArquivoOuiIeee -TimeoutSec 60 -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+                    Invoke-WebRequest -Uri 'https://standards-oui.ieee.org/oui/oui.csv' -OutFile $script:ArquivoOuiIeee -TimeoutSec 60 -UseBasicParsing
                 } catch {
                     Write-Log "Download da base IEEE falhou ($($_.Exception.Message)). Coloque um oui.csv ao lado do script para identificar fabricantes offline." 'AVISO'
                 }
@@ -973,7 +15349,7 @@ function Get-FabricanteMac {
     $hex = $prefixo -replace '-', ''
     if ($script:OuiIeee.ContainsKey($hex)) { $nomeCurto = Format-Fabricante $script:OuiIeee[$hex]; $script:CacheOui[$prefixo] = $nomeCurto; return $nomeCurto }
     $fabricante = ''
-    if (-not $SemConsultaInternet) {
+    if ($ConsultasWeb -and -not $SemConsultaInternet) {
         foreach ($tentativa in 1, 2) {
             Start-Sleep -Milliseconds 1500   # a API gratuita aceita ~1 consulta por segundo
             try {
@@ -1553,7 +15929,14 @@ function Get-ClasseIp {
 $script:Operadora = ''
 $script:IpPublico = ''
 Invoke-Etapa 'Internet, operadora e rota de saída' {
-    if (-not $SemConsultaInternet) {
+    if (-not $SemConsultaInternet -and -not $ConsultasWeb) {
+        try {
+            $publico = Get-IpPublicoDns
+            $script:IpPublico = $publico.IP
+            $script:Operadora = $publico.Operadora
+            $script:Resumo['IP público / operadora'] = "$($publico.IP) | AS$($publico.Asn) $($publico.Operadora)"
+        } catch { Write-Log "Consulta do IP público por DNS falhou: $($_.Exception.Message)" 'AVISO' }
+    } elseif (-not $SemConsultaInternet) {
         try {
             # O PS 5.1 lê a resposta como Latin-1 e quebra os acentos (Goiânia -> GoiÃ¢nia); força UTF-8.
             $resposta = Invoke-WebRequest -Uri 'https://ipinfo.io/json' -TimeoutSec 8 -UseBasicParsing
@@ -1712,7 +16095,7 @@ Invoke-Etapa 'Administradores locais' {
         Write-Log 'Servidor é controlador de domínio: administradores listados na etapa do AD.'
         return
     }
-    $membros = @(Get-LocalGroupMember -SID 'S-1-5-32-544' | Select-Object Name, ObjectClass, PrincipalSource)
+    $membros = @(Get-MembrosAdministradores)
     Save-Dados 'administradores_locais' $membros 'Membros do grupo Administradores local'
     $locais = @(Get-LocalUser | Select-Object Name, Enabled, LastLogon, PasswordLastSet, PasswordExpires, Description)
     Save-Dados 'usuarios_locais' $locais 'Contas locais do servidor'
@@ -1756,7 +16139,7 @@ Invoke-Etapa 'Portas em escuta' {
 }
 
 Invoke-Etapa 'Firewall do Windows' {
-    $perfis = @(Get-NetFirewallProfile | Select-Object Name, Enabled, DefaultInboundAction, DefaultOutboundAction, LogAllowed, LogBlocked, LogFileName)
+    $perfis = @(Get-NetFirewallProfile -PolicyStore ActiveStore | Select-Object Name, Enabled, DefaultInboundAction, DefaultOutboundAction, LogAllowed, LogBlocked, LogFileName)
     Save-Dados 'firewall_perfis' $perfis 'Perfis do firewall do Windows'
     foreach ($p in $perfis | Where-Object { -not $_.Enabled }) { Add-Alerta 'Média' 'Segurança' "Firewall do Windows desligado (perfil $($p.Name))" 'Religar o perfil e liberar só o necessário' }
     $script:Resumo['Firewall do Windows'] = ($perfis | ForEach-Object { "$($_.Name): $(if ($_.Enabled) { 'ligado' } else { 'DESLIGADO' })" }) -join ' | '
@@ -1769,7 +16152,7 @@ Invoke-Etapa 'Firewall do Windows' {
 }
 
 Invoke-Etapa 'Antivírus e proteção' {
-    $avServicos = @($script:ServicosLocal | Where-Object { $_.State -eq 'Running' -and $_.DisplayName -match '(?i)Acronis|Kaspersky|ESET|Sophos|Bitdefender|Trend Micro|McAfee|Trellix|Symantec|SentinelOne|CrowdStrike|Avast|AVG|Norton|Panda|Webroot|Malwarebytes|Cylance|Cortex|Huntress|Defender for Endpoint|Sense' })
+    $avServicos = @($script:ServicosLocal | Where-Object { $_.State -eq 'Running' -and $_.DisplayName -match '(?i)Acronis (Active Protection|Cyber Protection)|Kaspersky|\bESET\b|Sophos|Bitdefender|Trend Micro|McAfee|Trellix|Symantec|SentinelOne|CrowdStrike|Avast|\bAVG\b|Norton|Panda|Webroot|Malwarebytes|Cylance|Cortex|Huntress|Defender for Endpoint|\bSense\b' })
     $script:Resumo['Antivírus/EDR (serviços ativos)'] = (($avServicos.DisplayName) | Select-Object -Unique) -join ', '
     $defenderAtivo = $false
     if (Test-ComandoExiste 'Get-MpComputerStatus') {
@@ -1801,7 +16184,7 @@ Invoke-Etapa 'Configurações de segurança' {
     $uac = Get-ValorRegistro 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'EnableLUA'
     $llmnr = Get-ValorRegistro 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'EnableMulticast'
     $secureBoot = try { Confirm-SecureBootUEFI } catch { 'Não suportado/BIOS legado' }
-    $tpm = try { $t = Invoke-ComLimiteTempo { Get-Tpm } 'TPM' 20 | Select-Object -First 1; "Presente: $($t.TpmPresent) | Pronto: $($t.TpmReady)" } catch { 'Não identificado' }
+    $tpm = try { Format-SituacaoTpm (Invoke-ComLimiteTempo { Get-Tpm } 'TPM' 20 | Select-Object -First 1) } catch { 'Não identificado' }
     $script:Resumo['Secure Boot'] = $secureBoot
     $script:Resumo['TPM'] = $tpm
     $script:Resumo['Proteção LSA (RunAsPPL)'] = if ($lsaPpl -ge 1) { 'Sim' } else { 'Não' }
@@ -1820,7 +16203,7 @@ Invoke-Etapa 'Configurações de segurança' {
         $script:Resumo['BitLocker'] = ($bl | ForEach-Object { "$($_.MountPoint) $($_.ProtectionStatus)" }) -join ' | '
     }
     Save-TextoExterno 'politica_auditoria' @('auditpol /get /category:*') 'Política de auditoria do Windows' 20
-    Save-TextoExterno 'politica_senha_local' @('net accounts') 'Política de senha efetiva (local/domínio)' 30
+    if ($ComandosExternos) { Save-TextoExterno 'politica_senha_local' @('net accounts') 'Política de senha efetiva (local/domínio)' 30 }
 }
 
 Invoke-Etapa 'SQL Server e bancos de dados' {
@@ -1887,16 +16270,17 @@ Invoke-Etapa 'SQL Server e bancos de dados' {
 Invoke-Etapa 'Backup' {
     $padrao = '(?i)Acronis|Veeam|Ahsay|Cobian|Arcserve|Nakivo|Iperius|Duplicati|Macrium|Backup Exec|Altaro|Datto|Bacula|UrBackup|Areca|SyncBack|Backup'
     $softwares = @($script:SoftwareLocal | Where-Object { $_.Nome -match $padrao })
-    $servicos = @($script:ServicosLocal | Where-Object { $_.DisplayName -match $padrao })
+    $servicos = @($script:ServicosLocal | Where-Object { $_.DisplayName -match $padrao -and (Test-ServicoBackupReal $_) })
     Save-Dados 'backup_softwares' ($softwares) 'Softwares de backup instalados'
     Save-Dados 'backup_servicos' ($servicos) 'Serviços de backup'
     $script:Resumo['Backup identificado'] = (@($softwares.Nome) + @($servicos.DisplayName) | Select-Object -Unique) -join ', '
-    if ($softwares.Count -eq 0 -and $servicos.Count -eq 0) { Add-Alerta 'Alta' 'Backup' 'Nenhuma ferramenta de backup identificada no servidor' 'Confirmar rotina de backup local e em nuvem' }
+    $wsbComSucesso = $false
     if (Test-ComandoExiste 'Get-WBSummary') {
         try {
             $wb = Invoke-ComLimiteTempo { Get-WBSummary } 'Windows Server Backup' 45 | Select-Object -First 1
             if (-not $wb) { throw 'Windows Server Backup sem resposta' }
             $semSucesso = (-not $wb.LastSuccessfulBackupTime -or $wb.LastSuccessfulBackupTime -eq [datetime]::MinValue)
+            $wsbComSucesso = -not $semSucesso
             $script:Resumo['Windows Server Backup'] = if ($semSucesso) { 'Nenhum backup concluído (rotina de backup nativa não configurada)' } else { 'Último sucesso: {0} | Último resultado: {1}' -f (Format-Data $wb.LastSuccessfulBackupTime), $wb.LastBackupResultHR }
             if ($semSucesso) {
                 Add-Alerta 'Info' 'Backup' 'Windows Server Backup instalado sem backup concluído' 'Recurso presente, nenhum sucesso registrado; confirmar se a rotina real é outra ferramenta'
@@ -1905,9 +16289,24 @@ Invoke-Etapa 'Backup' {
             }
         } catch { }
     }
-    # vssadmin fica parado quando o serviço VSS está travado (comum em servidor com backup com problema).
-    Save-TextoExterno 'vss_armazenamento' @('vssadmin list shadowstorage') 'Armazenamento de cópias de sombra (VSS)' 30
-    Save-TextoExterno 'vss_writers' @('vssadmin list writers') 'Estado dos gravadores VSS' 60
+    if ($softwares.Count -eq 0 -and $servicos.Count -eq 0 -and -not $wsbComSucesso) { Add-Alerta 'Alta' 'Backup' 'Nenhuma ferramenta de backup identificada no servidor' 'Confirmar rotina de backup local e em nuvem' }
+    # Por CIM, sem processo externo; a consulta trava quando o serviço VSS está travado, por isso o limite de tempo.
+    try {
+        $sombras = @(Invoke-ComLimiteTempo {
+            Get-CimInstance Win32_ShadowStorage -ErrorAction Stop | ForEach-Object {
+                [pscustomobject]@{
+                    Volume    = $_.Volume.DeviceID
+                    UsadoGB   = [math]::Round($_.UsedSpace / 1GB, 2)
+                    AlocadoGB = [math]::Round($_.AllocatedSpace / 1GB, 2)
+                    MaximoGB  = [math]::Round($_.MaxSpace / 1GB, 2)
+                }
+            }
+        } 'Armazenamento VSS' 30)
+        Save-Dados 'vss_armazenamento' $sombras 'Armazenamento de cópias de sombra (VSS)'
+    } catch { Write-Log "Armazenamento VSS não lido: $($_.Exception.Message)" 'AVISO' }
+    if ($ComandosExternos) {
+        Save-TextoExterno 'vss_writers' @('vssadmin list writers') 'Estado dos gravadores VSS' 60
+    }
 }
 
 Invoke-Etapa 'Certificados digitais (máquina, usuário e A3)' {
@@ -2022,7 +16421,7 @@ Invoke-Etapa 'Impressoras' {
 
 Invoke-Etapa 'Monitores' {
     # Número de série do monitor é patrimônio: entra no inventário do cliente.
-    $mons = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction Stop | ForEach-Object {
+    $mons = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction SilentlyContinue | ForEach-Object {
         [pscustomobject]@{
             Fabricante    = ConvertFrom-CharArrayWmi $_.ManufacturerName
             Modelo        = ConvertFrom-CharArrayWmi $_.UserFriendlyName
@@ -2227,6 +16626,9 @@ Invoke-Etapa 'Licenciamento do Windows' {
         foreach ($o in $office | Where-Object { $_.Canal -eq 'KMS' -and $_.ServidorKms }) {
             Add-Alerta 'Média' 'Licenciamento' "Office ativado por KMS: $($o.Name)" "Servidor KMS $($o.ServidorKms). Confirmar se é KMS legítimo do cliente e não ativador irregular"
         }
+    } else {
+        $resumoC2r = Get-ResumoOfficeClickToRun (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction SilentlyContinue)
+        if ($resumoC2r) { $script:Resumo['Ativação do Office'] = $resumoC2r }
     }
 }
 
@@ -2573,7 +16975,7 @@ if (-not $SemVarreduraRede) {
                     if ($b) { "${p}: $b" }
                 })
 
-                # TLS: versões aceitas e certificado, no máximo duas portas por equipamento para não alongar demais.
+                # TLS: versões aceitas e certificado, no máximo uma porta por equipamento para não alongar demais.
                 $tlsHost = @(foreach ($p in @($script:PortasTls | Where-Object { $_ -in $portasHost } | Select-Object -First 1)) {
                     $t = Get-InfoTls -Ip $ip -Porta $p -NomeHost $nome -Timeout 2000
                     if ($t) { $listaTls.Add($t); $t }
@@ -2581,7 +16983,7 @@ if (-not $SemVarreduraRede) {
                 $soBanner = ($banners | ForEach-Object { Get-SoPorBanner $_ } | Where-Object { $_ } | Select-Object -First 1)
 
                 $compartilhados = @()
-                if ($portasHost -contains 445) {
+                if ($ComandosExternos -and $portasHost -contains 445) {
                     $compartilhados = @(Get-CompartilhamentosRemotos -Ip $ip)
                     foreach ($c in $compartilhados) {
                         $compartilhamentosRede.Add([pscustomobject]@{ IP = $ip; Nome = $(if ($nome) { $nome } else { $netbios }); Compartilhamento = $c.Nome; Tipo = $c.Tipo; Comentario = $c.Comentario })
@@ -2739,7 +17141,7 @@ function Get-InventarioRemoto {
         if (-not $av) {
             # Windows Server não tem Security Center: identifica o antivírus pelos serviços em execução,
             # senão todo servidor cai como "sem antivírus" mesmo com Acronis, Kaspersky ou ESET rodando.
-            $regexAv = '(?i)Acronis (Active Protection|Cyber Protection)|Kaspersky|ESET|Sophos|Bitdefender|Trend Micro|McAfee|Trellix|Symantec|SentinelOne|CrowdStrike|Avast|AVG|Norton|Panda|Webroot|Malwarebytes|Cylance|Cortex|Huntress|^WinDefend$'
+            $regexAv = '(?i)Acronis (Active Protection|Cyber Protection)|Kaspersky|\bESET\b|Sophos|Bitdefender|Trend Micro|McAfee|Trellix|Symantec|SentinelOne|CrowdStrike|Avast|\bAVG\b|Norton|Panda|Webroot|Malwarebytes|Cylance|Cortex|Huntress|^WinDefend$'
             $av = try {
                 (Get-CimInstance -CimSession $sessao -ClassName Win32_Service -Filter "State='Running'" -ErrorAction Stop |
                     Where-Object { $_.DisplayName -match $regexAv -or $_.Name -match $regexAv } |
@@ -2861,16 +17263,22 @@ if (-not $SemInventarioRemoto -and $temAD -and $script:ComputadoresAD.Count -gt 
             foreach ($arq in $arquivosLocais) {
                 $nomeMaq = [IO.Path]::GetFileNameWithoutExtension($arq.Name).ToUpper()
                 if ($nomeMaq -eq $env:COMPUTERNAME.ToUpper()) { continue }
+                $colunasNumericas = 'MemoriaGB', 'MemoriaLivreGB', 'DiscoCGB', 'LivreCPct', 'DiasSemPatch', 'DiasAssinaturaAV', 'TelasAzuis30d', 'DesligamentosInesperados30d', 'ErrosCriticos30d', 'ErrosSistema30d', 'LogonsFalha7d', 'DadosLocaisGB', 'Minidumps'
                 $cand = $candidatos | Where-Object { $_.Nome.ToUpper() -eq $nomeMaq } | Select-Object -First 1
                 if (-not $cand) { continue }
                 if ($arq.LastWriteTime -lt $validade) { $antigos++; continue }
+                if ($arq.Length -gt 10MB) { $invalidos++; Write-Log "  Coleta local de $nomeMaq recusada: arquivo acima de 10 MB" 'AVISO'; continue }
                 try {
                     $j = Get-Content -LiteralPath $arq.FullName -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
                     $h = [ordered]@{}
-                    foreach ($prop in $j.PSObject.Properties) { if ($prop.Name -ne 'Softwares') { $h[$prop.Name] = $prop.Value } }
+                    foreach ($prop in $j.PSObject.Properties) {
+                        if ($prop.Name -in 'Softwares', 'Detalhes') { continue }
+                        $h[$prop.Name] = if ($prop.Name -in $colunasNumericas -or $prop.Name -like 'Qtd*') { ConvertTo-NumeroOuNulo $prop.Value } else { $prop.Value }
+                    }
                     $h['Computador'] = $cand.Nome
                     $h['Suporte'] = Get-SituacaoSuporte -Caption "$($j.SO)" -Build ([int]$j.Build)
                     $resultados[$cand.Nome] = [pscustomobject]$h
+                    Add-DetalhesEstacao $j.Detalhes $cand.Nome
                     foreach ($sw in @($j.Softwares)) {
                         if ($sw.Nome) { $script:SoftwaresEstacoes.Add([pscustomobject]@{ Computador = $cand.Nome; Nome = $sw.Nome; Versao = $sw.Versao; Fabricante = $sw.Fabricante }) }
                     }
@@ -2920,6 +17328,9 @@ if (-not $SemInventarioRemoto -and $temAD -and $script:ComputadoresAD.Count -gt 
             $trabalhos.Add([pscustomobject]@{ Nome = $c.Nome; PS = $ps; Handle = $ps.BeginInvoke(); Lido = $false })
         }
         $ultimoAviso = Get-Date
+        $inicioParalelo = Get-Date
+        $prazoParalelo = [int][math]::Max(600, [math]::Ceiling($remotos.Count / $Paralelismo) * 120)
+        $abandonados = 0
         while (@($trabalhos | Where-Object { -not $_.Lido }).Count -gt 0) {
             foreach ($t in @($trabalhos | Where-Object { -not $_.Lido -and $_.Handle.IsCompleted })) {
                 try {
@@ -2944,13 +17355,19 @@ if (-not $SemInventarioRemoto -and $temAD -and $script:ComputadoresAD.Count -gt 
                 Write-Log "  ... $($resultados.Count) de $($candidatos.Count) concluídos"
                 $ultimoAviso = Get-Date
             }
+            $abandonados += Stop-TrabalhosVencidos $trabalhos $resultados $inicioParalelo $prazoParalelo
             Start-Sleep -Milliseconds 400
         }
-        $pool.Close(); $pool.Dispose()
+        # Com consulta abandonada, Close() ficaria esperando justamente o que travou.
+        if ($abandonados) {
+            Write-Log "  $abandonados computador(es) abandonado(s) depois de $prazoParalelo s sem resposta" 'AVISO'
+            [void]$pool.BeginClose($null, $null)
+        } else { $pool.Close(); $pool.Dispose() }
         $script:Estacoes = @(foreach ($c in $candidatos) { if ($resultados.ContainsKey($c.Nome)) { $resultados[$c.Nome] } })
         $colunasInventario = @($script:Estacoes | ForEach-Object { $_.PSObject.Properties.Name } | Select-Object -Unique)
         if ($colunasInventario.Count -gt 0) { $script:Estacoes = @($script:Estacoes | Select-Object -Property $colunasInventario) }
         Save-Dados 'inventario_computadores' $script:Estacoes 'Inventário das estações: hardware, SO, criptografia, antivírus, patch e administradores locais'
+        Save-DetalhesEstacoes
         $ok = @($script:Estacoes | Where-Object { $_.Status -eq 'OK' })
         $recusadas = @($script:Estacoes | Where-Object { $_.Status -like 'Credencial recusada*' })
         $script:Resumo['Inventário remoto'] = "$($ok.Count) de $($candidatos.Count) computadores inventariados" + $(if ($recusadas.Count -gt 0) { " | $($recusadas.Count) recusaram a credencial" } else { '' })
@@ -2958,8 +17375,10 @@ if (-not $SemInventarioRemoto -and $temAD -and $script:ComputadoresAD.Count -gt 
             Add-Alerta 'Alta' 'Estações' "$($recusadas.Count) computador(es) recusaram a credencial" ((($recusadas.Computador | ForEach-Object { "$_".Split('.')[0] }) -join ', ') + " | Conta usada: $($script:Resumo['Conta usada nas estações']). Conferir se ela é administradora local nessas máquinas (domínio fora do grupo Admins. locais, UAC remoto, GPO), ou refazer a coleta com outra conta (-PedirCredencial)")
         }
         foreach ($e in $ok | Where-Object { $_.LivreCPct -ne $null -and $_.LivreCPct -lt 10 }) { Add-Alerta 'Média' 'Estações' "Pouco espaço em $($e.Computador)" "$($e.LivreCPct)% livre no C:" }
-        foreach ($e in $ok | Where-Object { $_.MemoriaGB -lt 7.5 -and $_.SO -notmatch 'Server' }) { Add-Alerta 'Baixa' 'Estações' "Pouca memória em $($e.Computador)" "$($e.MemoriaGB) GB" }
+        foreach ($e in $ok | Where-Object { $null -ne $_.MemoriaGB -and $_.MemoriaGB -lt 7.5 -and $_.SO -notmatch 'Server' }) { Add-Alerta 'Baixa' 'Estações' "Pouca memória em $($e.Computador)" "$($e.MemoriaGB) GB" }
         foreach ($e in $ok | Where-Object { $_.TipoDisco -match 'HDD' -and $_.SO -notmatch 'Server' }) { Add-Alerta 'Baixa' 'Estações' "Disco mecânico (HDD) em $($e.Computador)" 'Candidato a troca por SSD' }
+
+        Add-AlertasColetaLocal $script:Estacoes
 
         # Cobertura de antivírus (AV.5, AV.6 e AV.7 do checklist; REQ-021 exige 100%).
         $semAv = @($ok | Where-Object { (-not $_.Antivirus -or $_.Antivirus -in 'N/D', '') -and $_.DefenderTempoReal -ne $true })
@@ -3131,13 +17550,13 @@ function New-ComputadoresHtml {
             if ($avTexto.Length -gt 34) { $avTexto = $avTexto.Substring(0, 33) + '…' }
             $blClasse = if ("$($e.BitLocker)" -match 'desprotegido') { 'ruim' } elseif ("$($e.BitLocker)" -match 'protegido') { 'ok' } else { 'neutro' }
             $blTexto = if ("$($e.BitLocker)" -match 'desprotegido') { 'Sem BitLocker' } elseif ("$($e.BitLocker)" -match 'protegido') { 'BitLocker ativo' } else { 'BitLocker n/d' }
-            $patchClasse = if ($null -ne $e.DiasSemPatch -and [int]$e.DiasSemPatch -gt 60) { 'aviso' } elseif ($null -ne $e.DiasSemPatch) { 'ok' } else { 'neutro' }
+            $patchClasse = if ($null -ne $e.DiasSemPatch -and ($e.DiasSemPatch -as [int]) -gt 60) { 'aviso' } elseif ($null -ne $e.DiasSemPatch) { 'ok' } else { 'neutro' }
             $patchTexto = if ($null -ne $e.DiasSemPatch) { "Patch há $($e.DiasSemPatch) d" } else { 'Patch n/d' }
             $admins = @("$($e.AdministradoresLocais)" -split ';\s*' | Where-Object { $_ -and $_ -ne 'N/D' })
             [void]$sb.Append("<div class='pc'><h4>$(ConvertTo-HtmlSeguro $nome) $(& $badge 'online' 'ok')</h4>")
             [void]$sb.Append("<div class='l'><b>$(ConvertTo-HtmlSeguro $e.SO)</b> $(& $badge $supTexto $supClasse)</div>")
             [void]$sb.Append("<div class='l'>$(ConvertTo-HtmlSeguro "$($e.Fabricante) $($e.Modelo)".Trim()) &middot; série $(ConvertTo-HtmlSeguro $e.NumeroSerie)</div>")
-            [void]$sb.Append("<div class='l'>RAM <b>$($e.MemoriaGB) GB</b> &middot; disco <b>$(ConvertTo-HtmlSeguro $e.TipoDisco)</b> &middot; C: <b>$($e.LivreCPct)%</b> livre</div>")
+            [void]$sb.Append("<div class='l'>RAM <b>$(ConvertTo-HtmlSeguro $e.MemoriaGB) GB</b> &middot; disco <b>$(ConvertTo-HtmlSeguro $e.TipoDisco)</b> &middot; C: <b>$(ConvertTo-HtmlSeguro $e.LivreCPct)%</b> livre</div>")
             [void]$sb.Append("<div class='l'>$(& $badge $avTexto $avClasse) $(& $badge $blTexto $blClasse) $(& $badge $patchTexto $patchClasse)</div>")
             [void]$sb.Append("<div class='l'>Admins locais: <b>$($admins.Count)</b>$(if ($admins.Count -gt 0) { " <span class='mudo'>(" + (ConvertTo-HtmlSeguro ($admins -join ', ')) + ')</span>' })</div>")
             if ($e.UsuarioLogado) { [void]$sb.Append("<div class='l'>Logado: $(ConvertTo-HtmlSeguro $e.UsuarioLogado)</div>") }
@@ -3613,8 +18032,9 @@ $(New-TabelaHtml $script:Tls @('IP', 'Porta', 'ProtocolosAceitos', 'ProtocoloObs
 $(New-TabelaHtml $script:CompartilhamentosRede @('IP', 'Nome', 'Compartilhamento', 'Tipo', 'Comentario'))
 
 <h2>Computadores do domínio</h2>
-<p class="legenda">Um cartão por máquina inventariada. Os dados completos (16 colunas) estão em <b>inventario_computadores.csv</b>.</p>
+<p class="legenda">Um cartão por máquina inventariada. Os dados completos estão em <b>inventario_computadores.csv</b> e nos arquivos <b>estacoes_*.csv</b>.</p>
 $(New-ComputadoresHtml $script:Estacoes)
+$(New-EstacoesHtml $script:Estacoes)
 
 <h2>Certificados digitais</h2>
 $(New-TabelaHtml $script:Certificados @('Repositorio', 'Titular', 'Emissor', 'IcpBrasil', 'ValidoAte', 'DiasRestantes', 'TemChavePrivada'))

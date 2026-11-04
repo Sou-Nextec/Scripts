@@ -6,7 +6,7 @@
 .DESCRIPTION
     Roda como SYSTEM na inicialização do computador, pela GPO. Em cada execução:
       1. copia o coletor (Nextec-Assessment-Estacao.ps1) para C:\ProgramData\Nextec\Assessment\Estacao;
-      2. registra a tarefa "Nextec - Assessment da estacao" (SYSTEM, oculta, sem janela);
+      2. registra a tarefa "Nextec - Assessment da estacao" (SYSTEM, visível no Agendador, sem usuário logado nem janela);
       3. dispara uma coleta se ainda não existir resultado ou se o último tiver mais de 6 dias.
     É idempotente: rodar de novo apenas atualiza o coletor e a tarefa. Somente leitura no restante da máquina.
 
@@ -49,12 +49,14 @@ try {
         $novo = (Get-FileHash -LiteralPath $origem -Algorithm SHA256).Hash
         $atual = if (Test-Path $coletorLocal) { (Get-FileHash -LiteralPath $coletorLocal -Algorithm SHA256).Hash } else { '' }
         if ($novo -ne $atual) { Copy-Item -LiteralPath $origem -Destination $coletorLocal -Force; Write-LogInstalacao 'Coletor atualizado.' }
+        # Script baixado da internet traz a marca de origem na cópia; com RemoteSigned ele seria recusado em silêncio.
+        Unblock-File -LiteralPath $coletorLocal
     } elseif (-not (Test-Path $coletorLocal)) {
         Write-LogInstalacao "Coletor não encontrado em $origem e não existe cópia local."
         exit 1
     }
 
-    $argumentos = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$coletorLocal`" -Destino `"$Destino`""
+    $argumentos = "-NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File `"$coletorLocal`" -Destino `"$Destino`""
     $acao = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argumentos
     # Na inicialização, com atraso para não competir com o login; e uma vez por dia no meio do expediente.
     $gatilhoBoot = New-ScheduledTaskTrigger -AtStartup
@@ -63,7 +65,7 @@ try {
     $gatilhos = @($gatilhoBoot, $gatilhoDia)
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     $config = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -ExecutionTimeLimit (New-TimeSpan -Minutes 15) -MultipleInstances IgnoreNew -RunOnlyIfNetworkAvailable -Hidden
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 15) -MultipleInstances IgnoreNew -RunOnlyIfNetworkAvailable
     Register-ScheduledTask -TaskName $nomeTarefa -Action $acao -Trigger $gatilhos -Principal $principal -Settings $config `
         -Description 'Inventario local da estacao para o Assessment Nextec. Somente leitura.' -Force | Out-Null
 
