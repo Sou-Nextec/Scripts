@@ -24,6 +24,8 @@ Módulos:
               servidor; VMware, Proxmox e XCP-ng pela rede): hosts, VMs,
               armazenamento, snapshots e cluster, no padrão
               nextec_hipervisor_* e nextec_vm_*
+  discos      saúde dos discos físicos pelo SMART (smartctl, pacote
+              smartmontools): NVMe e SATA/SAS, no padrão nextec_disco_*
 
 Uso:
   coleta-complementar.py executar            roda os módulos ligados (serviço)
@@ -61,7 +63,7 @@ import xmlrpc.client
 from xml.sax.saxutils import escape as xml_escape
 from datetime import datetime, timedelta, timezone
 
-VERSAO = "1.5.0"
+VERSAO = "1.6.0"
 
 CONFIG_PADRAO = "/etc/coleta-complementar/coleta-complementar.ini"
 DIR_DADOS_PADRAO = "/var/lib/coleta-complementar"
@@ -2459,8 +2461,376 @@ class ModuloVirtualizacao:
             raise RuntimeError("nenhum hipervisor respondeu")
 
 
+# ---------------------------------------------------------------------------
+# Módulo discos
+# ---------------------------------------------------------------------------
+# Saúde dos discos físicos pelo SMART (smartctl -j -a, pacote smartmontools),
+# no padrão nextec_disco_*{disco, modelo, serie}. Os nomes e os rótulos são
+# usados pela regra de alerta "Disco NVMe com problema"; não mudar.
+#   NVMe      aviso crítico, desgaste, erros de mídia, temperatura e largura
+#             do link PCIe (atual e máxima, lidas em /sys/class/nvme)
+#   SATA/SAS  SMART geral, temperatura, setores realocados, pendentes e
+#             incorrigíveis (atributos 5, 197 e 198, somados em erros de
+#             mídia) e vida útil usada (atributo 177, 231 ou 233)
+# Discos atrás de controladora RAID (Dell PERC, LSI/Broadcom MegaRAID e o que
+# mais o "smartctl --scan-open" listar com "-d tipo,N") são lidos um a um; o
+# volume lógico que a controladora apresenta fica de fora, porque não tem SMART.
+# Discos virtuais (VirtIO, QEMU, VMware, Hyper-V, Xen) e dispositivos lógicos
+# (dm-, loop, zram, md) ficam de fora. Um disco sem resposta não apaga os
+# outros: o erro vai para o log de eventos e a rodada segue.
+
+SMARTCTL_PADRAO = "smartctl"
+PREFIXOS_IGNORADOS = ("loop", "ram", "zram", "dm-", "md", "sr", "fd", "nbd", "rbd", "vd", "xvd", "zd", "mmcblk")
+RE_VIRTUAL = re.compile(r"qemu|vmware|virtio|vbox|virtual|msft|xen", re.IGNORECASE)
+# Volume de controladora RAID (Dell PERC, HPE Smart Array, LSI/Broadcom MegaRAID):
+# o SMART fica atrás da controladora e o volume não responde como disco.
+RE_VOLUME_RAID = re.compile(r"perc |logical volume|megaraid|mr9[0-9]{3}|raid", re.IGNORECASE)
+RE_NAMESPACE_NVME = re.compile(r"^(nvme\d+)n\d+$")
+ATRIBUTOS_ERROS_MIDIA = (5, 197, 198)
+ATRIBUTOS_VIDA_UTIL = (177, 231, 233)
+# Coleta avulsa antiga (nextec-smart.py) que grava as mesmas séries. Enquanto
+# ela existir, o módulo não grava, para o Alloy não receber série duplicada.
+ARQUIVO_SMART_AVULSO = "smart.prom"
+TIMEOUT_SMARTCTL = 60
+# Código de saída próprio do "-n standby,N": disco em SLEEP ou STANDBY, que o
+# smartctl pulou sem acordar. 3 não ocorre como erro real (bits 0 e 1 juntos:
+# linha de comando inválida e falha ao abrir o dispositivo na mesma execução).
+CODIGO_ESPERA = 3
+RE_ESPERA = re.compile(r"\b(standby|sleep)\b", re.IGNORECASE)
+
+
+def binario_smartctl(config):
+    """Caminho do smartctl: o do .ini, o do PATH ou vazio quando não está instalado."""
+    secao = config["discos"] if config.has_section("discos") else {}
+    configurado = secao.get("smartctl", "").strip()
+    if configurado:
+        return configurado if os.access(configurado, os.X_OK) else ""
+    for candidato in (shutil.which(SMARTCTL_PADRAO), "/usr/sbin/smartctl", "/sbin/smartctl"):
+        if candidato and os.access(candidato, os.X_OK):
+            return candidato
+    return ""
+
+
+def ler_sys(caminho):
+    try:
+        with open(caminho, encoding="utf-8", errors="replace") as arquivo:
+            return arquivo.read().strip()
+    except OSError:
+        return ""
+
+
+def disco_virtual_sys(raiz_sys, nome):
+    """True quando o sysfs mostra um disco de VM (VirtIO, Hyper-V, Xen, QEMU, VMware)."""
+    caminho = os.path.realpath(os.path.join(raiz_sys, "block", nome))
+    if "/virtio" in caminho or "/vmbus" in caminho.lower() or "/vbd-" in caminho:
+        return True
+    dispositivo = os.path.join(raiz_sys, "block", nome, "device")
+    texto = " ".join(ler_sys(os.path.join(dispositivo, campo)) for campo in ("vendor", "model"))
+    return bool(RE_VIRTUAL.search(texto) or RE_VOLUME_RAID.search(texto))
+
+
+def discos_fisicos(raiz_sys="/sys"):
+    """Nomes dos discos inteiros que não são virtuais nem lógicos (ex.: nvme0n1, sda)."""
+    try:
+        nomes = sorted(os.listdir(os.path.join(raiz_sys, "block")))
+    except OSError:
+        return []
+    achados = []
+    for nome in nomes:
+        if nome.startswith(PREFIXOS_IGNORADOS):
+            continue
+        # Removível (leitor de cartão, pendrive) e caminho oculto do multipath NVMe.
+        if "1" in (ler_sys(os.path.join(raiz_sys, "block", nome, "removable")),
+                   ler_sys(os.path.join(raiz_sys, "block", nome, "hidden"))):
+            continue
+        if disco_virtual_sys(raiz_sys, nome):
+            continue
+        achados.append(nome)
+    return achados
+
+
+def controlador_nvme(raiz_sys, nome):
+    """nvme0n1 -> nvme0; com multipath, segue o link do namespace."""
+    casamento = RE_NAMESPACE_NVME.match(nome)
+    if casamento and os.path.isdir(os.path.join(raiz_sys, "class", "nvme", casamento.group(1))):
+        return casamento.group(1)
+    alvo = os.path.basename(os.path.realpath(os.path.join(raiz_sys, "block", nome, "device")))
+    return alvo if alvo.startswith("nvme") else (casamento.group(1) if casamento else "")
+
+
+def largura_link_nvme(raiz_sys, controlador):
+    """(atual, máxima) do link PCIe do controlador NVMe, ou (None, None)."""
+    if not controlador:
+        return None, None
+    base = os.path.join(raiz_sys, "class", "nvme", controlador, "device")
+    valores = []
+    for arquivo in ("current_link_width", "max_link_width"):
+        texto = ler_sys(os.path.join(base, arquivo))
+        valores.append(int(texto) if texto.isdigit() else None)
+    return valores[0], valores[1]
+
+
+class LeituraSmart:
+    """Resultado do smartctl para um disco: dados, em espera ou erro."""
+
+    def __init__(self, dados=None, espera=False, erro="", codigo=0):
+        self.dados = dados or {}
+        self.espera = espera
+        self.erro = erro
+        self.codigo = codigo
+
+    def mensagens(self):
+        return " ".join(m.get("string", "") for m in (self.dados.get("smartctl") or {}).get("messages", []))
+
+
+def rodar_smartctl(binario, caminho, tipo=None):
+    """smartctl -j -a; -n standby não acorda HD parado (volta com espera=True)."""
+    comando = [binario, "-j", "-a", "-n", f"standby,{CODIGO_ESPERA}"] + (["-d", tipo] if tipo else []) + [caminho]
+    try:
+        saida = subprocess.run(comando, capture_output=True, text=True, timeout=TIMEOUT_SMARTCTL)
+    except subprocess.TimeoutExpired:
+        return LeituraSmart(erro=f"smartctl sem resposta em {TIMEOUT_SMARTCTL} s")
+    except OSError as erro:
+        return LeituraSmart(erro=f"smartctl não executou: {erro}")
+    return interpretar_smartctl(saida.returncode, saida.stdout)
+
+
+def interpretar_smartctl(codigo, texto):
+    """Separa os bits do código de saída: 1 e 2 impedem a leitura; os demais só avisam."""
+    try:
+        dados = json.loads(texto) if texto else {}
+    except ValueError:
+        return LeituraSmart(erro=f"saída do smartctl ilegível (código {codigo})")
+    mensagens = " ".join(m.get("string", "") for m in (dados.get("smartctl") or {}).get("messages", []))
+    if codigo == CODIGO_ESPERA:
+        return LeituraSmart(dados, espera=True, codigo=codigo)
+    if codigo & 0b11:
+        # smartctl antigo, sem o código próprio: a mensagem diz SLEEP ou STANDBY.
+        if RE_ESPERA.search(mensagens):
+            return LeituraSmart(dados, espera=True, codigo=codigo)
+        return LeituraSmart(dados, erro=(mensagens or f"smartctl terminou com código {codigo}")[:300], codigo=codigo)
+    return LeituraSmart(dados, codigo=codigo)
+
+
+def interpretar_varredura(texto):
+    """Discos atrás de controladora no "smartctl --scan-open -j": [(rótulo, caminho, tipo, erro)].
+
+    Só entram os tipos com número do disco na controladora (megaraid,0;
+    cciss,1; areca,1/1): os discos comuns já vêm do /sys/block. O rótulo é o
+    nome que o próprio smartctl dá (megaraid_disk_00); com mais de uma
+    controladora, o rótulo repetido ganha o barramento no fim. Disco que a
+    varredura não conseguiu abrir continua na lista, com o erro, para virar
+    falha e não sumir do monitoramento.
+    """
+    try:
+        dispositivos = (json.loads(texto) or {}).get("devices") or []
+    except ValueError:
+        return []
+    achados = []
+    for item in dispositivos:
+        caminho, tipo = str(item.get("name", "")), str(item.get("type", ""))
+        if not caminho or "," not in tipo:
+            continue
+        casamento = re.search(r"\[([^\]]+)\]", str(item.get("info_name", "")))
+        base = casamento.group(1) if casamento else f"{os.path.basename(caminho)}_{tipo}"
+        erro = str(item.get("open_error") or "")[:300]
+        achados.append([re.sub(r"[^A-Za-z0-9_.-]+", "_", base).strip("_"), caminho, tipo, erro])
+    vistos = {}
+    for item in achados:
+        vistos[item[0]] = vistos.get(item[0], 0) + 1
+    for item in achados:
+        if vistos[item[0]] > 1:
+            item[0] = f"{item[0]}_{os.path.basename(item[1])}"
+    return [tuple(item) for item in achados]
+
+
+def discos_controladora(binario):
+    """Roda o "smartctl --scan-open"; sem smartctl ou com erro, nenhum disco."""
+    if not binario:
+        return []
+    try:
+        saida = subprocess.run([binario, "--scan-open", "-j"], capture_output=True, text=True,
+                               timeout=TIMEOUT_SMARTCTL)
+    except (OSError, subprocess.TimeoutExpired) as erro:
+        log("aviso", "varredura de controladoras do smartctl falhou", erro=erro)
+        return []
+    return interpretar_varredura(saida.stdout)
+
+
+def _inteiro(valor):
+    return int(valor) if isinstance(valor, (int, float)) and not isinstance(valor, bool) else None
+
+
+def valores_disco(dados):
+    """Converte o JSON do smartctl nos valores do contrato (None quando não há)."""
+    valores = {
+        "smart_ok": None, "aviso_critico": None, "desgaste_percentual": None,
+        "erros_midia": None, "temperatura_celsius": _inteiro((dados.get("temperature") or {}).get("current")),
+    }
+    status = dados.get("smart_status") or {}
+    if isinstance(status.get("passed"), bool):
+        valores["smart_ok"] = 1 if status["passed"] else 0
+
+    nvme = dados.get("nvme_smart_health_information_log")
+    if isinstance(nvme, dict):
+        valores["aviso_critico"] = _inteiro(nvme.get("critical_warning"))
+        valores["desgaste_percentual"] = _inteiro(nvme.get("percentage_used"))
+        valores["erros_midia"] = _inteiro(nvme.get("media_errors"))
+        if valores["temperatura_celsius"] is None:
+            valores["temperatura_celsius"] = _inteiro(nvme.get("temperature"))
+        return valores
+
+    tabela = (dados.get("ata_smart_attributes") or {}).get("table") or []
+    atributos = {item.get("id"): item for item in tabela if isinstance(item, dict)}
+    erros = [_inteiro((atributos[i].get("raw") or {}).get("value")) for i in ATRIBUTOS_ERROS_MIDIA if i in atributos]
+    erros = [e for e in erros if e is not None]
+    if erros:
+        valores["erros_midia"] = sum(erros)
+    for ident in ATRIBUTOS_VIDA_UTIL:
+        normalizado = _inteiro((atributos.get(ident) or {}).get("value"))
+        if normalizado is not None:
+            # O valor normalizado começa em 100 (disco novo) e cai com o uso.
+            valores["desgaste_percentual"] = max(0, min(100, 100 - normalizado))
+            break
+
+    # SAS: lista de defeitos crescida e indicador de desgaste do próprio disco.
+    if valores["erros_midia"] is None:
+        valores["erros_midia"] = _inteiro(dados.get("scsi_grown_defect_list"))
+    if valores["desgaste_percentual"] is None:
+        valores["desgaste_percentual"] = _inteiro(dados.get("scsi_percentage_used_endurance_indicator"))
+    if valores["desgaste_percentual"] is None:
+        valores["desgaste_percentual"] = _inteiro((dados.get("endurance_used") or {}).get("current_percent"))
+    return valores
+
+
+def disco_virtual_smart(dados):
+    """Confere pelo próprio SMART: disco de VM ou volume de RAID que escapou do sysfs."""
+    texto = " ".join(str(dados.get(c, "")) for c in ("model_name", "model_family", "scsi_vendor", "scsi_product", "vendor"))
+    return bool(RE_VIRTUAL.search(texto) or RE_VOLUME_RAID.search(texto))
+
+
+def atras_de_controladora(leitura):
+    """smartctl pedindo "-d megaraid,N" (ou cciss, areca): é volume de RAID, não disco."""
+    return "please try adding '-d" in leitura.mensagens().lower()
+
+
+class ModuloDiscos:
+    nome = "discos"
+    AJUDAS = {
+        "smart_ok": "1 se o SMART passou no teste geral",
+        "aviso_critico": "Critical Warning do NVMe (0 = sem aviso)",
+        "desgaste_percentual": "Percentual de vida útil usada",
+        "erros_midia": "Erros de mídia e integridade (SATA: atributos 5, 197 e 198 somados)",
+        "temperatura_celsius": "Temperatura atual do disco",
+        "link_largura": "Largura atual do link PCIe (só NVMe)",
+        "link_largura_max": "Largura máxima do link PCIe (só NVMe)",
+    }
+
+    def __init__(self, config, eventos, estado, dir_textfile, raiz_sys="/sys", smartctl=None, varrer=None):
+        secao = config["discos"] if config.has_section("discos") else {}
+        self.intervalo = max(5, int(secao.get("intervalo_minutos", "10"))) * 60
+        self.binario = binario_smartctl(config)
+        self.eventos = eventos
+        self.raiz_sys = raiz_sys
+        # Disco atrás de controladora: rótulo -> (caminho, tipo do -d, erro da varredura).
+        self.alvos = {}
+        self.ler = smartctl or (lambda nome: rodar_smartctl(self.binario, *self.alvos.get(nome, (f"/dev/{nome}", None, ""))[:2]))
+        self.varrer = varrer or (lambda: discos_controladora(self.binario))
+        self.arquivo = os.path.join(dir_textfile, "coleta_complementar_discos.prom")
+        self.avulso = os.path.join(dir_textfile, ARQUIVO_SMART_AVULSO)
+        self.avisou_avulso = False
+        self.falhando = set()
+        self.ultimos = {}
+
+    def _avisar_falha(self, nome, motivo):
+        log("erro", "leitura SMART falhou", disco=nome, erro=motivo)
+        if nome not in self.falhando and self.eventos:
+            self.eventos.registrar("disco_evento", "smart", "disco_sem_resposta", "aviso", disco=nome, detalhe=motivo)
+        self.falhando.add(nome)
+
+    def _avisar_volta(self, nome):
+        if nome in self.falhando and self.eventos:
+            self.eventos.registrar("disco_evento", "smart", "disco_voltou", "info", disco=nome)
+        self.falhando.discard(nome)
+
+    def ler_disco(self, nome):
+        """(situação, leitura): ok, espera (HD parado: repete a última), virtual ou erro."""
+        erro_varredura = self.alvos.get(nome, ("", "", ""))[2]
+        if erro_varredura:
+            self._avisar_falha(nome, f"varredura da controladora: {erro_varredura}")
+            return "erro", None
+        leitura = self.ler(nome)
+        if leitura.espera:
+            self._avisar_volta(nome)
+            return "espera", self.ultimos.get(nome)
+        if leitura.erro and atras_de_controladora(leitura):
+            return "virtual", None
+        if leitura.erro:
+            self._avisar_falha(nome, leitura.erro)
+            return "erro", None
+        dados = leitura.dados
+        if disco_virtual_smart(dados):
+            return "virtual", None
+        rotulos = {
+            "disco": nome,
+            "modelo": str(dados.get("model_name") or dados.get("scsi_model_name") or dados.get("scsi_product") or ""),
+            "serie": str(dados.get("serial_number") or ""),
+        }
+        valores = valores_disco(dados)
+        # Bit 2 (código 4): comando SMART falhou. Com dados parciais, vale o que
+        # veio; sem nenhum dado de saúde, é falha e não leitura vazia como "ok".
+        if all(v is None for v in valores.values()):
+            motivo = leitura.mensagens() or "sem dados de saúde"
+            self._avisar_falha(nome, f"smartctl sem dados SMART (código {leitura.codigo}): {motivo}"[:300])
+            return "erro", None
+        if "nvme_smart_health_information_log" in dados:
+            atual, maxima = largura_link_nvme(self.raiz_sys, controlador_nvme(self.raiz_sys, nome))
+            valores["link_largura"] = atual
+            valores["link_largura_max"] = maxima
+        lido = {"rotulos": rotulos, "valores": valores}
+        # Só com a leitura validada: falha contínua não vira recuperação falsa.
+        self._avisar_volta(nome)
+        self.ultimos[nome] = lido
+        return "ok", lido
+
+    def rodada(self):
+        if os.path.exists(self.avulso):
+            if not self.avisou_avulso:
+                log("aviso", "coleta SMART avulsa ainda ativa; o módulo discos espera ela sair", arquivo=self.avulso)
+                self.avisou_avulso = True
+            if os.path.exists(self.arquivo):
+                os.remove(self.arquivo)
+            return 0
+        metricas = Metricas()
+        nomes = discos_fisicos(self.raiz_sys)
+        self.alvos = {rotulo: (caminho, tipo, erro) for rotulo, caminho, tipo, erro in self.varrer()}
+        nomes += [rotulo for rotulo in self.alvos if rotulo not in nomes]
+        encontrados = 0
+        for nome in nomes:
+            try:
+                situacao, lido = self.ler_disco(nome)
+            except Exception as erro:  # um disco com problema não derruba os outros
+                self._avisar_falha(nome, f"erro inesperado: {erro!r}"[:300])
+                situacao, lido = "erro", None
+            if situacao == "virtual":
+                continue
+            encontrados += 1
+            metricas.add("nextec_disco_leitura_ok", 0 if situacao == "erro" else 1, {"disco": nome},
+                         ajuda="1 com o SMART lido nesta rodada (ou disco em espera), 0 sem resposta")
+            for chave, ajuda in self.AJUDAS.items():
+                if lido:
+                    metricas.add(f"nextec_disco_{chave}", lido["valores"].get(chave), lido["rotulos"], ajuda=ajuda)
+        metricas.add("nextec_discos_encontrados", encontrados, ajuda="Discos físicos encontrados nesta rodada")
+        metricas.add("nextec_discos_coletor_ultima_execucao_segundos", round(agora()))
+        gravar_atomico(self.arquivo, metricas.texto())
+        if encontrados and len(self.falhando & set(nomes)) == encontrados:
+            raise RuntimeError("nenhum disco respondeu ao smartctl")
+        return encontrados
+
+
 MODULOS = {"internet": ModuloLinks, "docker": ModuloDocker, "velocidade": ModuloVelocidade,
-           "acessos": ModuloAcessos, "bancos": ModuloBancos, "virtualizacao": ModuloVirtualizacao}
+           "acessos": ModuloAcessos, "bancos": ModuloBancos, "virtualizacao": ModuloVirtualizacao,
+           "discos": ModuloDiscos}
 
 
 def carregar_config():
@@ -2486,14 +2856,26 @@ def modulos_ligados(config):
         ligados.append("bancos")
     if config.has_section("virtualizacao") and sim(config["virtualizacao"].get("ativo"), False):
         ligados.append("virtualizacao")
+    # Sem smartctl o módulo fica desligado; o "verificar" diz como instalar.
+    if discos_pedido(config) and binario_smartctl(config):
+        ligados.append("discos")
     return ligados
 
 
-def preparar(config):
+def discos_pedido(config):
+    return config.has_section("discos") and sim(config["discos"].get("ativo"), False)
+
+
+def preparar_caminhos(config):
+    """(pasta do textfile, pasta de dados, arquivo de eventos), sem criar nada."""
     geral = config["geral"] if config.has_section("geral") else {}
     dir_dados = geral.get("pasta_dados", DIR_DADOS_PADRAO)
     dir_textfile = geral.get("pasta_textfile", os.path.join(dir_dados, "textfile"))
-    arq_eventos = geral.get("arquivo_eventos", ARQ_EVENTOS_PADRAO)
+    return dir_textfile, dir_dados, geral.get("arquivo_eventos", ARQ_EVENTOS_PADRAO)
+
+
+def preparar(config):
+    dir_textfile, dir_dados, arq_eventos = preparar_caminhos(config)
     os.makedirs(dir_textfile, exist_ok=True)
     eventos = Eventos(arq_eventos)
     estado = Estado(os.path.join(dir_dados, "estado.json"))
@@ -2613,6 +2995,19 @@ def verificar():
                       f"{len(inv['hosts'])} host(s), {len(inv['vms'])} VM(s), {len(inv['armazenamentos'])} armazenamento(s)")
             except Exception as erro:  # noqa: BLE001 - o motivo vai para o técnico
                 problemas.append(f"hipervisor {fonte.nome} ({PLATAFORMAS[fonte.plataforma]}) sem resposta: {erro}")
+    if discos_pedido(config):
+        if not binario_smartctl(config):
+            problemas.append("smartctl não encontrado: o módulo discos fica desligado. Instale o pacote "
+                             "smartmontools (apt install smartmontools, dnf install smartmontools ou "
+                             "zypper install smartmontools) e reinicie o serviço")
+        else:
+            nomes = discos_fisicos() + [r for r, _, _, _ in discos_controladora(binario_smartctl(config))]
+            avulso = os.path.join(preparar_caminhos(config)[0], ARQUIVO_SMART_AVULSO)
+            if os.path.exists(avulso):
+                print(f"Aviso: coleta SMART avulsa ainda ativa ({avulso}); o módulo discos só grava depois que ela sair.")
+            print(f"Discos físicos: {len(nomes)}{(' (' + ', '.join(nomes) + ')') if nomes else ''}")
+            if not nomes:
+                print("Aviso: nenhum disco físico encontrado (servidor virtual?); o módulo discos não grava métricas.")
     for problema in problemas:
         print(f"PROBLEMA: {problema}")
     if not problemas:

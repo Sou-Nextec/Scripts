@@ -1,0 +1,36 @@
+{
+ "json_format_version": [
+  1,
+  0
+ ],
+ "smartctl": {
+  "version": [
+   7,
+   4
+  ],
+  "svn_revision": "5530",
+  "platform_info": "x86_64-linux-6.8.12-4-pve",
+  "build_info": "(local build)",
+  "argv": [
+   "smartctl",
+   "-j",
+   "-a",
+   "-n",
+   "standby,3",
+   "/dev/sdd"
+  ],
+  "messages": [
+   {
+    "string": "Device is in STANDBY mode, exit(3)",
+    "severity": "information"
+   }
+  ],
+  "exit_status": 3
+ },
+ "device": {
+  "name": "/dev/sdd",
+  "info_name": "/dev/sdd [SAT]",
+  "type": "sat",
+  "protocol": "ATA"
+ }
+}

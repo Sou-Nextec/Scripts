@@ -47,7 +47,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
-$Versao = "1.5.0"
+$Versao = "1.6.0"
 $PastaBase = Join-Path $env:ProgramData "GrafanaLabs\Alloy\coleta-complementar"
 if ([string]::IsNullOrWhiteSpace($Config)) {
     $Config = Join-Path $PastaBase "coleta-complementar.ini"

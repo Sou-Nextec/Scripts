@@ -10,7 +10,7 @@ Completa o que o Grafana Alloy não coleta sozinho. É um arquivo único por sis
 | Execução | serviço `coleta-complementar` (systemd) | tarefa agendada `NextecColetaComplementar` (SYSTEM) |
 | Métricas | `/var/lib/coleta-complementar/textfile/*.prom` | `...\coleta-complementar\textfile\*.prom` |
 | Eventos | `/var/log/coleta-complementar/eventos.jsonl` | `...\coleta-complementar\eventos.jsonl` |
-| Módulos | internet, links, docker, velocidade, acessos, bancos, virtualizacao | internet, links, acessos, bancos, velocidade, virtualizacao |
+| Módulos | internet, links, docker, velocidade, acessos, bancos, virtualizacao, discos | internet, links, acessos, bancos, velocidade, virtualizacao |
 
 Quem instala e liga é o instalador do Alloy (`install-nextec-monitoring-linux-v2.sh` 2.1.0+ e `install-nextec-monitoring-windows-v2.ps1` 2.12.0+; módulo acessos a partir de 2.4.0 e 2.14.0, que também instalam o [atualizador automático](../atualizador/README.md)): ao marcar Docker, Internet, Links, Velocidade ou um banco sem exportador próprio (Firebird, Oracle, SQL Anywhere, SQLite e, no Linux, SQL Server), ele baixa o arquivo deste diretório, grava a configuração, cria o serviço ou a tarefa e acrescenta no `config.alloy` a leitura dos arquivos. Modelo comentado da configuração: `coleta-complementar.ini.example`.
 
@@ -30,6 +30,7 @@ Quem instala e liga é o instalador do Alloy (`install-nextec-monitoring-linux-v
 | Bancos SQL Server (Windows), MySQL, MariaDB, PostgreSQL | Sim (coletores e exportadores do Alloy) | |
 | Bancos Firebird, Oracle, SQL Anywhere, SQLite e SQL Server no Linux: no ar, conexões, memória, tempo ligado, tamanho das bases | | Sim (processo, portas e arquivos, sem driver nem login no banco) |
 | Virtualização: hosts, VMs, armazenamento, snapshots, cluster, replicação Hyper-V | | Sim (Hyper-V, Proxmox VE e KVM/libvirt locais; VMware, Proxmox e XCP-ng pela API, usuário só leitura) |
+| Saúde dos discos físicos (SMART): NVMe e SATA/SAS | | Sim, só Linux (smartctl, pacote smartmontools) |
 
 ## Comandos
 
@@ -141,6 +142,21 @@ Causas de queda: `rede local: firewall sem resposta`, `operadora: gateway sem re
 
 VMs e hosts a cada `intervalo_segundos` (padrão 120); snapshots, discos e saúde do ZFS a cada 30 minutos. Senhas e tokens ficam em `segredos.ini` (Linux `/etc/coleta-complementar/segredos.ini`, 0600 root; Windows na pasta da coleta, só SYSTEM e Administradores), nunca no .ini. Proxmox local roda `pvesh` como root; KVM/libvirt usa `virsh` em `qemu:///system`.
 
+**Discos** (só Linux). SMART dos discos físicos lido com `smartctl -j -a -n standby,3` a cada `intervalo_minutos` (padrão 10, mínimo 5). Rótulos: `disco` (nome do dispositivo: `nvme0n1`, `sda`), `modelo` e `serie`. Os nomes e os rótulos alimentam a regra "Disco NVMe com problema" (`nx-disco-nvme-problema`): não mudar.
+
+| Métrica | Rótulos | Significado |
+| --- | --- | --- |
+| `nextec_disco_smart_ok` | disco, modelo, serie | 1 se o SMART passou no teste geral |
+| `nextec_disco_aviso_critico` | disco, modelo, serie | Critical Warning do NVMe (0 = sem aviso; não existe em SATA/SAS) |
+| `nextec_disco_desgaste_percentual` | disco, modelo, serie | Vida útil usada. NVMe: `percentage_used`; SATA: 100 menos o normalizado do atributo 177, 231 ou 233; SAS: indicador de desgaste |
+| `nextec_disco_erros_midia` | disco, modelo, serie | NVMe: `media_errors`. SATA: atributos 5, 197 e 198 somados (realocados, pendentes, incorrigíveis). SAS: lista de defeitos crescida |
+| `nextec_disco_temperatura_celsius` | disco, modelo, serie | Temperatura atual |
+| `nextec_disco_link_largura`, `nextec_disco_link_largura_max` | disco, modelo, serie | Largura atual e máxima do link PCIe (só NVMe, de `/sys/class/nvme/<ctrl>/device`) |
+| `nextec_disco_leitura_ok` | disco | 1 com o SMART lido (ou HD em espera), 0 sem resposta do smartctl |
+| `nextec_discos_encontrados`, `nextec_discos_coletor_ultima_execucao_segundos` | | Discos físicos na rodada e saúde do módulo |
+
+Discos atrás de controladora RAID (Dell PERC, LSI/Broadcom MegaRAID e o que mais o `smartctl --scan-open` listar com `-d tipo,N`) são lidos um a um, com `disco` igual ao nome que o smartctl dá (`megaraid_disk_00`); o volume lógico da controladora não entra, porque não tem SMART. Ficam de fora os discos virtuais (VirtIO, QEMU, VMware, Hyper-V, Xen), os lógicos (`dm-`, `loop`, `zram`, `md`, zvol `zd`) e os removíveis. HD em espera (SLEEP ou STANDBY) não é acordado: a rodada repete a última leitura. Disco que a varredura da controladora não abre aparece como falha (`leitura_ok = 0`). Enquanto existir `textfile/smart.prom` (coleta avulsa antiga), o módulo não grava, para não duplicar as séries. Sem `smartctl` o módulo fica desligado e o `verificar` mostra como instalar.
+
 **A própria coleta**: `nextec_coleta_complementar_info{versao, modulos}` e `nextec_coleta_complementar_modulo_ok{modulo}`.
 
 ## Eventos (Loki)
@@ -155,6 +171,7 @@ Um JSON por linha. `tipo`, `categoria` e `link` viram rótulos no Loki; o restan
 | `links_evento` | `instabilidade_externa` | `destino_sem_resposta`, `destino_voltou` (alvo) |
 | `links_evento` | `velocidade` | `teste_velocidade` (download_mbps, upload_mbps, latencia_ms) |
 | `links_evento` | `sistema` | `coletor_iniciado` |
+| `disco_evento` | `smart` | `disco_sem_resposta` (disco, detalhe: motivo do smartctl), `disco_voltou` (disco). Um evento por mudança, não a cada rodada |
 | `docker_evento` | `falha` | `caiu` (código diferente de 0, sem parada pedida), `sem_memoria`, `unhealthy`, `healthy` |
 | `docker_evento` | `acesso` | `acesso_inicio` (tty, comando, usuario_container, exec_id), `acesso_fim`, `arquivo_lido`, `arquivo_gravado`, `exportado` |
 | `docker_evento` | `auditoria` | `criado`, `removido`, `iniciado`, `parado`, `reiniciado`, `renomeado`, `alterado`, `pausado`, `retomado`, `imagem_gerada` |
@@ -208,3 +225,4 @@ $env:NEXTEC_COLETA_URL = "https://raw.githubusercontent.com/Sou-Nextec/Scripts/<
 | 1.3.0 | 05/10/2026 | Módulo bancos (Linux e Windows): Firebird, Oracle, SQL Anywhere, SQLite e SQL Server no Linux, com `nextec_banco_*`. No Windows, `[internet] ativo = nao` desliga a rodada de internet quando a coleta é instalada só para bancos. |
 | 1.4.0 | 05/10/2026 | Módulo velocidade no Windows (Speedtest CLI em segundo plano, sem atrasar os links), no lugar da tarefa NextecSpeedtest; `nextec_internet_estado_desde_segundos` (Linux e Windows), usado no painel NOC. |
 | 1.5.0 | 06/10/2026 | Módulo virtualizacao (Linux e Windows): Hyper-V, Proxmox VE e KVM/libvirt locais; VMware ESXi/vCenter, Proxmox e XCP-ng pela API com usuário só leitura, segredos em `segredos.ini`; `nextec_hipervisor_*` e `nextec_vm_*`. |
+| 1.6.0 | 04/11/2026 | Módulo discos (Linux): SMART de NVMe e SATA/SAS com `nextec_disco_*`, no lugar do `nextec-smart.py` avulso do `nxt-srv-hv01`. No Windows, só o número da versão. Testes em `testes/` (`python3 -m unittest discover -s Alloy/coleta-complementar/testes`). |
