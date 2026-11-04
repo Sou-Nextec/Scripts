@@ -374,8 +374,11 @@ function Get-MapaColunasCsv {
     param($Linhas)
     $originais = New-Object System.Collections.Generic.List[string]
     $vistos = New-Object System.Collections.Generic.HashSet[string]
+    $menor = [int]::MaxValue
     foreach ($linha in @($Linhas)) {
-        foreach ($p in $linha.PSObject.Properties) { if ($vistos.Add("$($p.Name)")) { $originais.Add("$($p.Name)") } }
+        $qtd = 0
+        foreach ($p in $linha.PSObject.Properties) { $qtd++; if ($vistos.Add("$($p.Name)")) { $originais.Add("$($p.Name)") } }
+        if ($qtd -lt $menor) { $menor = $qtd }
     }
     $usados = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
     $seguro = New-Object 'System.Collections.Generic.Dictionary[string,string]'
@@ -395,7 +398,8 @@ function Get-MapaColunasCsv {
         $seguro[$n] = $final
         $mudou = $true
     }
-    [pscustomobject]@{ Originais = $originais.ToArray(); Seguro = $seguro; Mudou = $mudou }
+    # Heterogêneo: alguma linha tem menos colunas que o conjunto todo. O Export-Csv do 5.1 usaria só as da primeira.
+    [pscustomobject]@{ Originais = $originais.ToArray(); Seguro = $seguro; Mudou = $mudou; Heterogeneo = ($originais.Count -gt 0 -and $menor -lt $originais.Count) }
 }
 
 function ConvertTo-LinhaCsvSegura {
@@ -403,8 +407,9 @@ function ConvertTo-LinhaCsvSegura {
     # Sem $Mapa (uma linha avulsa), o mapeamento é calculado só com ela.
     param($Linha, $Mapa = $null)
     if (-not $Mapa) { $Mapa = Get-MapaColunasCsv @($Linha) }
-    $valores = @{}
-    $perigosa = $Mapa.Mudou
+    # Dictionary ordinal, como o mapa: um @{} comum ignora maiúscula e juntaria "Campo" e "campo" no mesmo valor.
+    $valores = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+    $perigosa = $Mapa.Mudou -or $Mapa.Heterogeneo
     foreach ($p in $Linha.PSObject.Properties) {
         $v = $null
         try { $v = $p.Value } catch { }
@@ -414,7 +419,8 @@ function ConvertTo-LinhaCsvSegura {
     if (-not $perigosa) { return $Linha }
     $nova = [ordered]@{}
     foreach ($n in $Mapa.Originais) {
-        $v = $valores[$n]
+        $v = $null
+        [void]$valores.TryGetValue($n, [ref]$v)
         $nova[$Mapa.Seguro[$n]] = if (Test-CelulaPerigosa $v) { "'$v" } else { $v }
     }
     [pscustomobject]$nova
@@ -616,8 +622,8 @@ function Save-DetalhesEstacoes {
     foreach ($lista in $script:ListasEstacao.Keys) {
         $linhas = @(Get-ListaEstacao $lista)
         if ($linhas.Count -eq 0) { continue }
-        $colunas = @($linhas | ForEach-Object { $_.PSObject.Properties.Name } | Select-Object -Unique)
-        Save-Dados $script:ListasEstacao[$lista][0] @($linhas | Select-Object -Property $colunas) $script:ListasEstacao[$lista][1]
+        # O Save-Dados completa as colunas que faltam em cada linha (mapa único por arquivo).
+        Save-Dados $script:ListasEstacao[$lista][0] $linhas $script:ListasEstacao[$lista][1]
     }
 }
 

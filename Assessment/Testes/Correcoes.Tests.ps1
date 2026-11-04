@@ -504,6 +504,37 @@ Describe 'CSV gerado a partir do JSON da estação (fórmulas neutralizadas)' {
         $b = (Invoke-ExportacaoTeste $json 'Impressoras')[0].PSObject.Properties.Name -join '|'
         $a | Should Be $b
     }
+    It 'Save-Dados: nomes que só diferem em maiúscula, em linhas diferentes, não repetem o valor nas duas colunas' {
+        $script:Arquivos = New-Object System.Collections.Generic.List[object]
+        $script:PastaSaida = Join-Path $env:TEMP ('NxtCsv_' + [guid]::NewGuid().ToString('N'))
+        [void](New-Item -ItemType Directory -Path $script:PastaSaida)
+        try {
+            Save-Dados 'caixa' @([pscustomobject]@{ Campo = 'um' }, [pscustomobject]@{ campo = 'dois' }) 'teste'
+            $l = @(Import-Csv -LiteralPath (Join-Path $script:PastaSaida 'caixa.csv') -Delimiter ';')
+            $l.Count | Should Be 2
+            $nomes = @($l[0].PSObject.Properties.Name)
+            $nomes.Count | Should Be 2
+            $colUm = @($l[0].PSObject.Properties | Where-Object { $_.Value -eq 'um' })
+            $colUm.Count | Should Be 1
+            $colDois = @($l[1].PSObject.Properties | Where-Object { $_.Value -eq 'dois' })
+            $colDois.Count | Should Be 1
+            $colUm[0].Name | Should Not Be $colDois[0].Name
+            # A outra coluna de cada linha fica vazia, em vez de repetir o valor.
+            @($l[0].PSObject.Properties | Where-Object { $_.Value }).Count | Should Be 1
+            @($l[1].PSObject.Properties | Where-Object { $_.Value }).Count | Should Be 1
+        } finally { Remove-Item -LiteralPath $script:PastaSaida -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    It 'fluxo real do JSON: maiúscula e minúscula em linhas diferentes também não repetem o valor' {
+        $l = Invoke-ExportacaoTeste '{"Impressoras":[{"Campo":"um"},{"campo":"dois"}]}' 'Impressoras'
+        $l.Count | Should Be 2
+        $dados = @($l[0].PSObject.Properties | Where-Object { $_.Name -ne 'Computador' -and $_.Value })
+        $dados.Count | Should Be 1
+        $dados[0].Value | Should Be 'um'
+        $dados2 = @($l[1].PSObject.Properties | Where-Object { $_.Name -ne 'Computador' -and $_.Value })
+        $dados2.Count | Should Be 1
+        $dados2[0].Value | Should Be 'dois'
+        $dados[0].Name | Should Not Be $dados2[0].Name
+    }
     It 'valor comum, número negativo e traço ficam como estão' {
         $l = Invoke-ExportacaoTeste '{"Impressoras":[{"Nome":"HP 1020","Saldo":-5,"Texto":"-5,5","Vazio":"-","Mail":"a@b.com"}]}' 'Impressoras'
         $l[0].Nome | Should Be 'HP 1020'
