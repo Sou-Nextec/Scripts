@@ -11,7 +11,7 @@ $script:TextoV2 = [System.IO.File]::ReadAllText($arquivo, [System.Text.Encoding]
 $nomes = 'Get-SituacaoSuporte', 'Get-NomeNetBios', 'Stop-TrabalhosVencidos', 'Get-MembrosAdministradores',
     'Format-SituacaoTpm', 'Test-ServicoBackupReal', 'ConvertTo-NumeroOuNulo', 'New-ComputadoresHtml',
     'ConvertTo-HtmlSeguro', 'ConvertFrom-TxtCymru', 'Get-ResumoOfficeClickToRun', 'Add-DetalhesEstacao',
-    'Get-ListaEstacao', 'Save-DetalhesEstacoes', 'Save-Dados', 'ConvertTo-LinhaCsvSegura', 'Test-CelulaPerigosa', 'Add-AlertasColetaLocal', 'Add-Alerta', 'Add-AlertaPorMaquinas'
+    'Get-ListaEstacao', 'Save-DetalhesEstacoes', 'Save-Dados', 'ConvertTo-LinhaCsvSegura', 'Get-MapaColunasCsv', 'Test-CelulaPerigosa', 'Add-AlertasColetaLocal', 'Add-Alerta', 'Add-AlertaPorMaquinas'
 $funcoesCarregadas = New-Object System.Collections.Generic.List[string]
 foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $nomes }, $true)) {
     . ([scriptblock]::Create($f.Extent.Text))
@@ -476,6 +476,33 @@ Describe 'CSV gerado a partir do JSON da estação (fórmulas neutralizadas)' {
     It 'objeto aninhado, que o CSV escreveria como @{...}, sai como texto' {
         $l = Invoke-ExportacaoTeste '{"Impressoras":[{"Nome":{"a":"b"}}]}' 'Impressoras'
         $l[0].Nome | Should Be "'@{a=b}"
+    }
+    It 'cabeçalhos =A e ''=A na mesma linha viram colunas distintas, seguras, sem perder valor' {
+        $l = Invoke-ExportacaoTeste '{"Impressoras":[{"=A":"valor-formula","''=A":"valor-literal","Nome":"HP"}]}' 'Impressoras'
+        $nomes = @($l[0].PSObject.Properties.Name)
+        @($nomes | Select-Object -Unique).Count | Should Be $nomes.Count
+        # Computador, as duas colunas de =A e Nome
+        $nomes.Count | Should Be 4
+        @($nomes | Where-Object { Test-CelulaPerigosa $_ }).Count | Should Be 0
+        $valores = @($l[0].PSObject.Properties | ForEach-Object { $_.Value })
+        ($valores -contains 'valor-formula') | Should Be $true
+        ($valores -contains 'valor-literal') | Should Be $true
+    }
+    It 'o mapeamento dos cabeçalhos vale para todas as linhas, mesmo com a ordem das chaves trocada' {
+        $json = '{"Impressoras":[{"=A":"f1","''=A":"l1"},{"''=A":"l2","=A":"f2"}]}'
+        $l = Invoke-ExportacaoTeste $json 'Impressoras'
+        $l.Count | Should Be 2
+        $colunaFormula = @($l[0].PSObject.Properties | Where-Object { $_.Value -eq 'f1' })[0].Name
+        $colunaLiteral = @($l[0].PSObject.Properties | Where-Object { $_.Value -eq 'l1' })[0].Name
+        $colunaFormula | Should Not Be $colunaLiteral
+        $l[1].$colunaFormula | Should Be 'f2'
+        $l[1].$colunaLiteral | Should Be 'l2'
+    }
+    It 'a mesma entrada gera os mesmos nomes de coluna em duas exportações' {
+        $json = '{"Impressoras":[{"=A":"1","''=A":"2","@B":"3"}]}'
+        $a = (Invoke-ExportacaoTeste $json 'Impressoras')[0].PSObject.Properties.Name -join '|'
+        $b = (Invoke-ExportacaoTeste $json 'Impressoras')[0].PSObject.Properties.Name -join '|'
+        $a | Should Be $b
     }
     It 'valor comum, número negativo e traço ficam como estão' {
         $l = Invoke-ExportacaoTeste '{"Impressoras":[{"Nome":"HP 1020","Saldo":-5,"Texto":"-5,5","Vazio":"-","Mail":"a@b.com"}]}' 'Impressoras'

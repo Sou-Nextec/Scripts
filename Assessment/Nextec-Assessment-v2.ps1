@@ -368,30 +368,64 @@ function Test-CelulaPerigosa {
     ($texto -match '^\s*[=+\-@＝＋－＠]') -and ($texto -notmatch '^\s*[-+]?\d+([.,]\d+)*\s*$') -and ($texto -notmatch '^\s*-+\s*$')
 }
 
+function Get-MapaColunasCsv {
+    # Um mapeamento por arquivo: nome original -> nome seguro, igual em todas as linhas.
+    # Nome que já é seguro nunca muda; o que precisa de apóstrofo cede se o nome resultante já existir, ganhando " (2)", " (3)"...
+    param($Linhas)
+    $originais = New-Object System.Collections.Generic.List[string]
+    $vistos = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($linha in @($Linhas)) {
+        foreach ($p in $linha.PSObject.Properties) { if ($vistos.Add("$($p.Name)")) { $originais.Add("$($p.Name)") } }
+    }
+    $usados = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+    $seguro = New-Object 'System.Collections.Generic.Dictionary[string,string]'
+    $mudou = $false
+    # Primeiro os que ficam como estão, para que o literal "'=A" não seja tomado pela versão neutralizada de "=A".
+    foreach ($n in $originais) {
+        if (Test-CelulaPerigosa $n) { continue }
+        $final = $n; $i = 2
+        while (-not $usados.Add($final)) { $final = "$n ($i)"; $i++ }
+        $seguro[$n] = $final
+        if ($final -ne $n) { $mudou = $true }
+    }
+    foreach ($n in $originais) {
+        if (-not (Test-CelulaPerigosa $n)) { continue }
+        $base = "'$n"; $final = $base; $i = 2
+        while (-not $usados.Add($final)) { $final = "$base ($i)"; $i++ }
+        $seguro[$n] = $final
+        $mudou = $true
+    }
+    [pscustomobject]@{ Originais = $originais.ToArray(); Seguro = $seguro; Mudou = $mudou }
+}
+
 function ConvertTo-LinhaCsvSegura {
-    # O apóstrofo faz a planilha tratar como texto. Nome de coluna também conta: as colunas da estação vêm do JSON dela.
-    param($Linha)
-    $propriedades = @($Linha.PSObject.Properties)
+    # Valor perigoso ganha apóstrofo, que faz a planilha tratar como texto. Os nomes de coluna vêm do mapeamento do arquivo.
+    # Sem $Mapa (uma linha avulsa), o mapeamento é calculado só com ela.
+    param($Linha, $Mapa = $null)
+    if (-not $Mapa) { $Mapa = Get-MapaColunasCsv @($Linha) }
     $valores = @{}
-    $perigosa = $false
-    foreach ($p in $propriedades) {
-        try { $valores[$p.Name] = $p.Value } catch { $valores[$p.Name] = $null }
-        if ((Test-CelulaPerigosa $p.Name) -or (Test-CelulaPerigosa $valores[$p.Name])) { $perigosa = $true }
+    $perigosa = $Mapa.Mudou
+    foreach ($p in $Linha.PSObject.Properties) {
+        $v = $null
+        try { $v = $p.Value } catch { }
+        $valores["$($p.Name)"] = $v
+        if (Test-CelulaPerigosa $v) { $perigosa = $true }
     }
     if (-not $perigosa) { return $Linha }
     $nova = [ordered]@{}
-    foreach ($p in $propriedades) {
-        $valor = $valores[$p.Name]
-        $nome = if (Test-CelulaPerigosa $p.Name) { "'$($p.Name)" } else { $p.Name }
-        $nova[$nome] = if (Test-CelulaPerigosa $valor) { "'$valor" } else { $valor }
+    foreach ($n in $Mapa.Originais) {
+        $v = $valores[$n]
+        $nova[$Mapa.Seguro[$n]] = if (Test-CelulaPerigosa $v) { "'$v" } else { $v }
     }
     [pscustomobject]$nova
 }
 
 function Save-Dados {
     param([string]$Nome, $Dados, [string]$Descricao)
-    $lista = @($Dados | Where-Object { $null -ne $_ } | ForEach-Object { ConvertTo-LinhaCsvSegura $_ })
+    $lista = @($Dados | Where-Object { $null -ne $_ })
     if ($lista.Count -gt 0) {
+        $mapa = Get-MapaColunasCsv $lista
+        $lista = @($lista | ForEach-Object { ConvertTo-LinhaCsvSegura $_ $mapa })
         $lista | Export-Csv -Path (Join-Path $script:PastaSaida "$Nome.csv") -NoTypeInformation -Encoding UTF8 -Delimiter ';'
     }
     $script:Arquivos.Add([pscustomobject]@{ Arquivo = "$Nome.csv"; Registros = $lista.Count; Descricao = $Descricao })
