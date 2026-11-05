@@ -1,4 +1,4 @@
-﻿# Banner de login dos servidores
+# Banner de login dos servidores
 
 Aviso de acesso antes da senha e quadro informativo depois do login, nos servidores Linux e Windows da Nextec e dos clientes. O passo a passo completo fica no Confluence, na página "Como configurar o aviso de acesso e o banner de login nos servidores" (espaço Documentação Interna).
 
@@ -18,6 +18,12 @@ sudo TIPO="$TIPO" NOME="$NOME" FUNCAO="$FUNCAO" AMBIENTE="$AMBIENTE" bash /tmp/a
 ```
 
 O `aplicar-banner.sh` baixa os demais arquivos desta pasta, faz backup do que existe e pode ser executado de novo a qualquer momento.
+
+Funciona em qualquer Linux com bash e OpenSSH Server. O script identifica sozinho como o sistema exibe a mensagem de login:
+
+- Ubuntu e Debian: quadro em `/etc/update-motd.d`, executado pelo PAM no login.
+- CentOS, RHEL, Rocky, Alma, Fedora, SUSE, Alpine e demais: quadro em `/etc/nextec/motd.d`, executado por `/etc/profile.d/00-nextec-motd.sh` só em login interativo (scp, sftp e rsync não são afetados).
+- SSH: o aviso vai em `/etc/ssh/sshd_config.d/01-nextec-aviso.conf` quando o `sshd_config` inclui essa pasta; senão, no início do `sshd_config` (ex.: CentOS 8). Se a configuração ficar inválida, o original volta e nada é recarregado.
 
 ### Windows
 
@@ -90,11 +96,11 @@ Os dois arquivos `.ps1` ficam salvos em UTF-8 com BOM, para o Windows PowerShell
 
 | Arquivo | Onde vai | Para quê |
 | --- | --- | --- |
-| `aplicar-banner.sh` | Executado uma vez | Instala tudo: variáveis, quadro, aviso e limpeza do MOTD do Ubuntu |
+| `aplicar-banner.sh` | Executado uma vez | Instala tudo: variáveis, quadro, aviso e limpeza das demais mensagens de login (update-motd, `/etc/motd.d` e `/etc/motd`) |
 | `aviso-acesso.txt` | `/etc/issue.net` e `/etc/issue` | Aviso legal antes da senha (SSH e console) |
-| `05-servidor` | `/etc/update-motd.d/05-servidor` | Quadro neutro para servidores de clientes, sem logotipo |
-| `05-nextec` | `/etc/update-motd.d/05-nextec` | Logotipo e boas-vindas, só para servidores da Nextec |
-| `10-nextec-info` | `/etc/update-motd.d/10-nextec-info` | Identificação e resumo do sistema dos servidores da Nextec |
+| `05-servidor` | `/etc/update-motd.d/05-servidor` (Ubuntu/Debian) ou `/etc/nextec/motd.d/05-servidor` (demais) | Quadro neutro para servidores de clientes, sem logotipo |
+| `05-nextec` | `/etc/update-motd.d/05-nextec` (Ubuntu/Debian) ou `/etc/nextec/motd.d/05-nextec` (demais) | Logotipo e boas-vindas, só para servidores da Nextec |
+| `10-nextec-info` | `/etc/update-motd.d/10-nextec-info` (Ubuntu/Debian) ou `/etc/nextec/motd.d/10-nextec-info` (demais) | Identificação e resumo do sistema dos servidores da Nextec |
 | `aplicar-banner.ps1` | Executado uma vez | Windows: instala tudo (quadro, variáveis, aviso antes da senha e tarefa agendada) |
 | `atualizar-banner.ps1` | `C:\ProgramData\Nextec\Banner\` | Windows: mantém o painel na versão do repositório (clientes com 2 dias de espera) |
 | `quadro-windows.ps1` | `C:\ProgramData\Nextec\Banner\` | Windows: painel dinâmico sobre a área de trabalho, com as mesmas informações do quadro Linux, atualizado a cada 10 segundos |
@@ -117,6 +123,12 @@ Gravadas pelo `aplicar-banner.sh` em `/etc/environment` (Linux) e pelo `aplicar-
 Os valores são tratados só como texto: aspas, barras, quebras de linha e caracteres de controle são ignorados.
 
 ## Testes
+
+`testes/testar-banner.sh` testa o instalador Linux em quatro cenários (Ubuntu/Debian, CentOS 8, RHEL 9 e só busybox, como no Alpine), cada um numa cópia isolada do `/etc`, sem alterar a máquina onde roda. Precisa de root, OpenSSH Server, `script` e busybox:
+
+```bash
+sudo bash Banner/testes/testar-banner.sh
+```
 
 `testes/quadro-windows.testes.ps1` roda no CI a cada push e pull request, e também pode ser rodado à mão:
 
@@ -146,5 +158,6 @@ Toda correção de bug no painel deve vir com um teste novo aqui, para o mesmo e
 | 2.2.0 | 2026-10-19 | Windows: o quadro deixa de ser imagem aplicada como papel de parede e vira um painel dinâmico (janela ancorada na área de trabalho, atrás das janelas, sem capturar clique ou foco), atualizado a cada 10 segundos, um por sessão (inclusive RDP), recriado após reinício do Explorer ou mudança de resolução; não conflita com GPO de papel de parede; `$papel=''` passa a ser o fundo preto; tarefa sem limite de tempo; novo visual com hierarquia (nome em destaque, etiqueta do ambiente, faixa lateral na cor do ambiente, métricas em amarelo a partir de 80% e vermelho a partir de 90%) e fundo translúcido com texto opaco (opacidade padrão 230); validações de sistema no instalador (Windows 8 / Server 2012, PowerShell 5.1, .NET 4.5, Server Core) e conferência do painel na tela, com troca automática do modo de ancoragem (WorkerW, Progman do 24H2, janela comum) e motivo no `quadro.log`; opção `-Remover`, que devolve o aviso anterior e o papel de parede guardado |
 | 2.3.0 | 2026-10-24 | Windows: atualização diária do painel pela tarefa `Nextec - Atualizar banner da area de trabalho` (compara o commit antes de baixar, servidores `nextec` na hora e `cliente` após 2 dias, confere sintaxe, devolve a versão anterior se o painel não abrir); novo parâmetro `-Tipo` no instalador; testes do atualizador no CI |
 | 2.2.1 | 2026-10-24 | Windows: corrige o crescimento de memória e handles do painel aberto por dias (uma sessão CIM reaproveitada, instâncias CIM descartadas, IP lido por .NET no lugar do `Get-NetIPConfiguration`, processos descartados, IP, processos e usuários relidos a cada minuto); proteção que reinicia o painel acima de `NEXTEC_QUADRO_LIMITE_MB` |
+| 2.4.0 | 2026-11-05 | Linux: `aplicar-banner.sh` passa a funcionar em qualquer distribuição (detecta update-motd ou usa `/etc/profile.d`, grava o aviso no `sshd_config` quando não há `sshd_config.d`, desativa `/etc/motd.d`, recarrega o SSH em systemd, OpenRC ou service, restaura o `sshd_config` se a configuração ficar inválida, backups fora da pasta do quadro); quadros sem depender de `free`, `ps`, `hostname` e `C.UTF-8`; testes em `testes/testar-banner.sh` |
 | 2.0.0 | 2026-10-07 | Instalador único `aplicar-banner.sh`; aviso no padrão NIST AC-8, também no console; resumo do sistema no quadro; cor do ambiente; logotipo centralizado com separador; identificação no `10-nextec-info`; limpeza dos scripts de MOTD do Ubuntu |
 | 1.0.0 | 2026-10-04 | Primeira versão: `05-nextec` (logotipo Nextec, nome real e nome Nextec do servidor) e `05-servidor` (quadro neutro para clientes, com contato noc@nex.tec.br) |

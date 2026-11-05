@@ -3,7 +3,10 @@
 # Logotipo, boas-vindas e separador, centralizados na largura do logotipo.
 # A identificação do servidor e o resumo do sistema ficam no 10-nextec-info.
 set -euo pipefail
-export LC_ALL=C.UTF-8
+# Usa um locale UTF-8 que exista no sistema (C.UTF-8 não existe em todas as distribuições)
+NX_LOCALE="$(locale -a 2>/dev/null | grep -iE '^(c|en_us|pt_br)\.utf-?8$' | head -1 || true)"
+[[ -n "$NX_LOCALE" ]] && export LC_ALL="$NX_LOCALE"
+unset NX_LOCALE
 
 ROXO='\033[1m\033[38;2;92;80;255m'
 CLARO='\033[1m\033[38;2;244;244;244m'
