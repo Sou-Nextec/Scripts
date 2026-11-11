@@ -38,18 +38,24 @@ madison_longo() {
   done
 }
 
+# Os cenários rodam num subshell separado e o código de saída é lido depois,
+# com "$?". Pôr "|| ..." junto do subshell desligaria o errexit dentro dele e
+# esconderia o código 141 que o teste quer pegar.
+
 # rodar_versao VERSAO_PROCURADA VERSAO_NO_TOPO: imprime "<saída>|<código>".
 rodar_versao() {
-  local procurada="$1" topo="$2"
-  (
+  local procurada="$1" topo="$2" saida codigo
+  saida="$( (
     # shellcheck disable=SC1090
     source "$INSTALADOR"
     trap - ERR
     set -Eeuo pipefail
     apt-cache() { madison_longo "$topo"; }
     r="$(versao_alloy_apt "$procurada")"
-    echo "${r}|0"
-  ) 2>/dev/null || echo "|$?"
+    echo "$r"
+  ) 2>/dev/null )"
+  codigo=$?
+  echo "${saida}|${codigo}"
 }
 
 verificar "versão exata no topo de lista longa" "1.20.1|0" "$(rodar_versao 1.20.1 1.20.1)"
@@ -59,12 +65,13 @@ verificar "versão ausente devolve vazio sem erro" "|0" "$(rodar_versao 9.9.9 1.
 
 # Leitura do IP do iDRAC: mesma armadilha com o ipmitool.
 rodar_idrac() {
-  (
+  local saida codigo
+  saida="$( (
     # shellcheck disable=SC1090
     source "$INSTALADOR"
     trap - ERR
     set -Eeuo pipefail
-    linha="$(grep -n 'IDRAC_ENDERECO="\$(timeout 15 ipmitool' "$INSTALADOR" | head -n1 | cut -d: -f2-)"
+    linha="$(grep -m1 'IDRAC_ENDERECO="\$(timeout 15 ipmitool' "$INSTALADOR")"
     timeout() { shift; "$@"; }
     ipmitool() {
       local i
@@ -73,8 +80,10 @@ rodar_idrac() {
       for ((i = 0; i < 20000; i++)); do echo "Cipher Suite Priv Max   : XaaaXXaaaXaaaXa ${i}"; done
     }
     eval "$linha"
-    echo "${IDRAC_ENDERECO}|0"
-  ) 2>/dev/null || echo "|$?"
+    echo "$IDRAC_ENDERECO"
+  ) 2>/dev/null )"
+  codigo=$?
+  echo "${saida}|${codigo}"
 }
 
 verificar "IP do iDRAC com saída longa do ipmitool" "10.0.0.120|0" "$(rodar_idrac)"
