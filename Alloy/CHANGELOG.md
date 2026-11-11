@@ -10,10 +10,19 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.16.0 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.16.1 |
 | Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.29.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.6.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
+
+## 2026-11-11
+
+### Instalador Linux 2.16.1, atualização caindo com código 141
+
+- **Por que.** Na atualização automática 2026.11.04-1 o `nxt-srv-app01-eveo` voltou para a versão anterior com "instalador terminou com código 141" em `install_alloy_apt`. O `awk` que escolhe a versão fixada do Alloy saía (`exit`) na primeira linha que batia e fechava o pipe enquanto o `apt-cache madison` ainda escrevia a lista do repositório da Grafana, que hoje é longa. O `apt-cache` morria com SIGPIPE e, com `pipefail`, o instalador parava. Depende do tamanho da lista e do tempo de cada máquina, por isso outras atualizaram normalmente.
+- **Correção.** A escolha da versão foi para a função `versao_alloy_apt`, com o `awk` lendo a lista inteira e guardando só a primeira correspondência. A leitura do IP do iDRAC (`ipmitool lan print`) tinha o mesmo padrão e foi ajustada igual.
+- **Testes.** `Alloy/testes/instalador-linux-sigpipe.testes.sh` simula um `apt-cache` com lista longa sob `set -Eeuo pipefail`.
+- **Máquina que falhou** recebe na próxima rodada do atualizador, depois de publicada uma versão nova do manifesto.
 
 ## 2026-11-04
 
