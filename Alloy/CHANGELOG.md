@@ -11,9 +11,22 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
 | Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.16.0 |
-| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.29.0 |
+| Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.30.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.6.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
+
+## 2026-11-17
+
+### Instalador Windows 2.30.0, bloqueios de entrada do Firewall do Windows
+
+- **Por que.** O bloco que lê o `pfirewall.log` tinha sido colado à mão no `config.alloy` de um servidor e se perderia na próxima reconfiguração ou atualização. Agora é uma opção do instalador.
+- **Opção nova, desligada por padrão.** No modo interativo aparece como "Bloqueios de entrada do Firewall do Windows (pfirewall.log)" (lista de recursos, tela e item "Coleta de logs" do menu "Ver e alterar"). No `-Silent`, o parâmetro é `-ColetarBloqueiosFirewall` (apelido `-EnableFirewallLogs`). Exige modo que monitore o host.
+- **Resposta mantida.** Fica no cabeçalho do `config.alloy` (`// nextec:firewall_bloqueios = sim`) e sobrevive a "Reconfigurar", "Ver e alterar" e `-Atualizar`. Sem o parâmetro, o `-Silent` mantém o que já está gravado; `-ColetarBloqueiosFirewall:$false` desliga. Config sem o cabeçalho que já tenha o componente `firewall_windows` (bloco colado à mão) é lida como ligada e passa a ser regerada pelo instalador, sem duplicar.
+- **O que chega ao Loki (`servico="firewall_windows"`, `canal="firewall"`).** Só bloqueios recebidos: descarta cabeçalho, linha vazia e linha que não começa com data, ação ALLOW, tráfego SEND, loopback na origem e broadcast ou multicast no destino. Rótulos padrão (cliente, host, servico, tipo, ambiente, os, origem, criticidade, local, canal). Mensagem no formato `🔐 EQUIPAMENTO · Bloqueio no firewall do Windows · protocolo origem → porta`.
+- **Limites.** Lê só o que chega depois da ativação (`tail_from_end`) e aplica o freio de 20 linhas por segundo (burst 100), para varredura de porta não saturar o link do cliente.
+- **Log ausente.** O instalador não liga o firewall nem muda perfis. Se o `pfirewall.log` não existir, o resumo avisa que os bloqueios só serão registrados com o Firewall do Windows ligado e o registro de conexões bloqueadas ativo.
+- **Servidor já instalado** só muda se alguém ligar a opção; as demais coletas ficam como estão.
+- **Testes.** `.\Alloy\testes\instalador-windows-firewall.testes.ps1`.
 
 ## 2026-11-04
 

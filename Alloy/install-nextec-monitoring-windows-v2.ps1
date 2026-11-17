@@ -47,6 +47,13 @@
     -------------------------------------------------------------------------
     HISTÓRICO
     -------------------------------------------------------------------------
+    2.30.0 Bloqueios de entrada do Firewall do Windows (pfirewall.log) como
+           opção do instalador, desligada por padrão. Pergunta no
+           interativo, -ColetarBloqueiosFirewall no -Silent, resposta
+           gravada no cabeçalho do config.alloy (nextec:firewall_bloqueios)
+           e mantida por Reconfigurar, Ver e alterar e -Atualizar. O
+           instalador não liga o firewall nem altera perfis: sem o log, só
+           avisa no resumo.
     2.29.0 Coleta de eventos e do ERRORLOG do SQL Server. Em servidor com
            instância SQL detectada e logs ligados, o Alloy passa a enviar
            os eventos de serviço do SQL (7036 e 7040), 7045, 1074, 6005,
@@ -268,6 +275,14 @@ param(
     [switch]$EnableLogWarnings,
     # [Modo Silencioso] Habilita a coleta de logs de segurança (autenticação).
     [switch]$EnableSecurityLogs,
+    # [Modo Silencioso] Coleta os bloqueios de entrada do Firewall do Windows
+    # (pfirewall.log) e envia ao Loki (servico="firewall_windows"). Desligado
+    # por padrão. Sem o parâmetro, a resposta já gravada no config.alloy é
+    # mantida; -ColetarBloqueiosFirewall:$false desliga. O instalador não liga
+    # o firewall nem muda perfis: o log precisa existir (registro de conexões
+    # bloqueadas ativo) para haver bloqueios a enviar.
+    [Alias("EnableFirewallLogs")]
+    [switch]$ColetarBloqueiosFirewall,
     # [Modo Silencioso] Habilita a função de collector SNMP.
     [switch]$EnableSnmp,
     # [Modo Silencioso] Habilita a função de collector Blackbox (conectividade).
@@ -364,7 +379,7 @@ $ProgressPreference = "SilentlyContinue"
 # CONSTANTES E VARIÁVEIS GLOBAIS
 # ==============================================================================
 
-$InstallerVersion = "2.29.0"
+$InstallerVersion = "2.30.0"
 
 # SYSTEM e Administradores locais, os únicos com acesso às credenciais do NOC.
 # Por SID porque os nomes mudam com o idioma do Windows.
@@ -900,6 +915,7 @@ $script:SelectedHostFeatureKeys = [string[]]@()
 $script:EnableLogsResolved = $false
 $script:EnableLogWarningsResolved = $false
 $script:EnableSecurityLogsResolved = $false
+$script:EnableFirewallLogsResolved = $false
 $script:EnableSnmpResolved = $false
 $script:EnableBlackboxResolved = $false
 $script:EnableExportersResolved = $false
@@ -2314,6 +2330,7 @@ function Get-MaintenanceStatusRows {
             if ($atual.MonitorHost) { $ligadas += $(if ($atual.TipoLabel -eq "estacao") { "estação" } else { "servidor" }) }
             if ($atual.EnableLogs) { $ligadas += "logs" }
             if ($atual.EnableSecurity) { $ligadas += "segurança" }
+            if ($atual.EnableFirewall) { $ligadas += "bloqueios do firewall" }
             if (@($atual.BlackboxTargets).Count -gt 0) { $ligadas += "conectividade" }
             if (@($atual.SnmpTargets).Count -gt 0) { $ligadas += "snmp" }
             if (@($atual.CustomExporters).Count -gt 0) { $ligadas += "exporters" }
@@ -2609,6 +2626,11 @@ function Read-CurrentAlloyConfiguration {
     $logComponents = @([Regex]::Matches($content, 'loki\.source\.windowsevent\s+"([^"]+)"') |
                        ForEach-Object { $_.Groups[1].Value })
 
+    # Bloqueios do Firewall do Windows: o cabeçalho manda; sem ele (config
+    # anterior à 2.30, inclusive com o bloco colado à mão) vale a presença do
+    # componente firewall_windows.
+    $enableFirewall = Get-FirewallLogsDoConfig -Content $content
+
     $blackboxTargets = @()
     $blackboxSection = Get-AlloyConfigSection -Content $content -Header 'prometheus.exporter.blackbox "network"'
 
@@ -2750,6 +2772,7 @@ function Read-CurrentAlloyConfiguration {
         EnableLogs               = @($logComponents | Where-Object { $_ -match "_(error|warning)$" }).Count -gt 0
         EnableWarnings           = @($logComponents | Where-Object { $_ -match "_warning$" }).Count -gt 0
         EnableSecurity           = ($logComponents -contains "security")
+        EnableFirewall           = $enableFirewall
         BlackboxTargets          = $blackboxTargets
         SnmpTargets              = $snmpTargets
         CustomExporters          = $customExporters
@@ -2852,6 +2875,7 @@ function Show-CurrentConfiguration {
     if ($c.EnableLogs)     { $logResumo.Add("Critical/Error") }
     if ($c.EnableWarnings) { $logResumo.Add("Warning") }
     if ($c.EnableSecurity) { $logResumo.Add("segurança") }
+    if ($c.EnableFirewall) { $logResumo.Add("bloqueios do firewall") }
 
     if ($logResumo.Count -gt 0) {
         Write-Field -Label "Logs" -Value ($logResumo -join ", ")
@@ -2937,6 +2961,7 @@ function Import-CurrentConfiguration {
     $script:EnableLogsResolved         = $c.EnableLogs
     $script:EnableLogWarningsResolved  = $c.EnableWarnings
     $script:EnableSecurityLogsResolved = $c.EnableSecurity
+    $script:EnableFirewallLogsResolved = [bool]$c.EnableFirewall
     $script:EnableBlackboxResolved     = ($c.BlackboxTargets.Count -gt 0)
     $script:EnableSnmpResolved         = ($c.SnmpTargets.Count -gt 0)
     $script:EnableInternetResolved     = $c.EnableInternet
@@ -3072,6 +3097,11 @@ function Edit-LogSettings {
     }
 
     $script:EnableSecurityLogsResolved = Read-YesNo -Prompt "Coletar logs de autenticação e segurança?" -Default $script:EnableSecurityLogsResolved
+
+    $script:EnableFirewallLogsResolved = Read-YesNo -Prompt "Coletar os bloqueios de entrada do Firewall do Windows (pfirewall.log)?" -Default $script:EnableFirewallLogsResolved
+    if ($script:EnableFirewallLogsResolved) {
+        [void](Write-NextecFirewallAviso)
+    }
 
     # A credencial do Loki só é necessária quando algum log é coletado, e pode
     # não existir se o host nunca enviou log até agora.
@@ -3545,7 +3575,7 @@ function Invoke-ConfigurationMenu {
         # número fixo, para não quebrar quando um item entra ou sai da lista.
         $opcoes = New-Object System.Collections.Generic.List[string]
         [void]$opcoes.Add("Identificação (cliente, host, local, ambiente, criticidade)")
-        [void]$opcoes.Add("Coleta de logs (sistema, avisos, segurança)")
+        [void]$opcoes.Add("Coleta de logs (sistema, avisos, segurança, firewall)")
         [void]$opcoes.Add("Alvos de conectividade (Blackbox)")
         [void]$opcoes.Add("Alvos SNMP")
 
@@ -3569,7 +3599,7 @@ function Invoke-ConfigurationMenu {
 
         switch ($rotulo) {
             "Identificação (cliente, host, local, ambiente, criticidade)" { Edit-IdentificationSettings; $alterou = $true }
-            "Coleta de logs (sistema, avisos, segurança)" { Edit-LogSettings; $alterou = $true }
+            "Coleta de logs (sistema, avisos, segurança, firewall)" { Edit-LogSettings; $alterou = $true }
             "Alvos de conectividade (Blackbox)" { Edit-BlackboxTargets; $alterou = $true }
             "Alvos SNMP" { Edit-SnmpTargets; $alterou = $true }
             "Internet (Speedtest)" { Edit-InternetSettings; $alterou = $true }
@@ -4528,6 +4558,9 @@ function Read-ResourceChecklist {
     $script:EnableLogsResolved = $EnableLogs.IsPresent
     $script:EnableLogWarningsResolved = $EnableLogWarnings.IsPresent
     $script:EnableSecurityLogsResolved = $EnableSecurityLogs.IsPresent
+    # Padrão vem do parâmetro ou, sem ele, da resposta já gravada no config.alloy,
+    # para o Reconfigurar não perder a opção.
+    $script:EnableFirewallLogsResolved = Get-NextecFirewallPadrao
     $script:EnableSnmpResolved = $EnableSnmp.IsPresent
     $script:EnableBlackboxResolved = $EnableBlackbox.IsPresent
     $script:EnableExportersResolved = $EnableExporters.IsPresent
@@ -4546,6 +4579,7 @@ function Read-ResourceChecklist {
         $items.Add((New-NextecChecklistItem -Key "logs" -Label "Logs do sistema, Critical e Error" -Selected $script:EnableLogsResolved))
         $items.Add((New-NextecChecklistItem -Key "logs_warning" -Label "Incluir também os avisos (Warning), aumenta muito o volume" -Selected $script:EnableLogWarningsResolved))
         $items.Add((New-NextecChecklistItem -Key "security" -Label "Logs de autenticação e segurança" -Selected $script:EnableSecurityLogsResolved))
+        $items.Add((New-NextecChecklistItem -Key "firewall" -Label "Bloqueios de entrada do Firewall do Windows (pfirewall.log)" -Selected $script:EnableFirewallLogsResolved))
 
         foreach ($feature in $DetectedFeatures) {
             $items.Add((New-NextecChecklistItem `
@@ -4593,8 +4627,8 @@ function Read-ResourceChecklist {
         # se aplicam ao modo nem entram na lista: o flag voltaria a $false sem
         # nenhuma mensagem, e um rollout via RMM instalaria hosts sem log e sem
         # probe reportando sucesso.
-        if (($EnableLogs.IsPresent -or $EnableSecurityLogs.IsPresent -or $EnableLogWarnings.IsPresent) -and -not $MonitorHost) {
-            throw "-EnableLogs, -EnableLogWarnings e -EnableSecurityLogs exigem um modo que monitore o host (servidor, estacao, servidor_collector ou estacao_collector)."
+        if (($EnableLogs.IsPresent -or $EnableSecurityLogs.IsPresent -or $EnableLogWarnings.IsPresent -or $ColetarBloqueiosFirewall.IsPresent) -and -not $MonitorHost) {
+            throw "-EnableLogs, -EnableLogWarnings, -EnableSecurityLogs e -ColetarBloqueiosFirewall exigem um modo que monitore o host (servidor, estacao, servidor_collector ou estacao_collector)."
         }
 
         if ($EnableSnmp.IsPresent -and -not $Collector) {
@@ -4618,6 +4652,7 @@ function Read-ResourceChecklist {
     $script:EnableLogsResolved = ($selectedKeys -contains "logs")
     $script:EnableLogWarningsResolved = ($selectedKeys -contains "logs_warning")
     $script:EnableSecurityLogsResolved = ($selectedKeys -contains "security")
+    $script:EnableFirewallLogsResolved = ($selectedKeys -contains "firewall")
 
     # Warning depende de Critical/Error: sozinho geraria um pipeline de log
     # sem o canal principal.
@@ -5757,6 +5792,10 @@ function Show-Plan {
         Write-Field -Label "Recursos detectados" -Value $featureText -Width 26
         Write-Field -Label "Logs do sistema" -Value (& $simNao $script:EnableLogsResolved) -Width 26
         Write-Field -Label "Logs de autenticação" -Value (& $simNao $script:EnableSecurityLogsResolved) -Width 26
+        Write-Field -Label "Bloqueios do firewall" -Value (& $simNao $script:EnableFirewallLogsResolved) -Width 26
+        if ($script:EnableFirewallLogsResolved) {
+            [void](Write-NextecFirewallAviso)
+        }
     }
 
     if ($script:Collector) {
@@ -6642,8 +6681,187 @@ function Install-InternetMonitoring {
 # O coleta-complementar.ini é a fonte da verdade dos links: a reconfiguração
 # lê dali, e ajustes feitos à mão em [geral] e [internet] são preservados.
 
+function Get-NextecFirewallLogCaminho {
+    <#
+        Caminho do log do Firewall do Windows, com barras normais (é o formato
+        que o Alloy espera e que o Windows também aceita).
+    #>
+    $raiz = $env:SystemRoot
+    if ([string]::IsNullOrWhiteSpace($raiz)) { $raiz = "C:\Windows" }
+    return (($raiz.TrimEnd('\', '/') + "/System32/LogFiles/Firewall/pfirewall.log").Replace('\', '/'))
+}
+
+function Write-NextecFirewallAviso {
+    <#
+        Avisa quando o log do firewall não existe. O instalador não liga o
+        firewall nem muda perfis: o arquivo só passa a existir quando o
+        Firewall do Windows está ligado com o registro de conexões bloqueadas
+        ativo. Devolve $true quando o arquivo existe.
+    #>
+    $caminho = Get-NextecFirewallLogCaminho
+    $existe = Test-Path -LiteralPath $caminho -PathType Leaf
+    if (-not $existe) {
+        Write-Warn ("O log do firewall ({0}) ainda não existe. Os bloqueios só serão registrados com o Firewall do Windows ligado e o registro de conexões bloqueadas ativo; o instalador não liga o firewall nem altera perfis." -f $caminho)
+    }
+    return $existe
+}
+
+function Get-FirewallLogsDoConfig {
+    <#
+        Diz se o config.alloy tem a coleta dos bloqueios do firewall. O
+        cabeçalho nextec:firewall_bloqueios manda; sem ele vale a presença do
+        componente firewall_windows (config anterior à 2.30 ou bloco colado à
+        mão), para que a regeração não apague o que já estava coletando.
+    #>
+    param([AllowEmptyString()][string]$Content)
+
+    $cabecalho = [Regex]::Match($Content, '(?m)^\s*//\s*nextec:firewall_bloqueios\s*=\s*(?<valor>\S+)')
+    if ($cabecalho.Success) {
+        return ($cabecalho.Groups["valor"].Value -match '^(sim|s|1|true)$')
+    }
+    return [bool]($Content -match '(?m)^\s*loki\.source\.file\s+"firewall_windows"')
+}
+
+function Get-NextecFirewallPadrao {
+    <#
+        Resposta padrão para os bloqueios do firewall: o parâmetro, quando
+        informado (inclusive -ColetarBloqueiosFirewall:$false); senão a
+        resposta já gravada no config.alloy; senão desligado.
+    #>
+    if ($script:OriginalBoundParameters.ContainsKey("ColetarBloqueiosFirewall")) {
+        return [bool]$ColetarBloqueiosFirewall.IsPresent
+    }
+
+    try {
+        $atual = Read-CurrentAlloyConfiguration
+        if ($null -ne $atual) { return [bool]$atual.EnableFirewall }
+    }
+    catch {
+        Write-Warn ("Não foi possível ler a coleta dos bloqueios do firewall no config.alloy atual; a opção parte de desligada. Detalhe: {0}" -f $_.Exception.Message)
+    }
+    return $false
+}
+
+function Get-FirewallWindowsAlloyLines {
+    <#
+        Linhas Alloy da coleta dos bloqueios de entrada do Firewall do Windows
+        (pfirewall.log) para o loki.write "nextec". Devolve lista vazia quando
+        -Ativo é falso. Os rótulos são os mesmos dos eventos do Windows.
+
+        Filtros, nesta ordem: cabeçalho (#), linha vazia e linha que não
+        começa com data; ação ALLOW; tráfego SEND; loopback na origem;
+        broadcast e multicast no destino. Sobram os bloqueios recebidos.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][bool]$Ativo,
+        [string]$Cliente,
+        [string]$HostLabel,
+        [string]$Tipo,
+        [string]$Ambiente,
+        [string]$Criticidade,
+        [string]$Local,
+        [string]$CaminhoLog = "C:/Windows/System32/LogFiles/Firewall/pfirewall.log"
+    )
+
+    if (-not $Ativo) { return @() }
+
+    $molde = @'
+// Bloqueios de entrada do Firewall do Windows (pfirewall.log)
+local.file_match "firewall_windows" {
+  path_targets = [{"__path__" = "__CAMINHO__"}]
+}
+
+loki.source.file "firewall_windows" {
+  targets       = local.file_match.firewall_windows.targets
+  tail_from_end = true
+  forward_to    = [loki.process.firewall_windows.receiver]
+}
+
+loki.process "firewall_windows" {
+  forward_to = [loki.write.nextec.receiver]
+
+  // Cabeçalho (#), linha vazia e qualquer linha que não comece com data.
+  stage.drop {
+    expression = "^(#|\\s*$|\\D)"
+  }
+
+  stage.regex {
+    expression = "^\\d{4}-\\d{2}-\\d{2} \\S+ (?P<acao>\\S+) (?P<proto>\\S+) (?P<ip_origem>\\S+) (?P<ip_destino>\\S+) (?P<porta_origem>\\S+) (?P<porta_destino>\\S+) (?:\\S+ ){8}(?P<direcao>\\S+)"
+  }
+
+  stage.drop {
+    source = "acao"
+    value  = "ALLOW"
+  }
+
+  stage.drop {
+    source = "direcao"
+    value  = "SEND"
+  }
+
+  stage.drop {
+    source     = "ip_origem"
+    expression = "^(127\\.|::1|fe80:)"
+  }
+
+  stage.drop {
+    source     = "ip_destino"
+    expression = "^(22[4-9]\\.|23[0-9]\\.|255\\.|ff0)|\\.255$"
+  }
+
+  // Freio contra varredura de porta: milhares de bloqueios por segundo.
+  stage.limit {
+    rate  = 20
+    burst = 100
+    drop  = true
+  }
+
+  stage.label_drop {
+    values = ["filename"]
+  }
+
+  stage.static_labels {
+    values = {
+      cliente     = "__CLIENTE__",
+      host        = "__HOST__",
+      servico     = "firewall_windows",
+      canal       = "firewall",
+      tipo        = "__TIPO__",
+      ambiente    = "__AMBIENTE__",
+      os          = "windows",
+      origem      = "alloy",
+      criticidade = "__CRITICIDADE__",
+      local       = "__LOCAL__",
+    }
+  }
+
+  stage.template {
+    source   = "mensagem"
+    template = "🔐 __HOST_MAIUSCULO__ · Bloqueio no firewall do Windows · {{ .proto }} {{ .ip_origem }} → porta {{ .porta_destino }}"
+  }
+
+  stage.output {
+    source = "mensagem"
+  }
+}
+'@
+
+    $texto = $molde.
+        Replace("__CAMINHO__", (ConvertTo-AlloyEscapedString $CaminhoLog)).
+        Replace("__CLIENTE__", (ConvertTo-AlloyEscapedString $Cliente)).
+        Replace("__HOST_MAIUSCULO__", (ConvertTo-AlloyEscapedString ($HostLabel.ToUpperInvariant()))).
+        Replace("__HOST__", (ConvertTo-AlloyEscapedString $HostLabel)).
+        Replace("__TIPO__", (ConvertTo-AlloyEscapedString $Tipo)).
+        Replace("__AMBIENTE__", (ConvertTo-AlloyEscapedString $Ambiente)).
+        Replace("__CRITICIDADE__", (ConvertTo-AlloyEscapedString $Criticidade)).
+        Replace("__LOCAL__", (ConvertTo-AlloyEscapedString $Local))
+
+    # Fim de linha único, o mesmo do restante do arquivo (AppendLine).
+    return @(($texto -split "\r?\n") + "")
+}
+
 function Test-NextecNeedsLoki {
-    return ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved -or $script:EnableColetaResolved -or (Test-NextecSyslogAtivo))
+    return ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved -or $script:EnableFirewallLogsResolved -or $script:EnableColetaResolved -or (Test-NextecSyslogAtivo))
 }
 
 function Get-NextecSyslogOrigens {
@@ -7594,6 +7812,9 @@ function New-AlloyConfiguration {
     [void]$builder.AppendLine(("// nextec:local       = {0}" -f $script:Local))
     [void]$builder.AppendLine(("// nextec:criticidade = {0}" -f $script:Criticidade))
     [void]$builder.AppendLine(("// nextec:tipo        = {0}" -f $script:TipoLabel))
+    # Opções que não dependem de leitura do restante do arquivo: o menu e o
+    # -Atualizar relêem daqui e regeram o bloco correspondente.
+    [void]$builder.AppendLine(("// nextec:firewall_bloqueios = {0}" -f $(if ($script:MonitorHost -and $script:EnableFirewallLogsResolved) { "sim" } else { "nao" })))
     [void]$builder.AppendLine("// =============================================================================")
     [void]$builder.AppendLine("")
 
@@ -7823,7 +8044,7 @@ function New-AlloyConfiguration {
         [void]$builder.AppendLine("")
     }
 
-    if (($script:MonitorHost -and ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved)) -or $script:EnableColetaResolved -or (Test-NextecSyslogAtivo)) {
+    if (($script:MonitorHost -and ($script:EnableLogsResolved -or $script:EnableSecurityLogsResolved -or $script:EnableFirewallLogsResolved)) -or $script:EnableColetaResolved -or (Test-NextecSyslogAtivo)) {
         [void]$builder.AppendLine("// Logs Windows e eventos da Coleta Complementar")
         [void]$builder.AppendLine('loki.write "nextec" {')
         [void]$builder.AppendLine("  endpoint {")
@@ -8052,6 +8273,16 @@ function New-AlloyConfiguration {
                 [void]$builder.AppendLine("}")
                 [void]$builder.AppendLine("")
             }
+        }
+
+        # Bloqueios de entrada do Firewall do Windows (pfirewall.log).
+        $linhasFirewall = @(Get-FirewallWindowsAlloyLines `
+            -Ativo ([bool]($script:MonitorHost -and $script:EnableFirewallLogsResolved)) `
+            -Cliente $script:Cliente -HostLabel $script:HostLabel -Tipo $script:TipoLabel `
+            -Ambiente $script:Ambiente -Criticidade $script:Criticidade -Local $script:Local `
+            -CaminhoLog (Get-NextecFirewallLogCaminho))
+        foreach ($linhaFirewall in $linhasFirewall) {
+            [void]$builder.AppendLine($linhaFirewall)
         }
     }
 
@@ -8649,6 +8880,10 @@ function Show-FinalSummary {
         if ($selectedFeatures.Count -gt 0) {
             Write-Field -Label "Recursos" -Value (($selectedFeatures | ForEach-Object { $_.Label }) -join ", ") -ValueColor Green -Width 20
         }
+    }
+    if ($script:MonitorHost -and $script:EnableFirewallLogsResolved) {
+        Write-Field -Label "Firewall" -Value "bloqueios de entrada (pfirewall.log)" -ValueColor Green -Width 20
+        [void](Write-NextecFirewallAviso)
     }
     if ($script:EnableBlackboxResolved) {
         Write-Field -Label "Conectividade" -Value ("{0} alvo(s)" -f $script:BlackboxTargets.Count) -ValueColor Green -Width 20
@@ -9851,6 +10086,7 @@ function Show-NextecInstallerGui {
             logs = [bool]$script:EnableLogsResolved
             logs_warning = [bool]$script:EnableLogWarningsResolved
             security = [bool]$script:EnableSecurityLogsResolved
+            firewall = [bool]$script:EnableFirewallLogsResolved
             snmp = [bool]$script:EnableSnmpResolved
             blackbox = [bool]$script:EnableBlackboxResolved
             internet = [bool]$script:EnableInternetResolved
@@ -10423,6 +10659,7 @@ function Show-NextecInstallerGui {
             [void](& $novo $logs "logs_warning" "Incluir os avisos (Warning), aumenta muito o volume" ([bool]$EnableLogWarnings.IsPresent))
             $logs.Expand()
             [void](& $novo $null "security" "Logs de autenticação e segurança" ([bool]$EnableSecurityLogs.IsPresent -or $script:EnableSecurityLogsResolved))
+            [void](& $novo $null "firewall" "Bloqueios de entrada do Firewall do Windows (pfirewall.log)" (Get-NextecFirewallPadrao))
             foreach ($feature in $gg.Features) {
                 [void](& $novo $null ("feature:{0}" -f $feature.Key) ("{0} (detectado)" -f $feature.Label) ([bool]$feature.Selected))
             }
@@ -10693,6 +10930,7 @@ function Get-GuiResumo {
         [void]$linhas.Add("Perfil básico ...... CPU, memória, discos, rede, uptime, serviços")
         [void]$linhas.Add(("Logs do sistema .... {0}{1}" -f (& $simNao (& $gg.Marcado "logs")), $(if (& $gg.Marcado "logs_warning") { " (com avisos)" } else { "" })))
         [void]$linhas.Add(("Logs de segurança .. {0}" -f (& $simNao (& $gg.Marcado "security"))))
+        [void]$linhas.Add(("Bloqueios firewall . {0}" -f (& $simNao (& $gg.Marcado "firewall"))))
         $feats = @($gg.Features | Where-Object { & $gg.Marcado ("feature:{0}" -f $_.Key) } | ForEach-Object { $_.Label })
         if ($feats.Count -gt 0) { [void]$linhas.Add(("Detectados ......... {0}" -f ($feats -join ", "))) }
         if ($gg.Sqlite.Text.Trim()) { [void]$linhas.Add(("Bases SQLite ....... {0}" -f $gg.Sqlite.Text.Trim())) }
@@ -10758,6 +10996,7 @@ function Set-NextecConfigurationFromGui {
     $script:EnableLogsResolved = [bool](& $gg.Marcado "logs")
     $script:EnableLogWarningsResolved = [bool](& $gg.Marcado "logs_warning")
     $script:EnableSecurityLogsResolved = [bool](& $gg.Marcado "security")
+    $script:EnableFirewallLogsResolved = [bool](& $gg.Marcado "firewall")
     $script:EnableSnmpResolved = [bool](& $gg.Marcado "snmp")
     $script:EnableBlackboxResolved = [bool](& $gg.Marcado "blackbox")
     $script:EnableInternetResolved = [bool](& $gg.Marcado "internet")
@@ -10920,6 +11159,7 @@ function Save-NextecSimulacao {
         criticidade = $script:Criticidade; modo = $script:ResolvedMode; destino = $script:NocHost
         recursos_detectados = @($script:SelectedHostFeatureKeys)
         logs = $script:EnableLogsResolved; avisos = $script:EnableLogWarningsResolved; seguranca = $script:EnableSecurityLogsResolved
+        firewall_bloqueios = $script:EnableFirewallLogsResolved
         coleta = $script:EnableColetaResolved; links = @($script:ColetaLinks)
         speedtest = $script:EnableInternetResolved; speedtest_min = $script:InternetIntervalMinutesResolved
         blackbox = @($script:BlackboxTargets); blackbox_intervalo = $script:BlackboxIntervalSecondsResolved
