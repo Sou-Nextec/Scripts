@@ -10,12 +10,22 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.16.0 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.17.0 |
 | Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.30.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.6.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
 
 ## 2026-11-17
+
+### Instalador Linux 2.17.0, bloqueios de entrada do firewall
+
+- **Por que.** Mesma coleta do Windows 2.30.0, para a regra de alerta e os painéis valerem para os dois sistemas.
+- **Opção nova, desligada por padrão.** Item "Bloqueios de entrada do firewall (ufw, firewalld, nftables ou iptables)" na lista de recursos, também em "Alterar a configuração" > "Recursos". Só aparece habilitado com servidor monitorado. A resposta fica em `/etc/nextec/instalacao.conf` (`ENABLE_FIREWALL`) e é mantida pelo `--atualizar`; instalação anterior sem a chave fica desligada.
+- **De onde vem.** Log do kernel pelo journal (`loki.source.journal` com `_TRANSPORT=kernel`, últimos 10 min na primeira leitura). O usuário `alloy` entra no grupo `systemd-journal`.
+- **O que chega ao Loki (`servico="firewall_linux"`, `canal="firewall"`).** Só pacote recebido (`IN=` preenchido e `OUT=` vazio) com prefixo de bloqueio (block, drop, reject ou deny, como `[UFW BLOCK]` e o `LogDenied` do firewalld), TCP ou UDP. Descarta loopback na origem e broadcast ou multicast no destino. Mensagem no formato do Windows, trocando o sistema: `🔐 EQUIPAMENTO · Bloqueio no firewall do Linux · protocolo origem → porta`.
+- **Limite.** Freio de 20 linhas por segundo (burst 100), igual ao Windows.
+- **Sem registro.** O instalador não liga o firewall nem cria regra de registro. A detecção mostra o firewall ativo e avisa quando ele não registra os bloqueios (ufw com logging desligado, firewalld com LogDenied off, nftables ou iptables sem regra de log). Regras criadas só pelo Docker não contam como firewall.
+- **Testes.** `bash Alloy/testes/instalador-linux-firewall.testes.sh` (com `ALLOY_BIN` apontando para o binário, roda também o `alloy validate`). O teste de discos passou a ler a versão do próprio instalador.
 
 ### Instalador Windows 2.30.0, bloqueios de entrada do Firewall do Windows
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.16.0 (Saúde dos discos pelo SMART: NVMe e SATA/SAS)
+# Versão: 2.17.0 (Bloqueios de entrada do firewall do Linux)
 #
 # USO
 # ---
@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.16.0"
+INSTALLER_VERSION="2.17.0"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -126,6 +126,11 @@ DISCOS_LISTA=""
 DISCOS_RAID=0
 EM_VIRTUAL=0
 SYS_RAIZ="${SYS_RAIZ:-/sys}"
+# Bloqueios de entrada do firewall (log do kernel no journal). Desligado por
+# padrão. FIREWALL_TIPO e FIREWALL_REGISTRA vêm de detect_firewall_linux.
+ENABLE_FIREWALL=0
+FIREWALL_TIPO=""
+FIREWALL_REGISTRA=0
 
 # O pacote oficial usa /etc/default/alloy em Debian. No fallback binário também
 # adotamos o mesmo local para manter um único padrão de manutenção.
@@ -760,6 +765,82 @@ discos_resumo() {
   echo "$texto"
 }
 
+# Firewall ativo e se ele registra os bloqueios no log do kernel. Só lê: o
+# instalador não liga o firewall nem cria regra de registro. FIREWALL_TIPO:
+# ufw, firewalld, nftables, iptables ou vazio. FIREWALL_REGISTRA: 1 ou 0.
+detect_firewall_linux() {
+  FIREWALL_TIPO=""
+  FIREWALL_REGISTRA=0
+  local saida=""
+  if command -v ufw >/dev/null 2>&1; then
+    saida="$(ufw status verbose 2>/dev/null || true)"
+    if grep -q '^Status: active' <<<"$saida"; then
+      FIREWALL_TIPO="ufw"
+      grep -q '^Logging: on' <<<"$saida" && FIREWALL_REGISTRA=1
+      return 0
+    fi
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    FIREWALL_TIPO="firewalld"
+    saida="$(firewall-cmd --get-log-denied 2>/dev/null || true)"
+    [[ -n "$saida" && "$saida" != "off" ]] && FIREWALL_REGISTRA=1
+    return 0
+  fi
+  # nftables e iptables: só conta bloqueio no tráfego de entrada. Regras que o
+  # Docker cria (encaminhamento entre redes) não fazem do servidor um firewall.
+  if command -v nft >/dev/null 2>&1; then
+    saida="$(nft list ruleset 2>/dev/null || true)"
+    if awk '/^[[:space:]]*chain /{dentro=1; corpo=""}
+            dentro{corpo=corpo"\n"$0}
+            /^[[:space:]]*}/ && dentro{
+              if (corpo ~ /hook input/ && corpo ~ /(policy drop|[[:space:]](drop|reject)([[:space:];]|$))/) achou=1
+              dentro=0
+            }
+            END{exit !achou}' <<<"$saida"; then
+      FIREWALL_TIPO="nftables"
+      grep -Eq '[[:space:]]log([[:space:]]|$)' <<<"$saida" && FIREWALL_REGISTRA=1
+      return 0
+    fi
+  fi
+  if command -v iptables-save >/dev/null 2>&1; then
+    saida="$(iptables-save 2>/dev/null || true)"
+    if grep -Eq '^(:INPUT DROP|-A INPUT .*-j (DROP|REJECT))' <<<"$saida"; then
+      FIREWALL_TIPO="iptables"
+      grep -q -- '-j LOG' <<<"$saida" && FIREWALL_REGISTRA=1
+    fi
+  fi
+  return 0
+}
+
+firewall_resumo() {
+  if [[ -z "$FIREWALL_TIPO" ]]; then
+    echo "nenhum firewall ativo encontrado"
+  elif [[ "$FIREWALL_REGISTRA" == "1" ]]; then
+    echo "${FIREWALL_TIPO}, registrando bloqueios"
+  else
+    echo "${FIREWALL_TIPO}, sem registro de bloqueios"
+  fi
+}
+
+# Aviso quando a opção está ligada e não há o que enviar. Só avisa.
+firewall_aviso() {
+  [[ "${ENABLE_FIREWALL:-0}" == "1" ]] || return 0
+  [[ -n "$FIREWALL_TIPO" && "$FIREWALL_REGISTRA" == "1" ]] && return 0
+  if [[ -z "$FIREWALL_TIPO" ]]; then
+    warn "Nenhum firewall ativo encontrado (ufw, firewalld, nftables ou iptables). Os bloqueios só serão enviados com um firewall ligado e registrando; o instalador não liga o firewall nem altera regras."
+    return 0
+  fi
+  local como
+  case "$FIREWALL_TIPO" in
+    ufw) como="ufw logging on" ;;
+    firewalld) como="LogDenied do firewalld" ;;
+    nftables) como="regra com log antes do drop" ;;
+    *) como="regra -j LOG antes do DROP" ;;
+  esac
+  warn "O ${FIREWALL_TIPO} está ativo, mas não registra os bloqueios (${como}). O instalador não altera o firewall; sem o registro, nada é enviado."
+  return 0
+}
+
 # Servidor físico Dell (PowerEdge): o iDRAC é monitorado por SNMP junto com o
 # host. O IP vem do ipmitool (canal 1, o da rede do iDRAC), sem credencial;
 # sem ipmitool, o técnico digita. VM em hipervisor Dell não entra.
@@ -825,6 +906,7 @@ show_detection() {
   else
     info "Nenhum disco físico (servidor virtual): saúde dos discos não se aplica."
   fi
+  info "Firewall: $(firewall_resumo)."
   if [[ "${IDRAC_DETECTADO:-0}" == "1" ]]; then
     if [[ -n "$IDRAC_ENDERECO" ]]; then
       ok "Servidor Dell: iDRAC em ${IDRAC_ENDERECO}. Entra no cadastro SNMP."
@@ -1201,7 +1283,12 @@ bancos_arquivos() {
 }
 
 needs_loki() {
-  [[ "${ENABLE_LOGS:-0}" == "1" ]] || coleta_enabled || [[ -n "$(syslog_origens)" ]]
+  [[ "${ENABLE_LOGS:-0}" == "1" ]] || firewall_enabled || coleta_enabled || [[ -n "$(syslog_origens)" ]]
+}
+
+# Bloqueios do firewall só valem para o servidor monitorado.
+firewall_enabled() {
+  [[ "${ENABLE_FIREWALL:-0}" == "1" && "${MONITOR_SERVER:-0}" == "1" ]]
 }
 
 # Syslog dos equipamentos SNMP. 5514/udp recebe o formato BSD (RFC3164, pfSense,
@@ -2256,6 +2343,10 @@ configure_service_groups() {
     getent group adm >/dev/null 2>&1 && usermod -aG adm alloy || true
     getent group systemd-journal >/dev/null 2>&1 && usermod -aG systemd-journal alloy || true
   fi
+  # Os bloqueios do firewall vêm do log do kernel, lido pelo journal.
+  if firewall_enabled; then
+    getent group systemd-journal >/dev/null 2>&1 && usermod -aG systemd-journal alloy || true
+  fi
 
   if [[ "$ENABLE_DOCKER" == "1" ]]; then
     if getent group docker >/dev/null 2>&1; then
@@ -2398,6 +2489,74 @@ EOF
         ;;
     esac
   done
+}
+
+# Bloqueios de entrada do firewall (ufw, firewalld, nftables ou iptables) para
+# o loki.write "nextec". As linhas vêm do log do kernel, pelo journal.
+# Filtros, nesta ordem: só linha de pacote recebido (IN= preenchido e OUT=
+# vazio) com prefixo de bloqueio (block, drop, reject ou deny) e protocolo
+# TCP ou UDP; loopback na origem; broadcast e multicast no destino. A
+# mensagem segue o formato do Windows, para a mesma regra de alerta servir.
+firewall_linux_alloy() {
+  firewall_enabled || return 0
+  local host_maiusculo
+  host_maiusculo="$(tr '[:lower:]' '[:upper:]' <<<"$HOST_LABEL")"
+  cat <<EOF
+
+// -----------------------------------------------------------------------------
+// BLOQUEIOS DE ENTRADA DO FIREWALL (log do kernel)
+// -----------------------------------------------------------------------------
+loki.source.journal "firewall_linux" {
+  forward_to = [loki.process.firewall_linux.receiver]
+  matches    = "_TRANSPORT=kernel"
+  max_age    = "10m"
+  labels = {
+    cliente="$(alloy_escape "$CLIENTE")", host="$(alloy_escape "$HOST_LABEL")", servico="firewall_linux",
+    canal="firewall", tipo="servidor", ambiente="$(alloy_escape "$AMBIENTE")", os="linux", origem="alloy",
+    criticidade="$(alloy_escape "$CRITICIDADE")", local="$(alloy_escape "$LOCAL")",
+  }
+}
+
+loki.process "firewall_linux" {
+  forward_to = [loki.write.nextec.receiver]
+
+  // Fica só o pacote recebido e bloqueado, TCP ou UDP.
+  stage.match {
+    selector = \`{servico="firewall_linux"} !~ "(?i)^[^=]*(block|drop|reject|deny)[^=]* IN=\\\\S+ OUT= .*PROTO=(TCP|UDP) SPT=\\\\d+ DPT=\\\\d+"\`
+    action   = "drop"
+  }
+
+  stage.regex {
+    expression = \`SRC=(?P<ip_origem>\\S+) DST=(?P<ip_destino>\\S+) .*PROTO=(?P<proto>\\S+) SPT=(?P<porta_origem>\\d+) DPT=(?P<porta_destino>\\d+)\`
+  }
+
+  stage.drop {
+    source     = "ip_origem"
+    expression = \`^(127\\.|::1|fe80:)\`
+  }
+
+  stage.drop {
+    source     = "ip_destino"
+    expression = \`^(22[4-9]\\.|23[0-9]\\.|255\\.|ff0)|\\.255$\`
+  }
+
+  // Freio contra varredura de porta: milhares de bloqueios por segundo.
+  stage.limit {
+    rate  = 20
+    burst = 100
+    drop  = true
+  }
+
+  stage.template {
+    source   = "mensagem"
+    template = "🔐 $(alloy_escape "$host_maiusculo") · Bloqueio no firewall do Linux · {{ ToUpper .proto }} {{ .ip_origem }} → porta {{ .porta_destino }}"
+  }
+
+  stage.output {
+    source = "mensagem"
+  }
+}
+EOF
 }
 
 generate_config() {
@@ -2734,6 +2893,8 @@ loki.process "nextec_fail2ban" {
 EOF
       fi
     fi
+
+    firewall_linux_alloy
 
     if [[ "$ENABLE_BLACKBOX" == "1" ]]; then
       cat <<EOF
@@ -3558,8 +3719,8 @@ resource_checklist() {
   (( ${#DETECTED_DATABASES[@]} > 0 )) && db_available=1
 
   # Estado inicial recomendado.
-  local -a selected=(0 0 0 0 0 0 1 1 1 0 0)
-  local -a disabled=(0 0 0 0 0 0 0 0 0 0 0)
+  local -a selected=(0 0 0 0 0 0 1 1 1 0 0 0)
+  local -a disabled=(0 0 0 0 0 0 0 0 0 0 0 0)
   local -a labels=(
     "Docker / containers"
     "Logs do sistema, warning/error/critical"
@@ -3572,8 +3733,9 @@ resource_checklist() {
     "Acessos ao servidor (logins com origem, alerta de acesso privilegiado)"
     "Virtualização (VMs, armazenamento, snapshots: Proxmox, KVM, VMware, XCP-ng)"
     "Saúde dos discos (SMART: NVMe e SATA/SAS, a cada 10 min)"
+    "Bloqueios de entrada do firewall (ufw, firewalld, nftables ou iptables)"
   )
-  local -a details=("" "" "" "" "" "" "recomendado" "recomendado" "recomendado" "" "")
+  local -a details=("" "" "" "" "" "" "recomendado" "recomendado" "recomendado" "" "" "")
   if [[ "${IDRAC_DETECTADO:-0}" == "1" ]]; then
     selected[3]=1
     details[3]="iDRAC deste servidor Dell"
@@ -3592,7 +3754,8 @@ resource_checklist() {
   if [[ "$do_estado" == "1" ]]; then
     selected=("${ENABLE_DOCKER:-0}" "${ENABLE_LOGS:-0}" "${ENABLE_DATABASES:-0}" "${ENABLE_SNMP:-0}"
               "${ENABLE_BLACKBOX:-0}" "${ENABLE_EXPORTERS:-0}" "${ENABLE_INTERNET:-0}"
-              "${ENABLE_VELOCIDADE:-0}" "${ENABLE_ACESSOS:-0}" "${ENABLE_VIRT:-0}" "${ENABLE_DISCOS:-0}")
+              "${ENABLE_VELOCIDADE:-0}" "${ENABLE_ACESSOS:-0}" "${ENABLE_VIRT:-0}" "${ENABLE_DISCOS:-0}"
+              "${ENABLE_FIREWALL:-0}")
     details[6]=""; details[7]=""; details[8]=""
     local item_exp chave_exp
     for item_exp in "${CUSTOM_EXPORTERS[@]}"; do
@@ -3639,6 +3802,15 @@ resource_checklist() {
   else
     [[ "$do_estado" == "1" ]] || selected[10]=1
     details[10]="$(discos_resumo)"
+  fi
+
+  # Bloqueios do firewall: desligado por padrão, só no servidor monitorado.
+  if [[ "${MONITOR_SERVER:-0}" != "1" ]]; then
+    disabled[11]=1
+    selected[11]=0
+    details[11]="só no servidor monitorado"
+  else
+    details[11]="$(firewall_resumo)"
   fi
 
   # Marca do pai: segue os filhos.
@@ -3896,6 +4068,8 @@ resource_checklist() {
   ENABLE_ACESSOS="${selected[8]}"
   ENABLE_VIRT="${selected[9]}"
   ENABLE_DISCOS="${selected[10]}"
+  ENABLE_FIREWALL="${selected[11]}"
+  firewall_aviso
 
   EXPORTERS_MARCADOS=()
   for j in "${!filho_sel[@]}"; do
@@ -4202,6 +4376,7 @@ collect_inputs() {
   ENABLE_ACESSOS=0
   ENABLE_VIRT=0
   ENABLE_DISCOS=0
+  ENABLE_FIREWALL=0
   HIPERVISORES=()
   LINKS=()
   BLACKBOX_TARGETS=()
@@ -4292,6 +4467,8 @@ show_plan() {
   fi
   summary_row "Virtualização:" "$virt_resumo"
   summary_row "Saúde dos discos:" "$([[ "${ENABLE_DISCOS:-0}" == 1 ]] && echo "sim ($(discos_resumo))" || echo não)"
+  summary_row "Bloqueios do firewall:" "$(firewall_enabled && echo "sim ($(firewall_resumo))" || echo não)"
+  firewall_enabled && firewall_aviso
 
   echo
   [[ "$confirmacao" == "--resumo" ]] && return 0
@@ -4338,6 +4515,7 @@ final_summary() {
   [[ "$ENABLE_VELOCIDADE" == 1 ]] && campo "Teste de velocidade" "a cada 30 min" "$GREEN"
   [[ "${ENABLE_ACESSOS:-0}" == 1 ]] && campo "Acessos" "logins com origem e alerta de privilegiado" "$GREEN"
   [[ "${ENABLE_DISCOS:-0}" == 1 ]] && campo "Saúde dos discos" "$(discos_resumo), SMART a cada 10 min" "$GREEN"
+  firewall_enabled && campo "Bloqueios do firewall" "$(firewall_resumo)" "$GREEN"
   [[ "$ENABLE_BLACKBOX" == 1 ]] && campo "Conectividade" "${#BLACKBOX_TARGETS[@]} alvo(s)" "$GREEN"
   [[ "$ENABLE_SNMP" == 1 ]] && campo "SNMP" "${#SNMP_TARGETS[@]} equipamento(s)" "$GREEN"
   if [[ -n "$(syslog_origens)" ]]; then
@@ -4418,6 +4596,7 @@ salvar_estado_instalacao() {
     echo "BANCOS_SQLITE=${BANCOS_SQLITE}"
     echo "ENABLE_VIRT=${ENABLE_VIRT:-0}"
     echo "ENABLE_DISCOS=${ENABLE_DISCOS:-0}"
+    echo "ENABLE_FIREWALL=${ENABLE_FIREWALL:-0}"
     # Sem senha: o segredo de cada hipervisor fica em ${COLETA_SEGREDOS}.
     for item in "${HIPERVISORES[@]}"; do echo "HIPERVISOR=${item}"; done
   } > "$tmp"
@@ -4436,6 +4615,8 @@ carregar_estado_instalacao() {
   ENABLE_VIRT=""
   # Discos: sem resposta gravada, liga se o servidor tem disco físico.
   ENABLE_DISCOS=""
+  # Bloqueios do firewall: sem resposta gravada, desligado.
+  ENABLE_FIREWALL=0
   HIPERVISORES=()
   while IFS= read -r linha || [[ -n "$linha" ]]; do
     [[ -z "$linha" || "$linha" == \#* ]] && continue
@@ -4482,6 +4663,9 @@ carregar_estado_instalacao() {
       ENABLE_DISCOS)
         [[ "$valor" =~ ^[01]$ ]] || { err "Valor inválido de ENABLE_DISCOS."; return 1; }
         ENABLE_DISCOS="$valor" ;;
+      ENABLE_FIREWALL)
+        [[ "$valor" =~ ^[01]$ ]] || { err "Valor inválido de ENABLE_FIREWALL."; return 1; }
+        ENABLE_FIREWALL="$valor" ;;
       HIPERVISOR)
         [[ "$valor" =~ ^[a-z0-9_.-]+\|(vmware|proxmox|xcpng)\|[A-Za-z0-9.:-]+\|[^|]+\|[01]$ ]] || { err "HIPERVISOR inválido."; return 1; }
         HIPERVISORES+=("$valor") ;;
@@ -4496,6 +4680,7 @@ carregar_estado_instalacao() {
   fi
   detect_discos
   [[ -n "$ENABLE_DISCOS" ]] || ENABLE_DISCOS="$(discos_padrao)"
+  detect_firewall_linux
   RW_URL="https://${NOC_HOST}/api/v1/write"
   LOKI_URL="https://${NOC_HOST}/loki/api/v1/push"
   return 0
@@ -4688,6 +4873,7 @@ mostrar_status_instalacao() {
     [[ "${ENABLE_VELOCIDADE:-0}" == 1 ]] && ligados+=("velocidade")
     [[ "${ENABLE_ACESSOS:-0}" == 1 ]] && ligados+=("acessos")
     [[ "${ENABLE_DISCOS:-0}" == 1 ]] && ligados+=("discos")
+    firewall_enabled && ligados+=("bloqueios do firewall")
     local IFS=','
     summary_row "Coletas ligadas:" "$(printf '%s' "${ligados[*]:-nenhuma}" | sed 's/,/, /g')"
   fi
@@ -5065,6 +5251,7 @@ main_atualizar() {
   fi
 
   [[ "${ENABLE_DISCOS:-0}" == "1" ]] && info "Saúde dos discos: $(discos_resumo)."
+  firewall_enabled && { info "Bloqueios do firewall: $(firewall_resumo)."; firewall_aviso; }
   install_alloy
   install_coleta_complementar
   install_atualizador
@@ -5179,6 +5366,7 @@ main() {
   detect_virtualizacao
   detect_idrac
   detect_discos
+  detect_firewall_linux
   show_detection
   collect_inputs
   show_plan

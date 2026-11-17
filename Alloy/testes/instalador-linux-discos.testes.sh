@@ -211,7 +211,7 @@ d="$(preparar_cenario fisico)"
 rodar_atualizar "$d" "$SYS_FISICO" 0 0 1
 conferir "termina sem erro" "$(grep -c 'Atualização concluída' "$d/saida.log")" "1"
 conferir "ENABLE_DISCOS gravado ligado" "$(valor_conf "$d" ENABLE_DISCOS)" "1"
-conferir "versão do instalador atualizada" "$(valor_conf "$d" INSTALADOR_VERSAO)" "2.16.0"
+conferir "versão do instalador atualizada" "$(valor_conf "$d" INSTALADOR_VERSAO)" "$(sed -n 's/^INSTALLER_VERSION="\(.*\)"$/\1/p' "$INSTALADOR")"
 conferir "respostas antigas mantidas" "$(valor_conf "$d" HOST_LABEL)" "nxt-srv-hv01"
 conferir "[discos] ativo no .ini" "$(valor_ini "$d" discos ativo)" "sim"
 conferir "[discos] intervalo de 10 min" "$(valor_ini "$d" discos intervalo_minutos)" "10"
