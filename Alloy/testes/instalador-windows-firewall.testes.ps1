@@ -215,6 +215,84 @@ Conferir 'checklist do modo interativo e do -Silent tem o item firewall' ((Corpo
 Conferir 'o resumo avisa quando o log não existe' ((Corpo-Funcao 'Show-Plan').Contains('Write-NextecFirewallAviso'))
 Conferir 'o instalador não liga o firewall nem muda perfis' (-not ((Corpo-Funcao 'Write-NextecFirewallAviso') -match 'Set-NetFirewall|netsh|Enable-NetFirewall|auditpol'))
 
+Write-Host 'Parte 5: New-AlloyConfiguration inteira, com a chamada do bloco do firewall'
+# Os testes de função isolada não pegam erro na chamada dentro de New-AlloyConfiguration (um token
+# solto vira argumento posicional extra). Aqui a função roda de verdade e grava o config.alloy.
+$chamada = $ast.FindAll({
+    param($n)
+    $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-FirewallWindowsAlloyLines'
+}, $true) | Where-Object { $_.Extent.Text -match 'BroadcastsLocais' } | Select-Object -First 1
+Conferir 'a chamada do bloco está dentro de New-AlloyConfiguration' ($null -ne $chamada)
+
+$parametrosValidos = @((Get-Command Get-FirewallWindowsAlloyLines).Parameters.Keys)
+$elementos = @($chamada.CommandElements | Select-Object -Skip 1)
+$somenteParametrosComValor = $true
+for ($i = 0; $i -lt $elementos.Count; $i += 2) {
+    $ehParametro = $elementos[$i] -is [System.Management.Automation.Language.CommandParameterAst]
+    if (-not $ehParametro -or $parametrosValidos -notcontains $elementos[$i].ParameterName -or ($i + 1) -ge $elementos.Count) { $somenteParametrosComValor = $false; break }
+}
+Conferir 'a chamada só tem parâmetros nomeados, cada um com valor (sem argumento solto)' $somenteParametrosComValor
+
+foreach ($nome in 'Get-NextecBroadcastsLocais', 'New-AlloyConfiguration') { . ([scriptblock]::Create((Corpo-Funcao $nome))) }
+
+# O que mexe no servidor ou depende dele é trocado por função sem efeito; o resto é o código do instalador.
+function Definir-Stub([string]$nome, $retorno = $null) {
+    $bloco = { param([Parameter(ValueFromRemainingArguments = $true)]$Ignorado) $null = $Ignorado; return $retorno }.GetNewClosure()
+    Set-Item -Path "function:global:$nome" -Value $bloco
+}
+foreach ($nome in 'Write-Step', 'Write-Ok', 'Write-Warn', 'Add-NextecSyslogConfig', 'Add-AlloyRelabelRule') { Definir-Stub $nome }
+Definir-Stub 'Get-WindowsCollectors' @('cpu', 'os')
+Definir-Stub 'Get-MonitoredServiceRegex' 'Alloy'
+Definir-Stub 'Get-NextecIdracServidor' $null
+Definir-Stub 'Get-SqlErrorLogPaths' @()
+Definir-Stub 'Get-SqlServerDetection' ([pscustomobject]@{ Detected = $false })
+Definir-Stub 'Test-NextecColetaNecessaria' $false
+Definir-Stub 'Test-NextecSyslogAtivo' $false
+
+$pastaConfig = Join-Path ([IO.Path]::GetTempPath()) ('nx-config-' + [guid]::NewGuid().ToString('N'))
+$AlloyDir = $pastaConfig
+$StorageDir = Join-Path $pastaConfig 'data'
+$TextfileInputsDir = Join-Path $pastaConfig 'textfile'
+$ConfigFile = Join-Path $pastaConfig 'config.alloy'
+$InstallerVersion = 'teste'
+$ColetaEventos = Join-Path $pastaConfig 'eventos.jsonl'
+$script:Cliente = 'cartorio_adriana_celiac'; $script:HostLabel = 'servidor_online'; $script:TipoLabel = 'servidor'
+$script:Ambiente = 'producao'; $script:Criticidade = 'alto'; $script:Local = 'matriz'
+$script:RemoteWriteUrl = 'https://noc.exemplo.invalid/api/v1/write'; $script:LokiUrl = 'https://noc.exemplo.invalid/loki/api/v1/push'
+$script:MonitorHost = $true
+$script:EnableLogsResolved = $true; $script:EnableSecurityLogsResolved = $false; $script:EnableColetaResolved = $false
+$script:EnableBlackboxResolved = $false; $script:EnableSnmpResolved = $false
+$script:BlackboxTargets = @(); $script:SnmpTargets = @(); $script:CustomExporters = @(); $script:SelectedHostFeatureKeys = @()
+$script:ConfigChanged = $false
+
+function Gerar-Config([bool]$firewall) {
+    $script:EnableFirewallLogsResolved = $firewall
+    if (Test-Path -LiteralPath $ConfigFile) { Remove-Item -LiteralPath $ConfigFile -Force }
+    $erro = $null
+    try { New-AlloyConfiguration -Inventory ([pscustomobject]@{}) } catch { $erro = $_.Exception.Message }
+    $conteudo = ''
+    if (Test-Path -LiteralPath $ConfigFile) { $conteudo = [IO.File]::ReadAllText($ConfigFile) }
+    return [pscustomobject]@{ Erro = $erro; Conteudo = $conteudo }
+}
+
+try {
+    $semFirewall = Gerar-Config $false
+    Conferir 'logs ligados, firewall desligado: gera o config.alloy sem erro' ($null -eq $semFirewall.Erro -and $semFirewall.Conteudo.Length -gt 0) "erro: $($semFirewall.Erro)"
+    Conferir 'logs ligados, firewall desligado: loki.write presente e sem bloco do firewall' ($semFirewall.Conteudo.Contains('loki.write "nextec"') -and -not $semFirewall.Conteudo.Contains('firewall_windows'))
+    Conferir 'logs ligados, firewall desligado: cabeçalho marca nao' ($semFirewall.Conteudo.Contains('// nextec:firewall_bloqueios = nao'))
+
+    $comFirewall = Gerar-Config $true
+    Conferir 'firewall ligado: gera o config.alloy sem erro' ($null -eq $comFirewall.Erro -and $comFirewall.Conteudo.Length -gt 0) "erro: $($comFirewall.Erro)"
+    Conferir 'firewall ligado: bloco do firewall e filtro de destino sem .255 genérico' (
+        $comFirewall.Conteudo.Contains('loki.process "firewall_windows"') -and
+        $comFirewall.Conteudo.Contains('expression = "^(22[4-9]\\.|23[0-9]\\.|255\\.|ff0)') -and
+        -not $comFirewall.Conteudo.Contains('\\.255$'))
+    Conferir 'firewall ligado: cabeçalho marca sim' ($comFirewall.Conteudo.Contains('// nextec:firewall_bloqueios = sim'))
+    Conferir 'config gerado sem texto de continuação solto' ($comFirewall.Conteudo -notmatch '`n|`r')
+}
+finally {
+    Remove-Item -LiteralPath $pastaConfig -Recurse -Force -ErrorAction SilentlyContinue
+}
 if ($script:falhas -gt 0) {
     Write-Host "$script:falhas teste(s) falharam."
     exit 1

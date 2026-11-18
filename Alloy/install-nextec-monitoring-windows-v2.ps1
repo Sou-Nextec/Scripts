@@ -8329,7 +8329,8 @@ function New-AlloyConfiguration {
             -Ativo ([bool]($script:MonitorHost -and $script:EnableFirewallLogsResolved)) `
             -Cliente $script:Cliente -HostLabel $script:HostLabel -Tipo $script:TipoLabel `
             -Ambiente $script:Ambiente -Criticidade $script:Criticidade -Local $script:Local `
-            -CaminhoLog (Get-NextecFirewallLogCaminho) `n            -BroadcastsLocais @(Get-NextecBroadcastsLocais))
+            -CaminhoLog (Get-NextecFirewallLogCaminho) `
+            -BroadcastsLocais @(Get-NextecBroadcastsLocais))
         foreach ($linhaFirewall in $linhasFirewall) {
             [void]$builder.AppendLine($linhaFirewall)
         }
