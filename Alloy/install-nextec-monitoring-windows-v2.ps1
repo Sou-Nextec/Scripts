@@ -6742,6 +6742,45 @@ function Get-NextecFirewallPadrao {
     return $false
 }
 
+function Get-NextecBroadcastIPv4 {
+    <#
+        Broadcast direto de uma rede IPv4 (10.0.0.20 com prefixo 23 dá 10.0.1.255).
+        Devolve vazio quando não existe: endereço inválido, IPv6 ou prefixo fora
+        de 1 a 30 (em /31 e /32 não há endereço de broadcast).
+    #>
+    param([string]$Ip, [int]$Prefixo)
+
+    $endereco = $null
+    if (-not [System.Net.IPAddress]::TryParse($Ip, [ref]$endereco)) { return '' }
+    if ($endereco.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { return '' }
+    if ($Prefixo -lt 1 -or $Prefixo -gt 30) { return '' }
+
+    $b = $endereco.GetAddressBytes()
+    [long]$valor = ([long]$b[0] * 16777216) + ([long]$b[1] * 65536) + ([long]$b[2] * 256) + [long]$b[3]
+    [long]$mascaraHost = [long][math]::Pow(2, 32 - $Prefixo) - 1
+    [long]$bc = $valor -bor $mascaraHost
+    return ('{0}.{1}.{2}.{3}' -f (($bc -shr 24) -band 255), (($bc -shr 16) -band 255), (($bc -shr 8) -band 255), ($bc -band 255))
+}
+
+function Get-NextecBroadcastsLocais {
+    <#
+        Broadcast direto de cada rede IPv4 do servidor (ignora loopback e
+        169.254). O filtro do firewall descarta só esses endereços; um host
+        terminado em .255 numa rede maior que /24 continua sendo registrado.
+    #>
+    $lista = New-Object System.Collections.Generic.List[string]
+    try {
+        foreach ($a in @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop)) {
+            if ([string]$a.IPAddress -match '^(127\.|169\.254\.)') { continue }
+            $bc = Get-NextecBroadcastIPv4 -Ip ([string]$a.IPAddress) -Prefixo ([int]$a.PrefixLength)
+            if ($bc -and -not $lista.Contains($bc)) { $lista.Add($bc) }
+        }
+    } catch {
+        Write-Warn ("Não foi possível ler os endereços de rede para o filtro de broadcast; só o broadcast limitado e o multicast serão descartados. Detalhe: {0}" -f $_.Exception.Message)
+    }
+    return $lista.ToArray()
+}
+
 function Get-FirewallWindowsAlloyLines {
     <#
         Linhas Alloy da coleta dos bloqueios de entrada do Firewall do Windows
@@ -6750,7 +6789,8 @@ function Get-FirewallWindowsAlloyLines {
 
         Filtros, nesta ordem: cabeçalho (#), linha vazia e linha que não
         começa com data; ação ALLOW; tráfego SEND; loopback na origem;
-        broadcast e multicast no destino. Sobram os bloqueios recebidos.
+        multicast, broadcast limitado e broadcast direto das redes do servidor no
+        destino. Sobram os bloqueios recebidos.
     #>
     param(
         [Parameter(Mandatory=$true)][bool]$Ativo,
@@ -6760,10 +6800,18 @@ function Get-FirewallWindowsAlloyLines {
         [string]$Ambiente,
         [string]$Criticidade,
         [string]$Local,
-        [string]$CaminhoLog = "C:/Windows/System32/LogFiles/Firewall/pfirewall.log"
+        [string]$CaminhoLog = "C:/Windows/System32/LogFiles/Firewall/pfirewall.log",
+        [string[]]$BroadcastsLocais = @()
     )
 
     if (-not $Ativo) { return @() }
+
+    # Broadcast direto das redes do servidor, endereço a endereço (ex.: 10.0.1.255).
+    $broadcasts = @($BroadcastsLocais | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } | Select-Object -Unique)
+    $expressaoBroadcast = ''
+    if ($broadcasts.Count -gt 0) {
+        $expressaoBroadcast = '|^(' + (($broadcasts | ForEach-Object { $_.Replace('.', '\\.') }) -join '|') + ')$'
+    }
 
     $molde = @'
 // Bloqueios de entrada do Firewall do Windows (pfirewall.log)
@@ -6806,7 +6854,7 @@ loki.process "firewall_windows" {
 
   stage.drop {
     source     = "ip_destino"
-    expression = "^(22[4-9]\\.|23[0-9]\\.|255\\.|ff0)|\\.255$"
+    expression = "^(22[4-9]\\.|23[0-9]\\.|255\\.|ff0)__BROADCASTS__"
   }
 
   // Freio contra varredura de porta: milhares de bloqueios por segundo.
@@ -6847,6 +6895,7 @@ loki.process "firewall_windows" {
 '@
 
     $texto = $molde.
+        Replace("__BROADCASTS__", $expressaoBroadcast).
         Replace("__CAMINHO__", (ConvertTo-AlloyEscapedString $CaminhoLog)).
         Replace("__CLIENTE__", (ConvertTo-AlloyEscapedString $Cliente)).
         Replace("__HOST_MAIUSCULO__", (ConvertTo-AlloyEscapedString ($HostLabel.ToUpperInvariant()))).
@@ -8280,7 +8329,7 @@ function New-AlloyConfiguration {
             -Ativo ([bool]($script:MonitorHost -and $script:EnableFirewallLogsResolved)) `
             -Cliente $script:Cliente -HostLabel $script:HostLabel -Tipo $script:TipoLabel `
             -Ambiente $script:Ambiente -Criticidade $script:Criticidade -Local $script:Local `
-            -CaminhoLog (Get-NextecFirewallLogCaminho))
+            -CaminhoLog (Get-NextecFirewallLogCaminho) `n            -BroadcastsLocais @(Get-NextecBroadcastsLocais))
         foreach ($linhaFirewall in $linhasFirewall) {
             [void]$builder.AppendLine($linhaFirewall)
         }

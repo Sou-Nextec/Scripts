@@ -294,8 +294,39 @@ escape="$(
 )"
 conferir "aspas escapadas no cliente" "$escape" "1"
 
+echo "11. Filtro do destino: só o broadcast das redes do servidor é descartado"
+# Lê do bloco gerado a expressão do estágio que filtra o ip_destino. O "ip" é
+# trocado por uma função com a saída de "ip -4 -o addr show scope global".
+expressao_destino() {
+  (
+    # shellcheck disable=SC1090
+    source "$INSTALADOR"; trap - ERR
+    CLIENTE=cli HOST_LABEL=srv01 AMBIENTE=producao CRITICIDADE=alto LOCAL=matriz MONITOR_SERVER=1 ENABLE_FIREWALL=1
+    SAIDA_IP="$1"
+    ip() { printf '%s' "$SAIDA_IP"; }
+    firewall_linux_alloy | awk '/source.*"ip_destino"/ { getline; print }' | sed 's/^ *expression = `\(.*\)`$/\1/'
+  )
+}
+destino() {
+  python3 -c 'import re, sys; print("descarta" if re.search(sys.argv[1], sys.argv[2]) else "registra")' "$1" "$2"
+}
+REDES=$'2: eth0    inet 10.0.0.20/23 brd 10.0.1.255 scope global eth0\n3: eth1    inet 192.168.1.111/24 brd 192.168.1.255 scope global eth1\n'
+com_redes="$(expressao_destino "$REDES")"
+sem_redes="$(expressao_destino "")"
+conferir "pontos escapados e uma alternativa por rede" "$([[ "$com_redes" == *'|^(10\.0\.1\.255|192\.168\.1\.255)$' ]] && echo sim || echo nao)" "sim"
+conferir "broadcast da rede eth0 (10.0.1.255) é descartado" "$(destino "$com_redes" 10.0.1.255)" "descarta"
+conferir "broadcast da rede eth1 (192.168.1.255) é descartado" "$(destino "$com_redes" 192.168.1.255)" "descarta"
+conferir "host 10.0.0.255 da rede /23 é registrado" "$(destino "$com_redes" 10.0.0.255)" "registra"
+conferir "broadcast limitado 255.255.255.255 é descartado" "$(destino "$com_redes" 255.255.255.255)" "descarta"
+conferir "multicast 224.0.0.251 é descartado" "$(destino "$com_redes" 224.0.0.251)" "descarta"
+conferir "multicast 239.255.255.250 é descartado" "$(destino "$com_redes" 239.255.255.250)" "descarta"
+conferir "multicast IPv6 ff02::1 é descartado" "$(destino "$com_redes" ff02::1)" "descarta"
+conferir "destino comum é registrado" "$(destino "$com_redes" 203.0.113.5)" "registra"
+conferir "sem redes lidas: .255 é registrado" "$(destino "$sem_redes" 10.0.1.255)" "registra"
+conferir "sem redes lidas: multicast continua descartado" "$(destino "$sem_redes" 224.0.0.251)" "descarta"
+
 if [[ -n "${ALLOY_BIN:-}" ]]; then
-  echo "11. alloy validate no config gerado"
+  echo "12. alloy validate no config gerado"
   d="${BASE}/ligado"
   if "$ALLOY_BIN" validate "$d/etc/alloy/config.alloy" > "$d/validate.log" 2>&1; then
     conferir "config válido" "sim" "sim"

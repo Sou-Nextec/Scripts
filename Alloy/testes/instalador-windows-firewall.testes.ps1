@@ -37,6 +37,7 @@ function Corpo-Funcao([string]$nome) {
 . ([scriptblock]::Create((Corpo-Funcao 'ConvertTo-AlloyEscapedString')))
 . ([scriptblock]::Create((Corpo-Funcao 'Get-FirewallWindowsAlloyLines')))
 . ([scriptblock]::Create((Corpo-Funcao 'Get-FirewallLogsDoConfig')))
+. ([scriptblock]::Create((Corpo-Funcao 'Get-NextecBroadcastIPv4')))
 . ([scriptblock]::Create((Corpo-Funcao 'Get-NextecFirewallLogCaminho')))
 
 $dados = @{
@@ -48,7 +49,7 @@ Write-Host 'Parte 1: bloco desligado e ligado'
 $desligado = @(Get-FirewallWindowsAlloyLines -Ativo $false @dados)
 Conferir 'desligada: nenhuma linha' ($desligado.Count -eq 0) "linhas: $($desligado.Count)"
 
-$linhas = @(Get-FirewallWindowsAlloyLines -Ativo $true @dados)
+$linhas = @(Get-FirewallWindowsAlloyLines -Ativo $true @dados -BroadcastsLocais @('10.0.1.255'))
 $bloco = $linhas -join "`n"
 Conferir 'ligada: gera local.file_match, loki.source.file e loki.process' (
     $bloco.Contains('local.file_match "firewall_windows"') -and
@@ -72,6 +73,30 @@ Conferir 'mensagem no formato ícone EQUIPAMENTO · o que aconteceu · detalhes'
 Conferir 'valores com aspas e barras são escapados' (
     ((@(Get-FirewallWindowsAlloyLines -Ativo $true -Cliente 'a"b' -HostLabel 'h\1' -Tipo 'servidor' -Ambiente 'producao' -Criticidade 'alto' -Local 'matriz') -join "`n").Contains('cliente     = "a\"b"')))
 Conferir 'caminho do log usa barras normais' ((Get-NextecFirewallLogCaminho) -notmatch '\\' -and (Get-NextecFirewallLogCaminho) -match 'System32/LogFiles/Firewall/pfirewall\.log$')
+
+$semBroadcast = (@(Get-FirewallWindowsAlloyLines -Ativo $true @dados) -join "`n")
+Conferir 'sem redes locais: filtro de destino não descarta .255' ($semBroadcast.Contains('expression = "^(22[4-9]\\.|23[0-9]\\.|255\\.|ff0)"') -and -not $semBroadcast.Contains('\\.255'))
+Conferir 'broadcast local entra no filtro com os pontos escapados' ($bloco.Contains('expression = "^(22[4-9]\\.|23[0-9]\\.|255\\.|ff0)|^(10\\.0\\.1\\.255)$"'))
+$doisBroadcasts = (@(Get-FirewallWindowsAlloyLines -Ativo $true @dados -BroadcastsLocais @('10.0.1.255', '192.168.1.255', '192.168.1.255', 'texto', '300.1')) -join "`n")
+Conferir 'vários broadcasts: sem repetição e sem valor inválido' ($doisBroadcasts.Contains('|^(10\\.0\\.1\\.255|192\\.168\\.1\\.255)$"'))
+
+Write-Host 'Broadcast direto da rede (cálculo)'
+$calculos = [ordered]@{
+    '10.0.1.20/23'     = @('10.0.1.20', 23, '10.0.1.255')
+    '10.0.0.20/23'     = @('10.0.0.20', 23, '10.0.1.255')
+    '192.168.1.111/24' = @('192.168.1.111', 24, '192.168.1.255')
+    '172.16.5.9/16'    = @('172.16.5.9', 16, '172.16.255.255')
+    '10.0.0.5/30'      = @('10.0.0.5', 30, '10.0.0.7')
+    '10.0.0.1/31'      = @('10.0.0.1', 31, '')
+    '10.0.0.1/32'      = @('10.0.0.1', 32, '')
+    'IPv6'             = @('fe80::1', 64, '')
+    'texto inválido'   = @('x', 24, '')
+}
+foreach ($nome in $calculos.Keys) {
+    $ip, $prefixo, $esperado = $calculos[$nome]
+    $obtido = Get-NextecBroadcastIPv4 -Ip $ip -Prefixo $prefixo
+    Conferir "broadcast de $nome" ($obtido -eq $esperado) "esperado '$esperado', obtido '$obtido'"
+}
 
 Write-Host 'Parte 2: filtros do bloco'
 # Interpreta os estágios stage.drop e stage.regex do bloco gerado, na ordem, como o Alloy faz.
@@ -114,7 +139,8 @@ $casos = [ordered]@{
     'DROP UDP IPv6 passa'                = @("$cab DROP UDP 2001:db8::1 2001:db8::2 5353 5355 60 - - - - - - - RECEIVE", '🔐 SERVIDOR_ONLINE · Bloqueio no firewall do Windows · UDP 2001:db8::1 → porta 5355')
     'ALLOW é descartado'                 = @("$cab ALLOW TCP 203.0.113.5 10.0.0.10 51234 443 52 S 1 0 8192 0 0 - RECEIVE", $null)
     'SEND é descartado'                  = @("$cab DROP TCP 10.0.0.10 203.0.113.5 51234 443 52 S 1 0 8192 0 0 - SEND", $null)
-    'broadcast .255 é descartado'        = @("$cab DROP UDP 10.0.0.20 10.0.0.255 137 137 78 - - - - - - - RECEIVE", $null)
+    'broadcast direto da rede local é descartado' = @("$cab DROP UDP 10.0.1.20 10.0.1.255 137 137 78 - - - - - - - RECEIVE", $null)
+    'host .255 de rede maior (/23) passa' = @("$cab DROP TCP 203.0.113.5 10.0.0.255 51234 445 52 S 1 0 8192 0 0 - RECEIVE", '🔐 SERVIDOR_ONLINE · Bloqueio no firewall do Windows · TCP 203.0.113.5 → porta 445')
     'broadcast 255.255.255.255'          = @("$cab DROP UDP 10.0.0.20 255.255.255.255 68 67 328 - - - - - - - RECEIVE", $null)
     'multicast 224.0.0.251'              = @("$cab DROP UDP 10.0.0.20 224.0.0.251 5353 5353 72 - - - - - - - RECEIVE", $null)
     'multicast 239.255.255.250'          = @("$cab DROP UDP 10.0.0.20 239.255.255.250 50000 1900 200 - - - - - - - RECEIVE", $null)
@@ -145,7 +171,7 @@ Conferir 'bloco colado à mão, sem cabeçalho: ligada (não se perde na regera�
 Conferir 'conteúdo vazio: desligada' (-not (Get-FirewallLogsDoConfig -Content ''))
 # O que Reconfigurar e -Atualizar fazem: ler -> importar -> regerar. Aqui o ciclo inteiro, sem o Alloy.
 $lido = Get-FirewallLogsDoConfig -Content ($cabecalhoSim + $bloco)
-$regerado = @(Get-FirewallWindowsAlloyLines -Ativo $lido @dados) -join "`n"
+$regerado = @(Get-FirewallWindowsAlloyLines -Ativo $lido @dados -BroadcastsLocais @('10.0.1.255')) -join "`n"
 Conferir 'ciclo ler e regerar mantém o bloco' ($regerado -eq $bloco)
 
 # Padrão da resposta: parâmetro vence; sem parâmetro vale o config.alloy; sem config, desligada.

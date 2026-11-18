@@ -2495,12 +2495,31 @@ EOF
 # o loki.write "nextec". As linhas vêm do log do kernel, pelo journal.
 # Filtros, nesta ordem: só linha de pacote recebido (IN= preenchido e OUT=
 # vazio) com prefixo de bloqueio (block, drop, reject ou deny) e protocolo
-# TCP ou UDP; loopback na origem; broadcast e multicast no destino. A
-# mensagem segue o formato do Windows, para a mesma regra de alerta servir.
+# TCP ou UDP; loopback na origem; multicast, broadcast limitado e broadcast
+# direto das redes do servidor no destino. A mensagem segue o formato do
+# Windows, para a mesma regra de alerta servir.
+
+# Broadcast direto de cada rede IPv4 do servidor (campo brd do "ip addr"),
+# como alternativa de regex para o filtro do destino: "|^(10\.0\.1\.255)$".
+# Só esses endereços são descartados; um host terminado em .255 numa rede
+# maior que /24 continua sendo registrado. Sem "ip" ou sem brd, sai vazio.
+firewall_broadcasts_locais() {
+  command -v ip >/dev/null 2>&1 || return 0
+  local lista
+  lista="$(ip -4 -o addr show scope global 2>/dev/null \
+    | awk '{ for (i = 1; i < NF; i++) if ($i == "brd") print $(i + 1) }' \
+    | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort -u | sed 's/\./\\./g' | paste -sd'|' - || true)"
+  if [[ -n "$lista" ]]; then
+    printf '|^(%s)$' "$lista"
+  fi
+  return 0
+}
+
 firewall_linux_alloy() {
   firewall_enabled || return 0
-  local host_maiusculo
+  local host_maiusculo broadcasts_locais
   host_maiusculo="$(tr '[:lower:]' '[:upper:]' <<<"$HOST_LABEL")"
+  broadcasts_locais="$(firewall_broadcasts_locais)"
   cat <<EOF
 
 // -----------------------------------------------------------------------------
@@ -2537,7 +2556,7 @@ loki.process "firewall_linux" {
 
   stage.drop {
     source     = "ip_destino"
-    expression = \`^(22[4-9]\\.|23[0-9]\\.|255\\.|ff0)|\\.255$\`
+    expression = \`^(22[4-9]\\.|23[0-9]\\.|255\\.|ff0)${broadcasts_locais}\`
   }
 
   // Freio contra varredura de porta: milhares de bloqueios por segundo.
