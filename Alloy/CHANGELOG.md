@@ -10,10 +10,19 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.17.0 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.17.1 |
 | Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.30.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.6.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
+
+## 2026-11-21
+
+### Instalador Linux 2.17.1, credenciais em RHEL e Rocky
+
+- **Corrigido o carregamento das credenciais em RHEL, Rocky, Alma e CentOS.** O serviço do Alloy dessas distribuições lê `/etc/sysconfig/alloy`, e não `/etc/default/alloy`, onde o instalador grava as credenciais. Antes o serviço subia sem elas e o envio ao NOC falhava com erro 401. Agora o instalador cria o arquivo `/etc/systemd/system/alloy.service.d/nextec-env.conf`, que faz o serviço ler também o `/etc/default/alloy`, e confere que o systemd o aplicou antes de reiniciar.
+- **Quando vale.** Em toda instalação, reconfiguração e `--atualizar`, sempre que o serviço do Alloy não lê o `/etc/default/alloy`. Em Debian e Ubuntu nada muda. Rodar de novo não altera o que já está certo, e um arquivo criado à mão com esse nome é regravado no mesmo formato.
+- **Servidores já instalados.** Basta rodar o instalador com `--atualizar`; não é preciso criar o arquivo à mão. O atualizador automático só entrega esta versão depois que o manifesto for renovado.
+- **Testes.** `bash Alloy/testes/instalador-linux-rpm-env.testes.sh`, com unidades de Debian, RPM e fallback binário e o systemctl simulado.
 
 ## 2026-11-17
 

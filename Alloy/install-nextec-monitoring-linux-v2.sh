@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.17.0 (Bloqueios de entrada do firewall do Linux)
+# Versão: 2.17.1 (Credenciais carregadas também em RHEL/Rocky/Alma/CentOS)
 #
 # USO
 # ---
@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.17.0"
+INSTALLER_VERSION="2.17.1"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -133,10 +133,13 @@ FIREWALL_TIPO=""
 FIREWALL_REGISTRA=0
 
 # O pacote oficial usa /etc/default/alloy em Debian. No fallback binário também
-# adotamos o mesmo local para manter um único padrão de manutenção.
+# adotamos o mesmo local para manter um único padrão de manutenção. O pacote RPM
+# (RHEL, Rocky, Alma, CentOS) lê /etc/sysconfig/alloy: nele o alloy.service
+# ganha um drop-in que também carrega o ENV_FILE (garantir_env_no_servico).
 ENV_FILE="/etc/default/alloy"
 SYSTEMD_OVERRIDE_DIR="/etc/systemd/system/alloy.service.d"
 SYSTEMD_OVERRIDE="${SYSTEMD_OVERRIDE_DIR}/10-nextec.conf"
+SYSTEMD_ENV_DROPIN="${SYSTEMD_OVERRIDE_DIR}/nextec-env.conf"
 
 # Cores ANSI. Se o terminal não suportar cores, o conteúdo continua legível.
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -3534,6 +3537,73 @@ prepare_snmp_config() {
   return 0
 }
 
+# O alloy.service referencia ${ENV_FILE}? Só o arquivo da unidade conta (não os
+# drop-ins), para o drop-in da Nextec não se justificar sozinho.
+alloy_unit_le_env_file() {
+  local unit
+  unit="$(systemctl show -p FragmentPath alloy.service 2>/dev/null | sed -n 's/^FragmentPath=//p' || true)"
+  [[ -n "$unit" && -r "$unit" ]] || return 1
+  grep -Eq "^[[:space:]]*EnvironmentFile=-?${ENV_FILE}[[:space:]]*$" "$unit"
+}
+
+# O ${ENV_FILE} está entre os arquivos de ambiente efetivos do serviço? Versões
+# antigas do systemd (CentOS 7) chamam a propriedade EnvironmentFile.
+alloy_servico_carrega_env_file() {
+  local efetivos
+  efetivos="$(systemctl show -p EnvironmentFiles -p EnvironmentFile alloy.service 2>/dev/null || true)"
+  grep -qF -- "$ENV_FILE" <<<"$efetivos"
+}
+
+# No pacote RPM o alloy.service lê /etc/sysconfig/alloy, e não ${ENV_FILE}: sem
+# este drop-in o serviço sobe sem as credenciais e o envio falha com 401. Vale
+# para qualquer unidade que não referencie ${ENV_FILE}; no Debian não faz nada.
+# Idempotente: só grava o drop-in quando ele muda; recarrega o systemd sempre,
+# porque um drop-in idêntico pode ter sido gravado sem o reload.
+garantir_env_no_servico() {
+  systemctl cat alloy.service >/dev/null 2>&1 || return 0
+  alloy_unit_le_env_file && return 0
+
+  local tmp anterior="" mudou=0
+  tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
+# Gerado pelo instalador Nextec. O alloy.service deste sistema não lê ${ENV_FILE},
+# onde ficam as credenciais; este drop-in faz o serviço carregá-lo.
+[Service]
+EnvironmentFile=${ENV_FILE}
+EOF
+  if ! { [[ -f "$SYSTEMD_ENV_DROPIN" ]] && cmp -s "$tmp" "$SYSTEMD_ENV_DROPIN"; }; then
+    if [[ -f "$SYSTEMD_ENV_DROPIN" ]]; then
+      anterior="$(mktemp)"
+      cp -p "$SYSTEMD_ENV_DROPIN" "$anterior"
+    fi
+    install -d -m 0755 "$SYSTEMD_OVERRIDE_DIR"
+    install -m 0644 "$tmp" "$SYSTEMD_ENV_DROPIN"
+    mudou=1
+  fi
+  rm -f "$tmp"
+
+  systemctl daemon-reload
+
+  if ! alloy_servico_carrega_env_file; then
+    if [[ "$mudou" == "1" ]]; then
+      if [[ -n "$anterior" ]]; then
+        install -m 0644 "$anterior" "$SYSTEMD_ENV_DROPIN"
+      else
+        rm -f "$SYSTEMD_ENV_DROPIN"
+      fi
+      systemctl daemon-reload
+    fi
+    if [[ -n "$anterior" ]]; then rm -f "$anterior"; fi
+    err "O alloy.service não carregou ${ENV_FILE} pelo drop-in ${SYSTEMD_ENV_DROPIN}."
+    exit 1
+  fi
+  if [[ -n "$anterior" ]]; then rm -f "$anterior"; fi
+  if [[ "$mudou" == "1" ]]; then
+    ok "alloy.service passa a carregar ${ENV_FILE} (drop-in ${SYSTEMD_ENV_DROPIN})."
+  fi
+  return 0
+}
+
 validate_and_start() {
   step "Validando e iniciando Alloy"
 
@@ -3547,6 +3617,7 @@ validate_and_start() {
   ok "Sintaxe do Alloy válida."
 
   liberar_syslog_firewall
+  garantir_env_no_servico
 
   systemctl daemon-reload
   systemctl restart alloy
