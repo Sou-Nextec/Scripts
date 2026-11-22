@@ -3587,7 +3587,7 @@ EOF
   if ! alloy_servico_carrega_env_file; then
     if [[ "$mudou" == "1" ]]; then
       if [[ -n "$anterior" ]]; then
-        install -m 0644 "$anterior" "$SYSTEMD_ENV_DROPIN"
+        cp -p "$anterior" "$SYSTEMD_ENV_DROPIN"
       else
         rm -f "$SYSTEMD_ENV_DROPIN"
       fi

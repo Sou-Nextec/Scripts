@@ -216,10 +216,12 @@ conferir "drop-in continua gravado" "$([[ -f "${d}/dropins/nextec-env.conf" ]] &
 echo "8c. Falha com drop-in feito à mão já existente: restaura o conteúdo anterior"
 d="$(preparar_cenario restaura rpm)"
 printf '[Service]\nEnvironmentFile=/etc/default/alloy\n# feito a mao\n' > "${d}/dropins/nextec-env.conf"
+chmod 600 "${d}/dropins/nextec-env.conf"
 original="$(cksum < "${d}/dropins/nextec-env.conf")"
 IGNORA_DROPIN=1 executar "$d" garantir_env_no_servico
 conferir "sai com erro" "$([[ "$(codigo "$d")" != "0" ]] && echo sim || echo nao)" "sim"
 conferir "drop-in à mão restaurado byte a byte" "$(cksum < "${d}/dropins/nextec-env.conf")" "$original"
+conferir "drop-in à mão restaurado com o modo original" "$(stat -c '%a' "${d}/dropins/nextec-env.conf")" "600"
 
 echo "9. validate_and_start: drop-in aplicado antes do reinício"
 d="$(preparar_cenario ordem rpm)"

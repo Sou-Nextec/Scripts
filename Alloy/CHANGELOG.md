@@ -17,7 +17,7 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 ## 2026-11-21
 
-### Instalador Linux 2.17.1, credenciais em RHEL e Rocky
+### Instalador Linux 2.17.1, credenciais em RHEL, Rocky, Alma e CentOS
 
 - **Corrigido o carregamento das credenciais em RHEL, Rocky, Alma e CentOS.** O serviço do Alloy dessas distribuições lê `/etc/sysconfig/alloy`, e não `/etc/default/alloy`, onde o instalador grava as credenciais. Antes o serviço subia sem elas e o envio ao NOC falhava com erro 401. Agora o instalador cria o arquivo `/etc/systemd/system/alloy.service.d/nextec-env.conf`, que faz o serviço ler também o `/etc/default/alloy`, e confere que o systemd o aplicou antes de reiniciar.
 - **Quando vale.** Em toda instalação, reconfiguração e `--atualizar`, sempre que o serviço do Alloy não lê o `/etc/default/alloy`. Em Debian e Ubuntu nada muda. Rodar de novo não altera o que já está certo, e um arquivo criado à mão com esse nome é regravado no mesmo formato.
