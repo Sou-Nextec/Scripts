@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Nextec NOC Monitoring Installer for Linux
-# Versão: 2.17.1 (Credenciais carregadas também em RHEL/Rocky/Alma/CentOS)
+# Versão: 2.17.2 (Versão do Alloy escolhida sem derrubar o instalador por SIGPIPE)
 #
 # USO
 # ---
@@ -56,7 +56,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-INSTALLER_VERSION="2.17.1"
+INSTALLER_VERSION="2.17.2"
 DEFAULT_NOC_HOST="noc.nex.tec.br"
 NOC_HOST="${DEFAULT_NOC_HOST}"
 RW_URL=""
@@ -975,6 +975,15 @@ install_prerequisites() {
   esac
 }
 
+# alloy_candidato_apt VERSÃO: imprime a primeira versão do pacote alloy no
+# repositório que casa com VERSÃO (ex.: 1.20.1 vira 1.20.1-1).
+# O awk lê a lista inteira, sem "exit" antecipado: sair no primeiro acerto fecha
+# o pipe e o apt-cache morre por SIGPIPE; com "pipefail" o pipeline devolve 141 e
+# o instalador falha, mesmo com a versão encontrada.
+alloy_candidato_apt() {
+  apt-cache madison alloy 2>/dev/null | awk -F'|' -v v="$1" '{gsub(/ /,"",$2); if (!achou && ($2==v || index($2, v"-")==1)) {print $2; achou=1}}'
+}
+
 install_alloy_apt() {
   install -d -m 0755 /etc/apt/keyrings
   wget -q -O /etc/apt/keyrings/grafana.asc https://apt.grafana.com/gpg-full.key
@@ -987,7 +996,7 @@ install_alloy_apt() {
   DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confold || true
   local pacote="alloy" candidato
   if [[ -n "${ALLOY_VERSAO:-}" ]]; then
-    candidato="$(apt-cache madison alloy 2>/dev/null | awk -F'|' -v v="$ALLOY_VERSAO" '{gsub(/ /,"",$2); if ($2==v || index($2, v"-")==1) {print $2; exit}}')"
+    candidato="$(alloy_candidato_apt "$ALLOY_VERSAO")"
     [[ -n "$candidato" ]] || { err "Versão ${ALLOY_VERSAO} do Alloy não encontrada no repositório da Grafana."; exit 1; }
     pacote="alloy=${candidato}"
   fi

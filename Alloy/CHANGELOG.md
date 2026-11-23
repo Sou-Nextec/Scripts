@@ -10,10 +10,19 @@ Os números de versão seguem `MAIOR.MENOR.CORREÇÃO`:
 
 | Componente | Arquivo | Versão atual |
 | --- | --- | --- |
-| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.17.1 |
+| Instalador Linux | `install-nextec-monitoring-linux-v2.sh` | 2.17.2 |
 | Instalador Windows | `install-nextec-monitoring-windows-v2.ps1` | 2.30.0 |
 | Coleta Complementar | `coleta-complementar/` | 1.6.0 |
 | Atualizador automático | `atualizador/` | 1.0.0 |
+
+## 2026-11-23
+
+### Instalador Linux 2.17.2, atualização automática com versão fixa do Alloy
+
+- **Corrigido o erro 141 na atualização automática em Debian e Ubuntu.** Quando o manifesto define a versão do Alloy, o instalador procura essa versão na lista do repositório da Grafana. A busca saía no primeiro acerto, o `apt-cache` morria por SIGPIPE e, com `pipefail`, o instalador terminava com código 141 em `install_alloy_apt`. O atualizador voltava para a versão anterior e marcava a versão como falha no servidor. Agora a busca lê a lista inteira.
+- **Quando valia.** Em toda instalação ou atualização com versão do Alloy definida pelo manifesto, em servidores com apt. Nada muda quando a versão não é definida.
+- **Servidores já afetados.** O atualizador deixa de tentar a versão que falhou (`falhou_antes`) e só tenta de novo quando sair uma versão nova com esta correção.
+- **Testes.** `bash Alloy/testes/instalador-linux-alloy-versao.testes.sh`, com uma lista de versões longa, para o SIGPIPE aparecer sempre.
 
 ## 2026-11-21
 
