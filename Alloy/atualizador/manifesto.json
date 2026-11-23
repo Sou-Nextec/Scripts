@@ -1,44 +1,49 @@
 {
-  "commit": "1ddb6fbef620d38937eb3318a70bb801c1355ac4",
+  "commit": "38ee029ff8f05e9cd228dc79ab34cb79629cdce1",
   "formato": 1,
   "linux": {
-    "alloy": "1.20.1",
+    "alloy": "1.22.0",
     "alloy_binario": {
       "amd64": {
-        "sha256": "451fe650e8277d22d69cb8db50bba809f581fe78decba7fce4027ef185457be9",
-        "url": "https://github.com/grafana/alloy/releases/download/v1.20.1/alloy-linux-amd64.zip"
+        "sha256": "62d177feb18c9b6ffd636c8273aa82a6afc75a507d096ff951749df23c3176f9",
+        "url": "https://github.com/grafana/alloy/releases/download/v1.22.0/alloy-linux-amd64.zip"
       },
       "arm64": {
-        "sha256": "396827d58158f181c98d5776c908348b38b4099f1d18a1e7554f2fda0fcb9203",
-        "url": "https://github.com/grafana/alloy/releases/download/v1.20.1/alloy-linux-arm64.zip"
+        "sha256": "cc2c4d7bc25d3ef7df8c95395759879ba4eb0d016db068c07dcb7aa88f436ad3",
+        "url": "https://github.com/grafana/alloy/releases/download/v1.22.0/alloy-linux-arm64.zip"
       }
     },
     "arquivos": {
       "atualizador": {
         "sha256": "1c3bf5ea64e071aa7d555ef1e1c8b42f4ac91a8a0055a2bef8352d2beec5154e",
-        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/1ddb6fbef620d38937eb3318a70bb801c1355ac4/Alloy/atualizador/nextec-atualizador.py"
+        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/38ee029ff8f05e9cd228dc79ab34cb79629cdce1/Alloy/atualizador/nextec-atualizador.py"
       },
       "coleta": {
         "sha256": "16e5820644c68e134670ec28749cf266a6a94fa29a68776aabe6186d6d4f5126",
-        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/1ddb6fbef620d38937eb3318a70bb801c1355ac4/Alloy/coleta-complementar/coleta-complementar.py"
+        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/38ee029ff8f05e9cd228dc79ab34cb79629cdce1/Alloy/coleta-complementar/coleta-complementar.py"
       },
       "instalador": {
-        "sha256": "eff669450e1d7daabe8138bb323effc594db1ab5dbea50f4e87a14a5a091ea53",
-        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/1ddb6fbef620d38937eb3318a70bb801c1355ac4/Alloy/install-nextec-monitoring-linux-v2.sh"
+        "sha256": "676ee689ada67a5393f5d963cb7ef348d94523926e4a49f689c1a0013bc82c09",
+        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/38ee029ff8f05e9cd228dc79ab34cb79629cdce1/Alloy/install-nextec-monitoring-linux-v2.sh"
       }
     }
   },
   "ondas": {
-    "0": "2026-11-04T16:08:26Z",
-    "1": "2026-11-05T16:08:26Z",
+    "0": "2026-11-23T12:03:15Z",
+    "1": "2026-11-24T12:03:15Z",
     "2": null
   },
-  "publicado_em": "2026-11-04T16:08:26Z",
-  "sequencia": 1795116325,
-  "valido_ate": "2026-12-19T19:25:25Z",
-  "versao": "2026.11.04-1",
+  "publicado_em": "2026-11-23T12:03:15Z",
+  "sequencia": 1795435395,
+  "valido_ate": "2026-12-23T12:03:15Z",
+  "versao": "2026.11.23-1",
   "windows": {
     "alloy": {
+      "sha256": "83dd891780648dc3aee24b1f0c308a84c549b33c85cd2a805f1dc07e22a1024e",
+      "url": "https://github.com/grafana/alloy/releases/download/v1.22.0/alloy-installer-windows-amd64.exe",
+      "versao": "1.22.0"
+    },
+    "alloy_anterior": {
       "sha256": "23fcfe3755f02e8a6a83f27149851322ab2b66d584e76d239d9c031f50d3a8f0",
       "url": "https://github.com/grafana/alloy/releases/download/v1.20.1/alloy-installer-windows-amd64.exe",
       "versao": "1.20.1"
@@ -46,15 +51,15 @@
     "arquivos": {
       "atualizador": {
         "sha256": "e72c8583dd606fa3a371823e0306bf4b5ad3e7361ed5f99a4582b671e54954d1",
-        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/1ddb6fbef620d38937eb3318a70bb801c1355ac4/Alloy/atualizador/nextec-atualizador.ps1"
+        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/38ee029ff8f05e9cd228dc79ab34cb79629cdce1/Alloy/atualizador/nextec-atualizador.ps1"
       },
       "coleta": {
         "sha256": "950540bf7b4ea33cef1a45ccdab3453eb4d11b18e9e7293a2bbcc41f4af2f543",
-        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/1ddb6fbef620d38937eb3318a70bb801c1355ac4/Alloy/coleta-complementar/coleta-complementar.ps1"
+        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/38ee029ff8f05e9cd228dc79ab34cb79629cdce1/Alloy/coleta-complementar/coleta-complementar.ps1"
       },
       "instalador": {
-        "sha256": "fa927abb2063bb91e6e3b6249c9225a45935f31c738652030c484aed441198d4",
-        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/1ddb6fbef620d38937eb3318a70bb801c1355ac4/Alloy/install-nextec-monitoring-windows-v2.ps1"
+        "sha256": "12fd3457ac7482b0f0d52138feddff0c6439b1207c680cfdf0572f1b159383f5",
+        "url": "https://raw.githubusercontent.com/Sou-Nextec/Scripts/38ee029ff8f05e9cd228dc79ab34cb79629cdce1/Alloy/install-nextec-monitoring-windows-v2.ps1"
       }
     }
   }
